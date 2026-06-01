@@ -1,0 +1,32 @@
+FROM python:3.14-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /agent
+
+RUN pip install --no-cache-dir miragen
+
+# Agent profiles — required
+COPY agents/ ./agents/
+
+# Local tools module — optional.
+# If you have no tools.py, add it to .dockerignore to skip the COPY silently,
+# or use a multi-stage build that conditionally includes it.
+COPY tools.py ./tools.py
+
+# Non-root user
+RUN adduser --disabled-password --gecos "" agentuser
+USER agentuser
+
+# Overridden per-container in compose
+ENV AGENT_PROFILE=agents/agent.yaml \
+    HOST=0.0.0.0 \
+    PORT=8000
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"
+
+CMD ["miragen", "run"]

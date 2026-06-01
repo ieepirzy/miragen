@@ -1,0 +1,59 @@
+# ============================================================
+# COMPOSE EXAMPLE — miragen multi-agent stack
+#
+# Two agent containers sharing a common image build.
+# Each container gets its own profile and port.
+# Secrets are mounted as files — agents never see the raw keys.
+#
+# Usage:
+#   docker compose -f compose.example.yml up
+# ============================================================
+
+secrets:
+  anthropic_key:
+    file: ./secrets/anthropic_key.txt     # plain text file, one key per file
+  openai_key:
+    file: ./secrets/openai_key.txt
+
+# ── Shared build ─────────────────────────────────────────────────────────────
+x-agent-base: &agent-base
+  build: .
+  restart: unless-stopped
+  secrets:
+    - anthropic_key
+  environment:
+    ANTHROPIC_API_KEY_FILE: /run/secrets/anthropic_key
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+
+  # Autonomous agent — wakes on cron, no public port needed
+  morning-briefing:
+    <<: *agent-base
+    container_name: morning-briefing
+    environment:
+      ANTHROPIC_API_KEY_FILE: /run/secrets/anthropic_key
+      AGENT_PROFILE: agents/morning-briefing.yaml
+
+  # Interactive agent — exposes /run for request-response use
+  assistant:
+    <<: *agent-base
+    container_name: assistant
+    environment:
+      ANTHROPIC_API_KEY_FILE: /run/secrets/anthropic_key
+      AGENT_PROFILE: agents/assistant.yaml
+    ports:
+      - "8001:8000"
+
+  # Hybrid agent using a different model provider — OpenAI key via its own file
+  researcher:
+    build: .
+    container_name: researcher
+    restart: unless-stopped
+    secrets:
+      - openai_key
+    environment:
+      OPENAI_API_KEY_FILE: /run/secrets/openai_key
+      AGENT_PROFILE: agents/researcher.yaml
+    ports:
+      - "8002:8000"
