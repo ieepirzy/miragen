@@ -1,0 +1,159 @@
+import pytest
+from pydantic import ValidationError
+
+from miragen.models import (
+    AgentProfile,
+    AgentSpec,
+    CronTrigger,
+    HttpTrigger,
+    ModelSettings,
+    OnComplete,
+)
+
+
+def _spec(**kw):
+    return {"model": "anthropic:claude-haiku-4-5", "instructions": "Test.", **kw}
+
+
+def _profile(**kw):
+    return {
+        "name": "test",
+        "mode": "autonomous",
+        "triggers": [{"type": "cron", "schedule": "0 * * * *"}],
+        "spec": _spec(),
+        **kw,
+    }
+
+
+class TestCronTrigger:
+    def test_minimal(self):
+        t = CronTrigger(type="cron", schedule="0 * * * *")
+        assert t.schedule == "0 * * * *"
+        assert t.default_prompt is None
+
+    def test_with_default_prompt(self):
+        t = CronTrigger(type="cron", schedule="*/5 * * * *", default_prompt="Run report.")
+        assert t.default_prompt == "Run report."
+
+
+class TestHttpTrigger:
+    def test_minimal(self):
+        t = HttpTrigger(type="http")
+        assert t.header_prompt is None
+
+    def test_with_header_prompt(self):
+        t = HttpTrigger(type="http", header_prompt="Be concise.")
+        assert t.header_prompt == "Be concise."
+
+
+class TestModelSettings:
+    def test_all_optional(self):
+        ms = ModelSettings()
+        assert ms.max_tokens is None
+        assert ms.temperature is None
+
+    def test_max_tokens_only(self):
+        ms = ModelSettings(max_tokens=512)
+        assert ms.max_tokens == 512
+
+    def test_full(self):
+        ms = ModelSettings(max_tokens=1000, temperature=0.3)
+        assert ms.temperature == 0.3
+
+
+class TestOnComplete:
+    def test_all_optional(self):
+        oc = OnComplete()
+        assert oc.log_to is None
+        assert oc.notify is None
+        assert oc.post_to is None
+
+    def test_with_post_to(self):
+        oc = OnComplete(post_to="https://example.com/hook")
+        assert str(oc.post_to).startswith("https://example.com")
+
+    def test_invalid_url_raises(self):
+        with pytest.raises(ValidationError):
+            OnComplete(post_to="not-a-url")
+
+    def test_all_fields(self):
+        oc = OnComplete(log_to="miradb", notify="telegram", post_to="https://example.com/")
+        assert oc.log_to == "miradb"
+        assert oc.notify == "telegram"
+
+
+class TestAgentProfile:
+    def test_valid_autonomous_cron(self):
+        p = AgentProfile.model_validate(_profile())
+        assert p.name == "test"
+        assert p.mode == "autonomous"
+
+    def test_valid_interactive_http(self):
+        p = AgentProfile.model_validate(_profile(
+            mode="interactive",
+            triggers=[{"type": "http"}],
+        ))
+        assert p.mode == "interactive"
+
+    def test_valid_hybrid_both_triggers(self):
+        p = AgentProfile.model_validate(_profile(
+            mode="hybrid",
+            triggers=[{"type": "cron", "schedule": "0 * * * *"}, {"type": "http"}],
+        ))
+        assert len(p.triggers) == 2
+
+    def test_autonomous_http_only_raises(self):
+        with pytest.raises(ValidationError, match="cron trigger"):
+            AgentProfile.model_validate(_profile(
+                mode="autonomous",
+                triggers=[{"type": "http"}],
+            ))
+
+    def test_interactive_with_cron_raises(self):
+        with pytest.raises(ValidationError, match="cron triggers"):
+            AgentProfile.model_validate(_profile(
+                mode="interactive",
+                triggers=[{"type": "cron", "schedule": "0 * * * *"}],
+            ))
+
+    def test_autonomous_with_both_triggers_ok(self):
+        p = AgentProfile.model_validate(_profile(
+            mode="autonomous",
+            triggers=[{"type": "cron", "schedule": "0 * * * *"}, {"type": "http"}],
+        ))
+        assert p.mode == "autonomous"
+
+    def test_tools_list(self):
+        p = AgentProfile.model_validate(_profile(tools=["tool_a", "tool_b"]))
+        assert p.tools == ["tool_a", "tool_b"]
+
+    def test_tools_none_by_default(self):
+        p = AgentProfile.model_validate(_profile())
+        assert p.tools is None
+
+    def test_model_settings(self):
+        p = AgentProfile.model_validate(_profile(
+            spec=_spec(model_settings={"max_tokens": 256, "temperature": 0.5}),
+        ))
+        assert p.spec.model_settings.max_tokens == 256
+        assert p.spec.model_settings.temperature == 0.5
+
+    def test_capabilities_list(self):
+        p = AgentProfile.model_validate(_profile(
+            spec=_spec(capabilities=["WebSearch"]),
+        ))
+        assert p.spec.capabilities == ["WebSearch"]
+
+    def test_max_steps(self):
+        p = AgentProfile.model_validate(_profile(spec=_spec(max_steps=10)))
+        assert p.spec.max_steps == 10
+
+    def test_on_complete(self):
+        p = AgentProfile.model_validate(_profile(
+            on_complete={"log_to": "miradb", "notify": "telegram"},
+        ))
+        assert p.on_complete.log_to == "miradb"
+
+    def test_approval_required(self):
+        p = AgentProfile.model_validate(_profile(approval_required=["delete_*", "execute_*"]))
+        assert "delete_*" in p.approval_required
