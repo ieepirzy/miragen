@@ -10,7 +10,7 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.12"
 authors = [
-    { name = "AUTHOR_NAME", email = "AUTHOR_EMAIL" },
+    { name = "ieepirzy", email = "nervy_colder_1m@icloud.com" },
 ]
 keywords = ["ai", "agents", "pydantic-ai", "llm", "orchestration"]
 classifiers = [
@@ -43,9 +43,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "HOMEPAGE_URL"
-Repository = "REPOSITORY_URL"
-Issues = "ISSUES_URL"
+Homepage = "https://github.com/ieepirzy/miragen"
+Repository = "https://github.com/ieepirzy/miragen"
+Issues = "https://github.com/ieepirzy/miragen/issues"
 
 [project.scripts]
 miragen = "miragen.cli:cli"
