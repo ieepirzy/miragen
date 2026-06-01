@@ -1,0 +1,78 @@
+# ============================================================
+# AGENT PROFILE — FULL REFERENCE EXAMPLE
+# Swarm orchestration layer (yours) + PydanticAI spec (theirs)
+# ============================================================
+
+# --- Swarm layer (your parser owns this) --------------------
+
+name: morning-briefing                  # unique agent ID, also used as container name
+
+mode: autonomous                        # autonomous | interactive | hybrid
+                                        # autonomous  = cron-triggered, no human loop
+                                        # interactive = request-response, streaming
+                                        # hybrid      = long autonomous task + live HTTP query endpoint mid-run
+
+triggers:
+  - type: cron
+    schedule: "0 9 * * 1-5"            # standard cron expression (weekdays at 09:00)
+
+    #optional
+    default_prompt: |
+      Produce the morning briefing.
+      Include: weather, calendar events, top news headlines.
+
+  - type: http                          # exposes POST /run on the container's FastAPI
+                                        # no extra fields needed; prompt comes in request body
+    #optional
+    header_prompt: |
+      This is an optional prompt that gets injected into the top of every request via /run
+
+#optional
+approval_required:                      # glob patterns — matching tool calls are deferred 
+  - "delete_*"
+  - "execute_*"
+  - "fs_write"
+  - "register_*"                        # recommended for agents capable of code-execution.
+
+#optional
+tools:                                  # whitelisted tool names from your @mcp_tool registry
+  - search_observations                 # tools NOT listed here are not injected, even if registered
+  - add_observation
+  - get_weather
+  - get_calendar_events
+
+#optional
+on_complete:                            # what to do after an autonomous run finishes
+  log_to: storage                   # write result summary to persistent storage
+  notify: telegram                 # send completion notification
+  post_to: https://...            # deterministic completion endpoint that fires always
+
+# --- PydanticAI spec layer (their loader owns this) ---------
+
+spec:
+  model: anthropic:claude-sonnet-4-6   # any pydantic-ai model string
+
+  instructions: |                       # | = literal block scalar, preserves newlines
+    You are test-Mira, a test agent for my agent creation system.
+    Say hi to the developer, his name is Ilari!
+
+
+  model_settings:
+    max_tokens: 4096
+    temperature: 0.3                    # lower = more deterministic, good for autonomous agents
+
+  capabilities:
+    - WebSearch                         # no config needed, just the class name
+
+    - Thinking:                         # capability with config — name: {param: value}
+        effort: low                     # low | medium | high
+
+    - MCP:                              # attach an MCP server as a capability
+        url: https://private.mcp.muutto365.fi/mcp
+        name: miradb
+
+    - MCP:                              # multiple MCP servers are fine
+        url: https://mcp.muutto365.fi/mcp
+        name: muutto365-booking
+
+  max_steps: 30                         # maps to UsageLimits(request_limit=30)
