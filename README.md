@@ -1,5 +1,10 @@
 # miragen
 
+[![PyPI version](https://img.shields.io/pypi/v/miragen)](https://pypi.org/project/miragen/)
+[![Python versions](https://img.shields.io/pypi/pyversions/miragen)](https://pypi.org/project/miragen/)
+[![License](https://img.shields.io/github/license/ieepirzy/miragen)](https://github.com/ieepirzy/miragen/blob/main/LICENSE)
+[![Tests](https://img.shields.io/github/actions/workflow/status/ieepirzy/miragen/test.yml?label=tests)](https://github.com/ieepirzy/miragen/actions)
+
 **YAML-defined agent orchestration framework powered by [PydanticAI](https://ai.pydantic.dev).**
 
 Define agents as YAML profiles. Run them as isolated Docker containers. Wire them together into a swarm.
@@ -24,7 +29,7 @@ spec:
         effort: low
 ```
 
-```
+```bash
 miragen run
 ```
 
@@ -63,7 +68,7 @@ Each agent is defined by a YAML profile with two layers:
 
 Each agent runs in its own Docker container. Containers communicate over a Docker internal network — no host port exposure required for inter-agent calls.
 
-```
+```http
 http://researcher-agent:8000/run
 ```
 
@@ -126,7 +131,7 @@ docker run -e AGENT_PROFILE=agents/assistant.yaml -p 8000:8000 my-swarm
 
 ## Example project structure
 
-```
+```fs
 my-swarm/
 ├── agents/
 │   ├── morning-briefing.yaml
