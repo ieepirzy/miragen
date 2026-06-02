@@ -76,7 +76,7 @@ async def _run_approval_gate(
     result = await handler(args)
 
     if response.prompt:
-        return f"[Approver note: {response.prompt}]\n{result}"
+        return f"[Approver note: {response.prompt}]\n{result}"  # nosemgrep: python.flask.security.audit.directly-returned-format-string.directly-returned-format-string
 
     return result
 

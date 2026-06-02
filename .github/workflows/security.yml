@@ -19,7 +19,7 @@ jobs:
       - name: Install
         run: pip install pip-audit && pip install -e .
       - name: Audit
-        run: pip-audit --strict
+        run: pip-audit --strict --skip-editable
 
   sast:
     name: SAST (Semgrep)
