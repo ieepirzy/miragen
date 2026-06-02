@@ -37,6 +37,7 @@ _CAPABILITY_REGISTRY: dict[str, Any] = {
     "MCP":             lambda cfg: MCP(
                            url=cfg["url"],
                            id=cfg.get("name"),
+                           native=True,
                        ),
 }
 
