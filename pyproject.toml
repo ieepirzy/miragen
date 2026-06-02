@@ -46,6 +46,7 @@ dev = [
 Homepage = "https://github.com/ieepirzy/miragen"
 Repository = "https://github.com/ieepirzy/miragen"
 Issues = "https://github.com/ieepirzy/miragen/issues"
+Documentation = "https://github.com/ieepirzy/miragen/blob/main/README.md"
 
 [project.scripts]
 miragen = "miragen.cli:cli"

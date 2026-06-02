@@ -422,6 +422,8 @@ Without `register_*`, a prompt-injected agent could register a new tool at runti
 - If you give agents code-execution tools (Jupyter kernel, bash, etc.), add `register_*` to `approval_required`. Without it, a compromised agent could register and call arbitrary tools at runtime.
 - Containerized environments are recommended — they limit blast radius if an agent pulls in a malicious payload.
 
+A multitude of tutorials exist for hardening docker containers, one I found that goes [straight to the point](https://github.com/ieepirzy/container-hardening/blob/main/README.md). I recommend checking it out.
+
 ---
 
 ## License
