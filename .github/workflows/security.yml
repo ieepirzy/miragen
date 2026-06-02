@@ -17,9 +17,16 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install
-        run: pip install pip-audit && pip install -e .
+        run: |
+          pip install pip-audit
+          python -c "
+          import tomllib
+          with open('pyproject.toml', 'rb') as f:
+              d = tomllib.load(f)
+          print('\n'.join(d['project']['dependencies']))
+          " | pip install -r /dev/stdin
       - name: Audit
-        run: pip-audit --strict --skip-editable
+        run: pip-audit --strict
 
   sast:
     name: SAST (Semgrep)
