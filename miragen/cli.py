@@ -46,7 +46,7 @@ def run(tools: str, host: str, port: int, reload: bool) -> None:
     """Start the agent container server."""
     _import_tools(tools)
     uvicorn.run(
-        "swarm.app:app",
+        "miragen.app:app",
         host=host,
         port=port,
         reload=reload,
