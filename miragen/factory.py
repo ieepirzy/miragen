@@ -108,7 +108,7 @@ def get_approval_handler() -> Callable | None:
 
 # ── Factory ──────────────────────────────────────────────────────────────────
 
-def build_agent(profile: AgentProfile) -> Agent:
+def build_agent(profile: AgentProfile) -> tuple[Agent, UsageLimits | None]:
     """
     Construct a live PydanticAI Agent from a validated AgentProfile.
 
@@ -141,13 +141,12 @@ def build_agent(profile: AgentProfile) -> Agent:
         model=profile.spec.model,
         instructions=profile.spec.instructions,
         capabilities=capabilities,
-        usage_limits=limits,
         model_settings=model_settings,
     )
 
     _inject_tools(agent, profile)
 
-    return agent
+    return agent, limits
 
 
 def _inject_tools(agent: Agent, profile: AgentProfile) -> None:

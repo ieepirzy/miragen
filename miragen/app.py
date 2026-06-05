@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from pydantic_ai import Agent
+from pydantic_ai.usage import UsageLimits
 
 from miragen.factory import build_agent, registered_handlers
 from miragen.load import load_profile
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 _profile: AgentProfile | None = None
 _agent: Agent | None = None
+_limits: UsageLimits | None = None
 _scheduler: AsyncIOScheduler = AsyncIOScheduler()
 
 
@@ -33,7 +35,7 @@ _scheduler: AsyncIOScheduler = AsyncIOScheduler()
 async def run_agent(prompt: str) -> str:
     """Core agent execution. Called by both cron and HTTP triggers."""
     assert _agent is not None, "Agent not initialized"
-    result = await _agent.run(prompt)
+    result = await _agent.run(prompt, usage_limits=_limits)
     return str(result.output)
 
 
@@ -101,7 +103,7 @@ def _load_file_secrets() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _profile, _agent
+    global _profile, _agent, _limits
 
     _load_file_secrets()
 
@@ -109,7 +111,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"Loading agent profile: {profile_path}")
 
     _profile = load_profile(profile_path)
-    _agent = build_agent(_profile)
+    _agent, _limits = build_agent(_profile)
 
     logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode")
 
@@ -197,7 +199,7 @@ async def run_stream(request: RunRequest):
             break
 
     async def event_stream():
-        async with _agent.run_stream(prompt) as stream:
+        async with _agent.run_stream(prompt, usage_limits=_limits) as stream:
             async for chunk in stream.stream_text(delta=True):
                 yield f"data: {chunk}\n\n"
         yield "data: [DONE]\n\n"
