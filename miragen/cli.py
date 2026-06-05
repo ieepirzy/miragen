@@ -23,7 +23,7 @@ def _import_tools(tools: str) -> None:
     if path.exists():
         spec = importlib.util.spec_from_file_location("_user_tools", path)
         mod = importlib.util.module_from_spec(spec)
-        spec.load.exec_module(mod)
+        spec.loader.exec_module(mod)
         click.echo(f"Loaded tools from {path}")
     else:
         click.echo(f"No tools file found at {path}, starting without local tools")
