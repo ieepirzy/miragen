@@ -85,10 +85,11 @@ class TestRunEndpoint:
     async def test_header_prompt_prepended(self, mock_agent):
         profile = _make_profile(
             triggers=[{"type": "http", "header_prompt": "Context: be brief."}],
+            inject_timestamp=False,
         )
         captured = {}
 
-        async def capture(prompt):
+        async def capture(prompt, use_history=False):
             captured["prompt"] = prompt
             return "ok"
 
@@ -104,12 +105,41 @@ class TestRunEndpoint:
     async def test_no_header_prompt_passes_prompt_unchanged(self, client):
         captured = {}
 
-        async def capture(prompt):
+        async def capture(prompt, use_history=False):
             captured["prompt"] = prompt
             return "ok"
 
         with patch("miragen.app.run_agent", capture):
             await client.post("/run", json={"prompt": "raw prompt"})
+
+        assert "raw prompt" in captured["prompt"]
+
+    async def test_timestamp_injected_by_default(self, client):
+        captured = {}
+
+        async def capture(prompt, use_history=False):
+            captured["prompt"] = prompt
+            return "ok"
+
+        with patch("miragen.app.run_agent", capture):
+            await client.post("/run", json={"prompt": "hello"})
+
+        import re
+        assert re.search(r"\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\]", captured["prompt"])
+
+    async def test_timestamp_suppressed_when_disabled(self, mock_agent):
+        profile = _make_profile(inject_timestamp=False)
+        captured = {}
+
+        async def capture(prompt, use_history=False):
+            captured["prompt"] = prompt
+            return "ok"
+
+        app_module._profile = profile
+        app_module._agent = mock_agent
+        with patch("miragen.app.run_agent", capture):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                await c.post("/run", json={"prompt": "raw prompt"})
 
         assert captured["prompt"] == "raw prompt"
 

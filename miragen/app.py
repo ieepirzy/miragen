@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +15,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from pydantic_ai import Agent
+from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
 
 from miragen.factory import build_agent, registered_handlers
@@ -29,13 +31,39 @@ _agent: Agent | None = None
 _limits: UsageLimits | None = None
 _scheduler: AsyncIOScheduler = AsyncIOScheduler()
 
+HISTORY_FILE = Path("/agent/history.json")
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _stamp_prompt(prompt: str) -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return f"[{ts}]\n{prompt}"
+
 
 # ── Agent runner ─────────────────────────────────────────────────────────────
 
-async def run_agent(prompt: str) -> str:
+async def run_agent(prompt: str, use_history: bool = False) -> str:
     """Core agent execution. Called by both cron and HTTP triggers."""
     assert _agent is not None, "Agent not initialized"
-    result = await _agent.run(prompt, usage_limits=_limits)
+
+    history = None
+    if use_history:
+        try:
+            if HISTORY_FILE.exists():
+                history = ModelMessagesTypeAdapter.validate_json(HISTORY_FILE.read_bytes())
+        except Exception:
+            logger.warning("Failed to load history, starting fresh")
+
+    result = await _agent.run(prompt, usage_limits=_limits, message_history=history)
+
+    if use_history:
+        try:
+            HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            HISTORY_FILE.write_bytes(ModelMessagesTypeAdapter.dump_json(result.all_messages()))
+        except Exception:
+            logger.warning("Failed to save history")
+
     return str(result.output)
 
 
@@ -43,6 +71,9 @@ async def run_agent_cron(prompt: str) -> None:
     """Cron-triggered run. Handles on_complete side effects."""
     assert _profile is not None
     logger.info(f"[{_profile.name}] cron run triggered")
+
+    if _profile.inject_timestamp:
+        prompt = _stamp_prompt(prompt)
 
     try:
         output = await run_agent(prompt)
@@ -146,6 +177,7 @@ app = FastAPI(lifespan=lifespan)
 
 class RunRequest(BaseModel):
     prompt: str
+    use_history: bool = False
 
 
 class RunResponse(BaseModel):
@@ -168,15 +200,16 @@ async def run(request: RunRequest):
     if _agent is None:
         raise HTTPException(status_code=503, detail="Agent not ready")
 
-    # Prepend header_prompt if configured on the http trigger
     prompt = request.prompt
+    if _profile and _profile.inject_timestamp:
+        prompt = _stamp_prompt(prompt)
     for trigger in (_profile.triggers if _profile else []):
         if hasattr(trigger, "header_prompt") and trigger.header_prompt:
             prompt = f"{trigger.header_prompt.strip()}\n\n{prompt}"
             break
 
     try:
-        output = await run_agent(prompt)
+        output = await run_agent(prompt, use_history=request.use_history)
         return RunResponse(output=output)
     except Exception as e:
         logger.error(f"[{_profile.name if _profile else '?'}] run failed: {e}", exc_info=True)
@@ -193,15 +226,31 @@ async def run_stream(request: RunRequest):
         raise HTTPException(status_code=503, detail="Agent not ready")
 
     prompt = request.prompt
+    if _profile and _profile.inject_timestamp:
+        prompt = _stamp_prompt(prompt)
     for trigger in (_profile.triggers if _profile else []):
         if hasattr(trigger, "header_prompt") and trigger.header_prompt:
             prompt = f"{trigger.header_prompt.strip()}\n\n{prompt}"
             break
 
+    history = None
+    if request.use_history:
+        try:
+            if HISTORY_FILE.exists():
+                history = ModelMessagesTypeAdapter.validate_json(HISTORY_FILE.read_bytes())
+        except Exception:
+            logger.warning("Failed to load history for stream, starting fresh")
+
     async def event_stream():
-        async with _agent.run_stream(prompt, usage_limits=_limits) as stream:
+        async with _agent.run_stream(prompt, usage_limits=_limits, message_history=history) as stream:
             async for chunk in stream.stream_text(delta=True):
                 yield f"data: {chunk}\n\n"
+            if request.use_history:
+                try:
+                    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    HISTORY_FILE.write_bytes(ModelMessagesTypeAdapter.dump_json(stream.all_messages()))
+                except Exception:
+                    logger.warning("Failed to save history after stream")
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

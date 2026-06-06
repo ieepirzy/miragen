@@ -70,6 +70,7 @@ class AgentProfile(BaseModel):
     approval_webhook: Optional[HttpUrl] = None      # POST ApprovalRequest, expect ApprovalResponse
     tools: Optional[list[str]] = None               # whitelisted tool names; None = no tools injected
     on_complete: Optional[OnComplete] = None
+    inject_timestamp: bool = True                   # prepend UTC timestamp to every incoming prompt
     spec: AgentSpec
 
     @model_validator(mode="after")
