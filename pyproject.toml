@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "miragen"
-version = "0.1.4"
+version = "0.1.5"
 description = "YAML-defined agent orchestration framework powered by PydanticAI"
 readme = "README.md"
 license = { text = "MIT" }
