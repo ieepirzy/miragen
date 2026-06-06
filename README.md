@@ -131,13 +131,30 @@ docker run -e AGENT_PROFILE=agents/assistant.yaml -p 8000:8000 my-swarm
 
 ## Example project structure
 
+**Per-agent workspace** (recommended — each agent has its own directory):
+
+```fs
+my-swarm/
+├── agents/
+│   ├── morning-briefing/
+│   │   ├── agent.yaml
+│   │   └── tools.py
+│   └── assistant/
+│       ├── agent.yaml
+│       └── tools.py
+├── compose.yml
+└── secrets/
+    └── anthropic_key.txt
+```
+
+**Monorepo** (simpler for small swarms with shared tooling):
+
 ```fs
 my-swarm/
 ├── agents/
 │   ├── morning-briefing.yaml
-│   ├── assistant.yaml
-│   └── researcher.yaml
-├── tools.py              # @register decorated functions
+│   └── assistant.yaml
+├── tools.py              # shared @register decorated functions
 ├── Dockerfile
 ├── compose.yml
 └── secrets/
@@ -163,56 +180,70 @@ miragen uses `Pydantic AI`'s built in hooks to suspend execution for tools defin
 
 ## Docker & Compose
 
-**Dockerfile**
+### Pre-built base image (recommended)
 
-```dockerfile
-FROM python:3.12-slim
-WORKDIR /agent
-RUN pip install --no-cache-dir miragen
-COPY tools.py* ./
-COPY agents/ ./agents/
-RUN adduser --disabled-password --gecos "" agentuser
-USER agentuser
-ENV AGENT_PROFILE=agents/agent.yaml
-EXPOSE 8000
-CMD ["miragen", "run"]
-```
+A pre-built image is published at `ghcr.io/ieepirzy/miragen:latest`. Use it with volume mounts — no Dockerfile per agent needed.
 
-**compose.yml**
+Each agent workspace is mounted to `WORKDIR /agent` inside the container. `AGENT_PROFILE` defaults to `agent.yaml`, which is the profile filename at the root of that workspace.
 
 ```yaml
+# compose.yml
 secrets:
   anthropic_key:
     file: ./secrets/anthropic_key.txt
 
 x-agent-base: &agent-base
-  build: .
+  image: ghcr.io/ieepirzy/miragen:latest
   restart: unless-stopped
-  secrets: [anthropic_key]
-  environment:
-    ANTHROPIC_API_KEY_FILE: /run/secrets/anthropic_key
 
 services:
   morning-briefing:
     <<: *agent-base
+    container_name: morning-briefing
+    secrets: [anthropic_key]
     environment:
       ANTHROPIC_API_KEY_FILE: /run/secrets/anthropic_key
-      AGENT_PROFILE: agents/morning-briefing.yaml
+      AGENT_PROFILE: agent.yaml
+    volumes:
+      - ./agents/morning-briefing:/agent
 
   assistant:
     <<: *agent-base
+    container_name: assistant
+    secrets: [anthropic_key]
     environment:
       ANTHROPIC_API_KEY_FILE: /run/secrets/anthropic_key
-      AGENT_PROFILE: agents/assistant.yaml
-    ports:
-      - "8001:8000"
+      AGENT_PROFILE: agent.yaml
+    volumes:
+      - ./agents/assistant:/agent
 
 networks:
   default:
     internal: true
 ```
 
-API keys are mounted as Docker secrets — agents never see the raw key in their context.
+### Custom image (monorepo / extra dependencies)
+
+Build your own image when you need shared tooling baked in or extra pip packages:
+
+```dockerfile
+FROM ghcr.io/ieepirzy/miragen:latest
+COPY tools.py ./
+COPY agents/ ./agents/
+```
+
+Or from scratch:
+
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /agent
+RUN pip install --no-cache-dir miragen your-extra-dep \
+    && adduser --disabled-password --gecos "" agentuser \
+    && chown agentuser /agent
+USER agentuser
+EXPOSE 8000
+CMD ["miragen", "run"]
+```
 
 ---
 
@@ -416,7 +447,7 @@ Without `register_*`, a prompt-injected agent could register a new tool at runti
 
 ## Security notes
 
-- API keys are mounted as Docker secrets and read into the environment at startup. They are never present in the agent's context window.
+- API keys are mounted as Docker secrets and read into the environment at startup via the `*_API_KEY_FILE` → `*_API_KEY` pattern. Any env var ending in `_API_KEY_FILE` whose value is a readable path is resolved automatically — `ANTHROPIC_API_KEY_FILE`, `OPENAI_API_KEY_FILE`, `GEMINI_API_KEY_FILE`, etc. The `_FILE` var is removed after loading so keys are never visible in the agent's context window or environment dump.
 - Network egress is enforced at the container/firewall level, not in config files.
 - `approval_required` globs suspend matching tool calls for human approval before execution.
 - If you give agents code-execution tools (Jupyter kernel, bash, etc.), add `register_*` to `approval_required`. Without it, a compromised agent could register and call arbitrary tools at runtime.
