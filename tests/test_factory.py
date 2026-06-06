@@ -137,19 +137,17 @@ class TestBuildAgent:
 
     def test_applies_usage_limits(self):
         profile = _profile(spec={"model": "m", "instructions": "i", "max_steps": 5})
-        with patch("miragen.factory.Agent") as MockAgent, \
+        with patch("miragen.factory.Agent"), \
              patch("miragen.factory.resolve_capabilities", return_value=[]):
-            build_agent(profile)
-            kw = MockAgent.call_args.kwargs
-            assert kw["usage_limits"].request_limit == 5
+            _, limits = build_agent(profile)
+            assert limits.request_limit == 5
 
     def test_no_usage_limits_when_unset(self):
         profile = _profile()
-        with patch("miragen.factory.Agent") as MockAgent, \
+        with patch("miragen.factory.Agent"), \
              patch("miragen.factory.resolve_capabilities", return_value=[]):
-            build_agent(profile)
-            kw = MockAgent.call_args.kwargs
-            assert kw["usage_limits"] is None
+            _, limits = build_agent(profile)
+            assert limits is None
 
     def test_model_settings_max_tokens_and_temperature(self):
         profile = _profile(spec={
