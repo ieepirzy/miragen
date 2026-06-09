@@ -54,3 +54,6 @@ docs/_build/
 
 .venv/
 .pytest_cache/
+
+# local-only planning notes
+FUTURE_FEATURES.md
