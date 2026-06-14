@@ -5,7 +5,8 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /agent
 
-RUN pip install --no-cache-dir miragen \
+COPY . /build/
+RUN pip install --no-cache-dir /build \
     && adduser --disabled-password --gecos "" agentuser \
     && chown agentuser /agent
 
