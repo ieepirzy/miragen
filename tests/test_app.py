@@ -248,6 +248,16 @@ class TestRunAgentCron:
             from miragen.app import run_agent_cron
             await run_agent_cron("Run now.")
 
+    async def test_on_complete_error_logged_not_raised(self):
+        profile = _make_profile(mode="autonomous",
+                                 triggers=[{"type": "cron", "schedule": "0 * * * *"}])
+        app_module._profile = profile
+
+        with patch("miragen.app.run_agent", AsyncMock(return_value="done")), \
+             patch("miragen.app._handle_on_complete", AsyncMock(side_effect=RuntimeError("webhook failed"))):
+            from miragen.app import run_agent_cron
+            await run_agent_cron("Run now.")
+
 
 class TestLoadFileSecrets:
     def test_loads_secret_into_env(self, tmp_path):
@@ -303,3 +313,12 @@ class TestLoadFileSecrets:
             _load_file_secrets()
             assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-real-key"
             assert "ANTHROPIC_API_KEY_FILE" not in os.environ
+
+    def test_permission_error_logged_not_raised(self, tmp_path):
+        secret = tmp_path / "key"
+        secret.write_text("secret-value")
+        with patch.dict(os.environ, {"LOCKED_KEY_FILE": str(secret)}, clear=False):
+            with patch("pathlib.Path.read_text", side_effect=PermissionError("access denied")):
+                _load_file_secrets()
+            assert "LOCKED_KEY" not in os.environ
+            assert "LOCKED_KEY_FILE" in os.environ
