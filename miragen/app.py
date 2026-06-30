@@ -24,7 +24,7 @@ from miragen.models import AgentProfile, CronTrigger as ProfileCronTrigger
 
 logger = logging.getLogger(__name__)
 
-# ── State ────────────────────────────────────────────────────────────────────
+# ── State ────────────────────────────────────────────────────────────────────────────
 
 _profile: AgentProfile | None = None
 _agent: Agent | None = None
@@ -34,14 +34,14 @@ _scheduler: AsyncIOScheduler = AsyncIOScheduler()
 HISTORY_FILE = Path("/agent/history.json")
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────────────────────
 
 def _stamp_prompt(prompt: str) -> str:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return f"[{ts}]\n{prompt}"
 
 
-# ── Agent runner ─────────────────────────────────────────────────────────────
+# ── Agent runner ──────────────────────────────────────────────────────────────────
 
 async def run_agent(prompt: str, use_history: bool = False) -> str:
     """Core agent execution. Called by both cron and HTTP triggers."""
@@ -78,9 +78,14 @@ async def run_agent_cron(prompt: str) -> None:
     try:
         output = await run_agent(prompt)
         logger.info(f"[{_profile.name}] cron run complete")
-        await _handle_on_complete(output)
     except Exception as e:
         logger.error(f"[{_profile.name}] cron run failed: {e}", exc_info=True)
+        return
+
+    try:
+        await _handle_on_complete(output)
+    except Exception as e:
+        logger.error(f"[{_profile.name}] on_complete failed: {e}", exc_info=True)
 
 
 async def _handle_on_complete(output: str) -> None:
@@ -105,7 +110,7 @@ async def _handle_on_complete(output: str) -> None:
             logger.info(f"[{_profile.name}] posted output to {oc.post_to}")
 
 
-# ── Secrets loader ───────────────────────────────────────────────────────────
+# ── Secrets loader ───────────────────────────────────────────────────────────────────
 
 def _load_file_secrets() -> None:
     """
@@ -125,12 +130,15 @@ def _load_file_secrets() -> None:
             logger.warning(f"Secret file referenced by {file_var} not found: {path}")
             continue
         target_var = file_var[: -len("_FILE")]
-        os.environ[target_var] = secret_path.read_text().strip()
-        del os.environ[file_var]
-        logger.info(f"Loaded secret {target_var} from {file_var}")
+        try:
+            os.environ[target_var] = secret_path.read_text().strip()
+            del os.environ[file_var]
+            logger.info(f"Loaded secret {target_var} from {file_var}")
+        except OSError as e:
+            logger.error(f"Failed to read secret file {path} for {file_var}: {e}")
 
 
-# ── Lifespan ─────────────────────────────────────────────────────────────────
+# ── Lifespan ────────────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -168,12 +176,12 @@ async def lifespan(app: FastAPI):
     logger.info("Scheduler stopped")
 
 
-# ── App ───────────────────────────────────────────────────────────────────────
+# ── App ────────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(lifespan=lifespan)
 
 
-# ── HTTP trigger schemas ──────────────────────────────────────────────────────
+# ── HTTP trigger schemas ────────────────────────────────────────────────────────────────
 
 class RunRequest(BaseModel):
     prompt: str
@@ -184,7 +192,7 @@ class RunResponse(BaseModel):
     output: str
 
 
-# ── Routes ───────────────────────────────────────────────────────────────────
+# ── Routes ───────────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
