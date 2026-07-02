@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from typing import Annotated, Literal, Optional, Union
-from pydantic import BaseModel, Field, HttpUrl, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
 
 # ── Approval flow ────────────────────────────────────────────────────────────
+#
+# Wire models exchanged with approval handlers / webhooks. These stay lenient
+# (extra keys allowed) so third-party approval services can attach metadata.
 
 class ApprovalRequest(BaseModel):
     agent_name: str
@@ -18,17 +21,36 @@ class ApprovalResponse(BaseModel):
     prompt: Optional[str] = None  # folded back into agent context if provided
 
 
+# ── Profile models ───────────────────────────────────────────────────────────
+#
+# Everything below is authored by hand in agent.yaml, so unknown keys are
+# almost always typos (e.g. `aproval_required`). extra="forbid" turns those
+# into loud validation errors instead of silently ignored config.
+
+class _ProfileModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
 # ── Triggers ────────────────────────────────────────────────────────────────
 
-class CronTrigger(BaseModel):
+class CronTrigger(_ProfileModel):
     type: Literal["cron"]
-    schedule: str                               # standard cron expression
-    default_prompt: Optional[str] = None        # injected if no prompt provided at runtime
+    schedule: str = Field(
+        description="Standard 5-field cron expression, e.g. '0 9 * * 1-5' (09:00 Mon–Fri).",
+        min_length=1,
+    )
+    default_prompt: Optional[str] = Field(
+        default=None,
+        description="Prompt injected when the cron fires without an explicit prompt.",
+    )
 
 
-class HttpTrigger(BaseModel):
+class HttpTrigger(_ProfileModel):
     type: Literal["http"]
-    header_prompt: Optional[str] = None         # prepended to every incoming /run request body
+    header_prompt: Optional[str] = Field(
+        default=None,
+        description="Text prepended to every incoming POST /run request body.",
+    )
 
 
 Trigger = Annotated[
@@ -39,38 +61,81 @@ Trigger = Annotated[
 
 # ── On-complete ──────────────────────────────────────────────────────────────
 
-class OnComplete(BaseModel):
-    log_to: Optional[str] = None                # named storage target e.g. "miradb"
-    notify: Optional[str] = None                # named notification channel e.g. "telegram"
-    post_to: Optional[HttpUrl] = None           # arbitrary webhook — escape hatch for any output routing
+class OnComplete(_ProfileModel):
+    log_to: Optional[str] = Field(
+        default=None,
+        description="Named storage target registered via @register_handler, e.g. 'miradb'.",
+    )
+    notify: Optional[str] = Field(
+        default=None,
+        description="Named notification channel registered via @register_handler, e.g. 'telegram'.",
+    )
+    post_to: Optional[HttpUrl] = Field(
+        default=None,
+        description="Webhook URL that receives the run output — escape hatch for any output routing.",
+    )
 
 
 # ── PydanticAI spec (their layer) ───────────────────────────────────────────
 
-class ModelSettings(BaseModel):
-    max_tokens: Optional[int] = None
-    temperature: Optional[float] = None
+class ModelSettings(_ProfileModel):
+    max_tokens: Optional[int] = Field(default=None, ge=1)
+    temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
 
 
-class AgentSpec(BaseModel):
-    model: str                                  # any pydantic-ai model string e.g. "anthropic:claude-sonnet-4-6"
-    instructions: str                           # system prompt, supports YAML block scalar (|)
+class AgentSpec(_ProfileModel):
+    model: str = Field(
+        description="Any pydantic-ai model string, e.g. 'anthropic:claude-sonnet-4-6'.",
+        min_length=1,
+    )
+    instructions: str = Field(
+        description="System prompt; supports YAML block scalar (|).",
+        min_length=1,
+    )
     model_settings: Optional[ModelSettings] = None
-    capabilities: Optional[list[str | dict]] = None   # str = no-config cap, dict = cap with config
-    max_steps: Optional[int] = None             # maps to UsageLimits(request_limit=N)
+    capabilities: Optional[list[str | dict]] = Field(
+        default=None,
+        description=(
+            "Capability list. Strings for no-config capabilities ('WebSearch'), "
+            "single-key dicts for configured ones ({'Thinking': {'effort': 'low'}})."
+        ),
+    )
+    max_steps: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Maps to UsageLimits(request_limit=N) — caps model round-trips per run.",
+    )
 
 
 # ── Top-level agent profile ──────────────────────────────────────────────────
 
-class AgentProfile(BaseModel):
-    name: str
+class AgentProfile(_ProfileModel):
+    name: str = Field(
+        description=(
+            "Unique agent ID, also used as the Docker container name. Lowercase "
+            "letters, digits, hyphens and underscores; max 63 chars."
+        ),
+        pattern=r"^[a-z0-9][a-z0-9_-]{0,62}$",
+    )
     mode: Literal["autonomous", "interactive", "hybrid"]
-    triggers: list[Trigger]
-    approval_required: Optional[list[str]] = None   # glob patterns e.g. ["delete_*", "execute_*"]
-    approval_webhook: Optional[HttpUrl] = None      # POST ApprovalRequest, expect ApprovalResponse
-    tools: Optional[list[str]] = None               # whitelisted tool names; None = no tools injected
+    triggers: list[Trigger] = Field(min_length=1)
+    approval_required: Optional[list[str]] = Field(
+        default=None,
+        description="fnmatch glob patterns for human-in-the-loop gating, e.g. ['delete_*', 'execute_*'].",
+    )
+    approval_webhook: Optional[HttpUrl] = Field(
+        default=None,
+        description="URL that receives ApprovalRequest POSTs and returns an ApprovalResponse.",
+    )
+    tools: Optional[list[str]] = Field(
+        default=None,
+        description="Whitelisted @register tool names; None/omitted = no local tools injected.",
+    )
     on_complete: Optional[OnComplete] = None
-    inject_timestamp: bool = True                   # prepend UTC timestamp to every incoming prompt
+    inject_timestamp: bool = Field(
+        default=True,
+        description="Prepend the current UTC timestamp to every incoming prompt.",
+    )
     spec: AgentSpec
 
     @model_validator(mode="after")

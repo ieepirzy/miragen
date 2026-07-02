@@ -157,3 +157,59 @@ class TestAgentProfile:
     def test_approval_required(self):
         p = AgentProfile.model_validate(_profile(approval_required=["delete_*", "execute_*"]))
         assert "delete_*" in p.approval_required
+
+
+class TestStrictSchema:
+    def test_unknown_top_level_key_raises(self):
+        with pytest.raises(ValidationError, match="aproval_required"):
+            AgentProfile.model_validate(_profile(aproval_required=["delete_*"]))
+
+    def test_unknown_spec_key_raises(self):
+        with pytest.raises(ValidationError, match="instrutions"):
+            AgentProfile.model_validate(_profile(spec=_spec(instrutions="typo")))
+
+    def test_unknown_trigger_key_raises(self):
+        with pytest.raises(ValidationError):
+            AgentProfile.model_validate(_profile(
+                triggers=[{"type": "cron", "schedule": "0 * * * *", "prompt": "wrong key"}],
+            ))
+
+    def test_unknown_model_settings_key_raises(self):
+        with pytest.raises(ValidationError, match="temprature"):
+            AgentProfile.model_validate(_profile(
+                spec=_spec(model_settings={"temprature": 0.5}),
+            ))
+
+    def test_empty_triggers_raises(self):
+        with pytest.raises(ValidationError):
+            AgentProfile.model_validate(_profile(triggers=[]))
+
+    @pytest.mark.parametrize("bad", ["Upper", "has space", "-leading", "a/b", ""])
+    def test_invalid_name_raises(self, bad):
+        with pytest.raises(ValidationError):
+            AgentProfile.model_validate(_profile(name=bad))
+
+    @pytest.mark.parametrize("good", ["a", "morning-briefing", "agent_2", "0abc"])
+    def test_valid_name_ok(self, good):
+        assert AgentProfile.model_validate(_profile(name=good)).name == good
+
+    def test_temperature_out_of_range_raises(self):
+        with pytest.raises(ValidationError):
+            AgentProfile.model_validate(_profile(
+                spec=_spec(model_settings={"temperature": 3.0}),
+            ))
+
+    def test_max_steps_zero_raises(self):
+        with pytest.raises(ValidationError):
+            AgentProfile.model_validate(_profile(spec=_spec(max_steps=0)))
+
+    def test_approval_wire_models_stay_lenient(self):
+        # Third-party approval services may attach extra metadata — must not raise.
+        from miragen.models import ApprovalRequest, ApprovalResponse
+        req = ApprovalRequest.model_validate({
+            "agent_name": "a", "tool_name": "t", "tool_args": {}, "request_id": "id",
+            "extra_meta": "ok",
+        })
+        assert req.agent_name == "a"
+        resp = ApprovalResponse.model_validate({"approved": True, "reviewer": "human"})
+        assert resp.approved is True

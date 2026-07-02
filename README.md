@@ -252,6 +252,7 @@ CMD ["miragen", "run"]
 ```yaml
 # ── Swarm layer ───────────────────────────────────────────────
 name: my-agent                    # unique ID, used as container name
+                                  # (lowercase letters, digits, - and _; max 63 chars)
 mode: autonomous                  # autonomous | interactive | hybrid
 
 triggers:
@@ -300,6 +301,8 @@ spec:
 
   max_steps: 30
 ```
+
+Profiles are validated **strictly**: unknown keys are rejected with an error naming the offending field, so typos like `aproval_required:` fail at `miragen validate` time instead of silently disabling the feature.
 
 ---
 
