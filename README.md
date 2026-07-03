@@ -338,6 +338,23 @@ Built-in capabilities map directly to PydanticAI:
 | `Thinking` | `effort: low\|medium\|high` | Extended reasoning |
 | `ImageGeneration` | `fallback_model: str` | Image generation |
 | `MCP` | `url: str`, `name: str` | Attach an MCP server |
+| `Peer` | `agents: list[str]`, `timeout_s: int` (default 120) | Injects `call_agent(agent, prompt)` — swarm-to-swarm calls, restricted to an explicit allowlist |
+
+### Swarm calls
+
+`Peer` injects one tool, `call_agent`, that POSTs to another agent's `/run` over the Docker internal network:
+
+```yaml
+spec:
+  capabilities:
+    - Peer:
+        agents: [researcher, writer]
+        timeout_s: 120
+```
+
+Calls to agents outside the allowlist are rejected before any network request is made — `call_agent` returns an `ERROR: ...` string (never raises) naming the allowlist, so the model can self-correct. Connection failures and timeouts also come back as explanatory strings rather than exceptions.
+
+Since the injected tool is named `call_agent`, gate it like any other tool with `approval_required: ["call_agent"]` if you want a human in the loop before an agent calls a peer.
 
 Register custom capabilities from user code:
 

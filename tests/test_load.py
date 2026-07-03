@@ -54,7 +54,9 @@ class TestResolveCapabilities:
         assert len(caps) == 3
 
     def test_all_builtin_names_present(self):
-        assert set(_CAPABILITY_REGISTRY.keys()) == {"WebSearch", "WebFetch", "Thinking", "ImageGeneration", "MCP"}
+        assert set(_CAPABILITY_REGISTRY.keys()) == {
+            "WebSearch", "WebFetch", "Thinking", "ImageGeneration", "MCP", "Peer",
+        }
 
 
 class TestRegisterCapability:
