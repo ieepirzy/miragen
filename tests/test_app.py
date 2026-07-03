@@ -563,6 +563,126 @@ class TestGetRunEndpoint:
         assert len(resp.json()["detail"]["candidates"]) == 2
 
 
+class TestApprovalsEndpoints:
+    @pytest.fixture(autouse=True)
+    def fresh_broker(self):
+        import miragen.broker as broker_module
+
+        original = broker_module._broker
+        broker_module._broker = broker_module.ApprovalBroker()
+        yield
+        broker_module._broker = original
+
+    async def test_list_approvals_empty(self, client):
+        resp = await client.get("/approvals")
+        assert resp.status_code == 200
+        assert resp.json() == {"count": 0, "approvals": []}
+
+    async def test_pending_approval_appears_in_list(self, client):
+        from miragen.broker import get_broker
+        from miragen.models import ApprovalRequest
+
+        request = ApprovalRequest(
+            agent_name="test-agent", tool_name="delete_file", tool_args={"path": "/x"}, request_id="r1",
+        )
+        get_broker().submit(request, timeout_s=30)
+
+        resp = await client.get("/approvals")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] == 1
+        assert data["approvals"][0]["request"]["tool_name"] == "delete_file"
+        assert data["approvals"][0]["request"]["tool_args"] == {"path": "/x"}
+
+    async def test_resolve_approved_unblocks_the_waiting_future(self, client):
+        from miragen.broker import get_broker
+        from miragen.models import ApprovalRequest
+
+        request = ApprovalRequest(agent_name="test-agent", tool_name="delete_file", tool_args={}, request_id="r1")
+        future = get_broker().submit(request, timeout_s=30)
+
+        resp = await client.post("/approvals/r1", json={"approved": True})
+        assert resp.status_code == 200
+        assert resp.json() == {"resolved": True}
+
+        response = await future
+        assert response.approved is True
+
+    async def test_resolve_denied_with_reason_reaches_the_future(self, client):
+        from miragen.broker import get_broker
+        from miragen.models import ApprovalRequest
+
+        request = ApprovalRequest(agent_name="test-agent", tool_name="delete_file", tool_args={}, request_id="r1")
+        future = get_broker().submit(request, timeout_s=30)
+
+        resp = await client.post("/approvals/r1", json={"approved": False, "prompt": "reason"})
+        assert resp.status_code == 200
+
+        response = await future
+        assert response.approved is False
+        assert response.prompt == "reason"
+
+    async def test_resolve_unknown_id_returns_404_and_leaves_others_pending(self, client):
+        from miragen.broker import get_broker
+        from miragen.models import ApprovalRequest
+
+        request = ApprovalRequest(agent_name="test-agent", tool_name="delete_file", tool_args={}, request_id="r1")
+        get_broker().submit(request, timeout_s=30)
+
+        resp = await client.post("/approvals/does-not-exist", json={"approved": True})
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["pending"] == ["r1"]
+
+        still_pending = await client.get("/approvals")
+        assert still_pending.json()["count"] == 1
+
+    async def test_health_includes_pending_approvals_count(self, client):
+        from miragen.broker import get_broker
+        from miragen.models import ApprovalRequest
+
+        get_broker().submit(
+            ApprovalRequest(agent_name="test-agent", tool_name="t", tool_args={}, request_id="r1"),
+            timeout_s=30,
+        )
+
+        resp = await client.get("/health")
+        assert resp.json()["pending_approvals"] == 1
+
+    async def test_end_to_end_gated_tool_call_via_queue_mode_endpoint(self):
+        """A gated tool call submits to the broker; GET /approvals surfaces it;
+        POST /approvals/{id} against the real HTTP endpoint unblocks the run."""
+        from miragen.approval import _run_approval_gate
+        import miragen.factory as factory_module
+
+        profile = _make_profile(
+            approval_required=["delete_*"], approval_mode="queue", approval_timeout_s=30,
+        )
+        call = MagicMock()
+        call.tool_name = "delete_file"
+        call.args_as_dict = MagicMock(return_value={"path": "/data"})
+        handler = AsyncMock(return_value="deleted /data")
+        factory_module._approval_handler = None
+
+        async def approve_via_endpoint():
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                for _ in range(200):
+                    pending = (await c.get("/approvals")).json()["approvals"]
+                    if pending:
+                        request_id = pending[0]["request"]["request_id"]
+                        resp = await c.post(f"/approvals/{request_id}", json={"approved": True})
+                        assert resp.status_code == 200
+                        return
+                    await asyncio.sleep(0)
+            pytest.fail("no pending approval appeared")
+
+        result, _ = await asyncio.gather(
+            _run_approval_gate(profile, call, {}, handler),
+            approve_via_endpoint(),
+        )
+
+        assert result == "deleted /data"
+
+
 class TestLoadFileSecrets:
     def test_loads_secret_into_env(self, tmp_path):
         secret = tmp_path / "key"

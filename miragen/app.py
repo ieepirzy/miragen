@@ -21,10 +21,12 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
 
+from miragen.broker import PendingApproval, get_broker
 from miragen.factory import build_agent, registered_handlers
 from miragen.load import load_profile
 from miragen.models import (
     AgentProfile,
+    ApprovalResponse,
     CronTrigger as ProfileCronTrigger,
     IntervalTrigger as ProfileIntervalTrigger,
     RunRecord,
@@ -297,7 +299,12 @@ async def health():
     if _run_store is not None:
         recent = _run_store.list(limit=1)
         last_run = recent[0] if recent else None
-    return {"status": "ok", "agent": _profile.name if _profile else None, "last_run": last_run}
+    return {
+        "status": "ok",
+        "agent": _profile.name if _profile else None,
+        "last_run": last_run,
+        "pending_approvals": len(get_broker().pending()),
+    }
 
 
 @app.post("/run", response_model=RunResponse)
@@ -383,6 +390,33 @@ async def get_run(run_id: str):
         )
 
     return record
+
+
+class ApprovalListResponse(BaseModel):
+    count: int
+    approvals: list[PendingApproval]
+
+
+class ResolveApprovalResponse(BaseModel):
+    resolved: bool
+
+
+@app.get("/approvals", response_model=ApprovalListResponse)
+async def list_approvals():
+    pending = get_broker().pending()
+    return ApprovalListResponse(count=len(pending), approvals=pending)
+
+
+@app.post("/approvals/{request_id}", response_model=ResolveApprovalResponse)
+async def resolve_approval(request_id: str, response: ApprovalResponse):
+    broker = get_broker()
+    if not broker.resolve(request_id, response):
+        pending_ids = [p.request.request_id for p in broker.pending()]
+        raise HTTPException(
+            status_code=404,
+            detail={"error": f"unknown, already resolved, or expired approval '{request_id}'", "pending": pending_ids},
+        )
+    return ResolveApprovalResponse(resolved=True)
 
 
 @app.post("/run/stream")
