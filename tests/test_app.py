@@ -210,6 +210,114 @@ class TestRunStreamEndpoint:
         assert "data: [DONE]" in body
 
 
+def _stream_ctx(chunks=("Hello", " world"), messages=()):
+    async def fake_stream_text(delta):
+        for chunk in chunks:
+            yield chunk
+
+    stream = MagicMock()
+    stream.stream_text = fake_stream_text
+    stream.all_messages = MagicMock(return_value=list(messages))
+    ctx = AsyncMock()
+    ctx.__aenter__ = AsyncMock(return_value=stream)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    return ctx
+
+
+class TestRunStreamRunRecords:
+    async def test_stream_sets_run_id_header_and_finishes_record(
+        self, profile, mock_agent_with_usage, tmp_path
+    ):
+        from miragen.runs import RunStore
+
+        mock_agent_with_usage.run_stream = MagicMock(return_value=_stream_ctx())
+        app_module._profile = profile
+        app_module._agent = mock_agent_with_usage
+        store = RunStore(root=tmp_path)
+        app_module._run_store = store
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/run/stream", json={"prompt": "hi"})
+
+        run_id = resp.headers.get("X-Miragen-Run-Id")
+        assert run_id, "stream response must carry X-Miragen-Run-Id"
+        record = store.get(run_id)
+        assert record is not None
+        assert record.status == "succeeded"
+        assert record.output == "Hello world"
+
+    async def test_stream_without_store_has_no_header(self, client, mock_agent):
+        mock_agent.run_stream = MagicMock(return_value=_stream_ctx())
+        resp = await client.post("/run/stream", json={"prompt": "hi"})
+        assert resp.status_code == 200
+        assert "X-Miragen-Run-Id" not in resp.headers
+
+
+class TestHistorySidecar:
+    async def test_run_with_history_appends_sidecar_line(
+        self, profile, mock_agent_with_usage, tmp_path, monkeypatch
+    ):
+        import json as _json
+        from miragen.runs import RunStore
+
+        monkeypatch.setattr(app_module, "HISTORY_FILE", tmp_path / "history.json")
+        sidecar = tmp_path / "history.runs.jsonl"
+        monkeypatch.setattr(app_module, "HISTORY_SIDECAR", sidecar)
+
+        app_module._profile = profile
+        app_module._agent = mock_agent_with_usage
+        store = RunStore(root=tmp_path / "runs")
+        app_module._run_store = store
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/run", json={"prompt": "hi", "use_history": True})
+
+        assert resp.status_code == 200
+        run_id = resp.json()["run_id"]
+        lines = sidecar.read_text().strip().splitlines()
+        assert len(lines) == 1
+        entry = _json.loads(lines[0])
+        assert entry["run_id"] == run_id
+        assert entry["message_count"] == 0
+        assert "saved_at" in entry
+
+    async def test_stream_with_history_appends_sidecar_line(
+        self, profile, mock_agent_with_usage, tmp_path, monkeypatch
+    ):
+        import json as _json
+        from miragen.runs import RunStore
+
+        monkeypatch.setattr(app_module, "HISTORY_FILE", tmp_path / "history.json")
+        sidecar = tmp_path / "history.runs.jsonl"
+        monkeypatch.setattr(app_module, "HISTORY_SIDECAR", sidecar)
+
+        mock_agent_with_usage.run_stream = MagicMock(return_value=_stream_ctx())
+        app_module._profile = profile
+        app_module._agent = mock_agent_with_usage
+        app_module._run_store = RunStore(root=tmp_path / "runs")
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/run/stream", json={"prompt": "hi", "use_history": True})
+
+        entry = _json.loads(sidecar.read_text().strip().splitlines()[0])
+        assert entry["run_id"] == resp.headers["X-Miragen-Run-Id"]
+
+    async def test_sidecar_failure_never_fails_the_run(
+        self, profile, mock_agent_with_usage, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(app_module, "HISTORY_FILE", tmp_path / "history.json")
+        # Point the sidecar at an unwritable location (a directory).
+        monkeypatch.setattr(app_module, "HISTORY_SIDECAR", tmp_path)
+
+        app_module._profile = profile
+        app_module._agent = mock_agent_with_usage
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/run", json={"prompt": "hi", "use_history": True})
+
+        assert resp.status_code == 200
+
+
 class TestHandleOnComplete:
     async def test_no_on_complete_does_nothing(self):
         app_module._profile = _make_profile()

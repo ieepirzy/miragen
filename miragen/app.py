@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -46,6 +47,7 @@ _scheduler: AsyncIOScheduler = AsyncIOScheduler()
 _run_store: RunStore | None = None
 
 HISTORY_FILE = Path("/agent/history.json")
+HISTORY_SIDECAR = Path("/agent/history.runs.jsonl")
 
 # Keeps references to fire-and-forget /run/async tasks so they aren't
 # garbage-collected mid-run (a well-known asyncio.create_task gotcha).
@@ -67,6 +69,22 @@ def _stamp_prompt(prompt: str) -> str:
 
 
 # ── Agent runner ──────────────────────────────────────────────────────────────────
+
+def _append_history_sidecar(run_id: str | None, message_count: int) -> None:
+    """Correlate a history.json save with the run that produced it (best effort —
+    a failed sidecar write logs a warning, never fails the run)."""
+    try:
+        line = json.dumps({
+            "run_id": run_id,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "message_count": message_count,
+        })
+        HISTORY_SIDECAR.parent.mkdir(parents=True, exist_ok=True)
+        with open(HISTORY_SIDECAR, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        logger.warning("Failed to append history sidecar entry")
+
 
 async def run_agent(prompt: str, use_history: bool = False, record: RunRecord | None = None) -> str:
     """
@@ -95,8 +113,10 @@ async def run_agent(prompt: str, use_history: bool = False, record: RunRecord | 
 
     if use_history:
         try:
+            messages = result.all_messages()
             HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-            HISTORY_FILE.write_bytes(ModelMessagesTypeAdapter.dump_json(result.all_messages()))
+            HISTORY_FILE.write_bytes(ModelMessagesTypeAdapter.dump_json(messages))
+            _append_history_sidecar(record.run_id if record else None, len(messages))
         except Exception:
             logger.warning("Failed to save history")
 
@@ -483,16 +503,38 @@ async def run_stream(request: RunRequest):
         except Exception:
             logger.warning("Failed to load history for stream, starting fresh")
 
+    record = (
+        _run_store.start(agent_name=_profile.name, trigger="http", prompt=prompt, use_history=request.use_history)
+        if _run_store is not None and _profile is not None
+        else None
+    )
+
     async def event_stream():
-        async with _agent.run_stream(prompt, usage_limits=_limits, message_history=history) as stream:
-            async for chunk in stream.stream_text(delta=True):
-                yield f"data: {chunk}\n\n"
-            if request.use_history:
-                try:
-                    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-                    HISTORY_FILE.write_bytes(ModelMessagesTypeAdapter.dump_json(stream.all_messages()))
-                except Exception:
-                    logger.warning("Failed to save history after stream")
+        chunks: list[str] = []
+        try:
+            async with _agent.run_stream(prompt, usage_limits=_limits, message_history=history) as stream:
+                async for chunk in stream.stream_text(delta=True):
+                    chunks.append(chunk)
+                    yield f"data: {chunk}\n\n"
+                if request.use_history:
+                    try:
+                        messages = stream.all_messages()
+                        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+                        HISTORY_FILE.write_bytes(ModelMessagesTypeAdapter.dump_json(messages))
+                        _append_history_sidecar(record.run_id if record else None, len(messages))
+                    except Exception:
+                        logger.warning("Failed to save history after stream")
+        except Exception as e:
+            if record is not None and _run_store is not None:
+                _run_store.finish(record, status="failed", error=str(e), output="".join(chunks) or None)
+            raise
+        if record is not None and _run_store is not None:
+            try:
+                usage, tool_calls = extract_run_details(stream)
+            except Exception:
+                usage, tool_calls = None, []
+            _run_store.finish(record, status="succeeded", output="".join(chunks), usage=usage, tool_calls=tool_calls)
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    headers = {"X-Miragen-Run-Id": record.run_id} if record is not None else None
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=headers)
