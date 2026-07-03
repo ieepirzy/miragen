@@ -304,6 +304,27 @@ spec:
 
 Profiles are validated **strictly**: unknown keys are rejected with an error naming the offending field, so typos like `aproval_required:` fail at `miragen validate` time instead of silently disabling the feature.
 
+### Environment interpolation
+
+Any string value in the profile can reference an environment variable, so the same YAML works unchanged across deployments instead of hardcoding webhook URLs, MCP server URLs, or channel IDs:
+
+```yaml
+on_complete:
+  post_to: ${WEBHOOK_URL}                       # fails miragen validate if unset
+
+spec:
+  capabilities:
+    - MCP:
+        url: ${MCP_URL:-http://mcp:9000}        # falls back if unset
+```
+
+- `${VAR}` — substituted with the environment variable's value; validation fails with the variable name and its YAML path (e.g. `spec.capabilities[0].MCP.url`) if it's unset.
+- `${VAR:-default}` — falls back to `default` when `VAR` is unset. An empty-string env value still counts as set.
+- `$${VAR}` — escape hatch, renders the literal text `${VAR}`.
+- Interpolation runs on every string value, including inside multi-line `instructions` blocks, but never on dict keys or non-string values (ints, bools stay untouched).
+
+Agent containers already get `*_API_KEY` env vars injected by miragen-mcp's compose management, and file-based `*_FILE` secrets are resolved into the environment before the profile loads — so secrets are interpolatable out of the box. Be careful interpolating secrets into `instructions`, though: that puts them in the model's context window.
+
 ---
 
 ## Capabilities

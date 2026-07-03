@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -93,6 +95,42 @@ def resolve_capabilities(raw: list[str | dict]) -> list[AbstractCapability[Any]]
     return resolved
 
 
+# ── Environment interpolation ────────────────────────────────────────────────
+#
+# ${VAR} and ${VAR:-default} — the two POSIX forms people expect, nothing else.
+# $${VAR} escapes to a literal "${VAR}". Applied to string values only,
+# recursively through the whole document (dict values, list items — never
+# dict keys), between YAML parse and Pydantic validation.
+
+_ENV_RE = re.compile(r"\$\$\{|\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def interpolate_env(value: Any, path: str = "") -> Any:
+    """Recursively substitute ${VAR}/${VAR:-default} in string values."""
+    if isinstance(value, dict):
+        return {
+            key: interpolate_env(v, f"{path}.{key}" if path else str(key))
+            for key, v in value.items()
+        }
+    if isinstance(value, list):
+        return [interpolate_env(v, f"{path}[{i}]") for i, v in enumerate(value)]
+    if isinstance(value, str):
+        def _sub(m: re.Match[str]) -> str:
+            if m.group(0) == "$${":
+                return "${"
+            name, default = m.group(1), m.group(2)
+            if name in os.environ:
+                return os.environ[name]
+            if default is not None:
+                return default
+            raise ValueError(
+                f"profile references undefined environment variable '{name}' "
+                f"(at {path}); set it or use ${{{name}:-default}}"
+            )
+        return _ENV_RE.sub(_sub, value)
+    return value
+
+
 # ── Loader ───────────────────────────────────────────────────────────────────
 
 def load_profile(path: str | Path) -> AgentProfile:
@@ -112,6 +150,8 @@ def load_profile(path: str | Path) -> AgentProfile:
 
     if not isinstance(raw, dict):
         raise ValueError(f"Agent profile must be a YAML mapping, got: {type(raw).__name__}")
+
+    raw = interpolate_env(raw)
 
     # Validate + coerce via Pydantic
     profile = AgentProfile.model_validate(raw)
