@@ -27,6 +27,7 @@ def reset_app_state():
     app_module._profile = None
     app_module._agent = None
     app_module._run_store = None
+    app_module._broker = None
 
 
 @pytest.fixture
@@ -727,3 +728,91 @@ class TestBudgetGuardrails:
             from miragen.app import run_agent_cron
             await run_agent_cron("Run now.")
             mock_run.assert_not_awaited()
+
+
+class TestApprovalsEndpoints:
+    async def test_get_approvals_empty(self, client):
+        from miragen.broker import ApprovalBroker
+        app_module._broker = ApprovalBroker()
+        resp = await client.get("/approvals")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] == 0
+        assert data["approvals"] == []
+
+    async def test_post_approval_resolve_unknown_returns_404(self, client):
+        from miragen.broker import ApprovalBroker
+        app_module._broker = ApprovalBroker()
+        resp = await client.post(
+            "/approvals/nonexistent",
+            json={"approved": True},
+        )
+        assert resp.status_code == 404
+        assert "not found" in resp.json()["detail"]["error"]
+
+    async def test_post_approval_resolve_pending_request(self, client):
+        from miragen.broker import ApprovalBroker
+        from miragen.models import ApprovalRequest
+        import asyncio
+
+        broker = ApprovalBroker()
+        app_module._broker = broker
+
+        request = ApprovalRequest(
+            agent_name="test-agent", tool_name="delete_file",
+            tool_args={"path": "/tmp/x"}, request_id="test-req-123",
+        )
+
+        # Submit in background (will wait for resolution)
+        submit_task = asyncio.create_task(broker.submit(request, timeout_s=10))
+        await asyncio.sleep(0)  # Let task register
+
+        resp = await client.post(
+            "/approvals/test-req-123",
+            json={"approved": True, "prompt": "Looks good"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["resolved"] is True
+
+        response = await submit_task
+        assert response.approved is True
+
+    async def test_get_approvals_shows_pending(self, client):
+        from miragen.broker import ApprovalBroker
+        from miragen.models import ApprovalRequest
+        import asyncio
+
+        broker = ApprovalBroker()
+        app_module._broker = broker
+
+        request = ApprovalRequest(
+            agent_name="test-agent", tool_name="risky_op",
+            tool_args={}, request_id="pending-req-456",
+        )
+
+        submit_task = asyncio.create_task(broker.submit(request, timeout_s=10))
+        await asyncio.sleep(0)  # Let task register
+
+        resp = await client.get("/approvals")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] == 1
+        assert data["approvals"][0]["request_id"] == "pending-req-456"
+        assert data["approvals"][0]["tool_name"] == "risky_op"
+
+        # Clean up
+        broker.resolve("pending-req-456", __import__("miragen.models", fromlist=["ApprovalResponse"]).ApprovalResponse(approved=True))
+        await submit_task
+
+    async def test_health_includes_pending_approvals_count(self, client):
+        from miragen.broker import ApprovalBroker
+        app_module._broker = ApprovalBroker()
+        resp = await client.get("/health")
+        assert resp.status_code == 200
+        assert resp.json()["pending_approvals"] == 0
+
+    async def test_health_pending_approvals_null_when_no_broker(self, client):
+        app_module._broker = None
+        resp = await client.get("/health")
+        assert resp.status_code == 200
+        assert resp.json()["pending_approvals"] == 0

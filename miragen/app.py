@@ -21,10 +21,12 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
 
+from miragen.broker import ApprovalBroker, PendingApproval
 from miragen.factory import build_agent, registered_handlers
 from miragen.load import load_profile
 from miragen.models import (
     AgentProfile,
+    ApprovalResponse,
     CronTrigger as ProfileCronTrigger,
     IntervalTrigger as ProfileIntervalTrigger,
     RunRecord,
@@ -42,6 +44,7 @@ _agent: Agent | None = None
 _limits: UsageLimits | None = None
 _scheduler: AsyncIOScheduler = AsyncIOScheduler()
 _run_store: RunStore | None = None
+_broker: ApprovalBroker | None = None
 
 HISTORY_FILE = Path("/agent/history.json")
 
@@ -222,7 +225,7 @@ def _load_file_secrets() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _profile, _agent, _limits, _run_store
+    global _profile, _agent, _limits, _run_store, _broker
 
     _load_file_secrets()
 
@@ -236,6 +239,8 @@ async def lifespan(app: FastAPI):
     interrupted = _run_store.sweep_interrupted()
     if interrupted:
         logger.warning(f"Marked {interrupted} stale 'running' record(s) as interrupted")
+
+    _broker = ApprovalBroker()
 
     logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode")
 
@@ -327,7 +332,13 @@ async def health():
     if _run_store is not None:
         recent = _run_store.list(limit=1)
         last_run = recent[0] if recent else None
-    return {"status": "ok", "agent": _profile.name if _profile else None, "last_run": last_run}
+    pending_approvals = len(_broker.pending()) if _broker is not None else 0
+    return {
+        "status": "ok",
+        "agent": _profile.name if _profile else None,
+        "last_run": last_run,
+        "pending_approvals": pending_approvals,
+    }
 
 
 @app.post("/run", response_model=RunResponse)
@@ -431,6 +442,32 @@ async def get_run(run_id: str):
         )
 
     return record
+
+
+@app.get("/approvals")
+async def list_approvals():
+    """List all currently pending approval requests."""
+    pending = _broker.pending() if _broker is not None else []
+    return {"count": len(pending), "approvals": pending}
+
+
+@app.post("/approvals/{request_id}")
+async def resolve_approval(request_id: str, response: ApprovalResponse):
+    """Resolve a pending approval request (approve or deny)."""
+    if _broker is None:
+        raise HTTPException(status_code=503, detail="Approval broker not ready")
+
+    resolved = _broker.resolve(request_id, response)
+    if not resolved:
+        pending_ids = [p.request_id for p in _broker.pending()]
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": f"approval request '{request_id}' not found or already resolved",
+                "pending": pending_ids,
+            },
+        )
+    return {"resolved": True}
 
 
 @app.post("/run/stream")

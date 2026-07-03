@@ -50,11 +50,39 @@ async def _run_approval_gate(
     handler_fn = get_approval_handler()
 
     if handler_fn is None and profile.approval_webhook is None:
-        logger.warning(
-            f"[{profile.name}] Tool '{tool_name}' matches approval_required but no "
-            f"handler or webhook is configured — auto-approving (fail open)."
-        )
-        return await handler(args)
+        match profile.approval_mode:
+            case "strict":
+                raise ModelRetry(
+                    f"Tool call '{tool_name}' denied: approval gate is unconfigured "
+                    f"(approval_mode: strict)."
+                )
+            case "queue":
+                # Lazy import to avoid circular dependency
+                from miragen.app import _broker
+                if _broker is not None:
+                    response = await _broker.submit(request, profile.approval_timeout_s)
+                    if not response.approved:
+                        raise ModelRetry(
+                            f"Tool call '{tool_name}' was not approved."
+                            + (f" Reason: {response.prompt}" if response.prompt else "")
+                        )
+                    result = await handler(args)
+                    if response.prompt:
+                        return f"[Approver note: {response.prompt}]\n{result}"  # nosemgrep: python.flask.security.audit.directly-returned-format-string.directly-returned-format-string
+                    return result
+                else:
+                    # Broker not initialized — fall open with warning
+                    logger.warning(
+                        f"[{profile.name}] Tool '{tool_name}' in queue mode but broker "
+                        f"is not initialized — auto-approving (fail open)."
+                    )
+                    return await handler(args)
+            case _:  # "open"
+                logger.warning(
+                    f"[{profile.name}] Tool '{tool_name}' matches approval_required but no "
+                    f"handler or webhook is configured — auto-approving (fail open)."
+                )
+                return await handler(args)
 
     if handler_fn is not None:
         response: ApprovalResponse = await handler_fn(request)

@@ -358,3 +358,145 @@ class TestApprovalModels:
     def test_agent_profile_no_webhook_by_default(self):
         profile = _profile()
         assert profile.approval_webhook is None
+
+
+# ── ApprovalBroker ────────────────────────────────────────────────────────────
+
+class TestApprovalBroker:
+    async def test_submit_and_resolve_approved(self):
+        from miragen.broker import ApprovalBroker
+
+        broker = ApprovalBroker()
+        request = ApprovalRequest(
+            agent_name="a", tool_name="delete_file",
+            tool_args={"path": "/tmp/x"}, request_id="req-001",
+        )
+
+        # Resolve from a background task
+        async def _resolve():
+            await asyncio.sleep(0)
+            broker.resolve("req-001", ApprovalResponse(approved=True, prompt="OK"))
+
+        import asyncio
+        asyncio.create_task(_resolve())
+        response = await broker.submit(request, timeout_s=5)
+
+        assert response.approved is True
+        assert response.prompt == "OK"
+
+    async def test_submit_and_resolve_denied(self):
+        from miragen.broker import ApprovalBroker
+        import asyncio
+
+        broker = ApprovalBroker()
+        request = ApprovalRequest(
+            agent_name="a", tool_name="delete_file",
+            tool_args={}, request_id="req-002",
+        )
+
+        async def _resolve():
+            await asyncio.sleep(0)
+            broker.resolve("req-002", ApprovalResponse(approved=False, prompt="Denied"))
+
+        asyncio.create_task(_resolve())
+        response = await broker.submit(request, timeout_s=5)
+
+        assert response.approved is False
+
+    async def test_submit_timeout_auto_denies(self):
+        from miragen.broker import ApprovalBroker
+
+        broker = ApprovalBroker()
+        request = ApprovalRequest(
+            agent_name="a", tool_name="risky",
+            tool_args={}, request_id="req-003",
+        )
+
+        response = await broker.submit(request, timeout_s=0)
+        assert response.approved is False
+        assert "timed out" in response.prompt.lower()
+        # Should be removed from pending after timeout
+        assert len(broker.pending()) == 0
+
+    async def test_resolve_unknown_returns_false(self):
+        from miragen.broker import ApprovalBroker
+
+        broker = ApprovalBroker()
+        result = broker.resolve("nonexistent", ApprovalResponse(approved=True))
+        assert result is False
+
+    async def test_resolve_already_resolved_returns_false(self):
+        from miragen.broker import ApprovalBroker
+        import asyncio
+
+        broker = ApprovalBroker()
+        request = ApprovalRequest(
+            agent_name="a", tool_name="t", tool_args={}, request_id="req-004",
+        )
+
+        async def _resolve():
+            await asyncio.sleep(0)
+            broker.resolve("req-004", ApprovalResponse(approved=True))
+
+        asyncio.create_task(_resolve())
+        await broker.submit(request, timeout_s=5)
+
+        # Already resolved and removed from pending
+        result = broker.resolve("req-004", ApprovalResponse(approved=True))
+        assert result is False
+
+    async def test_pending_list(self):
+        from miragen.broker import ApprovalBroker
+        import asyncio
+
+        broker = ApprovalBroker()
+        request1 = ApprovalRequest(
+            agent_name="a", tool_name="t1", tool_args={}, request_id="r1",
+        )
+        request2 = ApprovalRequest(
+            agent_name="a", tool_name="t2", tool_args={}, request_id="r2",
+        )
+
+        # Submit two requests without resolving them
+        task1 = asyncio.create_task(broker.submit(request1, timeout_s=60))
+        task2 = asyncio.create_task(broker.submit(request2, timeout_s=60))
+        await asyncio.sleep(0)  # Let tasks register
+
+        pending = broker.pending()
+        assert len(pending) == 2
+        pending_ids = {p.request_id for p in pending}
+        assert "r1" in pending_ids
+        assert "r2" in pending_ids
+
+        # Clean up
+        broker.resolve("r1", ApprovalResponse(approved=True))
+        broker.resolve("r2", ApprovalResponse(approved=True))
+        await task1
+        await task2
+
+
+# ── Strict mode ───────────────────────────────────────────────────────────────
+
+class TestApprovalGateStrictMode:
+    async def test_strict_mode_denies_when_unconfigured(self):
+        profile = _profile(approval_required=["delete_*"], approval_mode="strict")
+        call = _mock_call("delete_file")
+        handler = AsyncMock(return_value="deleted")
+        factory_module._approval_handler = None
+
+        with pytest.raises(ModelRetry, match="unconfigured"):
+            await _run_approval_gate(profile, call, {}, handler)
+
+        handler.assert_not_awaited()
+
+    async def test_strict_mode_passes_when_handler_configured(self):
+        profile = _profile(approval_required=["delete_*"], approval_mode="strict")
+        call = _mock_call("delete_file")
+        handler = AsyncMock(return_value="deleted")
+
+        factory_module._approval_handler = AsyncMock(
+            return_value=ApprovalResponse(approved=True)
+        )
+
+        result = await _run_approval_gate(profile, call, {}, handler)
+        assert result == "deleted"
