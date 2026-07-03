@@ -15,6 +15,7 @@ from pydantic_ai.capabilities import (
 )
 
 from miragen.models import AgentProfile
+from miragen.peer import build_peer_capability
 
 
 # ── Capability registry ──────────────────────────────────────────────────────
@@ -39,6 +40,7 @@ _CAPABILITY_REGISTRY: dict[str, Any] = {
                            id=cfg.get("name"),
                            native=True,
                        ),
+    "Peer":            lambda cfg: build_peer_capability(cfg),
 }
 
 
