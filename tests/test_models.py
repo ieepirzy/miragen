@@ -7,6 +7,7 @@ from miragen.models import (
     CronTrigger,
     HttpTrigger,
     IntervalTrigger,
+    Limits,
     ModelSettings,
     OnComplete,
     StartupTrigger,
@@ -372,3 +373,56 @@ class TestApprovalMode:
             AgentProfile.model_validate(_profile(
                 approval_required=["delete_*"], approval_timeout_s=0,
             ))
+
+
+class TestLimits:
+    def test_tokens_per_run_only(self):
+        limits = Limits(tokens_per_run=200_000)
+        assert limits.tokens_per_run == 200_000
+        assert limits.tokens_per_day is None
+        assert limits.on_exceeded == "skip"
+
+    def test_tokens_per_day_only(self):
+        limits = Limits(tokens_per_day=2_000_000)
+        assert limits.tokens_per_day == 2_000_000
+
+    def test_both_caps(self):
+        limits = Limits(tokens_per_run=200_000, tokens_per_day=2_000_000, on_exceeded="notify")
+        assert limits.on_exceeded == "notify"
+
+    def test_empty_block_raises(self):
+        with pytest.raises(ValidationError, match="at least one"):
+            Limits()
+
+    def test_zero_tokens_per_run_raises(self):
+        with pytest.raises(ValidationError):
+            Limits(tokens_per_run=0)
+
+    def test_zero_tokens_per_day_raises(self):
+        with pytest.raises(ValidationError):
+            Limits(tokens_per_day=0)
+
+    def test_invalid_on_exceeded_raises(self):
+        with pytest.raises(ValidationError):
+            Limits(tokens_per_run=1, on_exceeded="explode")
+
+    def test_unknown_key_raises(self):
+        with pytest.raises(ValidationError):
+            Limits.model_validate({"tokens_per_run": 1, "cost_usd": 5})
+
+
+class TestAgentProfileLimits:
+    def test_profile_without_limits_unchanged(self):
+        p = AgentProfile.model_validate(_profile())
+        assert p.limits is None
+
+    def test_profile_with_limits(self):
+        p = AgentProfile.model_validate(_profile(
+            limits={"tokens_per_run": 200_000, "tokens_per_day": 2_000_000},
+        ))
+        assert p.limits.tokens_per_run == 200_000
+        assert p.limits.tokens_per_day == 2_000_000
+
+    def test_empty_limits_block_raises(self):
+        with pytest.raises(ValidationError, match="at least one"):
+            AgentProfile.model_validate(_profile(limits={}))

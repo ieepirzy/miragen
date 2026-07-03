@@ -215,6 +215,34 @@ class AgentSpec(_ProfileModel):
     )
 
 
+# ── Budgets ──────────────────────────────────────────────────────────────────
+
+class Limits(_ProfileModel):
+    tokens_per_run: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Per-run token cap, enforced by PydanticAI (UsageLimits.total_tokens_limit).",
+    )
+    tokens_per_day: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Rolling UTC-day token cap across this agent's run records, enforced by miragen.",
+    )
+    on_exceeded: Literal["skip", "notify"] = Field(
+        default="skip",
+        description="What a blocked cron/interval/startup run does when tokens_per_day is exceeded.",
+    )
+
+    @model_validator(mode="after")
+    def validate_at_least_one_cap(self) -> Limits:
+        if self.tokens_per_run is None and self.tokens_per_day is None:
+            raise ValueError(
+                "limits block requires at least one of tokens_per_run or tokens_per_day "
+                "(an empty limits: {} block is dead config)"
+            )
+        return self
+
+
 # ── Top-level agent profile ──────────────────────────────────────────────────
 
 class AgentProfile(_ProfileModel):
@@ -257,6 +285,7 @@ class AgentProfile(_ProfileModel):
         default=True,
         description="Prepend the current UTC timestamp to every incoming prompt.",
     )
+    limits: Optional[Limits] = None
     spec: AgentSpec
 
     @model_validator(mode="after")

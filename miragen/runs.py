@@ -146,6 +146,21 @@ class RunStore:
             path.unlink(missing_ok=True)
 
 
+def tokens_used_since(store: RunStore, since: datetime) -> int:
+    """
+    Sum input+output tokens across `store`'s run records with started_at >= since.
+
+    Records with no usage (e.g. a run that failed before the model responded)
+    contribute 0 — unknown usage counts as 0, not as unbounded.
+    """
+    total = 0
+    for record in store._iter_records():
+        if record.started_at < since or record.usage is None:
+            continue
+        total += (record.usage.input_tokens or 0) + (record.usage.output_tokens or 0)
+    return total
+
+
 def _new_run_id() -> str:
     return uuid.uuid4().hex
 
