@@ -33,7 +33,7 @@ from miragen.models import (
     RunSummary,
     StartupTrigger as ProfileStartupTrigger,
 )
-from miragen.runs import AmbiguousRunIdError, RunStore, extract_run_details, run_retention_from_env
+from miragen.runs import AmbiguousRunIdError, RunStore, extract_run_details, run_retention_from_env, tokens_used_since
 
 logger = logging.getLogger(__name__)
 
@@ -109,10 +109,43 @@ async def run_agent(prompt: str, use_history: bool = False, record: RunRecord | 
     return output
 
 
+def _daily_budget_status() -> tuple[int, int] | None:
+    """(used, limit) today (UTC) if profile.limits.tokens_per_day is configured, else None."""
+    if _profile is None or _profile.limits is None or _profile.limits.tokens_per_day is None:
+        return None
+    if _run_store is None:
+        return None
+    midnight_utc = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    used = tokens_used_since(_run_store, midnight_utc)
+    return used, _profile.limits.tokens_per_day
+
+
+async def _notify_budget_exceeded(used: int, limit: int) -> None:
+    """Dispatch through on_complete.notify only — this isn't a run output, just a heads-up."""
+    if not _profile or not _profile.on_complete or not _profile.on_complete.notify:
+        return
+    handlers = registered_handlers()
+    handler = handlers.get(_profile.on_complete.notify)
+    if handler is not None:
+        message = f"[{_profile.name}] scheduled run skipped: daily token budget exceeded ({used}/{limit})."
+        await handler(_profile.name, message)
+
+
 async def run_agent_scheduled(prompt: str) -> None:
     """Scheduler-triggered run (cron, interval, or startup). Handles on_complete side effects."""
     assert _profile is not None
     logger.info(f"[{_profile.name}] scheduled run triggered")
+
+    budget = _daily_budget_status()
+    if budget is not None and budget[0] >= budget[1]:
+        used, limit = budget
+        logger.warning(f"[{_profile.name}] daily token budget exceeded ({used}/{limit}) — skipping scheduled run")
+        if _profile.limits.on_exceeded == "notify":
+            try:
+                await _notify_budget_exceeded(used, limit)
+            except Exception as e:
+                logger.error(f"[{_profile.name}] budget-exceeded notify failed: {e}", exc_info=True)
+        return
 
     if _profile.inject_timestamp:
         prompt = _stamp_prompt(prompt)
@@ -307,6 +340,16 @@ async def health():
     }
 
 
+def _raise_if_daily_budget_exceeded() -> None:
+    budget = _daily_budget_status()
+    if budget is not None and budget[0] >= budget[1]:
+        used, limit = budget
+        raise HTTPException(
+            status_code=429,
+            detail=f"daily token budget exceeded ({used}/{limit} tokens), resets at 00:00 UTC",
+        )
+
+
 @app.post("/run", response_model=RunResponse)
 async def run(request: RunRequest):
     """
@@ -315,6 +358,7 @@ async def run(request: RunRequest):
     """
     if _agent is None:
         raise HTTPException(status_code=503, detail="Agent not ready")
+    _raise_if_daily_budget_exceeded()
 
     prompt = _apply_trigger_prompt(request.prompt)
 
@@ -342,6 +386,7 @@ async def run_async(request: RunRequest):
         raise HTTPException(status_code=503, detail="Agent not ready")
     if _run_store is None or _profile is None:
         raise HTTPException(status_code=503, detail="Run store not ready")
+    _raise_if_daily_budget_exceeded()
 
     prompt = _apply_trigger_prompt(request.prompt)
     record = _run_store.start(

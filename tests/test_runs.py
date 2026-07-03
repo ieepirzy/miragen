@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from miragen.models import RunRecord, RunUsage, ToolCallRecord
-from miragen.runs import AmbiguousRunIdError, RunStore, extract_run_details
+from miragen.runs import AmbiguousRunIdError, RunStore, extract_run_details, tokens_used_since
 
 
 class TestRunStoreStartFinish:
@@ -293,3 +293,68 @@ class TestExtractRunDetails:
         result = self._mock_result(self._usage(), [])
         _, tool_calls = extract_run_details(result)
         assert tool_calls == []
+
+
+class TestTokensUsedSince:
+    def _finished_record(self, run_id, started_at, input_tokens, output_tokens):
+        return RunRecord(
+            run_id=run_id, agent_name="a", trigger="cron", status="succeeded",
+            prompt="p", started_at=started_at,
+            usage=RunUsage(requests=1, input_tokens=input_tokens, output_tokens=output_tokens),
+        )
+
+    def test_empty_store_is_zero(self, tmp_path):
+        store = RunStore(root=tmp_path)
+        since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert tokens_used_since(store, since) == 0
+
+    def test_sums_usage_across_matching_records(self, tmp_path):
+        store = RunStore(root=tmp_path)
+        base = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+        store._write(self._finished_record("1" * 32, base, 100, 50))
+        store._write(self._finished_record("2" * 32, base + timedelta(hours=1), 200, 80))
+
+        total = tokens_used_since(store, base)
+        assert total == (100 + 50) + (200 + 80)
+
+    def test_excludes_records_before_since(self, tmp_path):
+        store = RunStore(root=tmp_path)
+        midnight = datetime(2026, 1, 2, tzinfo=timezone.utc)
+        yesterday = self._finished_record("1" * 32, midnight - timedelta(hours=1), 1_000, 1_000)
+        today = self._finished_record("2" * 32, midnight + timedelta(hours=1), 100, 50)
+        store._write(yesterday)
+        store._write(today)
+
+        total = tokens_used_since(store, midnight)
+        assert total == 150
+
+    def test_record_at_exact_boundary_counts(self, tmp_path):
+        store = RunStore(root=tmp_path)
+        midnight = datetime(2026, 1, 2, tzinfo=timezone.utc)
+        store._write(self._finished_record("1" * 32, midnight, 10, 5))
+
+        assert tokens_used_since(store, midnight) == 15
+
+    def test_records_without_usage_count_as_zero(self, tmp_path):
+        store = RunStore(root=tmp_path)
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        no_usage = RunRecord(
+            run_id="1" * 32, agent_name="a", trigger="cron", status="failed",
+            prompt="p", started_at=base, error="boom",
+        )
+        store._write(no_usage)
+        store._write(self._finished_record("2" * 32, base + timedelta(seconds=1), 10, 5))
+
+        assert tokens_used_since(store, base) == 15
+
+    def test_input_or_output_tokens_none_counts_as_zero(self, tmp_path):
+        store = RunStore(root=tmp_path)
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        record = RunRecord(
+            run_id="1" * 32, agent_name="a", trigger="cron", status="succeeded",
+            prompt="p", started_at=base,
+            usage=RunUsage(requests=1, input_tokens=None, output_tokens=20),
+        )
+        store._write(record)
+
+        assert tokens_used_since(store, base) == 20

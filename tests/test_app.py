@@ -1,6 +1,8 @@
 import asyncio
 import os
 import sys
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from httpx import AsyncClient, ASGITransport
@@ -32,6 +34,11 @@ def reset_app_state():
 @pytest.fixture
 def profile():
     return _make_profile()
+
+
+@pytest.fixture
+def profile_with_daily_limit():
+    return _make_profile(limits={"tokens_per_day": 100})
 
 
 @pytest.fixture
@@ -681,6 +688,150 @@ class TestApprovalsEndpoints:
         )
 
         assert result == "deleted /data"
+
+
+class TestBudgetGuardrails:
+    def _seed_usage(self, tmp_path, *, started_at, input_tokens, output_tokens, agent_name="test-agent"):
+        from miragen.models import RunRecord, RunUsage
+        from miragen.runs import RunStore
+
+        store = RunStore(root=tmp_path)
+        store._write(RunRecord(
+            run_id=f"{abs(hash(started_at)) % 10**32:032x}",
+            agent_name=agent_name, trigger="http", status="succeeded",
+            prompt="p", started_at=started_at,
+            usage=RunUsage(requests=1, input_tokens=input_tokens, output_tokens=output_tokens),
+        ))
+        return store
+
+    def _midnight_utc(self):
+        return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    async def test_run_returns_429_when_daily_budget_exceeded(self, profile_with_daily_limit, tmp_path):
+        store = self._seed_usage(tmp_path, started_at=self._midnight_utc(), input_tokens=80, output_tokens=30)
+        app_module._profile = profile_with_daily_limit
+        app_module._agent = MagicMock(run=AsyncMock(return_value=_mock_run_result()))
+        app_module._run_store = store
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/run", json={"prompt": "hi"})
+
+        assert resp.status_code == 429
+        assert "110/100" in resp.json()["detail"]
+        assert "00:00 UTC" in resp.json()["detail"]
+        app_module._agent.run.assert_not_called()
+
+    async def test_run_succeeds_when_under_budget(self, profile_with_daily_limit, tmp_path):
+        store = self._seed_usage(tmp_path, started_at=self._midnight_utc(), input_tokens=10, output_tokens=5)
+        app_module._profile = profile_with_daily_limit
+        app_module._agent = MagicMock(run=AsyncMock(return_value=_mock_run_result()))
+        app_module._run_store = store
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/run", json={"prompt": "hi"})
+
+        assert resp.status_code == 200
+
+    async def test_run_async_returns_429_when_exceeded(self, profile_with_daily_limit, tmp_path):
+        store = self._seed_usage(tmp_path, started_at=self._midnight_utc(), input_tokens=200, output_tokens=0)
+        app_module._profile = profile_with_daily_limit
+        app_module._agent = MagicMock(run=AsyncMock(return_value=_mock_run_result()))
+        app_module._run_store = store
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/run/async", json={"prompt": "hi"})
+
+        assert resp.status_code == 429
+
+    async def test_yesterdays_usage_does_not_count(self, profile_with_daily_limit, tmp_path):
+        yesterday = self._midnight_utc() - timedelta(hours=1)
+        store = self._seed_usage(tmp_path, started_at=yesterday, input_tokens=10_000, output_tokens=10_000)
+        app_module._profile = profile_with_daily_limit
+        app_module._agent = MagicMock(run=AsyncMock(return_value=_mock_run_result()))
+        app_module._run_store = store
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/run", json={"prompt": "hi"})
+
+        assert resp.status_code == 200
+
+    async def test_profile_without_limits_unaffected(self, store_client):
+        resp = await store_client.post("/run", json={"prompt": "hi"})
+        assert resp.status_code == 200
+
+    async def test_scheduled_run_skipped_when_budget_exceeded(self, tmp_path):
+        profile = _make_profile(
+            mode="autonomous", triggers=[{"type": "cron", "schedule": "0 * * * *"}],
+            limits={"tokens_per_day": 100},
+        )
+        store = self._seed_usage(tmp_path, started_at=self._midnight_utc(), input_tokens=200, output_tokens=0)
+        app_module._profile = profile
+        app_module._agent = MagicMock(run=AsyncMock(return_value=_mock_run_result()))
+        app_module._run_store = store
+
+        with patch("miragen.app._handle_on_complete", AsyncMock()) as mock_oc:
+            from miragen.app import run_agent_scheduled
+            await run_agent_scheduled("Run now.")
+
+        app_module._agent.run.assert_not_called()
+        mock_oc.assert_not_called()
+        assert len(store.list()) == 1  # only the seeded record — the skipped run created none
+
+    async def test_scheduled_run_proceeds_when_under_budget(self, tmp_path):
+        profile = _make_profile(
+            mode="autonomous", triggers=[{"type": "cron", "schedule": "0 * * * *"}],
+            limits={"tokens_per_day": 100},
+        )
+        store = self._seed_usage(tmp_path, started_at=self._midnight_utc(), input_tokens=10, output_tokens=5)
+        app_module._profile = profile
+        app_module._agent = MagicMock(run=AsyncMock(return_value=_mock_run_result()))
+        app_module._run_store = store
+
+        with patch("miragen.app._handle_on_complete", AsyncMock()) as mock_oc:
+            from miragen.app import run_agent_scheduled
+            await run_agent_scheduled("Run now.")
+
+        app_module._agent.run.assert_called_once()
+        mock_oc.assert_awaited_once()
+
+    async def test_scheduled_run_notifies_on_exceeded_notify(self, tmp_path):
+        profile = _make_profile(
+            mode="autonomous", triggers=[{"type": "cron", "schedule": "0 * * * *"}],
+            limits={"tokens_per_day": 100, "on_exceeded": "notify"},
+            on_complete={"notify": "telegram"},
+        )
+        store = self._seed_usage(tmp_path, started_at=self._midnight_utc(), input_tokens=200, output_tokens=0)
+        app_module._profile = profile
+        app_module._agent = MagicMock(run=AsyncMock(return_value=_mock_run_result()))
+        app_module._run_store = store
+
+        notify_handler = AsyncMock()
+        with patch("miragen.app.registered_handlers", return_value={"telegram": notify_handler}):
+            from miragen.app import run_agent_scheduled
+            await run_agent_scheduled("Run now.")
+
+        notify_handler.assert_awaited_once()
+        agent_name, message = notify_handler.call_args[0]
+        assert agent_name == "test-agent"
+        assert "budget" in message.lower()
+
+    async def test_scheduled_run_skip_mode_does_not_notify(self, tmp_path):
+        profile = _make_profile(
+            mode="autonomous", triggers=[{"type": "cron", "schedule": "0 * * * *"}],
+            limits={"tokens_per_day": 100, "on_exceeded": "skip"},
+            on_complete={"notify": "telegram"},
+        )
+        store = self._seed_usage(tmp_path, started_at=self._midnight_utc(), input_tokens=200, output_tokens=0)
+        app_module._profile = profile
+        app_module._agent = MagicMock(run=AsyncMock(return_value=_mock_run_result()))
+        app_module._run_store = store
+
+        notify_handler = AsyncMock()
+        with patch("miragen.app.registered_handlers", return_value={"telegram": notify_handler}):
+            from miragen.app import run_agent_scheduled
+            await run_agent_scheduled("Run now.")
+
+        notify_handler.assert_not_called()
 
 
 class TestLoadFileSecrets:

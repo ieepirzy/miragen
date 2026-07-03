@@ -122,11 +122,12 @@ def build_agent(profile: AgentProfile) -> tuple[Agent, UsageLimits | None]:
     if approval_hooks is not None:
         capabilities.append(approval_hooks)
 
-    limits = (
-        UsageLimits(request_limit=profile.spec.max_steps)
-        if profile.spec.max_steps
-        else None
-    )
+    limits_kwargs: dict[str, int] = {}
+    if profile.spec.max_steps:
+        limits_kwargs["request_limit"] = profile.spec.max_steps
+    if profile.limits and profile.limits.tokens_per_run:
+        limits_kwargs["total_tokens_limit"] = profile.limits.tokens_per_run
+    limits = UsageLimits(**limits_kwargs) if limits_kwargs else None
 
     model_settings: ModelSettings | None = None
     if profile.spec.model_settings:

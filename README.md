@@ -289,6 +289,11 @@ on_complete:                      # optional — autonomous run side effects
   notify: telegram
   post_to: https://my-service.com/webhook
 
+limits:                           # optional — spend guardrails, see "Budgets" below
+  tokens_per_run: 200000
+  tokens_per_day: 2000000
+  on_exceeded: skip                # skip | notify
+
 # ── PydanticAI spec layer ─────────────────────────────────────
 spec:
   model: anthropic:claude-sonnet-4-6
@@ -334,6 +339,27 @@ spec:
 - Interpolation runs on every string value, including inside multi-line `instructions` blocks, but never on dict keys or non-string values (ints, bools stay untouched).
 
 Agent containers already get `*_API_KEY` env vars injected by miragen-mcp's compose management, and file-based `*_FILE` secrets are resolved into the environment before the profile loads — so secrets are interpolatable out of the box. Be careful interpolating secrets into `instructions`, though: that puts them in the model's context window.
+
+### Budgets
+
+Autonomous + cron + LLM = unbounded spend. `max_steps` caps round-trips per run, but nothing caps tokens on its own — `limits` does:
+
+```yaml
+limits:
+  tokens_per_run: 200000     # optional, >= 1 — per-run cap, enforced by PydanticAI
+  tokens_per_day: 2000000    # optional, >= 1 — rolling UTC-day cap, enforced by miragen
+  on_exceeded: skip          # skip (default) | notify — what a blocked scheduled run does
+```
+
+At least one of `tokens_per_run` / `tokens_per_day` must be set — an empty `limits: {}` block fails `miragen validate` as dead config.
+
+- **`tokens_per_run`** wires straight into PydanticAI's `UsageLimits(total_tokens_limit=...)`. Exceeding it ends the run with PydanticAI's own usage-limit error; the [run record](#run-records) is written with `status: failed` and that error as `error`.
+- **`tokens_per_day`** is a rolling UTC-day sum of `input_tokens + output_tokens` across this agent's run records (a run with no recorded usage — e.g. one that failed before the model responded — counts as 0, not unbounded). Checked before every run starts:
+  - A cron/interval/startup run over budget is **skipped**, with a log line. If `on_exceeded: notify`, the `on_complete.notify` handler fires with a budget-exceeded message (not `log_to` or `post_to` — there's no run output to log).
+  - `POST /run` and `POST /run/async` return `429` with the used/limit counts and the UTC reset time in the message.
+  - The budget resets at UTC midnight — yesterday's records never count against today.
+
+Cost-in-dollars conversion, per-model pricing, and cross-agent (swarm-wide) budgets are out of scope for now — this is a token-count circuit breaker, not a billing system.
 
 ---
 
