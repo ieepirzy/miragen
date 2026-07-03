@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from miragen.models import RunRecord, RunUsage, ToolCallRecord
-from miragen.runs import AmbiguousRunIdError, RunStore, extract_run_details
+from miragen.runs import AmbiguousRunIdError, RunStore, extract_run_details, tokens_used_since
 
 
 class TestRunStoreStartFinish:
@@ -293,3 +293,77 @@ class TestExtractRunDetails:
         result = self._mock_result(self._usage(), [])
         _, tool_calls = extract_run_details(result)
         assert tool_calls == []
+
+
+class TestTokensUsedSince:
+    def test_sums_tokens_from_completed_records(self, tmp_path):
+        store = RunStore(root=tmp_path)
+        base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        since = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        r1 = RunRecord(
+            run_id="1" * 32, agent_name="a", trigger="cron", status="running",
+            prompt="p", started_at=base,
+        )
+        store.finish(r1, status="succeeded", output="ok",
+                     usage=RunUsage(requests=1, input_tokens=100, output_tokens=50))
+
+        total = tokens_used_since(store, since)
+        assert total == 150
+
+    def test_skips_running_records(self, tmp_path):
+        store = RunStore(root=tmp_path)
+        base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        since = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        r = RunRecord(
+            run_id="2" * 32, agent_name="a", trigger="cron", status="running",
+            prompt="p", started_at=base,
+            usage=RunUsage(requests=1, input_tokens=100, output_tokens=50),
+        )
+        store._write(r)
+
+        total = tokens_used_since(store, since)
+        assert total == 0
+
+    def test_skips_records_before_since(self, tmp_path):
+        store = RunStore(root=tmp_path)
+        since = datetime(2026, 1, 2, 0, 0, 0, tzinfo=timezone.utc)
+
+        r = RunRecord(
+            run_id="3" * 32, agent_name="a", trigger="cron", status="running",
+            prompt="p", started_at=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        )
+        store.finish(r, status="succeeded", output="ok",
+                     usage=RunUsage(requests=1, input_tokens=200, output_tokens=100))
+
+        total = tokens_used_since(store, since)
+        assert total == 0
+
+    def test_sums_multiple_records(self, tmp_path):
+        store = RunStore(root=tmp_path)
+        since = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        for i in range(3):
+            r = RunRecord(
+                run_id=f"{i:032x}", agent_name="a", trigger="cron", status="running",
+                prompt="p", started_at=datetime(2026, 1, 1, 12, i, 0, tzinfo=timezone.utc),
+            )
+            store.finish(r, status="succeeded", output="ok",
+                         usage=RunUsage(requests=1, input_tokens=10, output_tokens=5))
+
+        total = tokens_used_since(store, since)
+        assert total == 45  # 3 * (10 + 5)
+
+    def test_no_usage_counts_zero(self, tmp_path):
+        store = RunStore(root=tmp_path)
+        since = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        r = RunRecord(
+            run_id="4" * 32, agent_name="a", trigger="cron", status="running",
+            prompt="p", started_at=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        )
+        store.finish(r, status="succeeded", output="ok")
+
+        total = tokens_used_since(store, since)
+        assert total == 0

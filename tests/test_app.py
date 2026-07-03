@@ -626,3 +626,104 @@ class TestLoadFileSecrets:
                 _load_file_secrets()
             assert "LOCKED_KEY" not in os.environ
             assert "LOCKED_KEY_FILE" in os.environ
+
+
+class TestBudgetGuardrails:
+    def _make_profile_with_budget(self, tokens_per_day: int, **kw):
+        return _make_profile(limits={"tokens_per_day": tokens_per_day}, **kw)
+
+    def _seed_store(self, store, tokens: int, tmp_path):
+        """Seed store with a single completed run consuming `tokens` total tokens."""
+        from datetime import datetime, timezone
+        from miragen.models import RunRecord, RunUsage
+        r = RunRecord(
+            run_id="b" * 32, agent_name="test-agent", trigger="http",
+            status="running", prompt="p",
+            started_at=datetime.now(timezone.utc),
+        )
+        store._write(r)
+        store.finish(
+            r, status="succeeded", output="ok",
+            usage=RunUsage(requests=1, input_tokens=tokens // 2, output_tokens=tokens - tokens // 2),
+        )
+
+    async def test_post_run_returns_429_when_budget_exceeded(self, tmp_path):
+        from miragen.runs import RunStore
+
+        profile = self._make_profile_with_budget(tokens_per_day=100)
+        agent = MagicMock()
+        agent.run = AsyncMock(return_value=_mock_run_result())
+
+        store = RunStore(root=tmp_path)
+        self._seed_store(store, 200, tmp_path)  # already used 200 > 100
+
+        app_module._profile = profile
+        app_module._agent = agent
+        app_module._run_store = store
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/run", json={"prompt": "hi"})
+
+        assert resp.status_code == 429
+        assert "budget exceeded" in resp.json()["detail"]
+
+    async def test_post_run_succeeds_under_budget(self, tmp_path):
+        from miragen.runs import RunStore
+
+        profile = self._make_profile_with_budget(tokens_per_day=1000)
+        agent = MagicMock()
+        agent.run = AsyncMock(return_value=_mock_run_result())
+
+        store = RunStore(root=tmp_path)
+        self._seed_store(store, 50, tmp_path)  # used 50 < 1000
+
+        app_module._profile = profile
+        app_module._agent = agent
+        app_module._run_store = store
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/run", json={"prompt": "hi"})
+
+        assert resp.status_code == 200
+
+    async def test_run_async_returns_429_when_budget_exceeded(self, tmp_path):
+        from miragen.runs import RunStore
+
+        profile = self._make_profile_with_budget(tokens_per_day=10)
+        agent = MagicMock()
+        agent.run = AsyncMock(return_value=_mock_run_result())
+
+        store = RunStore(root=tmp_path)
+        self._seed_store(store, 100, tmp_path)  # already over budget
+
+        app_module._profile = profile
+        app_module._agent = agent
+        app_module._run_store = store
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/run/async", json={"prompt": "hi"})
+
+        assert resp.status_code == 429
+
+    async def test_scheduled_run_skipped_when_budget_exceeded(self, tmp_path):
+        from miragen.runs import RunStore
+
+        profile = _make_profile(
+            mode="autonomous",
+            triggers=[{"type": "cron", "schedule": "0 * * * *"}],
+            limits={"tokens_per_day": 10},
+        )
+        agent = MagicMock()
+        agent.run = AsyncMock(return_value=_mock_run_result())
+
+        store = RunStore(root=tmp_path)
+        self._seed_store(store, 100, tmp_path)  # already over budget
+
+        app_module._profile = profile
+        app_module._agent = agent
+        app_module._run_store = store
+
+        with patch("miragen.app.run_agent", AsyncMock()) as mock_run:
+            from miragen.app import run_agent_cron
+            await run_agent_cron("Run now.")
+            mock_run.assert_not_awaited()

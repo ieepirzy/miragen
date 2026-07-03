@@ -200,3 +200,26 @@ def extract_run_details(result: Any) -> tuple[RunUsage, list[ToolCallRecord]]:
 
 def run_retention_from_env() -> int:
     return int(os.environ.get("MIRAGEN_RUN_RETENTION", 200))
+
+
+def tokens_used_since(store: RunStore, since: datetime) -> int:
+    """Sum input+output tokens from completed/failed records newer than `since`."""
+    total = 0
+    # Use a high limit to get all records (don't cap at default 20)
+    for path in store._existing_files():
+        record = _read_record(path)
+        if record is None:
+            continue
+        if record.status not in ("succeeded", "failed"):
+            continue
+        if record.started_at.tzinfo is None:
+            record_time = record.started_at.replace(tzinfo=timezone.utc)
+        else:
+            record_time = record.started_at
+        if since.tzinfo is None:
+            since_aware = since.replace(tzinfo=timezone.utc)
+        else:
+            since_aware = since
+        if record_time >= since_aware and record.usage is not None:
+            total += (record.usage.input_tokens or 0) + (record.usage.output_tokens or 0)
+    return total

@@ -215,6 +215,20 @@ class AgentSpec(_ProfileModel):
     )
 
 
+# ── Budget limits ────────────────────────────────────────────────────────────
+
+class Limits(_ProfileModel):
+    tokens_per_run: Optional[int] = Field(default=None, ge=1)
+    tokens_per_day: Optional[int] = Field(default=None, ge=1)
+    on_exceeded: Literal["skip", "notify"] = "skip"
+
+    @model_validator(mode="after")
+    def at_least_one(self) -> "Limits":
+        if self.tokens_per_run is None and self.tokens_per_day is None:
+            raise ValueError("limits block must set at least one of tokens_per_run or tokens_per_day")
+        return self
+
+
 # ── Top-level agent profile ──────────────────────────────────────────────────
 
 class AgentProfile(_ProfileModel):
@@ -244,10 +258,26 @@ class AgentProfile(_ProfileModel):
         default=True,
         description="Prepend the current UTC timestamp to every incoming prompt.",
     )
+    limits: Optional[Limits] = None
+    approval_mode: Literal["open", "strict", "queue"] = "open"
+    approval_timeout_s: int = Field(default=300, ge=1)
     spec: AgentSpec
 
     @model_validator(mode="after")
-    def validate_triggers_match_mode(self) -> AgentProfile:
+    def validate_approval_mode_needs_approval_required(self) -> "AgentProfile":
+        if self.approval_required is None:
+            if self.approval_mode != "open":
+                raise ValueError(
+                    "approval_mode can only be set when approval_required is also set"
+                )
+            if self.approval_timeout_s != 300:
+                raise ValueError(
+                    "approval_timeout_s can only be set when approval_required is also set"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def validate_triggers_match_mode(self) -> "AgentProfile":
         types = {t.type for t in self.triggers}
         self_activating = {"cron", "interval"}
 

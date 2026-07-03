@@ -322,3 +322,90 @@ class TestStrictSchema:
         assert req.agent_name == "a"
         resp = ApprovalResponse.model_validate({"approved": True, "reviewer": "human"})
         assert resp.approved is True
+
+
+class TestLimits:
+    def test_tokens_per_run_only(self):
+        from miragen.models import Limits
+        l = Limits(tokens_per_run=1000)
+        assert l.tokens_per_run == 1000
+        assert l.tokens_per_day is None
+        assert l.on_exceeded == "skip"
+
+    def test_tokens_per_day_only(self):
+        from miragen.models import Limits
+        l = Limits(tokens_per_day=5000)
+        assert l.tokens_per_day == 5000
+
+    def test_both_fields(self):
+        from miragen.models import Limits
+        l = Limits(tokens_per_run=100, tokens_per_day=500)
+        assert l.tokens_per_run == 100
+        assert l.tokens_per_day == 500
+
+    def test_on_exceeded_notify(self):
+        from miragen.models import Limits
+        l = Limits(tokens_per_day=500, on_exceeded="notify")
+        assert l.on_exceeded == "notify"
+
+    def test_neither_field_raises(self):
+        from miragen.models import Limits
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError, match="at least one"):
+            Limits()
+
+    def test_zero_tokens_per_run_raises(self):
+        from miragen.models import Limits
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError):
+            Limits(tokens_per_run=0)
+
+    def test_unknown_key_raises(self):
+        from miragen.models import Limits
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError):
+            Limits(tokens_per_run=100, typo_key=1)
+
+
+class TestAgentProfileLimits:
+    def test_limits_field(self):
+        p = AgentProfile.model_validate(_profile(
+            limits={"tokens_per_run": 1000},
+        ))
+        assert p.limits.tokens_per_run == 1000
+
+    def test_limits_none_by_default(self):
+        p = AgentProfile.model_validate(_profile())
+        assert p.limits is None
+
+    def test_approval_mode_defaults_open(self):
+        p = AgentProfile.model_validate(_profile())
+        assert p.approval_mode == "open"
+
+    def test_approval_timeout_s_defaults_300(self):
+        p = AgentProfile.model_validate(_profile())
+        assert p.approval_timeout_s == 300
+
+    def test_approval_mode_strict_with_approval_required(self):
+        p = AgentProfile.model_validate(_profile(
+            approval_required=["delete_*"],
+            approval_mode="strict",
+        ))
+        assert p.approval_mode == "strict"
+
+    def test_approval_mode_queue_with_approval_required(self):
+        p = AgentProfile.model_validate(_profile(
+            approval_required=["delete_*"],
+            approval_mode="queue",
+        ))
+        assert p.approval_mode == "queue"
+
+    def test_approval_mode_strict_without_approval_required_raises(self):
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError, match="approval_required"):
+            AgentProfile.model_validate(_profile(approval_mode="strict"))
+
+    def test_approval_timeout_s_without_approval_required_raises(self):
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError, match="approval_required"):
+            AgentProfile.model_validate(_profile(approval_timeout_s=60))
