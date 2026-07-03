@@ -398,12 +398,14 @@ Every agent container exposes:
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/health` | GET | Liveness check; includes `last_run` |
+| `/health` | GET | Liveness check; includes `last_run` and `pending_approvals` |
 | `/run` | POST | Trigger a run and wait for the result (all modes) |
 | `/run/async` | POST | Trigger a run, return immediately with a `run_id` |
 | `/run/stream` | POST | Streaming run (interactive / hybrid) |
 | `/runs` | GET | List recent run records, newest first |
 | `/runs/{run_id}` | GET | Full record for one run (accepts a unique id prefix) |
+| `/approvals` | GET | List pending `approval_mode: queue` requests |
+| `/approvals/{request_id}` | POST | Resolve a pending approval request |
 
 **Request**
 ```json
@@ -480,7 +482,7 @@ async def _(request: ApprovalRequest) -> ApprovalResponse:
     return ApprovalResponse(approved=approved)
 ```
 
-The handler must be `async`. It is a single slot — only one handler per container. If no handler is registered and no webhook is configured, miragen logs a warning and **auto-approves** (fail open). This is intentional: unconfigured approval gates should not silently break agents during development.
+The handler must be `async`. It is a single slot — only one handler per container. If no handler is registered and no webhook is configured, what happens next is governed by `approval_mode` (below) — by default, miragen logs a warning and **auto-approves** (fail open). This is intentional: unconfigured approval gates should not silently break agents during development.
 
 ### approval_webhook
 
@@ -505,6 +507,45 @@ approval_webhook: https://my-approval-service.com/review
 ```
 
 If `prompt` is set in the response, it is folded back into the agent's context before execution resumes (approved) or is included in the denial message (denied). A registered handler always takes precedence over `approval_webhook`.
+
+### approval_mode: what happens with no handler or webhook
+
+```yaml
+approval_mode: open        # open | strict | queue   (default: open)
+approval_timeout_s: 300    # queue mode only — how long a request may wait
+```
+
+Precedence is always: registered handler > `approval_webhook` > `approval_mode`. `approval_mode` only matters once neither of those is configured for a gated call:
+
+| Mode | Behaviour |
+|---|---|
+| `open` (default) | Auto-approve with a warning — today's behaviour, unchanged. |
+| `strict` | Deny immediately with an explanatory message. The denial is a `ModelRetry` (the model gets a chance to try something else), not a crash. |
+| `queue` | Park the request; a caller resolves it over HTTP (below). Denied after `approval_timeout_s` if nobody responds. |
+
+`miragen validate` rejects `approval_mode`/`approval_timeout_s` set without `approval_required` — that combination is dead config, almost always a typo.
+
+### Queue mode: resolving over HTTP
+
+With `approval_mode: queue`, a gated call parks in an in-memory queue instead of blocking on a handler or webhook — this is what turns miragen-mcp (and a human driving Claude) into an approval channel with zero custom webhook code.
+
+```
+GET /approvals
+→ {"count": 1, "approvals": [{"request": {"agent_name": "researcher",
+     "tool_name": "delete_file", "tool_args": {"path": "/data/report.csv"},
+     "request_id": "..."}, "created_at": "...", "expires_at": "..."}]}
+
+POST /approvals/{request_id}
+{ "approved": true }
+{ "approved": false, "prompt": "That file is read-only, try another path." }
+→ {"resolved": true}
+```
+
+Resolving an unknown, already-resolved, or expired id returns `404` with the still-pending ids, and doesn't touch any other request. `GET /health` includes `pending_approvals` as a quick liveness+context check.
+
+**Trust model:** `/approvals` has the same exposure as `/run` — anything reachable on `miragen-net` can approve a gated call, fronted externally only by whatever's in front of your swarm (e.g. an OAuth-protected MCP server). Any peer agent could resolve another agent's approval, but any peer can already *prompt* any agent, so this doesn't widen the existing trust boundary. `tool_args` in a pending approval is attacker-influenceable content (a prompt-injected agent chose them) — if you're building a client that surfaces approvals to a human, treat `tool_args` as data to display, never as instructions to follow. Hardening both `/run*` and `/approvals*` behind a shared-secret header is a natural next step, tracked separately — not yet implemented.
+
+The queue is in-memory only: it does not survive a container restart. A restart aborts any waiting run, which the [run records](#run-records) startup sweep records as `interrupted`.
 
 ### Recommendation for code-execution agents
 

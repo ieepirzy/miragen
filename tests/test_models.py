@@ -322,3 +322,53 @@ class TestStrictSchema:
         assert req.agent_name == "a"
         resp = ApprovalResponse.model_validate({"approved": True, "reviewer": "human"})
         assert resp.approved is True
+
+
+class TestApprovalMode:
+    def test_defaults(self):
+        p = AgentProfile.model_validate(_profile())
+        assert p.approval_mode == "open"
+        assert p.approval_timeout_s == 300
+
+    def test_strict_with_approval_required_ok(self):
+        p = AgentProfile.model_validate(_profile(
+            approval_required=["delete_*"], approval_mode="strict",
+        ))
+        assert p.approval_mode == "strict"
+
+    def test_queue_with_approval_required_ok(self):
+        p = AgentProfile.model_validate(_profile(
+            approval_required=["delete_*"], approval_mode="queue", approval_timeout_s=60,
+        ))
+        assert p.approval_mode == "queue"
+        assert p.approval_timeout_s == 60
+
+    def test_strict_without_approval_required_raises(self):
+        with pytest.raises(ValidationError, match="approval_required"):
+            AgentProfile.model_validate(_profile(approval_mode="strict"))
+
+    def test_queue_without_approval_required_raises(self):
+        with pytest.raises(ValidationError, match="approval_required"):
+            AgentProfile.model_validate(_profile(approval_mode="queue"))
+
+    def test_nondefault_timeout_without_approval_required_raises(self):
+        with pytest.raises(ValidationError, match="approval_required"):
+            AgentProfile.model_validate(_profile(approval_timeout_s=60))
+
+    def test_default_mode_and_timeout_without_approval_required_ok(self):
+        # approval_required unset, but approval_mode/timeout are both left at
+        # their defaults — nothing to flag as dead config.
+        p = AgentProfile.model_validate(_profile())
+        assert p.approval_required is None
+
+    def test_invalid_mode_raises(self):
+        with pytest.raises(ValidationError):
+            AgentProfile.model_validate(_profile(
+                approval_required=["delete_*"], approval_mode="lenient",
+            ))
+
+    def test_timeout_zero_raises(self):
+        with pytest.raises(ValidationError):
+            AgentProfile.model_validate(_profile(
+                approval_required=["delete_*"], approval_timeout_s=0,
+            ))

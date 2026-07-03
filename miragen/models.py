@@ -235,6 +235,19 @@ class AgentProfile(_ProfileModel):
         default=None,
         description="URL that receives ApprovalRequest POSTs and returns an ApprovalResponse.",
     )
+    approval_mode: Literal["open", "strict", "queue"] = Field(
+        default="open",
+        description=(
+            "What a gated tool call does when no handler/webhook is configured: "
+            "'open' auto-approves with a warning (default, today's behaviour), "
+            "'strict' denies, 'queue' parks the request for HTTP resolution via /approvals."
+        ),
+    )
+    approval_timeout_s: int = Field(
+        default=300,
+        ge=1,
+        description="queue mode only — how long a request may wait before it's denied.",
+    )
     tools: Optional[list[str]] = Field(
         default=None,
         description="Whitelisted @register tool names; None/omitted = no local tools injected.",
@@ -263,4 +276,15 @@ class AgentProfile(_ProfileModel):
                 "use hybrid mode instead"
             )
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_approval_mode_needs_approval_required(self) -> AgentProfile:
+        non_default = self.approval_mode != "open" or self.approval_timeout_s != 300
+        if non_default and not self.approval_required:
+            raise ValueError(
+                "approval_mode/approval_timeout_s are set but approval_required is empty — "
+                "these only take effect once at least one glob is in approval_required "
+                "(dead config, likely a typo)"
+            )
         return self

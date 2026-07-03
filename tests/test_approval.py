@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from pydantic_ai.exceptions import ModelRetry
@@ -142,6 +144,149 @@ class TestApprovalGateFailOpen:
         assert result == "deleted"
         assert "auto-approving" in caplog.text
         assert "fail open" in caplog.text
+
+
+# ── _run_approval_gate — approval_mode: strict / queue ────────────────────────
+
+class TestApprovalModeStrict:
+    async def test_strict_denies_with_explanatory_retry(self):
+        profile = _profile(approval_required=["delete_*"], approval_mode="strict")
+        call = _mock_call("delete_file")
+        handler = AsyncMock()
+        factory_module._approval_handler = None
+
+        with pytest.raises(ModelRetry, match="approval_mode: strict"):
+            await _run_approval_gate(profile, call, {}, handler)
+
+        handler.assert_not_awaited()
+
+    async def test_strict_denial_is_a_retry_not_a_crash(self):
+        # ModelRetry is how PydanticAI signals "let the model try again", not a
+        # hard failure — the run continues, it doesn't propagate as a bare exception.
+        profile = _profile(approval_required=["delete_*"], approval_mode="strict")
+        call = _mock_call("delete_file")
+        handler = AsyncMock()
+        factory_module._approval_handler = None
+
+        try:
+            await _run_approval_gate(profile, call, {}, handler)
+            pytest.fail("expected ModelRetry")
+        except ModelRetry:
+            pass  # exactly the expected control-flow signal
+
+    async def test_strict_bypassed_by_registered_handler(self):
+        profile = _profile(approval_required=["delete_*"], approval_mode="strict")
+        call = _mock_call("delete_file")
+        handler = AsyncMock(return_value="ok")
+
+        async def approval_fn(req):
+            return ApprovalResponse(approved=True)
+        factory_module._approval_handler = approval_fn
+
+        result = await _run_approval_gate(profile, call, {}, handler)
+        assert result == "ok"
+
+
+class TestApprovalModeQueue:
+    def _resolved_future(self, response: ApprovalResponse):
+        future = asyncio.get_event_loop().create_future()
+        future.set_result(response)
+        return future
+
+    async def test_queue_submits_with_profile_timeout(self):
+        profile = _profile(approval_required=["delete_*"], approval_mode="queue", approval_timeout_s=45)
+        call = _mock_call("delete_file", args={"path": "/x"})
+        handler = AsyncMock(return_value="deleted")
+        factory_module._approval_handler = None
+
+        mock_broker = MagicMock()
+        mock_broker.submit = MagicMock(return_value=self._resolved_future(ApprovalResponse(approved=True)))
+
+        with patch("miragen.broker.get_broker", return_value=mock_broker):
+            result = await _run_approval_gate(profile, call, {}, handler)
+
+        assert result == "deleted"
+        mock_broker.submit.assert_called_once()
+        request, timeout_s = mock_broker.submit.call_args[0]
+        assert request.tool_name == "delete_file"
+        assert request.tool_args == {"path": "/x"}
+        assert timeout_s == 45
+
+    async def test_queue_approved_with_note_prefixes_result(self):
+        profile = _profile(approval_required=["delete_*"], approval_mode="queue")
+        call = _mock_call("delete_file")
+        handler = AsyncMock(return_value="deleted")
+        factory_module._approval_handler = None
+
+        mock_broker = MagicMock()
+        mock_broker.submit = MagicMock(
+            return_value=self._resolved_future(ApprovalResponse(approved=True, prompt="go ahead"))
+        )
+
+        with patch("miragen.broker.get_broker", return_value=mock_broker):
+            result = await _run_approval_gate(profile, call, {}, handler)
+
+        assert "go ahead" in result
+        assert "deleted" in result
+
+    async def test_queue_denied_reason_reaches_model_retry(self):
+        profile = _profile(approval_required=["delete_*"], approval_mode="queue")
+        call = _mock_call("delete_file")
+        handler = AsyncMock()
+        factory_module._approval_handler = None
+
+        mock_broker = MagicMock()
+        mock_broker.submit = MagicMock(
+            return_value=self._resolved_future(ApprovalResponse(approved=False, prompt="not today"))
+        )
+
+        with patch("miragen.broker.get_broker", return_value=mock_broker):
+            with pytest.raises(ModelRetry, match="not today"):
+                await _run_approval_gate(profile, call, {}, handler)
+
+    async def test_queue_bypassed_by_registered_handler(self):
+        profile = _profile(approval_required=["delete_*"], approval_mode="queue")
+        call = _mock_call("delete_file")
+        handler = AsyncMock(return_value="ok")
+
+        async def approval_fn(req):
+            return ApprovalResponse(approved=True)
+        factory_module._approval_handler = approval_fn
+
+        mock_broker = MagicMock()
+        with patch("miragen.broker.get_broker", return_value=mock_broker):
+            result = await _run_approval_gate(profile, call, {}, handler)
+
+        assert result == "ok"
+        mock_broker.submit.assert_not_called()
+
+    async def test_end_to_end_with_real_broker(self):
+        """Exercises the actual ApprovalBroker.submit()/resolve() interplay through the gate."""
+        from miragen.broker import ApprovalBroker
+
+        broker = ApprovalBroker()
+        profile = _profile(approval_required=["delete_*"], approval_mode="queue", approval_timeout_s=30)
+        call = _mock_call("delete_file")
+        handler = AsyncMock(return_value="deleted")
+        factory_module._approval_handler = None
+
+        async def resolver():
+            for _ in range(200):
+                pending = broker.pending()
+                if pending:
+                    broker.resolve(pending[0].request.request_id, ApprovalResponse(approved=True))
+                    return
+                await asyncio.sleep(0)
+            pytest.fail("gate never submitted to the broker")
+
+        with patch("miragen.broker.get_broker", return_value=broker):
+            result, _ = await asyncio.gather(
+                _run_approval_gate(profile, call, {}, handler),
+                resolver(),
+            )
+
+        assert result == "deleted"
+        assert broker.pending() == []
 
 
 # ── _run_approval_gate — registered handler ───────────────────────────────────
