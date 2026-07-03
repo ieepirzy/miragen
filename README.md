@@ -398,9 +398,12 @@ Every agent container exposes:
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/health` | GET | Liveness check |
-| `/run` | POST | Trigger a run (all modes) |
+| `/health` | GET | Liveness check; includes `last_run` |
+| `/run` | POST | Trigger a run and wait for the result (all modes) |
+| `/run/async` | POST | Trigger a run, return immediately with a `run_id` |
 | `/run/stream` | POST | Streaming run (interactive / hybrid) |
+| `/runs` | GET | List recent run records, newest first |
+| `/runs/{run_id}` | GET | Full record for one run (accepts a unique id prefix) |
 
 **Request**
 ```json
@@ -409,8 +412,29 @@ Every agent container exposes:
 
 **Response**
 ```json
-{ "output": "Currently 14°C and overcast in Helsinki." }
+{ "output": "Currently 14°C and overcast in Helsinki.", "run_id": "3f2a1b9c..." }
 ```
+
+### Run records
+
+Every run — cron, `/run`, or `/run/async` — is persisted as a JSON file under `/agent/runs/` with its status, timing, token usage, and a tool-call trace. This is what `docker logs` could never give you: "what did this agent do last night, and what did it cost?"
+
+```
+GET /runs?limit=20&status=succeeded
+→ {"count": 3, "runs": [{"run_id": "...", "status": "succeeded", "trigger": "cron",
+                          "prompt_preview": "...", "duration_s": 4.2, "usage": {...}}, ...]}
+
+GET /runs/3f2a1b9c
+→ {"run_id": "3f2a1b9c...", "status": "succeeded", "output": "...", "tool_calls": [...], ...}
+```
+
+`/run/async` is the non-blocking counterpart to `/run` — useful when a caller (notably miragen-mcp, with its own timeout) can't hold a connection open for a long-running agent:
+
+```
+POST /run/async {"prompt": "..."} → 202 {"run_id": "...", "status": "running"}
+```
+
+If the container is killed mid-run, the interrupted record is marked `interrupted` (not left `running` forever) the next time it starts. Retention defaults to the newest 200 runs; override with `MIRAGEN_RUN_RETENTION`.
 
 ---
 
