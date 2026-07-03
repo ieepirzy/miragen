@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Literal, Optional, Union
 
 from apscheduler.triggers.cron import CronTrigger as _APCronTrigger
@@ -21,6 +22,74 @@ class ApprovalRequest(BaseModel):
 class ApprovalResponse(BaseModel):
     approved: bool
     prompt: Optional[str] = None  # folded back into agent context if provided
+
+
+# ── Run records ──────────────────────────────────────────────────────────────
+#
+# Wire models for run telemetry (RunStore, miragen/runs.py). Lenient like the
+# approval models above — these are persisted/served data, not hand-authored
+# config, so extra="forbid" would just make old records on disk unreadable
+# after a schema change.
+
+class ToolCallRecord(BaseModel):
+    tool_name: str
+    args: str  # JSON-encoded, truncated to 2_000 chars
+    ok: bool  # False if the call raised / was denied
+
+
+class RunUsage(BaseModel):
+    requests: int
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+
+
+class RunRecord(BaseModel):
+    run_id: str  # uuid4 hex
+    agent_name: str
+    trigger: Literal["cron", "http", "http_async"]
+    status: Literal["running", "succeeded", "failed", "interrupted"]
+    prompt: str  # truncated to 20_000 chars
+    output: Optional[str] = None  # truncated to 100_000 chars
+    error: Optional[str] = None
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+    duration_s: Optional[float] = None
+    usage: Optional[RunUsage] = None
+    tool_calls: list[ToolCallRecord] = Field(default_factory=list)
+    use_history: bool = False
+
+
+class RunSummary(BaseModel):
+    # Everything in RunRecord except prompt/output/tool_calls, plus previews.
+    run_id: str
+    agent_name: str
+    trigger: Literal["cron", "http", "http_async"]
+    status: Literal["running", "succeeded", "failed", "interrupted"]
+    prompt_preview: str  # first 200 chars of prompt
+    output_preview: Optional[str] = None  # first 200 chars of output
+    error: Optional[str] = None
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+    duration_s: Optional[float] = None
+    usage: Optional[RunUsage] = None
+    use_history: bool = False
+
+    @classmethod
+    def from_record(cls, record: RunRecord) -> RunSummary:
+        return cls(
+            run_id=record.run_id,
+            agent_name=record.agent_name,
+            trigger=record.trigger,
+            status=record.status,
+            prompt_preview=record.prompt[:200],
+            output_preview=record.output[:200] if record.output is not None else None,
+            error=record.error,
+            started_at=record.started_at,
+            finished_at=record.finished_at,
+            duration_s=record.duration_s,
+            usage=record.usage,
+            use_history=record.use_history,
+        )
 
 
 # ── Profile models ───────────────────────────────────────────────────────────

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -26,8 +27,11 @@ from miragen.models import (
     AgentProfile,
     CronTrigger as ProfileCronTrigger,
     IntervalTrigger as ProfileIntervalTrigger,
+    RunRecord,
+    RunSummary,
     StartupTrigger as ProfileStartupTrigger,
 )
+from miragen.runs import AmbiguousRunIdError, RunStore, extract_run_details, run_retention_from_env
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +41,20 @@ _profile: AgentProfile | None = None
 _agent: Agent | None = None
 _limits: UsageLimits | None = None
 _scheduler: AsyncIOScheduler = AsyncIOScheduler()
+_run_store: RunStore | None = None
 
 HISTORY_FILE = Path("/agent/history.json")
+
+# Keeps references to fire-and-forget /run/async tasks so they aren't
+# garbage-collected mid-run (a well-known asyncio.create_task gotcha).
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────────────
@@ -50,8 +66,14 @@ def _stamp_prompt(prompt: str) -> str:
 
 # ── Agent runner ──────────────────────────────────────────────────────────────────
 
-async def run_agent(prompt: str, use_history: bool = False) -> str:
-    """Core agent execution. Called by both cron and HTTP triggers."""
+async def run_agent(prompt: str, use_history: bool = False, record: RunRecord | None = None) -> str:
+    """
+    Core agent execution. Called by cron/interval/startup and HTTP triggers.
+
+    If `record` is given (from _run_store.start()), the run's outcome — success
+    with usage/tool-calls, or failure with the error — is written back to it via
+    _run_store.finish() before returning (or before the exception propagates).
+    """
     assert _agent is not None, "Agent not initialized"
 
     history = None
@@ -62,7 +84,12 @@ async def run_agent(prompt: str, use_history: bool = False) -> str:
         except Exception:
             logger.warning("Failed to load history, starting fresh")
 
-    result = await _agent.run(prompt, usage_limits=_limits, message_history=history)
+    try:
+        result = await _agent.run(prompt, usage_limits=_limits, message_history=history)
+    except Exception as e:
+        if record is not None and _run_store is not None:
+            _run_store.finish(record, status="failed", error=str(e))
+        raise
 
     if use_history:
         try:
@@ -71,7 +98,13 @@ async def run_agent(prompt: str, use_history: bool = False) -> str:
         except Exception:
             logger.warning("Failed to save history")
 
-    return str(result.output)
+    output = str(result.output)
+
+    if record is not None and _run_store is not None:
+        usage, tool_calls = extract_run_details(result)
+        _run_store.finish(record, status="succeeded", output=output, usage=usage, tool_calls=tool_calls)
+
+    return output
 
 
 async def run_agent_scheduled(prompt: str) -> None:
@@ -82,8 +115,14 @@ async def run_agent_scheduled(prompt: str) -> None:
     if _profile.inject_timestamp:
         prompt = _stamp_prompt(prompt)
 
+    record = (
+        _run_store.start(agent_name=_profile.name, trigger="cron", prompt=prompt)
+        if _run_store is not None
+        else None
+    )
+
     try:
-        output = await run_agent(prompt)
+        output = await run_agent(prompt, record=record)
         logger.info(f"[{_profile.name}] scheduled run complete")
     except Exception as e:
         logger.error(f"[{_profile.name}] scheduled run failed: {e}", exc_info=True)
@@ -153,7 +192,7 @@ def _load_file_secrets() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _profile, _agent, _limits
+    global _profile, _agent, _limits, _run_store
 
     _load_file_secrets()
 
@@ -162,6 +201,11 @@ async def lifespan(app: FastAPI):
 
     _profile = load_profile(profile_path)
     _agent, _limits = build_agent(_profile)
+
+    _run_store = RunStore(retention=run_retention_from_env())
+    interrupted = _run_store.sweep_interrupted()
+    if interrupted:
+        logger.warning(f"Marked {interrupted} stale 'running' record(s) as interrupted")
 
     logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode")
 
@@ -226,13 +270,34 @@ class RunRequest(BaseModel):
 
 class RunResponse(BaseModel):
     output: str
+    run_id: Optional[str] = None
+
+
+class RunListResponse(BaseModel):
+    count: int
+    runs: list[RunSummary]
+
+
+def _apply_trigger_prompt(prompt: str) -> str:
+    """Stamp the timestamp and prepend a header_prompt, exactly as /run always has."""
+    if _profile and _profile.inject_timestamp:
+        prompt = _stamp_prompt(prompt)
+    for trigger in (_profile.triggers if _profile else []):
+        if hasattr(trigger, "header_prompt") and trigger.header_prompt:
+            prompt = f"{trigger.header_prompt.strip()}\n\n{prompt}"
+            break
+    return prompt
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "agent": _profile.name if _profile else None}
+    last_run = None
+    if _run_store is not None:
+        recent = _run_store.list(limit=1)
+        last_run = recent[0] if recent else None
+    return {"status": "ok", "agent": _profile.name if _profile else None, "last_run": last_run}
 
 
 @app.post("/run", response_model=RunResponse)
@@ -244,20 +309,80 @@ async def run(request: RunRequest):
     if _agent is None:
         raise HTTPException(status_code=503, detail="Agent not ready")
 
-    prompt = request.prompt
-    if _profile and _profile.inject_timestamp:
-        prompt = _stamp_prompt(prompt)
-    for trigger in (_profile.triggers if _profile else []):
-        if hasattr(trigger, "header_prompt") and trigger.header_prompt:
-            prompt = f"{trigger.header_prompt.strip()}\n\n{prompt}"
-            break
+    prompt = _apply_trigger_prompt(request.prompt)
+
+    record = (
+        _run_store.start(agent_name=_profile.name, trigger="http", prompt=prompt, use_history=request.use_history)
+        if _run_store is not None and _profile is not None
+        else None
+    )
 
     try:
-        output = await run_agent(prompt, use_history=request.use_history)
-        return RunResponse(output=output)
+        output = await run_agent(prompt, use_history=request.use_history, record=record)
+        return RunResponse(output=output, run_id=record.run_id if record else None)
     except Exception as e:
         logger.error(f"[{_profile.name if _profile else '?'}] run failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/run/async", status_code=202)
+async def run_async(request: RunRequest):
+    """
+    Non-blocking variant of /run: starts the run in the background and returns
+    immediately with a run_id. Poll GET /runs/{run_id} for the outcome.
+    """
+    if _agent is None:
+        raise HTTPException(status_code=503, detail="Agent not ready")
+    if _run_store is None or _profile is None:
+        raise HTTPException(status_code=503, detail="Run store not ready")
+
+    prompt = _apply_trigger_prompt(request.prompt)
+    record = _run_store.start(
+        agent_name=_profile.name, trigger="http_async", prompt=prompt, use_history=request.use_history
+    )
+
+    async def _background_run() -> None:
+        try:
+            await run_agent(prompt, use_history=request.use_history, record=record)
+        except Exception as e:
+            # run_agent already wrote the failure to the record; this is just
+            # so an async-run exception never propagates into a bare task error.
+            logger.error(f"[{_profile.name}] async run failed: {e}", exc_info=True)
+
+    _spawn_background(_background_run())
+
+    return {"run_id": record.run_id, "status": "running"}
+
+
+@app.get("/runs", response_model=RunListResponse)
+async def list_runs(limit: int = 20, status: Optional[str] = None):
+    if _run_store is None:
+        raise HTTPException(status_code=503, detail="Run store not ready")
+    runs = _run_store.list(limit=min(limit, 100), status=status)
+    return RunListResponse(count=len(runs), runs=runs)
+
+
+@app.get("/runs/{run_id}", response_model=RunRecord)
+async def get_run(run_id: str):
+    if _run_store is None:
+        raise HTTPException(status_code=503, detail="Run store not ready")
+
+    try:
+        record = _run_store.get(run_id)
+    except AmbiguousRunIdError as e:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": f"ambiguous run_id prefix '{run_id}'", "candidates": e.candidates},
+        )
+
+    if record is None:
+        recent = [s.run_id for s in _run_store.list(limit=10)]
+        raise HTTPException(
+            status_code=404,
+            detail={"error": f"unknown run_id '{run_id}'", "recent": recent},
+        )
+
+    return record
 
 
 @app.post("/run/stream")
@@ -269,13 +394,7 @@ async def run_stream(request: RunRequest):
     if _agent is None:
         raise HTTPException(status_code=503, detail="Agent not ready")
 
-    prompt = request.prompt
-    if _profile and _profile.inject_timestamp:
-        prompt = _stamp_prompt(prompt)
-    for trigger in (_profile.triggers if _profile else []):
-        if hasattr(trigger, "header_prompt") and trigger.header_prompt:
-            prompt = f"{trigger.header_prompt.strip()}\n\n{prompt}"
-            break
+    prompt = _apply_trigger_prompt(request.prompt)
 
     history = None
     if request.use_history:
