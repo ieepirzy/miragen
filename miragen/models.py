@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from typing import Annotated, Literal, Optional, Union
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
+
+from apscheduler.triggers.cron import CronTrigger as _APCronTrigger
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 
 # ── Approval flow ────────────────────────────────────────────────────────────
@@ -43,6 +45,18 @@ class CronTrigger(_ProfileModel):
         default=None,
         description="Prompt injected when the cron fires without an explicit prompt.",
     )
+
+    @field_validator("schedule")
+    @classmethod
+    def validate_cron(cls, v: str) -> str:
+        try:
+            _APCronTrigger.from_crontab(v)
+        except ValueError as e:
+            raise ValueError(
+                f"invalid cron expression '{v}': {e}. "
+                "Expected 5 fields (minute hour day month day_of_week), e.g. '0 9 * * 1-5'."
+            )
+        return v
 
 
 class HttpTrigger(_ProfileModel):

@@ -36,6 +36,23 @@ class TestCronTrigger:
         assert t.default_prompt == "Run report."
 
 
+class TestCronValidation:
+    @pytest.mark.parametrize("bad", ["0 9 * *", "61 * * * *", "not cron", ""])
+    def test_invalid_expressions_raise(self, bad):
+        with pytest.raises(ValidationError):
+            CronTrigger(type="cron", schedule=bad)
+
+    @pytest.mark.parametrize("good", ["0 * * * *", "*/5 * * * *", "0 9 * * 1-5"])
+    def test_valid_expressions_ok(self, good):
+        t = CronTrigger(type="cron", schedule=good)
+        assert t.schedule == good
+
+    def test_error_message_names_expression_and_example(self):
+        with pytest.raises(ValidationError, match=r"0 9 \* \*") as exc_info:
+            CronTrigger(type="cron", schedule="0 9 * *")
+        assert "0 9 * * 1-5" in str(exc_info.value)
+
+
 class TestHttpTrigger:
     def test_minimal(self):
         t = HttpTrigger(type="http")
