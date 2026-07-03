@@ -427,7 +427,7 @@ Every agent container exposes:
 | `/health` | GET | Liveness check; includes `last_run` and `pending_approvals` |
 | `/run` | POST | Trigger a run and wait for the result (all modes) |
 | `/run/async` | POST | Trigger a run, return immediately with a `run_id` |
-| `/run/stream` | POST | Streaming run (interactive / hybrid) |
+| `/run/stream` | POST | Streaming run (interactive / hybrid); the response carries an `X-Miragen-Run-Id` header for correlating with `GET /runs/{id}` |
 | `/runs` | GET | List recent run records, newest first |
 | `/runs/{run_id}` | GET | Full record for one run (accepts a unique id prefix) |
 | `/approvals` | GET | List pending `approval_mode: queue` requests |

@@ -1,6 +1,6 @@
 # Design: Run Records & Approval Bridge
 
-**Status:** draft for review
+**Status:** accepted — open questions resolved 2026-07-03, ready to implement
 **Scope:** miragen (HTTP API + runtime) and miragen-mcp (MCP tools)
 **Depends on:** the strict-schema work on `claude/friendly-wozniak-vuchr4`
 
@@ -116,6 +116,7 @@ class RunStore:
 | `GET /runs` | **New.** Query params `limit` (default 20, max 100) and `status`. Returns `{"count": N, "runs": [RunSummary, ...]}`, newest first. |
 | `GET /runs/{run_id}` | **New.** Full `RunRecord`; 404 with the list of recent ids if unknown. Accepts unique id prefixes so LLM callers can use the short id shown in summaries. |
 | `GET /health` | Gains `last_run` (RunSummary or null) and `pending_approvals` (int, Part 2) — cheap liveness+context in one probe. |
+| `POST /run/stream` | Response carries an `X-Miragen-Run-Id` header so streaming clients can correlate the stream with its run record. Body/stream format unchanged. |
 
 Wiring: `run_agent()` in `app.py` is refactored to take an optional
 `RunRecord` and do start/finish bookkeeping; `run_agent_cron`, `/run`,
@@ -126,6 +127,23 @@ Concurrency note: runs are already unserialized today (two `POST /run`s
 overlap); records don't change that, they just make it observable. A
 `max_concurrent_runs` profile field is out of scope but becomes trivial once
 records exist.
+
+### History correlation
+
+The roadmap's conversation-history work will reference run_ids. To enable that
+without touching the `history.json` format now: every time history is saved
+(`use_history=True` in `/run` or `/run/stream`), append one line to a sidecar
+`/agent/history.runs.jsonl`:
+
+```json
+{"run_id": "...", "saved_at": "...", "message_count": N}
+```
+
+Append-only JSONL, written in the same code path that writes `history.json`,
+subject to the same best-effort error handling (a failed sidecar write logs a
+warning, never fails the run). The history/RAG work can then map any slice of
+`history.json` back to the run — and the run record — that produced it, and
+may replace the sidecar with a richer format when it lands.
 
 ### MCP tools (miragen-mcp `server.py`)
 
@@ -259,12 +277,12 @@ Claude *surfacing* the request to the human.
   extend `tests/test_approval.py`.
 - miragen-mcp: mock `httpx` per existing conventions; verify degradation errors.
 
-## Open questions
+## Resolved questions (2026-07-03)
 
-1. Should `/run/stream` also return the run_id (header `X-Miragen-Run-Id`) so
-   streaming clients can correlate? (Proposed: yes, it's free.)
-2. Is 200-record retention the right default for chatty cron agents (every 5
-   min ⇒ ~17 h of history)? Env-tunable either way.
-3. Does the roadmap's conversation-history work want to reference run_ids in
-   `history.json` entries? Cheap to add now (`run_id` on the record is stable),
-   painful to retrofit.
+1. `/run/stream` returns the run_id via the `X-Miragen-Run-Id` response header
+   — free and useful. Folded into the HTTP API table above.
+2. 200-record retention stays the default; `MIRAGEN_RUN_RETENTION` covers
+   chatty agents.
+3. History ↔ run correlation is in scope now: the `history.runs.jsonl` sidecar
+   (see "History correlation" above) records the run_id for every history
+   save, so the roadmap history work never has to retrofit it.
