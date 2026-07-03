@@ -67,8 +67,33 @@ class HttpTrigger(_ProfileModel):
     )
 
 
+class IntervalTrigger(_ProfileModel):
+    type: Literal["interval"]
+    every_s: int = Field(
+        ge=10,
+        description="Fire every N seconds. Minimum 10s, guards against accidental hot loops.",
+    )
+    default_prompt: Optional[str] = Field(
+        default=None,
+        description="Prompt injected when the interval fires without an explicit prompt.",
+    )
+
+
+class StartupTrigger(_ProfileModel):
+    type: Literal["startup"]
+    default_prompt: Optional[str] = Field(
+        default=None,
+        description="Prompt injected when the startup trigger fires without an explicit prompt.",
+    )
+    delay_s: int = Field(
+        default=0,
+        ge=0,
+        description="Seconds to wait after container boot before firing.",
+    )
+
+
 Trigger = Annotated[
-    Union[CronTrigger, HttpTrigger],
+    Union[CronTrigger, HttpTrigger, IntervalTrigger, StartupTrigger],
     Field(discriminator="type"),
 ]
 
@@ -155,16 +180,18 @@ class AgentProfile(_ProfileModel):
     @model_validator(mode="after")
     def validate_triggers_match_mode(self) -> AgentProfile:
         types = {t.type for t in self.triggers}
+        self_activating = {"cron", "interval"}
 
-        if self.mode == "autonomous" and "http" in types and "cron" not in types:
+        if self.mode == "autonomous" and "http" in types and not (types & self_activating):
             raise ValueError(
-                "autonomous agents should have at least one cron trigger; "
+                "autonomous agents should have at least one cron trigger or interval trigger; "
                 "http-only autonomous agents will never self-activate"
             )
 
-        if self.mode == "interactive" and "cron" in types:
+        if self.mode == "interactive" and (types & self_activating):
             raise ValueError(
-                "interactive agents cannot have cron triggers; use hybrid mode instead"
+                "interactive agents cannot have cron triggers or interval triggers; "
+                "use hybrid mode instead"
             )
 
         return self

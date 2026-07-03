@@ -6,8 +6,10 @@ from miragen.models import (
     AgentSpec,
     CronTrigger,
     HttpTrigger,
+    IntervalTrigger,
     ModelSettings,
     OnComplete,
+    StartupTrigger,
 )
 
 
@@ -61,6 +63,49 @@ class TestHttpTrigger:
     def test_with_header_prompt(self):
         t = HttpTrigger(type="http", header_prompt="Be concise.")
         assert t.header_prompt == "Be concise."
+
+
+class TestIntervalTrigger:
+    def test_minimal(self):
+        t = IntervalTrigger(type="interval", every_s=900)
+        assert t.every_s == 900
+        assert t.default_prompt is None
+
+    def test_with_default_prompt(self):
+        t = IntervalTrigger(type="interval", every_s=60, default_prompt="Poll the feed.")
+        assert t.default_prompt == "Poll the feed."
+
+    def test_every_s_minimum(self):
+        with pytest.raises(ValidationError):
+            IntervalTrigger(type="interval", every_s=5)
+
+    def test_every_s_boundary_ok(self):
+        t = IntervalTrigger(type="interval", every_s=10)
+        assert t.every_s == 10
+
+    def test_every_s_non_int_raises(self):
+        with pytest.raises(ValidationError):
+            IntervalTrigger(type="interval", every_s="fast")
+
+    def test_unknown_key_raises(self):
+        with pytest.raises(ValidationError):
+            IntervalTrigger(type="interval", every_s=60, prompt="wrong key")
+
+
+class TestStartupTrigger:
+    def test_minimal(self):
+        t = StartupTrigger(type="startup")
+        assert t.default_prompt is None
+        assert t.delay_s == 0
+
+    def test_with_delay(self):
+        t = StartupTrigger(type="startup", delay_s=5, default_prompt="Announce you are online.")
+        assert t.delay_s == 5
+        assert t.default_prompt == "Announce you are online."
+
+    def test_negative_delay_raises(self):
+        with pytest.raises(ValidationError):
+            StartupTrigger(type="startup", delay_s=-1)
 
 
 class TestModelSettings:
@@ -139,6 +184,53 @@ class TestAgentProfile:
             triggers=[{"type": "cron", "schedule": "0 * * * *"}, {"type": "http"}],
         ))
         assert p.mode == "autonomous"
+
+    def test_autonomous_interval_and_http_ok(self):
+        p = AgentProfile.model_validate(_profile(
+            mode="autonomous",
+            triggers=[{"type": "interval", "every_s": 60}, {"type": "http"}],
+        ))
+        assert p.mode == "autonomous"
+
+    def test_autonomous_interval_only_ok(self):
+        p = AgentProfile.model_validate(_profile(
+            mode="autonomous",
+            triggers=[{"type": "interval", "every_s": 60}],
+        ))
+        assert p.mode == "autonomous"
+
+    def test_interactive_with_interval_raises(self):
+        with pytest.raises(ValidationError, match="cron triggers"):
+            AgentProfile.model_validate(_profile(
+                mode="interactive",
+                triggers=[{"type": "interval", "every_s": 60}],
+            ))
+
+    def test_interactive_with_startup_ok(self):
+        p = AgentProfile.model_validate(_profile(
+            mode="interactive",
+            triggers=[{"type": "http"}, {"type": "startup"}],
+        ))
+        assert p.mode == "interactive"
+
+    def test_autonomous_with_startup_only_raises(self):
+        # startup doesn't count as self-activating for the http-only check.
+        with pytest.raises(ValidationError, match="cron trigger"):
+            AgentProfile.model_validate(_profile(
+                mode="autonomous",
+                triggers=[{"type": "http"}, {"type": "startup"}],
+            ))
+
+    def test_hybrid_with_startup_and_cron_ok(self):
+        p = AgentProfile.model_validate(_profile(
+            mode="hybrid",
+            triggers=[
+                {"type": "cron", "schedule": "0 * * * *"},
+                {"type": "http"},
+                {"type": "startup"},
+            ],
+        ))
+        assert len(p.triggers) == 3
 
     def test_tools_list(self):
         p = AgentProfile.model_validate(_profile(tools=["tool_a", "tool_b"]))

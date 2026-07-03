@@ -259,6 +259,89 @@ class TestRunAgentCron:
             await run_agent_cron("Run now.")
 
 
+class TestLifespanSchedulerRegistration:
+    async def test_registers_cron_interval_and_startup_jobs(self):
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from apscheduler.triggers.cron import CronTrigger as APCronTrigger
+        from apscheduler.triggers.date import DateTrigger
+        from apscheduler.triggers.interval import IntervalTrigger as APIntervalTrigger
+
+        profile = _make_profile(
+            mode="hybrid",
+            triggers=[
+                {"type": "cron", "schedule": "0 * * * *"},
+                {"type": "interval", "every_s": 30},
+                {"type": "interval", "every_s": 60},
+                {"type": "startup", "delay_s": 5},
+                {"type": "http"},
+            ],
+        )
+        mock_agent = MagicMock()
+        test_scheduler = AsyncIOScheduler()
+
+        with patch("miragen.app.load_profile", return_value=profile), \
+             patch("miragen.app.build_agent", return_value=(mock_agent, None)), \
+             patch("miragen.app._load_file_secrets"), \
+             patch.object(app_module, "_scheduler", test_scheduler):
+            async with app_module.lifespan(app):
+                jobs = {job.id: job for job in test_scheduler.get_jobs()}
+
+        assert set(jobs) == {
+            "test-agent:cron",
+            "test-agent:interval:0",
+            "test-agent:interval:1",
+            "test-agent:startup:0",
+        }
+        assert isinstance(jobs["test-agent:cron"].trigger, APCronTrigger)
+        assert isinstance(jobs["test-agent:interval:0"].trigger, APIntervalTrigger)
+        assert jobs["test-agent:interval:0"].trigger.interval.total_seconds() == 30
+        assert jobs["test-agent:interval:1"].trigger.interval.total_seconds() == 60
+        assert isinstance(jobs["test-agent:startup:0"].trigger, DateTrigger)
+
+    async def test_multiple_startup_triggers_get_distinct_ids(self):
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+        profile = _make_profile(
+            mode="hybrid",
+            triggers=[
+                {"type": "http"},
+                {"type": "startup", "delay_s": 0},
+                {"type": "startup", "delay_s": 10},
+            ],
+        )
+        mock_agent = MagicMock()
+        test_scheduler = AsyncIOScheduler()
+
+        with patch("miragen.app.load_profile", return_value=profile), \
+             patch("miragen.app.build_agent", return_value=(mock_agent, None)), \
+             patch("miragen.app._load_file_secrets"), \
+             patch.object(app_module, "_scheduler", test_scheduler):
+            async with app_module.lifespan(app):
+                job_ids = {job.id for job in test_scheduler.get_jobs()}
+
+        assert "test-agent:startup:0" in job_ids
+        assert "test-agent:startup:1" in job_ids
+
+    async def test_existing_cron_only_profile_unchanged(self):
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+        profile = _make_profile(
+            mode="autonomous",
+            triggers=[{"type": "cron", "schedule": "0 9 * * 1-5", "default_prompt": "Briefing."}],
+        )
+        mock_agent = MagicMock()
+        test_scheduler = AsyncIOScheduler()
+
+        with patch("miragen.app.load_profile", return_value=profile), \
+             patch("miragen.app.build_agent", return_value=(mock_agent, None)), \
+             patch("miragen.app._load_file_secrets"), \
+             patch.object(app_module, "_scheduler", test_scheduler):
+            async with app_module.lifespan(app):
+                job_ids = {job.id for job in test_scheduler.get_jobs()}
+
+        assert job_ids == {"test-agent:cron"}
+
+
 class TestLoadFileSecrets:
     def test_loads_secret_into_env(self, tmp_path):
         secret = tmp_path / "key"

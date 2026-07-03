@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -11,6 +11,8 @@ import httpx
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger as APIntervalTrigger
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -20,7 +22,12 @@ from pydantic_ai.usage import UsageLimits
 
 from miragen.factory import build_agent, registered_handlers
 from miragen.load import load_profile
-from miragen.models import AgentProfile, CronTrigger as ProfileCronTrigger
+from miragen.models import (
+    AgentProfile,
+    CronTrigger as ProfileCronTrigger,
+    IntervalTrigger as ProfileIntervalTrigger,
+    StartupTrigger as ProfileStartupTrigger,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,25 +74,29 @@ async def run_agent(prompt: str, use_history: bool = False) -> str:
     return str(result.output)
 
 
-async def run_agent_cron(prompt: str) -> None:
-    """Cron-triggered run. Handles on_complete side effects."""
+async def run_agent_scheduled(prompt: str) -> None:
+    """Scheduler-triggered run (cron, interval, or startup). Handles on_complete side effects."""
     assert _profile is not None
-    logger.info(f"[{_profile.name}] cron run triggered")
+    logger.info(f"[{_profile.name}] scheduled run triggered")
 
     if _profile.inject_timestamp:
         prompt = _stamp_prompt(prompt)
 
     try:
         output = await run_agent(prompt)
-        logger.info(f"[{_profile.name}] cron run complete")
+        logger.info(f"[{_profile.name}] scheduled run complete")
     except Exception as e:
-        logger.error(f"[{_profile.name}] cron run failed: {e}", exc_info=True)
+        logger.error(f"[{_profile.name}] scheduled run failed: {e}", exc_info=True)
         return
 
     try:
         await _handle_on_complete(output)
     except Exception as e:
         logger.error(f"[{_profile.name}] on_complete failed: {e}", exc_info=True)
+
+
+# Alias — kept so existing imports of `run_agent_cron` (e.g. in tests) don't break.
+run_agent_cron = run_agent_scheduled
 
 
 async def _handle_on_complete(output: str) -> None:
@@ -154,18 +165,43 @@ async def lifespan(app: FastAPI):
 
     logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode")
 
-    # Register cron triggers
+    # Register self-activating triggers (cron, interval, startup)
+    interval_i = 0
+    startup_i = 0
     for trigger in _profile.triggers:
         if isinstance(trigger, ProfileCronTrigger):
             prompt = trigger.default_prompt or "Run."
             _scheduler.add_job(
-                run_agent_cron,
+                run_agent_scheduled,
                 CronTrigger.from_crontab(trigger.schedule),
                 args=[prompt],
                 id=f"{_profile.name}:cron",
                 replace_existing=True,
             )
             logger.info(f"Registered cron trigger: {trigger.schedule}")
+        elif isinstance(trigger, ProfileIntervalTrigger):
+            prompt = trigger.default_prompt or "Run."
+            _scheduler.add_job(
+                run_agent_scheduled,
+                APIntervalTrigger(seconds=trigger.every_s),
+                args=[prompt],
+                id=f"{_profile.name}:interval:{interval_i}",
+                replace_existing=True,
+            )
+            logger.info(f"Registered interval trigger: every {trigger.every_s}s")
+            interval_i += 1
+        elif isinstance(trigger, ProfileStartupTrigger):
+            prompt = trigger.default_prompt or "Run."
+            run_date = datetime.now(timezone.utc) + timedelta(seconds=trigger.delay_s)
+            _scheduler.add_job(
+                run_agent_scheduled,
+                DateTrigger(run_date=run_date),
+                args=[prompt],
+                id=f"{_profile.name}:startup:{startup_i}",
+                replace_existing=True,
+            )
+            logger.info(f"Registered startup trigger: delay {trigger.delay_s}s")
+            startup_i += 1
 
     _scheduler.start()
     logger.info("Scheduler started")

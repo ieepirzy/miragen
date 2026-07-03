@@ -265,6 +265,16 @@ triggers:
     header_prompt: |              # optional — prepended to every /run request
       You are operating in strict mode.
 
+  - type: interval                # fires every N seconds
+    every_s: 900                  # >= 10, guards against accidental hot loops
+    default_prompt: |              # optional — injected if no prompt at runtime
+      Poll the feed.
+
+  - type: startup                 # fires once when the container boots
+    delay_s: 5                    # optional, default 0 — wait after boot before firing
+    default_prompt: |
+      Announce you are online.
+
 approval_required:                # optional — glob patterns for human-in-the-loop
   - "delete_*"
   - "execute_*"
