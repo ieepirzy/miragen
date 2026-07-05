@@ -15,7 +15,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger as APIntervalTrigger
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from pydantic_ai import Agent
@@ -344,6 +344,18 @@ def _apply_trigger_prompt(prompt: str) -> str:
     return prompt
 
 
+def _require_internal_token(x_miragen_token: Optional[str] = Header(default=None, alias="X-Miragen-Token")) -> None:
+    """Guard for /run* and /approvals*: when MIRAGEN_INTERNAL_TOKEN is set, require
+    a matching X-Miragen-Token header. Unset (the default) means no enforcement,
+    keeping single-container deployments zero-config."""
+    expected = os.environ.get("MIRAGEN_INTERNAL_TOKEN")
+    if expected and x_miragen_token != expected:
+        raise HTTPException(status_code=401, detail={"error": "unauthorized"})
+
+
+_internal_auth = Depends(_require_internal_token)
+
+
 # ── Routes ───────────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -370,7 +382,7 @@ def _raise_if_daily_budget_exceeded() -> None:
         )
 
 
-@app.post("/run", response_model=RunResponse)
+@app.post("/run", response_model=RunResponse, dependencies=[_internal_auth])
 async def run(request: RunRequest):
     """
     HTTP trigger endpoint. Available for interactive and hybrid agents,
@@ -396,7 +408,7 @@ async def run(request: RunRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/run/async", status_code=202)
+@app.post("/run/async", status_code=202, dependencies=[_internal_auth])
 async def run_async(request: RunRequest):
     """
     Non-blocking variant of /run: starts the run in the background and returns
@@ -426,7 +438,7 @@ async def run_async(request: RunRequest):
     return {"run_id": record.run_id, "status": "running"}
 
 
-@app.get("/runs", response_model=RunListResponse)
+@app.get("/runs", response_model=RunListResponse, dependencies=[_internal_auth])
 async def list_runs(limit: int = 20, status: Optional[str] = None):
     if _run_store is None:
         raise HTTPException(status_code=503, detail="Run store not ready")
@@ -434,7 +446,7 @@ async def list_runs(limit: int = 20, status: Optional[str] = None):
     return RunListResponse(count=len(runs), runs=runs)
 
 
-@app.get("/runs/{run_id}", response_model=RunRecord)
+@app.get("/runs/{run_id}", response_model=RunRecord, dependencies=[_internal_auth])
 async def get_run(run_id: str):
     if _run_store is None:
         raise HTTPException(status_code=503, detail="Run store not ready")
@@ -466,13 +478,13 @@ class ResolveApprovalResponse(BaseModel):
     resolved: bool
 
 
-@app.get("/approvals", response_model=ApprovalListResponse)
+@app.get("/approvals", response_model=ApprovalListResponse, dependencies=[_internal_auth])
 async def list_approvals():
     pending = get_broker().pending()
     return ApprovalListResponse(count=len(pending), approvals=pending)
 
 
-@app.post("/approvals/{request_id}", response_model=ResolveApprovalResponse)
+@app.post("/approvals/{request_id}", response_model=ResolveApprovalResponse, dependencies=[_internal_auth])
 async def resolve_approval(request_id: str, response: ApprovalResponse):
     broker = get_broker()
     if not broker.resolve(request_id, response):
@@ -484,7 +496,7 @@ async def resolve_approval(request_id: str, response: ApprovalResponse):
     return ResolveApprovalResponse(resolved=True)
 
 
-@app.post("/run/stream")
+@app.post("/run/stream", dependencies=[_internal_auth])
 async def run_stream(request: RunRequest):
     """
     Streaming variant of /run for interactive and hybrid agents.

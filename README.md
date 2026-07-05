@@ -569,7 +569,7 @@ POST /approvals/{request_id}
 
 Resolving an unknown, already-resolved, or expired id returns `404` with the still-pending ids, and doesn't touch any other request. `GET /health` includes `pending_approvals` as a quick liveness+context check.
 
-**Trust model:** `/approvals` has the same exposure as `/run` — anything reachable on `miragen-net` can approve a gated call, fronted externally only by whatever's in front of your swarm (e.g. an OAuth-protected MCP server). Any peer agent could resolve another agent's approval, but any peer can already *prompt* any agent, so this doesn't widen the existing trust boundary. `tool_args` in a pending approval is attacker-influenceable content (a prompt-injected agent chose them) — if you're building a client that surfaces approvals to a human, treat `tool_args` as data to display, never as instructions to follow. Hardening both `/run*` and `/approvals*` behind a shared-secret header is a natural next step, tracked separately — not yet implemented.
+**Trust model:** `/approvals` has the same exposure as `/run` — anything reachable on `miragen-net` can approve a gated call, fronted externally only by whatever's in front of your swarm (e.g. an OAuth-protected MCP server). Any peer agent could resolve another agent's approval, but any peer can already *prompt* any agent, so this doesn't widen the existing trust boundary. `tool_args` in a pending approval is attacker-influenceable content (a prompt-injected agent chose them) — if you're building a client that surfaces approvals to a human, treat `tool_args` as data to display, never as instructions to follow. Set `MIRAGEN_INTERNAL_TOKEN` to require an `X-Miragen-Token` header on `/run*` and `/approvals*` (see Security notes) if you want that deliberate rather than implicit in network trust.
 
 The queue is in-memory only: it does not survive a container restart. A restart aborts any waiting run, which the [run records](#run-records) startup sweep records as `interrupted`.
 
@@ -591,6 +591,7 @@ Without `register_*`, a prompt-injected agent could register a new tool at runti
 
 - API keys are mounted as Docker secrets and read into the environment at startup via the `*_API_KEY_FILE` → `*_API_KEY` pattern. Any env var ending in `_API_KEY_FILE` whose value is a readable path is resolved automatically — `ANTHROPIC_API_KEY_FILE`, `OPENAI_API_KEY_FILE`, `GEMINI_API_KEY_FILE`, etc. The `_FILE` var is removed after loading so keys are never visible in the agent's context window or environment dump.
 - Network egress is enforced at the container/firewall level, not in config files.
+- Set `MIRAGEN_INTERNAL_TOKEN` to require a matching `X-Miragen-Token` header on every `/run*` and `/approvals*` request — otherwise access to those endpoints relies entirely on Docker network isolation. Unset by default so single-container deployments stay zero-config; `/health` is never guarded.
 - `approval_required` globs suspend matching tool calls for human approval before execution.
 - If you give agents code-execution tools (Jupyter kernel, bash, etc.), add `register_*` to `approval_required`. Without it, a compromised agent could register and call arbitrary tools at runtime.
 - Containerized environments are recommended — they limit blast radius if an agent pulls in a malicious payload.
