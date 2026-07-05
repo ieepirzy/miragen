@@ -294,6 +294,10 @@ limits:                           # optional — spend guardrails, see "Budgets"
   tokens_per_day: 2000000
   on_exceeded: skip                # skip | notify
 
+history_max_messages: 200         # optional — cap on /agent/history.json;
+                                  # only the newest N messages are kept on load.
+                                  # unset = unbounded (today's behaviour).
+
 # ── PydanticAI spec layer ─────────────────────────────────────
 spec:
   model: anthropic:claude-sonnet-4-6
@@ -602,7 +606,7 @@ A multitude of tutorials exist for hardening docker containers, one I found that
 
 ## Roadmap
 
-- **Interactive conversation history** _(in progress)_ — `use_history: bool` on `/run`. Persists conversation turns to `/agent/history.json` using PydanticAI's `ModelMessagesTypeAdapter`. Stateless by default, opt-in continuity.
+- **Interactive conversation history** _(in progress)_ — `use_history: bool` on `/run`. Persists conversation turns to `/agent/history.json` using PydanticAI's `ModelMessagesTypeAdapter`. Stateless by default, opt-in continuity. `history_max_messages` caps unbounded growth (newest N kept); a `GET /history` API and semantic retrieval are still open.
 - **Autonomous vs interactive history split** — The agent's autonomous working memory (tool calls, cron run observations) and the `/run` interactive conversation history are kept as separate stores. Interactive history is not injected into autonomous context by default — the agent stays focused. It can access interactive history explicitly via a tool call when needed.
 - **Hybrid mode interrupt handler** — When `/run` hits a hybrid agent mid-autonomous-run, the interrupt handler selectively decides what context from the interactive history to inject before resuming.
 - **RAG over history** — Instead of injecting full conversation history into context, the agent retrieves only relevant parts via semantic search. Keeps token usage low for long-running agents.

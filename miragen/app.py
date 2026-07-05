@@ -68,6 +68,14 @@ def _stamp_prompt(prompt: str) -> str:
     return f"[{ts}]\n{prompt}"
 
 
+def _cap_history(messages: list) -> list:
+    """Trim to the newest `history_max_messages` if the profile sets a cap (oldest dropped)."""
+    cap = _profile.history_max_messages if _profile else None
+    if cap is not None and len(messages) > cap:
+        return messages[-cap:]
+    return messages
+
+
 # ── Agent runner ──────────────────────────────────────────────────────────────────
 
 def _append_history_sidecar(run_id: str | None, message_count: int) -> None:
@@ -100,7 +108,7 @@ async def run_agent(prompt: str, use_history: bool = False, record: RunRecord | 
     if use_history:
         try:
             if HISTORY_FILE.exists():
-                history = ModelMessagesTypeAdapter.validate_json(HISTORY_FILE.read_bytes())
+                history = _cap_history(ModelMessagesTypeAdapter.validate_json(HISTORY_FILE.read_bytes()))
         except Exception:
             logger.warning("Failed to load history, starting fresh")
 
@@ -511,7 +519,7 @@ async def run_stream(request: RunRequest):
     if request.use_history:
         try:
             if HISTORY_FILE.exists():
-                history = ModelMessagesTypeAdapter.validate_json(HISTORY_FILE.read_bytes())
+                history = _cap_history(ModelMessagesTypeAdapter.validate_json(HISTORY_FILE.read_bytes()))
         except Exception:
             logger.warning("Failed to load history for stream, starting fresh")
 

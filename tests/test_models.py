@@ -426,3 +426,21 @@ class TestAgentProfileLimits:
     def test_empty_limits_block_raises(self):
         with pytest.raises(ValidationError, match="at least one"):
             AgentProfile.model_validate(_profile(limits={}))
+
+
+class TestAgentProfileHistoryMaxMessages:
+    def test_defaults_to_unbounded(self):
+        p = AgentProfile.model_validate(_profile())
+        assert p.history_max_messages is None
+
+    def test_accepts_positive_int(self):
+        p = AgentProfile.model_validate(_profile(history_max_messages=50))
+        assert p.history_max_messages == 50
+
+    def test_zero_raises(self):
+        with pytest.raises(ValidationError):
+            AgentProfile.model_validate(_profile(history_max_messages=0))
+
+    def test_negative_raises(self):
+        with pytest.raises(ValidationError):
+            AgentProfile.model_validate(_profile(history_max_messages=-1))
