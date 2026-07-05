@@ -1041,3 +1041,44 @@ class TestInternalTokenGuard:
         monkeypatch.setenv("MIRAGEN_INTERNAL_TOKEN", "s3cret")
         resp = await client.get("/health")
         assert resp.status_code == 200
+
+
+class TestHistoryCap:
+    def test_no_cap_returns_all_messages(self):
+        app_module._profile = _make_profile()
+        assert app_module._cap_history([1, 2, 3]) == [1, 2, 3]
+
+    def test_cap_keeps_newest_n(self):
+        app_module._profile = _make_profile(history_max_messages=2)
+        assert app_module._cap_history([1, 2, 3, 4]) == [3, 4]
+
+    def test_cap_larger_than_history_is_a_noop(self):
+        app_module._profile = _make_profile(history_max_messages=10)
+        assert app_module._cap_history([1, 2]) == [1, 2]
+
+    def test_no_profile_returns_all_messages(self):
+        app_module._profile = None
+        assert app_module._cap_history([1, 2, 3]) == [1, 2, 3]
+
+    async def test_run_passes_capped_history_to_agent(self, mock_agent_with_usage, tmp_path, monkeypatch):
+        from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelRequest, ModelResponse, TextPart
+
+        history_file = tmp_path / "history.json"
+        monkeypatch.setattr(app_module, "HISTORY_FILE", history_file)
+        stored = [
+            ModelRequest.user_text_prompt("turn 1"),
+            ModelResponse(parts=[TextPart(content="reply 1")]),
+            ModelRequest.user_text_prompt("turn 2"),
+            ModelResponse(parts=[TextPart(content="reply 2")]),
+        ]
+        history_file.write_bytes(ModelMessagesTypeAdapter.dump_json(stored))
+
+        app_module._profile = _make_profile(history_max_messages=2)
+        app_module._agent = mock_agent_with_usage
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/run", json={"prompt": "turn 3", "use_history": True})
+
+        assert resp.status_code == 200
+        passed_history = mock_agent_with_usage.run.call_args.kwargs["message_history"]
+        assert passed_history == stored[-2:]

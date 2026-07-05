@@ -286,6 +286,14 @@ class AgentProfile(_ProfileModel):
         description="Prepend the current UTC timestamp to every incoming prompt.",
     )
     limits: Optional[Limits] = None
+    history_max_messages: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Cap on /agent/history.json length: when set, only the newest N messages "
+            "are kept after loading (oldest dropped first). None = unbounded (today's behaviour)."
+        ),
+    )
     spec: AgentSpec
 
     @model_validator(mode="after")
