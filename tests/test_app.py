@@ -1005,3 +1005,39 @@ class TestLoadFileSecrets:
                 _load_file_secrets()
             assert "LOCKED_KEY" not in os.environ
             assert "LOCKED_KEY_FILE" in os.environ
+
+
+class TestInternalTokenGuard:
+    async def test_unset_token_allows_run_without_header(self, client, monkeypatch):
+        monkeypatch.delenv("MIRAGEN_INTERNAL_TOKEN", raising=False)
+        with patch("miragen.app.run_agent", AsyncMock(return_value="hello")):
+            resp = await client.post("/run", json={"prompt": "hi"})
+        assert resp.status_code == 200
+
+    async def test_set_token_rejects_missing_header(self, client, monkeypatch):
+        monkeypatch.setenv("MIRAGEN_INTERNAL_TOKEN", "s3cret")
+        resp = await client.post("/run", json={"prompt": "hi"})
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == {"error": "unauthorized"}
+
+    async def test_set_token_rejects_wrong_header(self, client, monkeypatch):
+        monkeypatch.setenv("MIRAGEN_INTERNAL_TOKEN", "s3cret")
+        resp = await client.post("/run", json={"prompt": "hi"}, headers={"X-Miragen-Token": "wrong"})
+        assert resp.status_code == 401
+
+    async def test_set_token_accepts_matching_header(self, client, monkeypatch):
+        monkeypatch.setenv("MIRAGEN_INTERNAL_TOKEN", "s3cret")
+        with patch("miragen.app.run_agent", AsyncMock(return_value="hello")):
+            resp = await client.post("/run", json={"prompt": "hi"}, headers={"X-Miragen-Token": "s3cret"})
+        assert resp.status_code == 200
+
+    async def test_guards_runs_and_approvals_endpoints(self, client, monkeypatch):
+        monkeypatch.setenv("MIRAGEN_INTERNAL_TOKEN", "s3cret")
+        assert (await client.get("/runs")).status_code == 401
+        assert (await client.get("/approvals")).status_code == 401
+        assert (await client.post("/approvals/r1", json={"approved": True})).status_code == 401
+
+    async def test_health_is_never_guarded(self, client, monkeypatch):
+        monkeypatch.setenv("MIRAGEN_INTERNAL_TOKEN", "s3cret")
+        resp = await client.get("/health")
+        assert resp.status_code == 200
