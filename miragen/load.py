@@ -159,8 +159,9 @@ def load_profile(path: str | Path) -> AgentProfile:
     profile = AgentProfile.model_validate(raw)
 
     # Eagerly resolve capabilities so we catch unknown names at load time
-    # rather than at agent construction time
-    if profile.spec.capabilities:
+    # rather than at agent construction time (model tier only — executor
+    # profiles carry no capability list; the executor's tools are its own)
+    if profile.spec is not None and profile.spec.capabilities:
         resolve_capabilities(profile.spec.capabilities)
 
     return profile

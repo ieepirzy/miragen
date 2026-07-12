@@ -58,6 +58,10 @@ class RunStore:
         error: str | None = None,
         usage: RunUsage | None = None,
         tool_calls: Sequence[ToolCallRecord] = (),
+        thread_id: str | None = None,
+        workspace: str | None = None,
+        exit_reason: str | None = None,
+        diff_path: str | None = None,
     ) -> RunRecord:
         finished_at = datetime.now(timezone.utc)
         updated = record.model_copy(update={
@@ -68,9 +72,28 @@ class RunStore:
             "duration_s": (finished_at - record.started_at).total_seconds(),
             "usage": usage,
             "tool_calls": list(tool_calls),
+            # Executor-tier handles: never clear an already-recorded value —
+            # thread/workspace bindings survive every state transition.
+            "thread_id": thread_id or record.thread_id,
+            "workspace": workspace or record.workspace,
+            "exit_reason": exit_reason,
+            "diff_path": diff_path or record.diff_path,
         })
         self._write(updated)
         self._prune()
+        return updated
+
+    def reopen(self, record: RunRecord) -> RunRecord:
+        """Executor resume: transition a suspended/failed run back to running,
+        preserving its thread/workspace bindings and accumulated usage."""
+        updated = record.model_copy(update={
+            "status": "running",
+            "finished_at": None,
+            "duration_s": None,
+            "error": None,
+            "exit_reason": None,
+        })
+        self._write(updated)
         return updated
 
     def get(self, run_id: str) -> RunRecord | None:

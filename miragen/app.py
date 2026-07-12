@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 import os
+import shutil
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +25,7 @@ from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
 
 from miragen.broker import PendingApproval, get_broker
+from miragen.executor import CodexExecutor
 from miragen.factory import build_agent, registered_handlers
 from miragen.load import load_profile
 from miragen.models import (
@@ -32,6 +35,7 @@ from miragen.models import (
     IntervalTrigger as ProfileIntervalTrigger,
     RunRecord,
     RunSummary,
+    RunUsage,
     StartupTrigger as ProfileStartupTrigger,
 )
 from miragen.runs import (
@@ -52,6 +56,7 @@ _agent: Agent | None = None
 _limits: UsageLimits | None = None
 _scheduler: AsyncIOScheduler = AsyncIOScheduler()
 _run_store: RunStore | None = None
+_executor: "CodexExecutor | None" = None
 
 HISTORY_FILE = Path("/agent/history.json")
 HISTORY_SIDECAR = Path("/agent/history.runs.jsonl")
@@ -141,7 +146,14 @@ async def run_agent(prompt: str, use_history: bool = False, record: RunRecord | 
     If `record` is given (from _run_store.start()), the run's outcome — success
     with usage/tool-calls, or failure with the error — is written back to it via
     _run_store.finish() before returning (or before the exception propagates).
+
+    Executor-tier profiles dispatch to the executor backend instead of the
+    pydantic-ai agent; `use_history` does not apply there (the executor thread
+    is the history).
     """
+    if _executor is not None:
+        return await _run_executor_turn(prompt, record)
+
     assert _agent is not None, "Agent not initialized"
 
     history = None
@@ -175,6 +187,66 @@ async def run_agent(prompt: str, use_history: bool = False, record: RunRecord | 
         _run_store.finish(record, status="succeeded", output=output, usage=usage, tool_calls=tool_calls)
 
     return output
+
+
+async def _run_executor_turn(
+    prompt: str,
+    record: RunRecord | None,
+    *,
+    resume: bool = False,
+) -> str:
+    """One executor turn bound to an agent-run. Terminal-state bookkeeping:
+    succeeded harvests the diff; suspended (budget) and failed (crash) keep
+    thread + workspace as resume state; failed raises so callers see the
+    same error contract as model-tier runs."""
+    assert _executor is not None
+    run_id = record.run_id if record is not None else uuid.uuid4().hex
+
+    result = await _executor.run_job(
+        prompt,
+        run_id,
+        thread_id=record.thread_id if record is not None else None,
+        workspace=record.workspace if record is not None else None,
+        first_turn=not resume,
+    )
+
+    if record is not None and _run_store is not None:
+        usage = _accumulate_usage(record.usage, result.usage)
+        _run_store.finish(
+            record,
+            status=result.status,
+            output=result.output,
+            error=result.error,
+            usage=usage,
+            thread_id=result.thread_id,
+            workspace=str(Path(_executor.spec.workspace_root) / run_id)
+            if record.workspace is None else record.workspace,
+            exit_reason=result.exit_reason,
+            diff_path=result.diff_path,
+        )
+
+    if result.status == "failed":
+        raise RuntimeError(result.error or "executor turn failed")
+    if result.status == "suspended":
+        return (
+            f"[suspended: {result.exit_reason}] turn completed but the run is suspended; "
+            f"resume via POST /runs/{run_id}/resume"
+        )
+    return result.output or ""
+
+
+def _accumulate_usage(previous: RunUsage | None, latest: RunUsage | None) -> RunUsage | None:
+    """Resumed runs accumulate usage across turns — tokens_per_day sums run
+    records, so each record must carry its own true total."""
+    if previous is None:
+        return latest
+    if latest is None:
+        return previous
+    return RunUsage(
+        requests=previous.requests + latest.requests,
+        input_tokens=(previous.input_tokens or 0) + (latest.input_tokens or 0) or None,
+        output_tokens=(previous.output_tokens or 0) + (latest.output_tokens or 0) or None,
+    )
 
 
 def _daily_budget_status() -> tuple[int, int] | None:
@@ -295,7 +367,7 @@ def _load_file_secrets() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _profile, _agent, _limits, _run_store
+    global _profile, _agent, _limits, _run_store, _executor
 
     _load_file_secrets()
 
@@ -303,14 +375,19 @@ async def lifespan(app: FastAPI):
     logger.info(f"Loading agent profile: {profile_path}")
 
     _profile = load_profile(profile_path)
-    _agent, _limits = build_agent(_profile)
 
     _run_store = RunStore(retention=run_retention_from_env())
     interrupted = _run_store.sweep_interrupted()
     if interrupted:
         logger.warning(f"Marked {interrupted} stale 'running' record(s) as interrupted")
 
-    logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode")
+    if _profile.is_executor:
+        _executor = CodexExecutor(_profile, runs_root=_run_store.root)
+        _executor.prepare()
+        logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode (executor tier: {_profile.executor.executor})")
+    else:
+        _agent, _limits = build_agent(_profile)
+        logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode")
 
     # Register self-activating triggers (cron, interval, startup)
     interval_i = 0
@@ -442,7 +519,7 @@ async def run(request: RunRequest):
     HTTP trigger endpoint. Available for interactive and hybrid agents,
     and for manually triggering autonomous agents outside their cron schedule.
     """
-    if _agent is None:
+    if _agent is None and _executor is None:
         raise HTTPException(status_code=503, detail="Agent not ready")
     _raise_if_daily_budget_exceeded()
 
@@ -468,7 +545,7 @@ async def run_async(request: RunRequest):
     Non-blocking variant of /run: starts the run in the background and returns
     immediately with a run_id. Poll GET /runs/{run_id} for the outcome.
     """
-    if _agent is None:
+    if _agent is None and _executor is None:
         raise HTTPException(status_code=503, detail="Agent not ready")
     if _run_store is None or _profile is None:
         raise HTTPException(status_code=503, detail="Run store not ready")
@@ -521,6 +598,106 @@ async def get_run(run_id: str):
         )
 
     return record
+
+
+# ── Executor-tier routes ─────────────────────────────────────────────────────
+#
+# Resume/abandon drive the executor state machine; diff/events expose the
+# workspace-in / diff-and-events-out contract to the layers above.
+
+class ResumeRequest(BaseModel):
+    prompt: str
+
+
+def _get_executor_record(run_id: str) -> RunRecord:
+    if _executor is None:
+        raise HTTPException(status_code=400, detail="this agent is not executor-backed")
+    if _run_store is None:
+        raise HTTPException(status_code=503, detail="Run store not ready")
+    try:
+        record = _run_store.get(run_id)
+    except AmbiguousRunIdError as e:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": f"ambiguous run_id prefix '{run_id}'", "candidates": e.candidates},
+        )
+    if record is None:
+        raise HTTPException(status_code=404, detail={"error": f"unknown run_id '{run_id}'"})
+    return record
+
+
+@app.post("/runs/{run_id}/resume", response_model=RunRecord, dependencies=[_internal_auth])
+async def resume_run(run_id: str, request: ResumeRequest):
+    """Re-open the executor thread bound to a suspended/failed run and give it
+    another turn. The workspace (with any partial diff) is the resume state."""
+    record = _get_executor_record(run_id)
+    if record.status not in ("suspended", "failed"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"run is '{record.status}'; only suspended/failed runs are resumable",
+        )
+    if record.thread_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail="run has no executor thread handle; it cannot be resumed",
+        )
+    _raise_if_daily_budget_exceeded()
+
+    record = _run_store.reopen(record)
+    try:
+        await _run_executor_turn(request.prompt, record, resume=True)
+    except RuntimeError:
+        pass  # outcome (failed:crash) is already on the record; return it
+    return _run_store.get(record.run_id)
+
+
+@app.post("/runs/{run_id}/abandon", response_model=RunRecord, dependencies=[_internal_auth])
+async def abandon_run(run_id: str, discard_workspace: bool = False):
+    """Human gives up on a suspended/failed run — the only human-terminal
+    state, and the only place keep-for-forensics vs discard is decided."""
+    record = _get_executor_record(run_id)
+    if record.status not in ("suspended", "failed"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"run is '{record.status}'; only suspended/failed runs can be abandoned",
+        )
+    updated = _run_store.finish(
+        record,
+        status="abandoned",
+        output=record.output,
+        usage=record.usage,
+        exit_reason="abandoned",
+    )
+    if discard_workspace and record.workspace:
+        shutil.rmtree(record.workspace, ignore_errors=True)
+        logger.info(f"[{_profile.name}] workspace discarded: {record.workspace}")
+    return updated
+
+
+@app.get("/runs/{run_id}/diff", dependencies=[_internal_auth])
+async def get_run_diff(run_id: str):
+    """The harvested diff — set exactly once, on terminal success."""
+    record = _get_executor_record(run_id)
+    if record.diff_path is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"run '{record.run_id}' has no harvested diff (status: {record.status})",
+        )
+    path = Path(record.diff_path)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="diff file missing from workspace volume")
+    from fastapi.responses import PlainTextResponse
+
+    return PlainTextResponse(path.read_text())
+
+
+@app.get("/runs/{run_id}/events", dependencies=[_internal_auth])
+async def get_run_events(run_id: str, limit: int = 200):
+    """The executor event stream (turn events, item/tool events, errors) —
+    what this tier owes the layers above, alongside the exit reason."""
+    record = _get_executor_record(run_id)
+    events = _executor.read_events(record.run_id, limit=min(limit, 1000))
+    return {"run_id": record.run_id, "count": len(events), "events": events}
 
 
 @app.get("/history", response_model=HistoryResponse, dependencies=[_internal_auth])
@@ -587,6 +764,11 @@ async def run_stream(request: RunRequest):
     Streaming variant of /run for interactive and hybrid agents.
     Returns a text/event-stream response.
     """
+    if _executor is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="executor-backed agents do not stream text; poll GET /runs/{run_id}/events instead",
+        )
     if _agent is None:
         raise HTTPException(status_code=503, detail="Agent not ready")
 

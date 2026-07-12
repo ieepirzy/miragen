@@ -43,11 +43,19 @@ class RunUsage(BaseModel):
     output_tokens: Optional[int] = None
 
 
+RunStatus = Literal[
+    "running", "succeeded", "failed", "interrupted",
+    # Executor-tier states: suspended/failed executor runs are RESUMABLE
+    # (workspace + thread survive); abandoned is the only human-terminal state.
+    "suspended", "abandoned",
+]
+
+
 class RunRecord(BaseModel):
     run_id: str  # uuid4 hex
     agent_name: str
     trigger: Literal["cron", "http", "http_async"]
-    status: Literal["running", "succeeded", "failed", "interrupted"]
+    status: RunStatus
     prompt: str  # truncated to 20_000 chars
     output: Optional[str] = None  # truncated to 100_000 chars
     error: Optional[str] = None
@@ -57,6 +65,14 @@ class RunRecord(BaseModel):
     usage: Optional[RunUsage] = None
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
     use_history: bool = False
+    # Executor-tier fields (None for model-tier runs). The thread handle lives
+    # on the agent-run record, not any job record — resume re-opens the thread
+    # bound to this run. exit_reason qualifies non-succeeded terminal states
+    # (e.g. 'budget', 'crash', 'abandoned').
+    thread_id: Optional[str] = None
+    workspace: Optional[str] = None
+    exit_reason: Optional[str] = None
+    diff_path: Optional[str] = None  # set exactly once, on terminal success
 
 
 class RunSummary(BaseModel):
@@ -64,7 +80,7 @@ class RunSummary(BaseModel):
     run_id: str
     agent_name: str
     trigger: Literal["cron", "http", "http_async"]
-    status: Literal["running", "succeeded", "failed", "interrupted"]
+    status: RunStatus
     prompt_preview: str  # first 200 chars of prompt
     output_preview: Optional[str] = None  # first 200 chars of output
     error: Optional[str] = None
@@ -243,6 +259,83 @@ class Limits(_ProfileModel):
         return self
 
 
+# ── Executor spec (second backend tier) ─────────────────────────────────────
+#
+# Self-harnessed executors (Codex first) own their own agent loop; the
+# contract inverts from messages-in/completions-out to workspace-in /
+# diff-and-events-out. This is a SECOND TIER next to AgentSpec, not another
+# model backend inside it: profiles declare exactly one of `spec` / `executor`.
+
+class ExecutorMCPServer(_ProfileModel):
+    name: str = Field(
+        description="Server name as it appears in the executor's MCP config, e.g. 'loimi'.",
+        pattern=r"^[a-z0-9][a-z0-9_-]*$",
+    )
+    url: str = Field(
+        description="Streamable-HTTP MCP endpoint URL.",
+        min_length=1,
+    )
+    bearer_token_env: Optional[str] = Field(
+        default=None,
+        description=(
+            "Name of the env var holding this agent's bearer token for the server. "
+            "Per-agent Origo confidential-client credentials are supplied to the "
+            "container at spawn (env or mounted secret) and referenced here by NAME — "
+            "the token value never enters the profile."
+        ),
+    )
+
+
+class ExecutorSpec(_ProfileModel):
+    executor: Literal["codex"] = Field(
+        description="Executor backend. Codex is the first target; the contract is executor-agnostic.",
+    )
+    instructions: str = Field(
+        description="Task framing prepended to the first prompt of every job.",
+        min_length=1,
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description="Executor-side model override (e.g. a codex model name); executor default when None.",
+    )
+    sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"] = Field(
+        default="workspace-write",
+        description="Codex sandbox mode, passed per turn. The container itself is the outer sandbox.",
+    )
+    approval_policy: Literal["untrusted", "on-failure", "on-request", "never"] = Field(
+        default="never",
+        description=(
+            "MUST be effective for unattended runs — an executor waiting on interactive "
+            "approval stalls the job. Default 'never' (the container + sandbox_mode are the guard)."
+        ),
+    )
+    network_access: bool = Field(
+        default=False,
+        description="Allow network access inside the executor sandbox (workspace-write mode).",
+    )
+    web_search: bool = Field(default=False)
+    reasoning_effort: Optional[Literal["minimal", "low", "medium", "high"]] = None
+    workspace_root: str = Field(
+        default="/agent/workspaces",
+        description=(
+            "Parent directory for per-run workspaces. Workspace lifetime != container "
+            "lifetime: mount a persistent volume here so suspended/failed runs stay resumable."
+        ),
+    )
+    codex_home: str = Field(
+        default="/agent/codex-home",
+        description=(
+            "CODEX_HOME for the executor. auth.json must be volume-mounted here "
+            "(ephemeral containers fail auth on spawn otherwise); miragen writes "
+            "config.toml (MCP servers, trust settings) into it at startup."
+        ),
+    )
+    mcp_servers: Optional[list[ExecutorMCPServer]] = Field(
+        default=None,
+        description="MCP servers injected into the executor's config at startup (e.g. Loimi via Origo).",
+    )
+
+
 # ── Top-level agent profile ──────────────────────────────────────────────────
 
 class AgentProfile(_ProfileModel):
@@ -294,7 +387,49 @@ class AgentProfile(_ProfileModel):
             "are kept after loading (oldest dropped first). None = unbounded (today's behaviour)."
         ),
     )
-    spec: AgentSpec
+    spec: Optional[AgentSpec] = Field(
+        default=None,
+        description="Model-tier backend (miragen owns the loop). Exactly one of spec/executor.",
+    )
+    executor: Optional[ExecutorSpec] = Field(
+        default=None,
+        description="Executor-tier backend (self-harnessed loop). Exactly one of spec/executor.",
+    )
+
+    @property
+    def is_executor(self) -> bool:
+        return self.executor is not None
+
+    @model_validator(mode="after")
+    def validate_exactly_one_backend(self) -> AgentProfile:
+        if (self.spec is None) == (self.executor is None):
+            raise ValueError(
+                "an agent profile declares exactly one backend: `spec` (model tier) "
+                "or `executor` (executor tier)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_executor_profile_fields(self) -> AgentProfile:
+        if self.executor is None:
+            return self
+        # Model-tier-only knobs on an executor profile are dead config at best
+        # and a false sense of a guardrail at worst — reject loudly.
+        offending = [
+            name for name, value in (
+                ("tools", self.tools),
+                ("approval_required", self.approval_required),
+                ("approval_webhook", self.approval_webhook),
+                ("history_max_messages", self.history_max_messages),
+            ) if value
+        ]
+        if offending:
+            raise ValueError(
+                f"executor-tier profiles do not support model-tier fields: {offending}. "
+                "Tool access is the executor's own; approvals are `executor.approval_policy`; "
+                "history is the executor thread itself."
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_triggers_match_mode(self) -> AgentProfile:
