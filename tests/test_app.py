@@ -318,6 +318,102 @@ class TestHistorySidecar:
         assert resp.status_code == 200
 
 
+class TestHistoryEndpoint:
+    def _write_history(self, path, messages):
+        from pydantic_ai.messages import ModelMessagesTypeAdapter
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(ModelMessagesTypeAdapter.dump_json(messages))
+
+    def _messages(self, pairs):
+        """`pairs` user/assistant turns, oldest first: [user0, assistant0, user1, ...]."""
+        from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+
+        msgs = []
+        for i in range(pairs):
+            msgs.append(ModelRequest(parts=[UserPromptPart(content=f"user {i}")]))
+            msgs.append(ModelResponse(parts=[TextPart(content=f"assistant {i}")]))
+        return msgs
+
+    async def test_no_history_file_returns_empty(self, client, tmp_path, monkeypatch):
+        monkeypatch.setattr(app_module, "HISTORY_FILE", tmp_path / "missing.json")
+
+        resp = await client.get("/history")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"message_count": 0, "messages": [], "run_id": None}
+
+    async def test_returns_newest_limit_messages(self, client, tmp_path, monkeypatch):
+        history_path = tmp_path / "history.json"
+        self._write_history(history_path, self._messages(5))  # 10 messages total
+        monkeypatch.setattr(app_module, "HISTORY_FILE", history_path)
+
+        resp = await client.get("/history", params={"limit": 4})
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["message_count"] == 4
+        assert data["run_id"] is None
+        assert [m["content"] for m in data["messages"]] == ["user 3", "assistant 3", "user 4", "assistant 4"]
+
+    async def test_default_limit_is_20(self, client, tmp_path, monkeypatch):
+        history_path = tmp_path / "history.json"
+        self._write_history(history_path, self._messages(15))  # 30 messages total
+        monkeypatch.setattr(app_module, "HISTORY_FILE", history_path)
+
+        resp = await client.get("/history")
+
+        assert resp.json()["message_count"] == 20
+
+    async def test_limit_is_clamped_to_200(self, client, tmp_path, monkeypatch):
+        history_path = tmp_path / "history.json"
+        self._write_history(history_path, self._messages(150))  # 300 messages total
+        monkeypatch.setattr(app_module, "HISTORY_FILE", history_path)
+
+        resp = await client.get("/history", params={"limit": 10_000})
+
+        assert resp.json()["message_count"] == 200
+
+    async def test_run_id_returns_prefix_slice(self, client, tmp_path, monkeypatch):
+        import json as _json
+
+        history_path = tmp_path / "history.json"
+        sidecar_path = tmp_path / "history.runs.jsonl"
+        self._write_history(history_path, self._messages(3))  # 6 messages total
+        monkeypatch.setattr(app_module, "HISTORY_FILE", history_path)
+        monkeypatch.setattr(app_module, "HISTORY_SIDECAR", sidecar_path)
+
+        sidecar_path.write_text(
+            _json.dumps({"run_id": "run-a", "saved_at": "t1", "message_count": 2}) + "\n"
+            + _json.dumps({"run_id": "run-b", "saved_at": "t2", "message_count": 4}) + "\n"
+        )
+
+        resp = await client.get("/history", params={"run_id": "run-b"})
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["message_count"] == 4
+        assert data["run_id"] == "run-b"
+        assert [m["role"] for m in data["messages"]] == ["user", "assistant", "user", "assistant"]
+
+    async def test_unknown_run_id_returns_404(self, client, tmp_path, monkeypatch):
+        monkeypatch.setattr(app_module, "HISTORY_FILE", tmp_path / "history.json")
+        monkeypatch.setattr(app_module, "HISTORY_SIDECAR", tmp_path / "history.runs.jsonl")
+
+        resp = await client.get("/history", params={"run_id": "nope"})
+
+        assert resp.status_code == 404
+
+    async def test_run_id_with_no_history_saved_returns_404(self, client, tmp_path, monkeypatch):
+        """A run_id present in the sidecar but from a use_history=False run never appears there."""
+        monkeypatch.setattr(app_module, "HISTORY_FILE", tmp_path / "history.json")
+        monkeypatch.setattr(app_module, "HISTORY_SIDECAR", tmp_path / "missing.jsonl")
+
+        resp = await client.get("/history", params={"run_id": "abc123"})
+
+        assert resp.status_code == 404
+
+
 class TestHandleOnComplete:
     async def test_no_on_complete_does_nothing(self):
         app_module._profile = _make_profile()
@@ -1036,6 +1132,7 @@ class TestInternalTokenGuard:
         assert (await client.get("/runs")).status_code == 401
         assert (await client.get("/approvals")).status_code == 401
         assert (await client.post("/approvals/r1", json={"approved": True})).status_code == 401
+        assert (await client.get("/history")).status_code == 401
 
     async def test_health_is_never_guarded(self, client, monkeypatch):
         monkeypatch.setenv("MIRAGEN_INTERNAL_TOKEN", "s3cret")

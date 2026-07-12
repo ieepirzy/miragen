@@ -434,6 +434,7 @@ Every agent container exposes:
 | `/run/stream` | POST | Streaming run (interactive / hybrid); the response carries an `X-Miragen-Run-Id` header for correlating with `GET /runs/{id}` |
 | `/runs` | GET | List recent run records, newest first |
 | `/runs/{run_id}` | GET | Full record for one run (accepts a unique id prefix) |
+| `/history` | GET | Read-only slice of persisted conversation history (`?limit=` or `?run_id=`) |
 | `/approvals` | GET | List pending `approval_mode: queue` requests |
 | `/approvals/{request_id}` | POST | Resolve a pending approval request |
 
@@ -467,6 +468,20 @@ POST /run/async {"prompt": "..."} → 202 {"run_id": "...", "status": "running"}
 ```
 
 If the container is killed mid-run, the interrupted record is marked `interrupted` (not left `running` forever) the next time it starts. Retention defaults to the newest 200 runs; override with `MIRAGEN_RUN_RETENTION`.
+
+### History
+
+`GET /history` is a read-only view of the conversation history persisted at `/agent/history.json` (see [Interactive conversation history](#roadmap) below). Messages are flattened to plain `{"role", "content"}` pairs.
+
+```
+GET /history?limit=20
+→ {"message_count": 12, "messages": [{"role": "user", "content": "..."}, ...], "run_id": null}
+
+GET /history?run_id=3f2a1b9c
+→ {"message_count": 8, "messages": [...], "run_id": "3f2a1b9c..."}
+```
+
+Without `run_id`, returns the newest `limit` messages (default 20, max 200). With `run_id`, returns the message slice that existed right after that run saved history, correlated via `history.runs.jsonl`; an unknown or non-history-saving `run_id` returns `404`. If `history.json` doesn't exist yet, returns an empty list rather than erroring.
 
 ---
 
@@ -606,7 +621,7 @@ A multitude of tutorials exist for hardening docker containers, one I found that
 
 ## Roadmap
 
-- **Interactive conversation history** _(in progress)_ — `use_history: bool` on `/run`. Persists conversation turns to `/agent/history.json` using PydanticAI's `ModelMessagesTypeAdapter`. Stateless by default, opt-in continuity. `history_max_messages` caps unbounded growth (newest N kept); a `GET /history` API and semantic retrieval are still open.
+- **Interactive conversation history** _(in progress)_ — `use_history: bool` on `/run`. Persists conversation turns to `/agent/history.json` using PydanticAI's `ModelMessagesTypeAdapter`. Stateless by default, opt-in continuity. `history_max_messages` caps unbounded growth (newest N kept); `GET /history` exposes it read-only. Semantic retrieval (RAG) is still open.
 - **Autonomous vs interactive history split** — The agent's autonomous working memory (tool calls, cron run observations) and the `/run` interactive conversation history are kept as separate stores. Interactive history is not injected into autonomous context by default — the agent stays focused. It can access interactive history explicitly via a tool call when needed.
 - **Hybrid mode interrupt handler** — When `/run` hits a hybrid agent mid-autonomous-run, the interrupt handler selectively decides what context from the interactive history to inject before resuming.
 - **RAG over history** — Instead of injecting full conversation history into context, the agent retrieves only relevant parts via semantic search. Keeps token usage low for long-running agents.
