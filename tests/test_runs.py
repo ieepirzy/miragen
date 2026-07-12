@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from miragen.models import RunRecord, RunUsage, ToolCallRecord
-from miragen.runs import AmbiguousRunIdError, RunStore, extract_run_details, tokens_used_since
+from miragen.runs import AmbiguousRunIdError, RunStore, extract_run_details, simplify_history_messages, tokens_used_since
 
 
 class TestRunStoreStartFinish:
@@ -293,6 +293,57 @@ class TestExtractRunDetails:
         result = self._mock_result(self._usage(), [])
         _, tool_calls = extract_run_details(result)
         assert tool_calls == []
+
+
+class TestSimplifyHistoryMessages:
+    def _part(self, part_kind, **kw):
+        p = MagicMock()
+        p.part_kind = part_kind
+        for k, v in kw.items():
+            setattr(p, k, v)
+        return p
+
+    def _message(self, kind, parts):
+        m = MagicMock()
+        m.kind = kind
+        m.parts = parts
+        return m
+
+    def test_system_and_user_prompt_request(self):
+        sys_part = self._part("system-prompt", content="You are helpful.")
+        user_part = self._part("user-prompt", content="hi")
+        simplified = simplify_history_messages([self._message("request", [sys_part, user_part])])
+
+        assert simplified == [{"role": "system", "content": "You are helpful.\nhi"}]
+
+    def test_user_prompt_only_request(self):
+        user_part = self._part("user-prompt", content="hi")
+        simplified = simplify_history_messages([self._message("request", [user_part])])
+
+        assert simplified == [{"role": "user", "content": "hi"}]
+
+    def test_tool_return_request(self):
+        ret = self._part("tool-return", content="42 degrees")
+        simplified = simplify_history_messages([self._message("request", [ret])])
+
+        assert simplified == [{"role": "tool", "content": "42 degrees"}]
+
+    def test_response_text(self):
+        text = self._part("text", content="hello there")
+        simplified = simplify_history_messages([self._message("response", [text])])
+
+        assert simplified == [{"role": "assistant", "content": "hello there"}]
+
+    def test_response_tool_call(self):
+        call = self._part("tool-call", tool_name="get_weather", args={"city": "Turku"})
+        simplified = simplify_history_messages([self._message("response", [call])])
+
+        assert simplified[0]["role"] == "assistant"
+        assert "get_weather" in simplified[0]["content"]
+        assert "Turku" in simplified[0]["content"]
+
+    def test_empty_messages_returns_empty_list(self):
+        assert simplify_history_messages([]) == []
 
 
 class TestTokensUsedSince:

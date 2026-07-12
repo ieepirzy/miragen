@@ -34,7 +34,14 @@ from miragen.models import (
     RunSummary,
     StartupTrigger as ProfileStartupTrigger,
 )
-from miragen.runs import AmbiguousRunIdError, RunStore, extract_run_details, run_retention_from_env, tokens_used_since
+from miragen.runs import (
+    AmbiguousRunIdError,
+    RunStore,
+    extract_run_details,
+    run_retention_from_env,
+    simplify_history_messages,
+    tokens_used_since,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +81,39 @@ def _cap_history(messages: list) -> list:
     if cap is not None and len(messages) > cap:
         return messages[-cap:]
     return messages
+
+
+def _load_history_messages() -> list:
+    """Read + validate HISTORY_FILE; a missing or unparsable file behaves as empty history."""
+    if not HISTORY_FILE.exists():
+        return []
+    try:
+        return ModelMessagesTypeAdapter.validate_json(HISTORY_FILE.read_bytes())
+    except Exception:
+        logger.warning("Failed to parse history.json")
+        return []
+
+
+def _sidecar_message_count(run_id: str) -> int | None:
+    """
+    message_count recorded in HISTORY_SIDECAR the last time `run_id` saved history,
+    or None if that run never appears there. History only ever grows by appending,
+    so that count is also the prefix length of the current history at save time.
+    """
+    if not HISTORY_SIDECAR.exists():
+        return None
+    count = None
+    for line in HISTORY_SIDECAR.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get("run_id") == run_id:
+            count = entry.get("message_count")
+    return count
 
 
 # ── Agent runner ──────────────────────────────────────────────────────────────────
@@ -341,6 +381,12 @@ class RunListResponse(BaseModel):
     runs: list[RunSummary]
 
 
+class HistoryResponse(BaseModel):
+    message_count: int
+    messages: list[dict]
+    run_id: Optional[str] = None
+
+
 def _apply_trigger_prompt(prompt: str) -> str:
     """Stamp the timestamp and prepend a header_prompt, exactly as /run always has."""
     if _profile and _profile.inject_timestamp:
@@ -475,6 +521,37 @@ async def get_run(run_id: str):
         )
 
     return record
+
+
+@app.get("/history", response_model=HistoryResponse, dependencies=[_internal_auth])
+async def get_history(limit: int = 20, run_id: Optional[str] = None):
+    """
+    Read-only view of the conversation history persisted at HISTORY_FILE.
+
+    Without run_id: newest `limit` messages (default 20, max 200).
+    With run_id: the message slice history.json held right after that run saved
+    it, recovered via history.runs.jsonl. 404 if that run never saved history.
+    """
+    messages = _load_history_messages()
+
+    if run_id is not None:
+        message_count = _sidecar_message_count(run_id)
+        if message_count is None:
+            raise HTTPException(status_code=404, detail={"error": f"no history entry for run_id '{run_id}'"})
+        sliced = messages[:message_count]
+        return HistoryResponse(
+            message_count=len(sliced),
+            messages=simplify_history_messages(sliced),
+            run_id=run_id,
+        )
+
+    capped = max(0, min(limit, 200))
+    sliced = messages[-capped:] if capped else []
+    return HistoryResponse(
+        message_count=len(sliced),
+        messages=simplify_history_messages(sliced),
+        run_id=None,
+    )
 
 
 class ApprovalListResponse(BaseModel):

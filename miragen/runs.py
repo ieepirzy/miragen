@@ -215,3 +215,36 @@ def extract_run_details(result: Any) -> tuple[RunUsage, list[ToolCallRecord]]:
 
 def run_retention_from_env() -> int:
     return int(os.environ.get("MIRAGEN_RUN_RETENTION", 200))
+
+
+def simplify_history_messages(messages: Sequence[Any]) -> list[dict[str, str]]:
+    """
+    Flatten PydanticAI ModelMessages into plain {"role", "content"} dicts for the
+    GET /history API, walking parts the same way extract_run_details does.
+    """
+    simplified: list[dict[str, str]] = []
+    for message in messages:
+        if getattr(message, "kind", None) == "response":
+            texts = []
+            for part in getattr(message, "parts", []):
+                kind = getattr(part, "part_kind", None)
+                if kind == "text":
+                    texts.append(str(part.content))
+                elif kind == "tool-call":
+                    args = part.args if isinstance(part.args, str) else json.dumps(part.args or {})
+                    texts.append(f"[tool_call: {part.tool_name}({args})]")
+            simplified.append({"role": "assistant", "content": "\n".join(t for t in texts if t)})
+            continue
+
+        role = "user"
+        texts = []
+        for part in getattr(message, "parts", []):
+            kind = getattr(part, "part_kind", None)
+            if kind == "system-prompt":
+                role = "system"
+            elif kind == "tool-return":
+                role = "tool"
+            if kind in ("system-prompt", "user-prompt", "tool-return", "retry-prompt"):
+                texts.append(str(part.content))
+        simplified.append({"role": role, "content": "\n".join(t for t in texts if t)})
+    return simplified
