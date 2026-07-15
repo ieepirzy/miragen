@@ -619,6 +619,12 @@ A multitude of tutorials exist for hardening docker containers, one I found that
 
 ---
 
+## Executor backend tier
+
+A second backend tier for self-harnessed executors (Codex first): the executor owns its own agent loop and the contract inverts to **workspace-in / diff-and-events-out**. A profile declares exactly one of `spec` (model tier) or `executor` (executor tier); executor runs land in the same run store with resumable `suspended`/`failed` states, a persistent per-run workspace, and a diff harvested exactly once on success. Install with `pip install miragen[codex]`. Full reference: [docs/executor-tier.md](docs/executor-tier.md).
+
+---
+
 ## Roadmap
 
 - **Interactive conversation history** _(in progress)_ — `use_history: bool` on `/run`. Persists conversation turns to `/agent/history.json` using PydanticAI's `ModelMessagesTypeAdapter`. Stateless by default, opt-in continuity. `history_max_messages` caps unbounded growth (newest N kept); `GET /history` exposes it read-only. Semantic retrieval (RAG) is still open.
