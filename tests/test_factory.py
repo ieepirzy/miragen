@@ -149,6 +149,36 @@ class TestBuildAgent:
             _, limits = build_agent(profile)
             assert limits is None
 
+    def test_tokens_per_run_sets_total_tokens_limit(self):
+        profile = _profile(limits={"tokens_per_run": 200_000})
+        with patch("miragen.factory.Agent"), \
+             patch("miragen.factory.resolve_capabilities", return_value=[]):
+            _, limits = build_agent(profile)
+            assert limits.total_tokens_limit == 200_000
+            # request_limit wasn't passed, so it's PydanticAI's own default (50),
+            # not miragen's max_steps — max_steps is unset in this profile.
+            assert limits.request_limit == 50
+
+    def test_tokens_per_run_and_max_steps_both_applied(self):
+        profile = _profile(
+            spec={"model": "m", "instructions": "i", "max_steps": 10},
+            limits={"tokens_per_run": 200_000},
+        )
+        with patch("miragen.factory.Agent"), \
+             patch("miragen.factory.resolve_capabilities", return_value=[]):
+            _, limits = build_agent(profile)
+            assert limits.request_limit == 10
+            assert limits.total_tokens_limit == 200_000
+
+    def test_tokens_per_day_only_does_not_set_usage_limits(self):
+        # tokens_per_day is enforced by miragen (app.py), not PydanticAI —
+        # it shouldn't appear in the UsageLimits object at all.
+        profile = _profile(limits={"tokens_per_day": 2_000_000})
+        with patch("miragen.factory.Agent"), \
+             patch("miragen.factory.resolve_capabilities", return_value=[]):
+            _, limits = build_agent(profile)
+            assert limits is None
+
     def test_model_settings_max_tokens_and_temperature(self):
         profile = _profile(spec={
             "model": "m", "instructions": "i",

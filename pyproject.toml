@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "miragen"
-version = "0.1.7"
+version = "0.1.8"
 description = "YAML-defined agent orchestration framework powered by PydanticAI"
 readme = "README.md"
 license = { text = "MIT" }
@@ -41,6 +41,12 @@ dependencies = [
 dev = [
     "pytest>=9.0",
     "pytest-asyncio>=1.0",
+]
+# Executor backend tier (self-harnessed executors). NOTE: the official SDK is
+# `openai-codex-sdk` (Author: OpenAI) — `codex-sdk` on PyPI is an unrelated
+# Cleanlab package.
+codex = [
+    "openai-codex-sdk>=0.1.11",
 ]
 
 [project.urls]

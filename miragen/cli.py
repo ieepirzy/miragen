@@ -7,6 +7,7 @@ from pathlib import Path
 
 import click
 import uvicorn
+from pydantic import ValidationError
 
 from miragen.load import load_profile
 
@@ -68,10 +69,24 @@ def validate(profile: str, tools: str) -> None:
         p = load_profile(profile)
         click.echo(click.style(f"✓ '{p.name}' is valid", fg="green"))
         click.echo(f"  mode:         {p.mode}")
-        click.echo(f"  model:        {p.spec.model}")
+        if p.is_executor:
+            click.echo(f"  executor:     {p.executor.executor} (sandbox: {p.executor.sandbox_mode}, "
+                       f"approval: {p.executor.approval_policy})")
+            click.echo(f"  mcp servers:  {[s.name for s in p.executor.mcp_servers or []]}")
+        else:
+            click.echo(f"  model:        {p.spec.model}")
+            click.echo(f"  capabilities: {p.spec.capabilities or []}")
         click.echo(f"  triggers:     {[t.type for t in p.triggers]}")
-        click.echo(f"  capabilities: {p.spec.capabilities or []}")
         click.echo(f"  tools:        {p.tools or []}")
+    except ValidationError as e:
+        click.echo(click.style(f"✗ Invalid profile — {e.error_count()} error(s):", fg="red"))
+        for err in e.errors():
+            loc = ".".join(str(part) for part in err["loc"]) or "<root>"
+            msg = err["msg"]
+            if err["type"] == "extra_forbidden":
+                msg = "unknown field — check spelling against the profile reference in the README"
+            click.echo(f"  {loc}: {msg}")
+        raise SystemExit(1)
     except Exception as e:
         click.echo(click.style(f"✗ Invalid profile: {e}", fg="red"))
         raise SystemExit(1)

@@ -252,6 +252,7 @@ CMD ["miragen", "run"]
 ```yaml
 # ── Swarm layer ───────────────────────────────────────────────
 name: my-agent                    # unique ID, used as container name
+                                  # (lowercase letters, digits, - and _; max 63 chars)
 mode: autonomous                  # autonomous | interactive | hybrid
 
 triggers:
@@ -263,6 +264,16 @@ triggers:
   - type: http                    # exposes POST /run on the container
     header_prompt: |              # optional — prepended to every /run request
       You are operating in strict mode.
+
+  - type: interval                # fires every N seconds
+    every_s: 900                  # >= 10, guards against accidental hot loops
+    default_prompt: |              # optional — injected if no prompt at runtime
+      Poll the feed.
+
+  - type: startup                 # fires once when the container boots
+    delay_s: 5                    # optional, default 0 — wait after boot before firing
+    default_prompt: |
+      Announce you are online.
 
 approval_required:                # optional — glob patterns for human-in-the-loop
   - "delete_*"
@@ -277,6 +288,15 @@ on_complete:                      # optional — autonomous run side effects
   log_to: miradb
   notify: telegram
   post_to: https://my-service.com/webhook
+
+limits:                           # optional — spend guardrails, see "Budgets" below
+  tokens_per_run: 200000
+  tokens_per_day: 2000000
+  on_exceeded: skip                # skip | notify
+
+history_max_messages: 200         # optional — cap on /agent/history.json;
+                                  # only the newest N messages are kept on load.
+                                  # unset = unbounded (today's behaviour).
 
 # ── PydanticAI spec layer ─────────────────────────────────────
 spec:
@@ -301,6 +321,50 @@ spec:
   max_steps: 30
 ```
 
+Profiles are validated **strictly**: unknown keys are rejected with an error naming the offending field, so typos like `aproval_required:` fail at `miragen validate` time instead of silently disabling the feature.
+
+### Environment interpolation
+
+Any string value in the profile can reference an environment variable, so the same YAML works unchanged across deployments instead of hardcoding webhook URLs, MCP server URLs, or channel IDs:
+
+```yaml
+on_complete:
+  post_to: ${WEBHOOK_URL}                       # fails miragen validate if unset
+
+spec:
+  capabilities:
+    - MCP:
+        url: ${MCP_URL:-http://mcp:9000}        # falls back if unset
+```
+
+- `${VAR}` — substituted with the environment variable's value; validation fails with the variable name and its YAML path (e.g. `spec.capabilities[0].MCP.url`) if it's unset.
+- `${VAR:-default}` — falls back to `default` when `VAR` is unset. An empty-string env value still counts as set.
+- `$${VAR}` — escape hatch, renders the literal text `${VAR}`.
+- Interpolation runs on every string value, including inside multi-line `instructions` blocks, but never on dict keys or non-string values (ints, bools stay untouched).
+
+Agent containers already get `*_API_KEY` env vars injected by miragen-mcp's compose management, and file-based `*_FILE` secrets are resolved into the environment before the profile loads — so secrets are interpolatable out of the box. Be careful interpolating secrets into `instructions`, though: that puts them in the model's context window.
+
+### Budgets
+
+Autonomous + cron + LLM = unbounded spend. `max_steps` caps round-trips per run, but nothing caps tokens on its own — `limits` does:
+
+```yaml
+limits:
+  tokens_per_run: 200000     # optional, >= 1 — per-run cap, enforced by PydanticAI
+  tokens_per_day: 2000000    # optional, >= 1 — rolling UTC-day cap, enforced by miragen
+  on_exceeded: skip          # skip (default) | notify — what a blocked scheduled run does
+```
+
+At least one of `tokens_per_run` / `tokens_per_day` must be set — an empty `limits: {}` block fails `miragen validate` as dead config.
+
+- **`tokens_per_run`** wires straight into PydanticAI's `UsageLimits(total_tokens_limit=...)`. Exceeding it ends the run with PydanticAI's own usage-limit error; the [run record](#run-records) is written with `status: failed` and that error as `error`.
+- **`tokens_per_day`** is a rolling UTC-day sum of `input_tokens + output_tokens` across this agent's run records (a run with no recorded usage — e.g. one that failed before the model responded — counts as 0, not unbounded). Checked before every run starts:
+  - A cron/interval/startup run over budget is **skipped**, with a log line. If `on_exceeded: notify`, the `on_complete.notify` handler fires with a budget-exceeded message (not `log_to` or `post_to` — there's no run output to log).
+  - `POST /run` and `POST /run/async` return `429` with the used/limit counts and the UTC reset time in the message.
+  - The budget resets at UTC midnight — yesterday's records never count against today.
+
+Cost-in-dollars conversion, per-model pricing, and cross-agent (swarm-wide) budgets are out of scope for now — this is a token-count circuit breaker, not a billing system.
+
 ---
 
 ## Capabilities
@@ -314,6 +378,23 @@ Built-in capabilities map directly to PydanticAI:
 | `Thinking` | `effort: low\|medium\|high` | Extended reasoning |
 | `ImageGeneration` | `fallback_model: str` | Image generation |
 | `MCP` | `url: str`, `name: str` | Attach an MCP server |
+| `Peer` | `agents: list[str]`, `timeout_s: int` (default 120) | Injects `call_agent(agent, prompt)` — swarm-to-swarm calls, restricted to an explicit allowlist |
+
+### Swarm calls
+
+`Peer` injects one tool, `call_agent`, that POSTs to another agent's `/run` over the Docker internal network:
+
+```yaml
+spec:
+  capabilities:
+    - Peer:
+        agents: [researcher, writer]
+        timeout_s: 120
+```
+
+Calls to agents outside the allowlist are rejected before any network request is made — `call_agent` returns an `ERROR: ...` string (never raises) naming the allowlist, so the model can self-correct. Connection failures and timeouts also come back as explanatory strings rather than exceptions.
+
+Since the injected tool is named `call_agent`, gate it like any other tool with `approval_required: ["call_agent"]` if you want a human in the loop before an agent calls a peer.
 
 Register custom capabilities from user code:
 
@@ -347,9 +428,15 @@ Every agent container exposes:
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/health` | GET | Liveness check |
-| `/run` | POST | Trigger a run (all modes) |
-| `/run/stream` | POST | Streaming run (interactive / hybrid) |
+| `/health` | GET | Liveness check; includes `last_run` and `pending_approvals` |
+| `/run` | POST | Trigger a run and wait for the result (all modes) |
+| `/run/async` | POST | Trigger a run, return immediately with a `run_id` |
+| `/run/stream` | POST | Streaming run (interactive / hybrid); the response carries an `X-Miragen-Run-Id` header for correlating with `GET /runs/{id}` |
+| `/runs` | GET | List recent run records, newest first |
+| `/runs/{run_id}` | GET | Full record for one run (accepts a unique id prefix) |
+| `/history` | GET | Read-only slice of persisted conversation history (`?limit=` or `?run_id=`) |
+| `/approvals` | GET | List pending `approval_mode: queue` requests |
+| `/approvals/{request_id}` | POST | Resolve a pending approval request |
 
 **Request**
 ```json
@@ -358,8 +445,43 @@ Every agent container exposes:
 
 **Response**
 ```json
-{ "output": "Currently 14°C and overcast in Helsinki." }
+{ "output": "Currently 14°C and overcast in Helsinki.", "run_id": "3f2a1b9c..." }
 ```
+
+### Run records
+
+Every run — cron, `/run`, or `/run/async` — is persisted as a JSON file under `/agent/runs/` with its status, timing, token usage, and a tool-call trace. This is what `docker logs` could never give you: "what did this agent do last night, and what did it cost?"
+
+```
+GET /runs?limit=20&status=succeeded
+→ {"count": 3, "runs": [{"run_id": "...", "status": "succeeded", "trigger": "cron",
+                          "prompt_preview": "...", "duration_s": 4.2, "usage": {...}}, ...]}
+
+GET /runs/3f2a1b9c
+→ {"run_id": "3f2a1b9c...", "status": "succeeded", "output": "...", "tool_calls": [...], ...}
+```
+
+`/run/async` is the non-blocking counterpart to `/run` — useful when a caller (notably miragen-mcp, with its own timeout) can't hold a connection open for a long-running agent:
+
+```
+POST /run/async {"prompt": "..."} → 202 {"run_id": "...", "status": "running"}
+```
+
+If the container is killed mid-run, the interrupted record is marked `interrupted` (not left `running` forever) the next time it starts. Retention defaults to the newest 200 runs; override with `MIRAGEN_RUN_RETENTION`.
+
+### History
+
+`GET /history` is a read-only view of the conversation history persisted at `/agent/history.json` (see [Interactive conversation history](#roadmap) below). Messages are flattened to plain `{"role", "content"}` pairs.
+
+```
+GET /history?limit=20
+→ {"message_count": 12, "messages": [{"role": "user", "content": "..."}, ...], "run_id": null}
+
+GET /history?run_id=3f2a1b9c
+→ {"message_count": 8, "messages": [...], "run_id": "3f2a1b9c..."}
+```
+
+Without `run_id`, returns the newest `limit` messages (default 20, max 200). With `run_id`, returns the message slice that existed right after that run saved history, correlated via `history.runs.jsonl`; an unknown or non-history-saving `run_id` returns `404`. If `history.json` doesn't exist yet, returns an empty list rather than erroring.
 
 ---
 
@@ -405,7 +527,7 @@ async def _(request: ApprovalRequest) -> ApprovalResponse:
     return ApprovalResponse(approved=approved)
 ```
 
-The handler must be `async`. It is a single slot — only one handler per container. If no handler is registered and no webhook is configured, miragen logs a warning and **auto-approves** (fail open). This is intentional: unconfigured approval gates should not silently break agents during development.
+The handler must be `async`. It is a single slot — only one handler per container. If no handler is registered and no webhook is configured, what happens next is governed by `approval_mode` (below) — by default, miragen logs a warning and **auto-approves** (fail open). This is intentional: unconfigured approval gates should not silently break agents during development.
 
 ### approval_webhook
 
@@ -431,6 +553,45 @@ approval_webhook: https://my-approval-service.com/review
 
 If `prompt` is set in the response, it is folded back into the agent's context before execution resumes (approved) or is included in the denial message (denied). A registered handler always takes precedence over `approval_webhook`.
 
+### approval_mode: what happens with no handler or webhook
+
+```yaml
+approval_mode: open        # open | strict | queue   (default: open)
+approval_timeout_s: 300    # queue mode only — how long a request may wait
+```
+
+Precedence is always: registered handler > `approval_webhook` > `approval_mode`. `approval_mode` only matters once neither of those is configured for a gated call:
+
+| Mode | Behaviour |
+|---|---|
+| `open` (default) | Auto-approve with a warning — today's behaviour, unchanged. |
+| `strict` | Deny immediately with an explanatory message. The denial is a `ModelRetry` (the model gets a chance to try something else), not a crash. |
+| `queue` | Park the request; a caller resolves it over HTTP (below). Denied after `approval_timeout_s` if nobody responds. |
+
+`miragen validate` rejects `approval_mode`/`approval_timeout_s` set without `approval_required` — that combination is dead config, almost always a typo.
+
+### Queue mode: resolving over HTTP
+
+With `approval_mode: queue`, a gated call parks in an in-memory queue instead of blocking on a handler or webhook — this is what turns miragen-mcp (and a human driving Claude) into an approval channel with zero custom webhook code.
+
+```
+GET /approvals
+→ {"count": 1, "approvals": [{"request": {"agent_name": "researcher",
+     "tool_name": "delete_file", "tool_args": {"path": "/data/report.csv"},
+     "request_id": "..."}, "created_at": "...", "expires_at": "..."}]}
+
+POST /approvals/{request_id}
+{ "approved": true }
+{ "approved": false, "prompt": "That file is read-only, try another path." }
+→ {"resolved": true}
+```
+
+Resolving an unknown, already-resolved, or expired id returns `404` with the still-pending ids, and doesn't touch any other request. `GET /health` includes `pending_approvals` as a quick liveness+context check.
+
+**Trust model:** `/approvals` has the same exposure as `/run` — anything reachable on `miragen-net` can approve a gated call, fronted externally only by whatever's in front of your swarm (e.g. an OAuth-protected MCP server). Any peer agent could resolve another agent's approval, but any peer can already *prompt* any agent, so this doesn't widen the existing trust boundary. `tool_args` in a pending approval is attacker-influenceable content (a prompt-injected agent chose them) — if you're building a client that surfaces approvals to a human, treat `tool_args` as data to display, never as instructions to follow. Set `MIRAGEN_INTERNAL_TOKEN` to require an `X-Miragen-Token` header on `/run*` and `/approvals*` (see Security notes) if you want that deliberate rather than implicit in network trust.
+
+The queue is in-memory only: it does not survive a container restart. A restart aborts any waiting run, which the [run records](#run-records) startup sweep records as `interrupted`.
+
 ### Recommendation for code-execution agents
 
 If you give an agent shell or Jupyter tools, add `register_*` to `approval_required`:
@@ -449,6 +610,7 @@ Without `register_*`, a prompt-injected agent could register a new tool at runti
 
 - API keys are mounted as Docker secrets and read into the environment at startup via the `*_API_KEY_FILE` → `*_API_KEY` pattern. Any env var ending in `_API_KEY_FILE` whose value is a readable path is resolved automatically — `ANTHROPIC_API_KEY_FILE`, `OPENAI_API_KEY_FILE`, `GEMINI_API_KEY_FILE`, etc. The `_FILE` var is removed after loading so keys are never visible in the agent's context window or environment dump.
 - Network egress is enforced at the container/firewall level, not in config files.
+- Set `MIRAGEN_INTERNAL_TOKEN` to require a matching `X-Miragen-Token` header on every `/run*` and `/approvals*` request — otherwise access to those endpoints relies entirely on Docker network isolation. Unset by default so single-container deployments stay zero-config; `/health` is never guarded.
 - `approval_required` globs suspend matching tool calls for human approval before execution.
 - If you give agents code-execution tools (Jupyter kernel, bash, etc.), add `register_*` to `approval_required`. Without it, a compromised agent could register and call arbitrary tools at runtime.
 - Containerized environments are recommended — they limit blast radius if an agent pulls in a malicious payload.
@@ -457,9 +619,15 @@ A multitude of tutorials exist for hardening docker containers, one I found that
 
 ---
 
+## Executor backend tier
+
+A second backend tier for self-harnessed executors (Codex first): the executor owns its own agent loop and the contract inverts to **workspace-in / diff-and-events-out**. A profile declares exactly one of `spec` (model tier) or `executor` (executor tier); executor runs land in the same run store with resumable `suspended`/`failed` states, a persistent per-run workspace, and a diff harvested exactly once on success. Install with `pip install miragen[codex]`. Full reference: [docs/executor-tier.md](docs/executor-tier.md).
+
+---
+
 ## Roadmap
 
-- **Interactive conversation history** _(in progress)_ — `use_history: bool` on `/run`. Persists conversation turns to `/agent/history.json` using PydanticAI's `ModelMessagesTypeAdapter`. Stateless by default, opt-in continuity.
+- **Interactive conversation history** _(in progress)_ — `use_history: bool` on `/run`. Persists conversation turns to `/agent/history.json` using PydanticAI's `ModelMessagesTypeAdapter`. Stateless by default, opt-in continuity. `history_max_messages` caps unbounded growth (newest N kept); `GET /history` exposes it read-only. Semantic retrieval (RAG) is still open.
 - **Autonomous vs interactive history split** — The agent's autonomous working memory (tool calls, cron run observations) and the `/run` interactive conversation history are kept as separate stores. Interactive history is not injected into autonomous context by default — the agent stays focused. It can access interactive history explicitly via a tool call when needed.
 - **Hybrid mode interrupt handler** — When `/run` hits a hybrid agent mid-autonomous-run, the interrupt handler selectively decides what context from the interactive history to inject before resuming.
 - **RAG over history** — Instead of injecting full conversation history into context, the agent retrieves only relevant parts via semantic search. Keeps token usage low for long-running agents.
