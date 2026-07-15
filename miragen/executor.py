@@ -29,12 +29,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
-from miragen.models import AgentProfile, ExecutorSpec, RunUsage
+from miragen.models import AgentProfile, ExecutorSpec, RunUsage, sum_usage
 
 logger = logging.getLogger("miragen.executor")
 
 _DIFF_NAME = "diff.patch"
 _EVENTS_SUFFIX = ".events.jsonl"
+_BASELINE_TAG = "miragen-baseline"
 
 
 class ExecutorResult:
@@ -134,14 +135,17 @@ class CodexExecutor:
         thread_id: str | None = None,
         workspace: str | None = None,
         first_turn: bool = True,
+        prior_usage: RunUsage | None = None,
     ) -> ExecutorResult:
         """Execute one turn of a job bound to an agent-run.
 
         First turn: fresh workspace + fresh thread; `instructions` are
         prepended. Resume: existing workspace + `resume_thread(thread_id)`.
+        `prior_usage` is the run's accumulated usage from earlier turns —
+        needed so a per-run budget check on resume sees the true total, not
+        just this turn's usage.
         """
         ws = Path(workspace) if workspace else Path(self.spec.workspace_root) / run_id
-        self._prepare_workspace(ws)
 
         if first_turn and self.spec.instructions:
             prompt = f"{self.spec.instructions}\n\n{prompt}"
@@ -156,6 +160,11 @@ class CodexExecutor:
         turn_failed = False
 
         try:
+            # Inside the try: a bad workspace_root, missing git, or a
+            # permission error here must still produce a 'failed' result
+            # (and thus a RunStore.finish() call) rather than an unhandled
+            # exception that leaves the run record stuck at 'running'.
+            self._prepare_workspace(ws)
             thread = self._thread_factory(
                 thread_id=thread_id,
                 options=self._thread_options(ws),
@@ -200,9 +209,12 @@ class CodexExecutor:
                 usage=usage,
             )
 
-        if self._budget_exhausted(usage):
+        if self._budget_exhausted(sum_usage(prior_usage, usage)):
             # Turn completed but blew the per-run budget: suspend, keep the
-            # partial diff as resume state, do not harvest.
+            # partial diff as resume state, do not harvest. Checked against
+            # the run's cumulative usage (prior turns + this one) — a resumed
+            # run must not be able to sneak back under a per-run cap just
+            # because a single resumed turn's own usage looks small.
             return ExecutorResult(
                 status="suspended",
                 exit_reason="budget",
@@ -296,15 +308,26 @@ class CodexExecutor:
         ws.mkdir(parents=True, exist_ok=True)
         if not (ws / ".git").exists():
             # The diff IS the deliverable; a git baseline makes harvest exact.
+            # Tagged (not just left as a loose commit) so harvest can diff
+            # against it even after the executor makes its own commits —
+            # the tag lives in .git, so the executor's own `git add -A` /
+            # commits never touch or shadow it.
             _git(ws, "init", "-q")
             _git(ws, "add", "-A")
             _git(ws, "-c", "user.email=miragen@local", "-c", "user.name=miragen",
                  "commit", "-q", "--allow-empty", "-m", "miragen: workspace baseline")
+            _git(ws, "tag", "-f", _BASELINE_TAG)
 
     async def _harvest_diff(self, ws: Path) -> str:
-        """git-diff harvest, exactly once, on terminal success (§293 decision 3)."""
+        """git-diff harvest, exactly once, on terminal success (§293 decision 3).
+
+        Diffs against the baseline tag, not HEAD: if the executor committed
+        mid-turn, HEAD has moved past the baseline, and `git diff --cached`
+        with no revision arg would only show the *uncommitted* remainder,
+        silently dropping everything the executor already committed.
+        """
         _git(ws, "add", "-A")  # stage everything so new files appear in the diff
-        diff = _git(ws, "diff", "--cached", "--binary")
+        diff = _git(ws, "diff", "--cached", "--binary", _BASELINE_TAG)
         marker_dir = ws / ".miragen"
         marker_dir.mkdir(exist_ok=True)
         diff_path = marker_dir / _DIFF_NAME

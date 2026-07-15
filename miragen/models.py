@@ -43,6 +43,21 @@ class RunUsage(BaseModel):
     output_tokens: Optional[int] = None
 
 
+def sum_usage(a: Optional[RunUsage], b: Optional[RunUsage]) -> Optional[RunUsage]:
+    """Combine usage across turns of the same run (resumed executor turns,
+    or any other multi-turn accounting) — sums so each side's true total is
+    preserved even when one side is None."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return RunUsage(
+        requests=a.requests + b.requests,
+        input_tokens=(a.input_tokens or 0) + (b.input_tokens or 0) or None,
+        output_tokens=(a.output_tokens or 0) + (b.output_tokens or 0) or None,
+    )
+
+
 RunStatus = Literal[
     "running", "succeeded", "failed", "interrupted",
     # Executor-tier states: suspended/failed executor runs are RESUMABLE

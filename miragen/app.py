@@ -35,8 +35,8 @@ from miragen.models import (
     IntervalTrigger as ProfileIntervalTrigger,
     RunRecord,
     RunSummary,
-    RunUsage,
     StartupTrigger as ProfileStartupTrigger,
+    sum_usage,
 )
 from miragen.runs import (
     AmbiguousRunIdError,
@@ -208,10 +208,11 @@ async def _run_executor_turn(
         thread_id=record.thread_id if record is not None else None,
         workspace=record.workspace if record is not None else None,
         first_turn=not resume,
+        prior_usage=record.usage if record is not None else None,
     )
 
     if record is not None and _run_store is not None:
-        usage = _accumulate_usage(record.usage, result.usage)
+        usage = sum_usage(record.usage, result.usage)
         _run_store.finish(
             record,
             status=result.status,
@@ -233,20 +234,6 @@ async def _run_executor_turn(
             f"resume via POST /runs/{run_id}/resume"
         )
     return result.output or ""
-
-
-def _accumulate_usage(previous: RunUsage | None, latest: RunUsage | None) -> RunUsage | None:
-    """Resumed runs accumulate usage across turns — tokens_per_day sums run
-    records, so each record must carry its own true total."""
-    if previous is None:
-        return latest
-    if latest is None:
-        return previous
-    return RunUsage(
-        requests=previous.requests + latest.requests,
-        input_tokens=(previous.input_tokens or 0) + (latest.input_tokens or 0) or None,
-        output_tokens=(previous.output_tokens or 0) + (latest.output_tokens or 0) or None,
-    )
 
 
 def _daily_budget_status() -> tuple[int, int] | None:
@@ -302,6 +289,20 @@ async def run_agent_scheduled(prompt: str) -> None:
     except Exception as e:
         logger.error(f"[{_profile.name}] scheduled run failed: {e}", exc_info=True)
         return
+
+    if record is not None and _run_store is not None:
+        # Executor-tier suspended runs (budget) return normally from
+        # run_agent instead of raising, so a status check is the only way
+        # to tell "truly done" from "one resumable turn completed" — an
+        # unconditional on_complete would fire notifications/webhooks as if
+        # a still-unfinished autonomous job had succeeded.
+        final = _run_store.get(record.run_id)
+        if final is not None and final.status != "succeeded":
+            logger.info(
+                f"[{_profile.name}] scheduled run ended in status '{final.status}', "
+                "not 'succeeded' — skipping on_complete"
+            )
+            return
 
     try:
         await _handle_on_complete(output)

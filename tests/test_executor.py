@@ -169,6 +169,50 @@ async def test_success_harvests_diff_and_captures_thread(tmp_path):
     assert "hello.py" in diff and "+print('warp')" in diff
 
 
+async def test_harvest_diff_includes_executors_own_mid_turn_commit(tmp_path):
+    """Regression: harvest must diff against the workspace baseline, not HEAD.
+    If the executor commits mid-turn, HEAD moves past the baseline and a bare
+    `git diff --cached` (no revision) only shows the uncommitted remainder,
+    silently dropping everything already committed."""
+    profile = _executor_profile()
+    run_id = "run-mid-commit"
+
+    def commit_mid_turn():
+        (ws / "committed.py").write_text("print('committed by executor')\n")
+        import subprocess
+
+        subprocess.run(["git", "-C", str(ws), "add", "-A"], check=True)
+        subprocess.run(
+            ["git", "-C", str(ws), "-c", "user.email=x@y.z", "-c", "user.name=x",
+             "commit", "-q", "-m", "executor's own commit"],
+            check=True,
+        )
+        (ws / "uncommitted.py").write_text("print('left uncommitted')\n")
+
+    executor = make_executor(profile, tmp_path, thread=StubThread(default_events(), touch=commit_mid_turn))
+    ws = Path(profile.executor.workspace_root) / run_id
+
+    result = await executor.run_job("fix the bug", run_id)
+    assert result.status == "succeeded"
+    diff = Path(result.diff_path).read_text()
+    assert "committed.py" in diff
+    assert "uncommitted.py" in diff
+
+
+async def test_workspace_prep_failure_is_resumable_crash(tmp_path):
+    """Regression: a workspace-prep failure (bad workspace_root, missing git,
+    permission error) must surface as a 'failed' ExecutorResult — same as any
+    other crash — not an unhandled exception that skips RunStore.finish() and
+    leaves the run record stuck at 'running'."""
+    executor = make_executor(_executor_profile(), tmp_path)
+    executor._prepare_workspace = lambda ws: (_ for _ in ()).throw(OSError("permission denied"))
+
+    result = await executor.run_job("try", "run-prep-fail")
+    assert result.status == "failed"
+    assert result.exit_reason == "crash"
+    assert "permission denied" in result.error
+
+
 async def test_instructions_prepended_only_on_first_turn(tmp_path):
     thread = StubThread(default_events())
     executor = make_executor(_executor_profile(), tmp_path, thread=thread)
@@ -208,6 +252,25 @@ async def test_budget_exhaustion_suspends_without_harvest(tmp_path):
     assert result.exit_reason == "budget"
     assert result.diff_path is None
     assert result.thread_id == "thr_stub123"
+
+
+async def test_budget_exhaustion_persists_across_resume(tmp_path):
+    """Regression: the budget check must see cumulative usage across resumed
+    turns, not just the latest turn's — otherwise a run suspended for going
+    over budget could resume, add a small extra turn, and be reported
+    'succeeded' while its true total usage is still over the cap."""
+    profile = _executor_profile(limits={"tokens_per_run": 100})
+    executor = make_executor(profile, tmp_path, events=default_events(tokens=(90, 60)))  # 150 > 100
+    result = await executor.run_job("big task", "run-budget-resume")
+    assert result.status == "suspended"
+
+    executor._thread_factory = lambda **kw: StubThread(default_events(tokens=(5, 5)))
+    result2 = await executor.run_job(
+        "keep going", "run-budget-resume",
+        thread_id=result.thread_id, first_turn=False, prior_usage=result.usage,
+    )
+    assert result2.status == "suspended"
+    assert result2.exit_reason == "budget"
 
 
 async def test_events_are_persisted_jsonl(tmp_path):
@@ -281,6 +344,54 @@ async def test_resume_and_abandon_flow(executor_client, tmp_path):
     assert resp.status_code == 409
     resp = await executor_client.post(f"/runs/{run_id}/abandon")
     assert resp.status_code == 409
+
+
+async def test_resume_stays_suspended_if_cumulative_budget_still_exceeded(executor_client, tmp_path):
+    app_module._profile.limits = type(app_module._profile).model_validate({
+        **json.loads(app_module._profile.model_dump_json()),
+        "limits": {"tokens_per_run": 100},
+    }).limits
+    resp = await executor_client.post("/run", json={"prompt": "big task"})
+    run_id = resp.json()["run_id"]
+    record = app_module._run_store.get(run_id)
+    assert record.status == "suspended"
+    assert record.usage.input_tokens == 100 and record.usage.output_tokens == 50  # default_events(), 150 > 100
+
+    # Resume without raising the budget: this turn's own usage is small, but
+    # combined with the prior turn's it's still over the per-run cap.
+    app_module._executor._thread_factory = lambda **kw: StubThread(default_events(tokens=(5, 5)))
+    resp = await executor_client.post(f"/runs/{run_id}/resume", json={"prompt": "keep going"})
+    assert resp.status_code == 200, resp.text
+    resumed = resp.json()
+    assert resumed["status"] == "suspended"
+    assert resumed["usage"]["input_tokens"] == 105  # 100 + 5, accumulated
+
+
+async def test_scheduled_run_skips_on_complete_when_suspended(tmp_path):
+    """Regression: a scheduled executor run that suspends on budget must not
+    trigger on_complete — run_agent returns normally (doesn't raise) for a
+    suspension, so run_agent_scheduled must check the final run status
+    rather than treating any non-exception return as 'done'."""
+    from unittest.mock import AsyncMock, patch
+
+    profile = _executor_profile(
+        mode="autonomous",
+        triggers=[{"type": "cron", "schedule": "0 * * * *"}],
+        limits={"tokens_per_run": 100},
+        on_complete={"notify": "telegram"},
+    )
+    executor = make_executor(profile, tmp_path, events=default_events(tokens=(90, 60)))  # 150 > 100
+    app_module._profile = profile
+    app_module._executor = executor
+    app_module._run_store = RunStore(root=tmp_path / "runs", retention=50)
+
+    with patch("miragen.app._handle_on_complete", AsyncMock()) as mock_oc:
+        from miragen.app import run_agent_scheduled
+        await run_agent_scheduled("Run now.")
+        mock_oc.assert_not_awaited()
+
+    runs = app_module._run_store.list()
+    assert runs[0].status == "suspended"
 
 
 async def test_abandon_with_workspace_discard(executor_client, tmp_path):
