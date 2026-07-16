@@ -75,7 +75,7 @@ class RunSummary(BaseModel):
     output_preview: str | None        # first 200 chars
 ```
 
-`usage` comes from `result.usage()` on the PydanticAI `AgentRunResult`;
+`usage` comes from `result.usage` on the PydanticAI `AgentRunResult`;
 `tool_calls` is extracted by walking `result.all_messages()` for
 `ToolCallPart`s and pairing them with their return/retry parts.
 

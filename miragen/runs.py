@@ -199,11 +199,12 @@ def extract_run_details(result: Any) -> tuple[RunUsage, list[ToolCallRecord]]:
     """
     Extract usage and a tool-call trace from a PydanticAI AgentRunResult.
 
-    Usage comes from result.usage(); tool calls are recovered by walking
+    Usage comes from result.usage (a property since pydantic-ai's AgentRunResult
+    stopped exposing it as a callable); tool calls are recovered by walking
     result.all_messages() for tool-call parts and pairing them with their
     return/retry parts via tool_call_id.
     """
-    pai_usage = result.usage()
+    pai_usage = result.usage
     usage = RunUsage(
         requests=pai_usage.requests,
         input_tokens=pai_usage.input_tokens or None,
