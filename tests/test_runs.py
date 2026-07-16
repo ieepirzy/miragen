@@ -221,7 +221,7 @@ class TestRunStoreSweepInterrupted:
 class TestExtractRunDetails:
     def _mock_result(self, usage, messages):
         result = MagicMock()
-        result.usage.return_value = usage
+        result.usage = usage
         result.all_messages.return_value = messages
         return result
 

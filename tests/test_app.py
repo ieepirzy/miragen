@@ -65,7 +65,7 @@ def _mock_run_result(output="agent output", requests=1, input_tokens=10, output_
 
     result = MagicMock()
     result.output = output
-    result.usage = MagicMock(return_value=usage)
+    result.usage = usage
     result.all_messages = MagicMock(return_value=[])
     return result
 
