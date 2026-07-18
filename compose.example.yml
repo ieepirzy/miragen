@@ -57,3 +57,25 @@ services:
       AGENT_PROFILE: agents/researcher.yaml
     ports:
       - "8002:8000"
+
+  # Executor-tier agent (Codex) — self-harnessed executor, not a model backend.
+  # codex_home and workspace_root are volumes, not bind-mounted directories:
+  # auth.json must already exist inside the codex_home volume (`docker compose
+  # cp` it in, or seed the volume at provision time) — miragen warns at
+  # startup if neither auth.json nor CODEX_API_KEY is present, and an
+  # ephemeral container with an empty codex_home will fail auth on spawn.
+  codex-executor:
+    build: .
+    container_name: codex-executor
+    restart: unless-stopped
+    environment:
+      AGENT_PROFILE: agents/codex-executor.yaml
+    volumes:
+      - codex-home:/agent/codex-home
+      - codex-workspaces:/agent/workspaces
+    ports:
+      - "8003:8000"
+
+volumes:
+  codex-home:
+  codex-workspaces:
