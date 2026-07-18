@@ -57,10 +57,36 @@ executor:
     bearer_token_env: LOIMI_TOKEN
 ```
 
+A `claude-code` profile is identical minus `codex_home` (auth is
+`ANTHROPIC_API_KEY` or mounted `~/.claude` credentials instead) — the same
+`mcp_servers` list is injected per-session, and `approval_policy` maps onto
+permission modes:
+
+```yaml
+executor:
+  executor: claude-code
+  instructions: |
+    You operate on the repository mounted in your workspace.
+  approval_policy: never       # -> bypassPermissions
+  turn_timeout_s: 1800
+  mcp_servers:
+    - name: loimi
+      url: https://loimi.mesh/mcp/
+      bearer_token_env: LOIMI_TOKEN
+```
+
 The spawn backend swaps `mcp_servers` (rejected — a spawned CLI reads its own
 config) for a `command` argv template: `{workspace}` and `{prompt}` are
 substituted per element, and when no element contains `{prompt}` the prompt
-arrives on stdin.
+arrives on stdin:
+
+```yaml
+executor:
+  executor: spawn
+  instructions: "One-shot batch job."
+  command: ["my-agent-cli", "--repo", "{workspace}", "--task", "{prompt}"]
+  turn_timeout_s: 600
+```
 
 The artifact sink is **not a primary channel**: it never gates success, and a
 sink failure only marks `artifact_stored: false` on the run record while the

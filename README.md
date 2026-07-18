@@ -633,6 +633,57 @@ Auth is per backend and always spawn-time state, never profile content. Codex: `
 
 Optionally, `executor.artifact_sink` names a place to *also* put the harvested diff after a successful run (Loimi `store_document` with `kind="executor_diff"` is the first sink). It is advisory by construction: sink failures mark `artifact_stored: false` on the run record but never change run status — the diff on disk stays the source of truth. Full reference: [docs/executor-tier.md](docs/executor-tier.md).
 
+### Example profiles
+
+A Claude Code worker with a Loimi artifact sink:
+
+```yaml
+name: claude-worker
+mode: interactive
+triggers:
+  - type: http
+limits:
+  tokens_per_run: 500000       # exceeded -> suspended (budget), resumable
+executor:
+  executor: claude-code
+  instructions: |
+    You operate on the repository mounted in your workspace.
+    Make the change, run the tests, leave the tree clean.
+  approval_policy: never       # -> bypassPermissions; unattended runs must not stall
+  turn_timeout_s: 1800         # wall-clock cap per turn -> suspended (timeout), resumable
+  workspace_root: /agent/workspaces
+  mcp_servers:                 # injected into the executor's own session
+    - name: loimi
+      url: https://loimi.mesh/mcp/
+      bearer_token_env: LOIMI_TOKEN
+  artifact_sink:               # optional: ALSO push harvested diffs here
+    kind: loimi
+    url: https://loimi.mesh/mcp/
+    bearer_token_env: LOIMI_TOKEN
+```
+
+A Codex worker looks the same with `executor: codex` plus `codex_home: /agent/codex-home` (see the auth note above). A spawn fallback needs only an argv template — `{workspace}` and `{prompt}` are substituted per element; with no `{prompt}` placeholder the prompt arrives on stdin:
+
+```yaml
+executor:
+  executor: spawn
+  instructions: "One-shot batch job."
+  command: ["my-agent-cli", "--repo", "{workspace}", "--task", "{prompt}"]
+  turn_timeout_s: 600
+```
+
+Driving it is the same HTTP surface as the model tier, plus the executor endpoints:
+
+```bash
+curl -X POST localhost:8000/run -d '{"prompt": "fix the failing test in tests/test_api.py"}'
+# -> {"run_id": "abc123...", "output": "..."}
+
+curl localhost:8000/runs/abc123/diff        # the harvested diff (404 until success)
+curl localhost:8000/runs/abc123/events      # the executor's event stream
+curl -X POST localhost:8000/runs/abc123/resume -d '{"prompt": "keep going"}'   # suspended/failed only
+curl -X POST "localhost:8000/runs/abc123/abandon?discard_workspace=true"       # human-terminal
+```
+
 ---
 
 ## Roadmap
