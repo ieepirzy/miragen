@@ -76,6 +76,24 @@ services:
     ports:
       - "8003:8000"
 
+  # Executor-tier agent (Claude Code) — same workspace-in / diff-out contract,
+  # different auth story: ANTHROPIC_API_KEY via the file-secrets loader (or
+  # mount Claude Code OAuth credentials at /root/.claude instead).
+  claude-code-executor:
+    build: .
+    container_name: claude-code-executor
+    restart: unless-stopped
+    secrets:
+      - anthropic_key
+    environment:
+      ANTHROPIC_API_KEY_FILE: /run/secrets/anthropic_key
+      AGENT_PROFILE: agents/claude-code-executor.yaml
+    volumes:
+      - claude-workspaces:/agent/workspaces
+    ports:
+      - "8004:8000"
+
 volumes:
   codex-home:
   codex-workspaces:
+  claude-workspaces:

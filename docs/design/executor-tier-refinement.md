@@ -1,6 +1,9 @@
 # Plan: Executor tier refinement — closing the #26 gaps
 
-**Status:** proposed — plan for review, no code yet
+**Status:** accepted 2026-07-18 (Ilari: "execution is authorized") — implemented
+on this branch as phased commits in a single PR rather than three separate PRs.
+Naming note: the shipped classes follow the codebase's existing convention
+(`ClaudeCodeExecutor`, `SpawnExecutor`), not the issue's `*Adapter` names.
 **Scope:** miragen executor tier (`miragen/executor.py`, `miragen/app.py`, `miragen/models.py`)
 **Baseline:** the gap audit on issue #26 (2026-07-18) against `main` after PR #29/#31
 
