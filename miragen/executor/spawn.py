@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
+import signal
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -43,6 +45,10 @@ class SpawnExecutor(ExecutorBackend):
             stdin=asyncio.subprocess.PIPE if prompt_on_stdin else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            # Own process group: cancellation must take down the whole tree,
+            # not just the wrapper — a surviving grandchild would keep mutating
+            # a workspace that resume/abandon assumes is quiescent.
+            start_new_session=True,
         )
 
         lines: list[str] = []
@@ -60,10 +66,13 @@ class SpawnExecutor(ExecutorBackend):
                 yield {"type": "item.completed", "item": {"type": "stdout", "text": text}}
             returncode = await proc.wait()
         except asyncio.CancelledError:
-            # Timeout/cancellation contract: the subprocess must not outlive
-            # the turn — kill it before propagating.
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
+            # Timeout/cancellation contract: the process TREE must not outlive
+            # the turn — SIGKILL the group (pgid == proc.pid thanks to
+            # start_new_session), then reap briefly before propagating.
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=5)
             raise
 
         if returncode == 0:

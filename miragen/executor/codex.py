@@ -90,6 +90,15 @@ class CodexExecutor(ExecutorBackend):
             thread_id=thread_id,
             options=self._thread_options(workspace),
         )
+        # Some SDK paths only expose the id on the thread object. Persist it
+        # BEFORE streaming when it's already known: a turn that hangs and gets
+        # cancelled (turn_timeout_s) never reaches any post-stream code, and a
+        # resume handle that only exists after the stream ends is a resume
+        # handle the timeout path can't recover. Duplicate thread.started
+        # events are harmless — the parser just re-records the same id.
+        emitted_early = getattr(thread, "id", None)
+        if emitted_early:
+            yield {"type": "thread.started", "thread_id": emitted_early, "synthetic": True}
         streamed = await thread.run_streamed(prompt)
         saw_thread_started = False
         async for event in self._iter_events(streamed):
@@ -97,10 +106,8 @@ class CodexExecutor(ExecutorBackend):
             if payload.get("type") == "thread.started":
                 saw_thread_started = True
             yield payload
-        if not saw_thread_started and getattr(thread, "id", None):
-            # Some SDK paths only expose the id on the thread object; emit it
-            # as a synthetic event so the resume handle survives in the
-            # persisted stream too.
+        if not saw_thread_started and not emitted_early and getattr(thread, "id", None):
+            # Fallback for SDK paths where the id appears only after streaming.
             yield {"type": "thread.started", "thread_id": thread.id, "synthetic": True}
 
     # ── Pieces ─────────────────────────────────────────────────────────────

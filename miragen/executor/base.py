@@ -245,11 +245,27 @@ class ExecutorBackend(ABC):
     def latest_thread_id(self, run_id: str) -> str | None:
         """Recover the resume handle from the persisted event stream — used by
         the app tier when a turn is cancelled (timeout) before run_job could
-        return a result carrying the thread_id."""
-        for event in reversed(self.read_events(run_id, limit=1000)):
-            if event.get("type") == "thread.started" and event.get("thread_id"):
-                return event["thread_id"]
-        return None
+        return a result carrying the thread_id.
+
+        Scans the WHOLE file, not a tail window: thread.started is typically
+        the first event, so a long turn would push it out of any tail.
+        """
+        path = self._events_path(run_id)
+        if not path.exists():
+            return None
+        thread_id: str | None = None
+        with path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if event.get("type") == "thread.started" and event.get("thread_id"):
+                    thread_id = event["thread_id"]
+        return thread_id
 
     # ── Workspace + harvest ────────────────────────────────────────────────
 

@@ -159,6 +159,51 @@ async def test_no_timeout_when_disabled(tmp_path):
         assert app_module._run_store.get(resp.json()["run_id"]).status == "succeeded"
 
 
+class SilentHangingThread:
+    """Hangs before emitting ANY event — the id exists only on the thread
+    object. Regression for Codex review: the resume handle must be persisted
+    before streaming, or a timeout here becomes non-resumable."""
+
+    id = "thr_early"
+
+    async def run_streamed(self, prompt):
+        async def gen():
+            await asyncio.sleep(30)
+            yield {}  # pragma: no cover — makes gen() an async generator
+
+        class _S:
+            events = gen()
+
+        return _S()
+
+
+async def test_timeout_before_any_event_still_recovers_thread_id(tmp_path):
+    profile = _profile({"executor": "codex"})
+    runs_root = _paths(profile, tmp_path)
+    executor = CodexExecutor(
+        profile, runs_root=runs_root, thread_factory=lambda **kw: SilentHangingThread()
+    )
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(executor.run_job("wedge", "run-early"), timeout=0.3)
+    assert executor.latest_thread_id("run-early") == "thr_early"
+
+
+def test_latest_thread_id_survives_long_event_streams(tmp_path):
+    """Regression for Codex review: thread.started is typically the FIRST
+    event; a tail-window scan loses it once a long turn pushes it out."""
+    profile = _profile({"executor": "codex"})
+    runs_root = _paths(profile, tmp_path)
+    executor = CodexExecutor(profile, runs_root=runs_root, thread_factory=lambda **kw: None)
+
+    events_path = executor._events_path("run-long")
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    with events_path.open("w") as f:
+        f.write(json.dumps({"type": "thread.started", "thread_id": "thr_first"}) + "\n")
+        for i in range(1500):
+            f.write(json.dumps({"type": "item.completed", "item": {"type": "stdout", "text": str(i)}}) + "\n")
+    assert executor.latest_thread_id("run-long") == "thr_first"
+
+
 # ── ClaudeCodeExecutor ────────────────────────────────────────────────────────
 #
 # Stand-in classes: the adapter matches SDK messages by class NAME, so these
@@ -330,6 +375,26 @@ async def test_spawn_prompt_placeholder_substitution(tmp_path):
     result = await executor.run_job("just this", "sp-run4", first_turn=False)
     assert result.status == "succeeded"
     assert result.output.strip() == "just this"
+
+
+async def test_spawn_cancellation_kills_the_whole_process_tree(tmp_path):
+    """Regression for Codex review: killing only the wrapper leaves grand-
+    children alive to keep mutating a workspace that resume/abandon assumes
+    is quiescent. The backgrounded subshell here would touch the file ~1s
+    after cancellation if it survived the group kill."""
+    profile, executor = _spawn_executor(
+        tmp_path, ["/bin/sh", "-c", "(sleep 1; touch child-escaped.txt) & sleep 30"]
+    )
+    run_id = "sp-cancel"
+    task = asyncio.create_task(executor.run_job("wedge", run_id))
+    await asyncio.sleep(0.3)  # let the shell start and background its child
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    await asyncio.sleep(1.2)  # past the child's sleep — it must be dead by now
+    ws = Path(profile.executor.workspace_root) / run_id
+    assert not (ws / "child-escaped.txt").exists()
 
 
 # ── Artifact sink ─────────────────────────────────────────────────────────────
