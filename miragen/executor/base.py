@@ -1,4 +1,4 @@
-"""Executor backend tier — self-harnessed executors (Codex first).
+"""Executor backend tier — abstract contract + shared machinery.
 
 Contract: workspace-in / diff-and-events-out. The executor owns its own agent
 loop; miragen owes the layers above a sufficient event stream (turn events,
@@ -6,10 +6,12 @@ tool/item events, exit reason) and a diff harvested EXACTLY ONCE on terminal
 success. Tool-level failures inside the loop are the agent's problem and are
 not modeled here.
 
-State machine (design record: miradb #293):
+State machine (design record: miradb #293; refinement plan:
+docs/design/executor-tier-refinement.md):
 
     running -> succeeded            (diff harvested)
             -> suspended  (budget)  RESUMABLE
+            -> suspended  (timeout) RESUMABLE (wall-clock, enforced by app tier)
             -> failed     (crash)   RESUMABLE
             -> abandoned            (human gave up; only human-terminal state)
 
@@ -17,17 +19,33 @@ Workspace lifetime != container lifetime: the workspace is a persistent
 volume keyed to the agent-run, alongside the executor thread_id on the run
 record. The container is disposable; resume re-opens the thread bound to the
 run and reuses its workspace.
+
+Adapters implement `_stream_turn()`, an async generator of NORMALIZED event
+payloads (dicts). The base class owns everything backend-agnostic: workspace
+baseline, events.jsonl persistence, payload parsing, budget check, and the
+diff harvest. Payload kinds the base parser understands:
+
+    thread.started   {"thread_id": ...}          resume handle
+    turn.completed   {"usage": {input_tokens, output_tokens}}
+    turn.failed      {"error": ...}              -> failed (resumable crash)
+    item.completed   {"item": {"type": "agent_message", "text": ...}} -> output
+
+Cancellation contract: `run_job()` may be cancelled at any await point (the
+app tier enforces `turn_timeout_s` via asyncio.wait_for). Adapters must let
+CancelledError propagate (never swallow it into a 'failed' result) and must
+release their underlying process/session on the way out; the base class
+guarantees the events file is flushed and closed.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import os
+import subprocess
+from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator
 
 from miragen.models import AgentProfile, ExecutorSpec, RunUsage, sum_usage
 
@@ -61,71 +79,41 @@ class ExecutorResult:
         self.diff_path = diff_path
 
 
-class CodexExecutor:
-    """Runs jobs through the official openai-codex-sdk.
+class ExecutorBackend(ABC):
+    """Backend-agnostic half of the executor contract.
 
-    The SDK wraps the bundled `codex` CLI (`codex exec --experimental-json`,
-    `... resume <thread_id>`) and yields typed Pydantic events — verified
-    against openai-codex-sdk 0.1.11. `thread_factory` exists for tests: it
-    receives (codex, thread_id | None, thread_options) and returns a Thread-
-    compatible object with `.id` and `.run_streamed(prompt)`.
+    Owns workspace prep, the events.jsonl sink, payload parsing, the per-run
+    budget check, and the baseline-tag diff harvest. Concrete adapters own
+    only how to start/resume their agent and how to map its native event
+    stream into normalized payloads.
     """
 
-    def __init__(
-        self,
-        profile: AgentProfile,
-        *,
-        runs_root: Path = Path("/agent/runs"),
-        thread_factory: Callable[..., Any] | None = None,
-    ):
-        assert profile.executor is not None, "CodexExecutor requires an executor-tier profile"
+    def __init__(self, profile: AgentProfile, *, runs_root: Path = Path("/agent/runs")):
+        assert profile.executor is not None, "executor backends require an executor-tier profile"
         self.profile = profile
         self.spec: ExecutorSpec = profile.executor
         self.runs_root = Path(runs_root)
-        self._thread_factory = thread_factory or self._sdk_thread
 
     # ── Startup ────────────────────────────────────────────────────────────
 
     def prepare(self) -> None:
-        """Write the executor's config (MCP servers, trust settings) into
-        CODEX_HOME. Idempotent; called once at container startup.
+        """Startup-time config (idempotent). Default: nothing to write."""
 
-        auth.json is NOT written here — it must be volume-mounted into
-        CODEX_HOME by the deployment (per-agent Origo/Codex credentials are
-        spawn-time secrets, never profile content).
-        """
-        codex_home = Path(self.spec.codex_home)
-        codex_home.mkdir(parents=True, exist_ok=True)
-        os.environ.setdefault("CODEX_HOME", str(codex_home))
+    # ── Adapter seam ───────────────────────────────────────────────────────
 
-        config_path = codex_home / "config.toml"
-        config_path.write_text(self._render_config())
-        logger.info(f"[{self.profile.name}] executor config written: {config_path}")
+    @abstractmethod
+    def _stream_turn(
+        self,
+        prompt: str,
+        *,
+        run_id: str,
+        thread_id: str | None,
+        workspace: Path,
+        first_turn: bool,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Run one turn and yield normalized event payloads (see module doc)."""
 
-        if not (codex_home / "auth.json").exists() and not os.environ.get("CODEX_API_KEY"):
-            logger.warning(
-                f"[{self.profile.name}] no auth.json in {codex_home} and CODEX_API_KEY unset — "
-                "executor spawns will fail auth. Mount auth.json into CODEX_HOME."
-            )
-
-    def _render_config(self) -> str:
-        lines = [
-            "# Generated by miragen at startup — do not edit; edit the agent profile instead.",
-            f'# agent: {self.profile.name}',
-        ]
-        for server in self.spec.mcp_servers or []:
-            lines += [
-                "",
-                f"[mcp_servers.{server.name}]",
-                f'url = "{server.url}"',
-            ]
-            if server.bearer_token_env:
-                # Reference by NAME: the per-agent credential is injected into the
-                # container environment at spawn, not stored in config.
-                lines.append(f'bearer_token_env_var = "{server.bearer_token_env}"')
-        return "\n".join(lines) + "\n"
-
-    # ── Job execution ──────────────────────────────────────────────────────
+    # ── Job execution (template) ───────────────────────────────────────────
 
     async def run_job(
         self,
@@ -140,7 +128,7 @@ class CodexExecutor:
         """Execute one turn of a job bound to an agent-run.
 
         First turn: fresh workspace + fresh thread; `instructions` are
-        prepended. Resume: existing workspace + `resume_thread(thread_id)`.
+        prepended. Resume: existing workspace + adapter-side thread resume.
         `prior_usage` is the run's accumulated usage from earlier turns —
         needed so a per-run budget check on resume sees the true total, not
         just this turn's usage.
@@ -165,14 +153,15 @@ class CodexExecutor:
             # (and thus a RunStore.finish() call) rather than an unhandled
             # exception that leaves the run record stuck at 'running'.
             self._prepare_workspace(ws)
-            thread = self._thread_factory(
-                thread_id=thread_id,
-                options=self._thread_options(ws),
-            )
-            streamed = await thread.run_streamed(prompt)
             with events_path.open("a") as sink:
-                async for event in self._iter_events(streamed):
-                    payload = self._event_payload(event)
+                async for payload in self._stream_turn(
+                    prompt,
+                    run_id=run_id,
+                    thread_id=thread_id,
+                    workspace=ws,
+                    first_turn=first_turn,
+                ):
+                    payload.setdefault("ts", datetime.now(timezone.utc).isoformat())
                     sink.write(json.dumps(payload, default=str) + "\n")
 
                     kind = payload.get("type")
@@ -187,10 +176,11 @@ class CodexExecutor:
                         item = payload.get("item") or {}
                         if item.get("type") in ("agent_message", "agent-message"):
                             output = item.get("text") or output
-            observed_thread_id = observed_thread_id or getattr(thread, "id", None)
         except Exception as e:
             # Crash / API error: resumable. Partial workspace changes are
             # neither harvested nor discarded — they are resume state.
+            # (CancelledError is a BaseException and deliberately NOT caught:
+            # the app-tier timeout owns that path.)
             logger.error(f"[{self.profile.name}] executor crashed: {e}", exc_info=True)
             return ExecutorResult(
                 status="failed",
@@ -232,59 +222,7 @@ class CodexExecutor:
             diff_path=diff_path,
         )
 
-    # ── Pieces ─────────────────────────────────────────────────────────────
-
-    def _sdk_thread(self, *, thread_id: str | None, options: Any):
-        from openai_codex_sdk import Codex
-
-        codex = Codex()
-        if thread_id:
-            return codex.resume_thread(thread_id, options)
-        return codex.start_thread(options)
-
-    def _thread_options(self, workspace: Path) -> Any:
-        try:
-            from openai_codex_sdk.types import ThreadOptions
-        except ImportError:  # tests with a stub factory never reach the SDK
-            return {
-                "working_directory": str(workspace),
-                "sandbox_mode": self.spec.sandbox_mode,
-                "approval_policy": self.spec.approval_policy,
-            }
-        return ThreadOptions(
-            model=self.spec.model,
-            sandbox_mode=self.spec.sandbox_mode,
-            working_directory=str(workspace),
-            skip_git_repo_check=True,  # miragen initializes the repo itself
-            model_reasoning_effort=self.spec.reasoning_effort,
-            network_access_enabled=self.spec.network_access,
-            web_search_enabled=self.spec.web_search,
-            # Explicit ALWAYS: an unattended executor waiting on interactive
-            # approval stalls the job (operational gotcha, miradb #293).
-            approval_policy=self.spec.approval_policy,
-        )
-
-    @staticmethod
-    async def _iter_events(streamed: Any) -> AsyncIterator[Any]:
-        events = getattr(streamed, "events", streamed)
-        if hasattr(events, "__aiter__"):
-            async for event in events:
-                yield event
-        else:  # pragma: no cover — sync iterable stubs
-            for event in events:
-                yield event
-                await asyncio.sleep(0)
-
-    @staticmethod
-    def _event_payload(event: Any) -> dict[str, Any]:
-        if isinstance(event, dict):
-            payload = dict(event)
-        elif hasattr(event, "model_dump"):
-            payload = event.model_dump(by_alias=False)
-        else:
-            payload = {"type": "unknown", "repr": repr(event)}
-        payload.setdefault("ts", datetime.now(timezone.utc).isoformat())
-        return payload
+    # ── Events ─────────────────────────────────────────────────────────────
 
     def _events_path(self, run_id: str) -> Path:
         return self.runs_root / f"{run_id}{_EVENTS_SUFFIX}"
@@ -303,6 +241,17 @@ class CodexExecutor:
                     except ValueError:
                         continue
         return events[-limit:]
+
+    def latest_thread_id(self, run_id: str) -> str | None:
+        """Recover the resume handle from the persisted event stream — used by
+        the app tier when a turn is cancelled (timeout) before run_job could
+        return a result carrying the thread_id."""
+        for event in reversed(self.read_events(run_id, limit=1000)):
+            if event.get("type") == "thread.started" and event.get("thread_id"):
+                return event["thread_id"]
+        return None
+
+    # ── Workspace + harvest ────────────────────────────────────────────────
 
     def _prepare_workspace(self, ws: Path) -> None:
         ws.mkdir(parents=True, exist_ok=True)
@@ -334,12 +283,27 @@ class CodexExecutor:
         diff_path.write_text(diff)
         return str(diff_path)
 
+    # ── Budget ─────────────────────────────────────────────────────────────
+
     def _budget_exhausted(self, usage: RunUsage | None) -> bool:
         limits = self.profile.limits
         if limits is None or limits.tokens_per_run is None or usage is None:
             return False
         total = (usage.input_tokens or 0) + (usage.output_tokens or 0)
         return total > limits.tokens_per_run
+
+
+def event_payload(event: Any) -> dict[str, Any]:
+    """Normalize an SDK event (pydantic model, dict, or opaque object) into a
+    JSON-able payload dict, stamping a ts if the event carries none."""
+    if isinstance(event, dict):
+        payload = dict(event)
+    elif hasattr(event, "model_dump"):
+        payload = event.model_dump(by_alias=False)
+    else:
+        payload = {"type": "unknown", "repr": repr(event)}
+    payload.setdefault("ts", datetime.now(timezone.utc).isoformat())
+    return payload
 
 
 def _usage_from_payload(raw: Any) -> RunUsage | None:
@@ -353,8 +317,6 @@ def _usage_from_payload(raw: Any) -> RunUsage | None:
 
 
 def _git(ws: Path, *args: str) -> str:
-    import subprocess
-
     result = subprocess.run(
         ["git", "-C", str(ws), *args],
         capture_output=True,

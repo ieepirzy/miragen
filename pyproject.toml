@@ -48,6 +48,11 @@ dev = [
 codex = [
     "openai-codex-sdk>=0.1.11",
 ]
+# Claude Code executor backend (claude-agent-sdk is the official Anthropic
+# package; the spawn backend needs no extra at all).
+claude-code = [
+    "claude-agent-sdk>=0.1.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/ieepirzy/miragen"
