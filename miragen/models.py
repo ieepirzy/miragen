@@ -88,6 +88,9 @@ class RunRecord(BaseModel):
     workspace: Optional[str] = None
     exit_reason: Optional[str] = None
     diff_path: Optional[str] = None  # set exactly once, on terminal success
+    # None = no sink configured / not applicable; True/False = sink outcome.
+    # Advisory only — the diff on disk is the source of truth either way.
+    artifact_stored: Optional[bool] = None
 
 
 class RunSummary(BaseModel):
@@ -301,9 +304,40 @@ class ExecutorMCPServer(_ProfileModel):
     )
 
 
+class ArtifactSinkSpec(_ProfileModel):
+    """Optional "put things that were produced somewhere" hook.
+
+    Not a primary channel: when configured, a successfully harvested diff is
+    ALSO pushed to the sink after the run finishes. Sink failures are logged
+    and recorded on the run (`artifact_stored=False`) but never change run
+    status — the diff on disk stays the source of truth.
+    """
+
+    kind: Literal["loimi"] = Field(
+        default="loimi",
+        description="Sink implementation. Loimi (store_document over MCP) is the first.",
+    )
+    url: str = Field(
+        description="Streamable-HTTP MCP endpoint URL of the sink service.",
+        min_length=1,
+    )
+    bearer_token_env: Optional[str] = Field(
+        default=None,
+        description="Env var NAME holding the bearer token; value injected at spawn, never in the profile.",
+    )
+    document_kind: str = Field(
+        default="executor_diff",
+        description="`kind` stamped on stored documents (Loimi store_document argument).",
+    )
+
+
 class ExecutorSpec(_ProfileModel):
-    executor: Literal["codex"] = Field(
-        description="Executor backend. Codex is the first target; the contract is executor-agnostic.",
+    executor: Literal["codex", "claude-code", "spawn"] = Field(
+        description=(
+            "Executor backend. 'codex' (openai-codex-sdk), 'claude-code' "
+            "(claude-agent-sdk), or 'spawn' (argv-template fallback for CLIs "
+            "with no SDK). The contract is executor-agnostic."
+        ),
     )
     instructions: str = Field(
         description="Task framing prepended to the first prompt of every job.",
@@ -349,6 +383,49 @@ class ExecutorSpec(_ProfileModel):
         default=None,
         description="MCP servers injected into the executor's config at startup (e.g. Loimi via Origo).",
     )
+    turn_timeout_s: Optional[int] = Field(
+        default=1800,
+        gt=0,
+        description=(
+            "Wall-clock cap on a single executor turn, enforced by miragen "
+            "independent of the backend (asyncio timeout around the whole turn). "
+            "On expiry the run suspends (exit_reason='timeout') — resumable, no "
+            "harvest. None disables the cap. The token budget is a spend limit, "
+            "not a clock; this is the clock."
+        ),
+    )
+    command: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "spawn backend only: argv template run inside the workspace. "
+            "'{workspace}' and '{prompt}' are substituted per element; if no "
+            "element contains '{prompt}', the prompt is written to stdin."
+        ),
+    )
+    artifact_sink: Optional[ArtifactSinkSpec] = Field(
+        default=None,
+        description=(
+            "Optional post-success artifact sink — pushes the harvested diff "
+            "somewhere (Loimi first). Never required, never blocking, never "
+            "affects run status."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_backend_fields(self) -> "ExecutorSpec":
+        # Same loud-rejection philosophy as the model-tier/executor-tier field
+        # split: dead config is a false sense of a guardrail.
+        if self.executor == "spawn":
+            if not self.command:
+                raise ValueError("spawn executor requires `command` (argv template)")
+            if self.mcp_servers:
+                raise ValueError(
+                    "spawn executor cannot inject `mcp_servers` — a spawned CLI "
+                    "reads its own config; configure its MCP access there"
+                )
+        elif self.command is not None:
+            raise ValueError(f"`command` only applies to the spawn executor, not '{self.executor}'")
+        return self
 
 
 # ── Top-level agent profile ──────────────────────────────────────────────────

@@ -83,6 +83,13 @@ class RunStore:
         self._prune()
         return updated
 
+    def annotate(self, record: RunRecord, **updates) -> RunRecord:
+        """Write advisory fields onto an already-finished record (e.g. the
+        artifact-sink outcome) without touching status or timing."""
+        updated = record.model_copy(update=updates)
+        self._write(updated)
+        return updated
+
     def reopen(self, record: RunRecord) -> RunRecord:
         """Executor resume: transition a suspended/failed run back to running,
         preserving its thread/workspace bindings and accumulated usage."""

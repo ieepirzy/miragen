@@ -25,7 +25,8 @@ from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
 
 from miragen.broker import PendingApproval, get_broker
-from miragen.executor import CodexExecutor
+from miragen.executor import ExecutorBackend, ExecutorResult, build_executor
+from miragen.executor.sink import build_sink
 from miragen.factory import build_agent, registered_handlers
 from miragen.load import load_profile
 from miragen.models import (
@@ -56,7 +57,7 @@ _agent: Agent | None = None
 _limits: UsageLimits | None = None
 _scheduler: AsyncIOScheduler = AsyncIOScheduler()
 _run_store: RunStore | None = None
-_executor: "CodexExecutor | None" = None
+_executor: "ExecutorBackend | None" = None
 
 HISTORY_FILE = Path("/agent/history.json")
 HISTORY_SIDECAR = Path("/agent/history.runs.jsonl")
@@ -202,7 +203,7 @@ async def _run_executor_turn(
     assert _executor is not None
     run_id = record.run_id if record is not None else uuid.uuid4().hex
 
-    result = await _executor.run_job(
+    turn = _executor.run_job(
         prompt,
         run_id,
         thread_id=record.thread_id if record is not None else None,
@@ -210,10 +211,26 @@ async def _run_executor_turn(
         first_turn=not resume,
         prior_usage=record.usage if record is not None else None,
     )
+    timeout_s = _executor.spec.turn_timeout_s
+    try:
+        result = await (asyncio.wait_for(turn, timeout=timeout_s) if timeout_s else turn)
+    except asyncio.TimeoutError:
+        # Wall-clock cap, enforced here so it holds regardless of the
+        # backend's cooperation. Suspended, not terminal: workspace and (if
+        # the stream got far enough to record one) thread survive as resume
+        # state — a wedged executor is exactly the case where resume-or-
+        # abandon is the right human decision.
+        result = ExecutorResult(
+            status="suspended",
+            exit_reason="timeout",
+            thread_id=_executor.latest_thread_id(run_id)
+            or (record.thread_id if record is not None else None),
+            error=f"turn exceeded turn_timeout_s={timeout_s}s and was cancelled",
+        )
 
     if record is not None and _run_store is not None:
         usage = sum_usage(record.usage, result.usage)
-        _run_store.finish(
+        record = _run_store.finish(
             record,
             status=result.status,
             output=result.output,
@@ -226,6 +243,9 @@ async def _run_executor_turn(
             diff_path=result.diff_path,
         )
 
+    if result.status == "succeeded" and _executor.spec.artifact_sink is not None:
+        await _store_artifact(result, run_id, record)
+
     if result.status == "failed":
         raise RuntimeError(result.error or "executor turn failed")
     if result.status == "suspended":
@@ -234,6 +254,34 @@ async def _run_executor_turn(
             f"resume via POST /runs/{run_id}/resume"
         )
     return result.output or ""
+
+
+async def _store_artifact(result: "ExecutorResult", run_id: str, record: RunRecord | None) -> None:
+    """Push the harvested diff to the configured artifact sink. Advisory by
+    construction: failure logs and marks artifact_stored=False on the record,
+    but never raises into the run path — the diff on disk is the source of
+    truth either way."""
+    assert _executor is not None and _executor.spec.artifact_sink is not None
+    sink_spec = _executor.spec.artifact_sink
+    stored = False
+    try:
+        diff = Path(result.diff_path).read_text() if result.diff_path else ""
+        token = os.environ.get(sink_spec.bearer_token_env) if sink_spec.bearer_token_env else None
+        sink = build_sink(sink_spec, bearer_token=token)
+        await sink.store(
+            diff=diff,
+            metadata={
+                "run_id": run_id,
+                "agent": _profile.name if _profile else None,
+                "thread_id": result.thread_id,
+            },
+        )
+        stored = True
+        logger.info(f"[{_profile.name}] artifact sink stored diff for run {run_id}")
+    except Exception as e:
+        logger.error(f"[{_profile.name}] artifact sink failed for run {run_id}: {e}", exc_info=True)
+    if record is not None and _run_store is not None:
+        _run_store.annotate(record, artifact_stored=stored)
 
 
 def _daily_budget_status() -> tuple[int, int] | None:
@@ -383,7 +431,7 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Marked {interrupted} stale 'running' record(s) as interrupted")
 
     if _profile.is_executor:
-        _executor = CodexExecutor(_profile, runs_root=_run_store.root)
+        _executor = build_executor(_profile, runs_root=_run_store.root)
         _executor.prepare()
         logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode (executor tier: {_profile.executor.executor})")
     else:
