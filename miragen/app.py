@@ -268,6 +268,14 @@ async def _run_executor_turn(
             if result.repositories
             else None
         )
+
+        def _accumulate(prior, this_turn):
+            # None + None stays None (metric not reportable); any reported
+            # value starts/extends the accumulated total.
+            if this_turn is None:
+                return prior
+            return (prior or 0) + this_turn
+
         record = _run_store.finish(
             record,
             status=result.status,
@@ -280,6 +288,9 @@ async def _run_executor_turn(
             exit_reason=result.exit_reason,
             diff_path=result.diff_path,
             repositories=prepared_revisions,
+            setup_s=_accumulate(record.setup_s, result.setup_s),
+            tool_call_count=_accumulate(record.tool_call_count, result.tool_call_count),
+            tool_call_failures=_accumulate(record.tool_call_failures, result.tool_call_failures),
         )
         if prepared_revisions:
             _record_snapshot_commits(record.run_id, prepared_revisions)

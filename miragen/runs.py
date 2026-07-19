@@ -101,14 +101,25 @@ class RunStore:
         exit_reason: str | None = None,
         diff_path: str | None = None,
         repositories: list[RepositoryRevision] | None = None,
+        setup_s: float | None = None,
+        tool_call_count: int | None = None,
+        tool_call_failures: int | None = None,
     ) -> RunRecord:
+        """Telemetry params (`setup_s`, tool-call counts) are the run's
+        ACCUMULATED values — callers sum across turns before passing; None
+        keeps whatever the record already carries (an executor that can't
+        report a metric never zeroes it)."""
         finished_at = datetime.now(timezone.utc)
+        duration_s = (finished_at - record.started_at).total_seconds()
         updated = record.model_copy(update={
             "status": status,
             "output": output[:_OUTPUT_MAX] if output is not None else None,
             "error": error,
             "finished_at": finished_at,
-            "duration_s": (finished_at - record.started_at).total_seconds(),
+            "duration_s": duration_s,
+            # active = wall clock minus time spent suspended awaiting a human
+            # (blocked_s accumulates in reopen()).
+            "active_s": duration_s - (record.blocked_s or 0),
             "usage": usage,
             "tool_calls": list(tool_calls),
             # Executor-tier handles: never clear an already-recorded value —
@@ -118,6 +129,9 @@ class RunStore:
             "exit_reason": exit_reason,
             "diff_path": diff_path or record.diff_path,
             "repositories": repositories or record.repositories,
+            "setup_s": setup_s if setup_s is not None else record.setup_s,
+            "tool_call_count": tool_call_count if tool_call_count is not None else record.tool_call_count,
+            "tool_call_failures": tool_call_failures if tool_call_failures is not None else record.tool_call_failures,
         })
         self._write(updated)
         self._prune()
@@ -132,13 +146,23 @@ class RunStore:
 
     def reopen(self, record: RunRecord) -> RunRecord:
         """Executor resume: transition a suspended/failed run back to running,
-        preserving its thread/workspace bindings and accumulated usage."""
+        preserving its thread/workspace bindings and accumulated usage.
+        Telemetry: counts the resume and accumulates the blocked interval —
+        the time this run sat suspended/failed awaiting a human decision."""
+        blocked_s = record.blocked_s
+        if record.finished_at is not None:
+            blocked_s = (blocked_s or 0) + (
+                datetime.now(timezone.utc) - record.finished_at
+            ).total_seconds()
         updated = record.model_copy(update={
             "status": "running",
             "finished_at": None,
             "duration_s": None,
+            "active_s": None,
             "error": None,
             "exit_reason": None,
+            "resume_count": record.resume_count + 1,
+            "blocked_s": blocked_s,
         })
         self._write(updated)
         return updated

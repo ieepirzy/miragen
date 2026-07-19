@@ -41,6 +41,9 @@ class RunUsage(BaseModel):
     requests: int
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
+    # Prompt-cache reads, where the adapter reports them (issue #33 Phase E).
+    # None = the executor cannot report this metric; never coerced to 0.
+    cached_input_tokens: Optional[int] = None
 
 
 def sum_usage(a: Optional[RunUsage], b: Optional[RunUsage]) -> Optional[RunUsage]:
@@ -55,6 +58,7 @@ def sum_usage(a: Optional[RunUsage], b: Optional[RunUsage]) -> Optional[RunUsage
         requests=a.requests + b.requests,
         input_tokens=(a.input_tokens or 0) + (b.input_tokens or 0) or None,
         output_tokens=(a.output_tokens or 0) + (b.output_tokens or 0) or None,
+        cached_input_tokens=(a.cached_input_tokens or 0) + (b.cached_input_tokens or 0) or None,
     )
 
 
@@ -132,6 +136,19 @@ class RunRecord(BaseModel):
     snapshot_sha256: Optional[str] = None
     provenance: Optional[RunProvenance] = None
     repositories: Optional[list[RepositoryRevision]] = None
+    # Timing/telemetry intervals (issue #33 Phase E). Formulas:
+    #   wall clock  = duration_s = finished_at - started_at (includes blocked)
+    #   blocked_s   = Σ (resume time - previous finished_at) across reopens
+    #   active_s    = duration_s - blocked_s
+    #   setup_s     = Σ per-turn workspace-preparation time
+    # resume_count counts reopen transitions. Tool-call summaries come from
+    # normalized item events; all stay None where an executor can't report.
+    resume_count: int = 0
+    blocked_s: Optional[float] = None
+    active_s: Optional[float] = None
+    setup_s: Optional[float] = None
+    tool_call_count: Optional[int] = None
+    tool_call_failures: Optional[int] = None
 
 
 class RunSummary(BaseModel):
@@ -149,6 +166,7 @@ class RunSummary(BaseModel):
     usage: Optional[RunUsage] = None
     use_history: bool = False
     snapshot_sha256: Optional[str] = None
+    resume_count: int = 0
 
     @classmethod
     def from_record(cls, record: RunRecord) -> RunSummary:
@@ -166,6 +184,7 @@ class RunSummary(BaseModel):
             usage=record.usage,
             use_history=record.use_history,
             snapshot_sha256=record.snapshot_sha256,
+            resume_count=record.resume_count,
         )
 
 

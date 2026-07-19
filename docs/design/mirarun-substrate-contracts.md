@@ -1,6 +1,6 @@
 # MiraRun substrate contracts: EDF resolution, idempotent launch, sequenced events
 
-**Status:** implemented (issue #33 Phases A, B, C — the Stage-1 blockers)
+**Status:** implemented (issue #33 Phases A, B, C — the Stage-1 blockers — plus D and E)
 **Design inputs:** [issue #33](https://github.com/ieepirzy/miragen/issues/33), mirarun `docs/architecture/implementation-plan.md`, mirarun `docs/contracts/edf/v1alpha1.schema.json`
 
 miragen is the execution substrate under the planned MiraRun control plane.
@@ -195,15 +195,67 @@ A related hardening: diff harvest now runs inside the same failure envelope
 as the turn itself, so a harvest failure produces a resumable `failed(crash)`
 result instead of an unhandled exception that leaves the record `running`.
 
-## 5. What this deliberately does not do
+## 5. Multi-repository workspace preparation (Phase D)
+
+A launch whose EDF declares repositories must supply an **authorized runtime
+binding** for every opaque `connectionRef` via
+`context.repositories[connectionRef].clone_url` — missing bindings are a 422
+up front, not a mid-run clone failure. Bindings are ephemeral by contract:
+consumed during preparation, never persisted (not in profiles, snapshots,
+records, or events), redacted from error text (git embeds remote URLs in
+stderr), and stripped from each clone's `.git/config` after checkout.
+
+Preparation semantics:
+
+- Each repository is fetched into its validated mount path as **its own git
+  repo** (shallow explicit-ref fetch, falling back to full-ref then
+  unqualified fetch for arbitrary SHAs). The workspace root stays a plain
+  directory — a root git repo would record nested clones as gitlinks and
+  silently swallow their diffs. `mountPath: .miragen` is reserved.
+- Concrete commit SHAs are recorded in three places: the run record's
+  `repositories`, the snapshot's `repository_plan`, and per-repo
+  `lifecycle.repo.prepared` timing events.
+- Setup failures are resumable `failed(crash)`; preparation is idempotent
+  (already-prepared mounts are skipped), so resume re-runs it safely with
+  binding-less checkouts rebuilt from the run record. A discarded workspace
+  cannot be re-cloned on resume — bindings cannot be re-minted by miragen.
+- Without a repository plan, the classic single-baseline workspace is
+  byte-for-byte unchanged.
+
+**Multi-repo artifact contract:** only *writable* repositories get the
+baseline tag and are harvested. Each yields an apply-able
+`.miragen/diffs/<name>.patch`; `diff_path` / `GET /runs/{id}/diff` serve a
+section-marked bundle of all of them, and `?repository=<name>` serves one
+repo's own patch. Non-writable mounts are reference material — changes there
+are deliberately not part of the deliverable.
+
+## 6. Telemetry (Phase E)
+
+Formulas, all persisted on the run record:
+
+```
+wall clock   duration_s = finished_at - started_at        (includes blocked)
+blocked_s    Σ (resume time - previous finished_at)       (accumulated in reopen)
+active_s     duration_s - blocked_s                       (computed at finish)
+setup_s      Σ per-turn workspace-preparation time
+resume_count number of reopen transitions
+```
+
+`RunUsage` gains `cached_input_tokens` (normalized flat key or OpenAI-style
+`input_tokens_details.cached_tokens`), summed across turns like the other
+token fields. Tool-call summaries (`tool_call_count` / `tool_call_failures`)
+come from normalized `item.completed` events: an adapter that emits no item
+events reports **null** (cannot report), while a run whose item stream simply
+contained no tool work reports **0** — nullability is preserved everywhere; a
+metric an executor can't report is never coerced to zero. Pricing tables and
+product analytics stay out of miragen.
+
+## 7. What this deliberately does not do
 
 Per the issue's phasing and stop-for-review rules:
 
-- **Phase D** — actual multi-repository checkout, per-repo baselines/diffs,
-  lifecycle execution, ephemeral checkout credentials. Plans and `commit`
-  fields are in place; execution changes workspace isolation and diff
-  semantics and needs its own review.
-- **Phase E** — cached-token and blocked-interval telemetry.
+- **Phase D remainder** — lifecycle phase *execution* (`workspaceSetup` etc.
+  are validated and recorded, not run).
 - **Phase F** — managed schedule reconciliation.
 - **Phase G** — structured intervention events and target provenance.
 - No product entities, pricing, or analytics in miragen; no executor

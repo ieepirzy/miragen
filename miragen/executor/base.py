@@ -186,6 +186,9 @@ class ExecutorResult:
         usage: RunUsage | None = None,
         diff_path: str | None = None,
         repositories: list[dict[str, Any]] | None = None,
+        setup_s: float | None = None,
+        tool_call_count: int | None = None,
+        tool_call_failures: int | None = None,
     ):
         self.status = status
         self.exit_reason = exit_reason
@@ -197,6 +200,11 @@ class ExecutorResult:
         # Concrete prepared-repository state (name/ref/mount_path/writable/
         # commit) — filled by workspace preparation, no credentials ever.
         self.repositories = repositories
+        # This TURN's telemetry (the app tier accumulates across turns).
+        # None = not reportable this turn, never a claimed zero.
+        self.setup_s = setup_s
+        self.tool_call_count = tool_call_count
+        self.tool_call_failures = tool_call_failures
 
 
 class ExecutorBackend(ABC):
@@ -270,6 +278,11 @@ class ExecutorBackend(ABC):
         observed_thread_id: str | None = thread_id
         turn_failed = False
         prepared: list[dict[str, Any]] | None = None
+        setup_s: float | None = None
+        # None until the first item.completed arrives: an adapter that emits
+        # no item events cannot report tool metrics (nullable, not zero).
+        tool_calls: int | None = None
+        tool_failures: int | None = None
 
         try:
             # Inside the try: a bad workspace_root, missing git, a failed
@@ -283,10 +296,11 @@ class ExecutorBackend(ABC):
                 setup_t0 = time.monotonic()
                 sink.write({"type": "lifecycle.setup.started", "phase": "workspace", "first_turn": first_turn})
                 prepared = self._prepare_workspace(ws, repositories, sink=sink)
+                setup_s = time.monotonic() - setup_t0
                 sink.write({
                     "type": "lifecycle.setup.completed",
                     "phase": "workspace",
-                    "duration_ms": int((time.monotonic() - setup_t0) * 1000),
+                    "duration_ms": int(setup_s * 1000),
                 })
                 async for payload in self._stream_turn(
                     prompt,
@@ -309,6 +323,13 @@ class ExecutorBackend(ABC):
                         item = payload.get("item") or {}
                         if item.get("type") in ("agent_message", "agent-message"):
                             output = item.get("text") or output
+                        if item.get("type") not in _NON_TOOL_ITEM_TYPES:
+                            tool_calls = (tool_calls or 0) + 1
+                            tool_failures = (tool_failures or 0) + (1 if _item_is_failure(item) else 0)
+                        elif tool_calls is None:
+                            # item events flow, so tool metrics ARE reportable
+                            # for this adapter — start the counters at zero.
+                            tool_calls, tool_failures = 0, 0
 
                 if turn_failed:
                     return ExecutorResult(
@@ -318,6 +339,9 @@ class ExecutorBackend(ABC):
                         error=error,
                         usage=usage,
                         repositories=prepared,
+                        setup_s=setup_s,
+                        tool_call_count=tool_calls,
+                        tool_call_failures=tool_failures,
                     )
 
                 if self._budget_exhausted(sum_usage(prior_usage, usage)):
@@ -334,6 +358,9 @@ class ExecutorBackend(ABC):
                         output=output,
                         usage=usage,
                         repositories=prepared,
+                        setup_s=setup_s,
+                        tool_call_count=tool_calls,
+                        tool_call_failures=tool_failures,
                     )
 
                 harvest_t0 = time.monotonic()
@@ -359,6 +386,9 @@ class ExecutorBackend(ABC):
                 error=message,
                 usage=usage,
                 repositories=prepared,
+                setup_s=setup_s,
+                tool_call_count=tool_calls,
+                tool_call_failures=tool_failures,
             )
 
         return ExecutorResult(
@@ -368,6 +398,9 @@ class ExecutorBackend(ABC):
             usage=usage,
             diff_path=diff_path,
             repositories=prepared,
+            setup_s=setup_s,
+            tool_call_count=tool_calls,
+            tool_call_failures=tool_failures,
         )
 
     # ── Events ─────────────────────────────────────────────────────────────
@@ -601,11 +634,32 @@ def event_payload(event: Any) -> dict[str, Any]:
 def _usage_from_payload(raw: Any) -> RunUsage | None:
     if not isinstance(raw, dict):
         return None
+    # Cached tokens where the adapter reports them: either normalized flat
+    # (cached_input_tokens) or OpenAI-style nested details. Absent → None,
+    # never a claimed zero.
+    cached = raw.get("cached_input_tokens")
+    if cached is None:
+        details = raw.get("input_tokens_details")
+        if isinstance(details, dict):
+            cached = details.get("cached_tokens")
     return RunUsage(
         requests=1,
         input_tokens=raw.get("input_tokens"),
         output_tokens=raw.get("output_tokens"),
+        cached_input_tokens=cached,
     )
+
+
+# item.completed types that are NOT tool work — everything else counts toward
+# the tool-call summary.
+_NON_TOOL_ITEM_TYPES = {"agent_message", "agent-message", "reasoning"}
+
+
+def _item_is_failure(item: dict[str, Any]) -> bool:
+    exit_code = item.get("exit_code")
+    if isinstance(exit_code, int) and exit_code != 0:
+        return True
+    return item.get("status") in ("failed", "error")
 
 
 def _git(ws: Path, *args: str) -> str:
