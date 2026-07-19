@@ -437,6 +437,13 @@ Every agent container exposes:
 | `/history` | GET | Read-only slice of persisted conversation history (`?limit=` or `?run_id=`) |
 | `/approvals` | GET | List pending `approval_mode: queue` requests |
 | `/approvals/{request_id}` | POST | Resolve a pending approval request |
+| `/profiles/resolve` | POST | Validate + resolve an EDF (canonical doc, SHA-256, executable profile) without starting a run |
+| `/executor-runs` | POST | Idempotent, provenance-carrying executor launch (durable before ack) |
+| `/runs/{run_id}/snapshot` | GET | Immutable resolved-EDF snapshot persisted at launch |
+| `/runs/{run_id}/events` | GET | Executor event stream: tail read, or cursor replay with `?after=&limit=` |
+| `/runs/{run_id}/diff` | GET | Harvested diff (executor tier, 404 until success) |
+| `/runs/{run_id}/resume` | POST | Give a suspended/failed executor run another turn |
+| `/runs/{run_id}/abandon` | POST | Human-terminal state; `?discard_workspace=true` to drop the workspace |
 
 **Request**
 ```json
@@ -683,6 +690,30 @@ curl localhost:8000/runs/abc123/events      # the executor's event stream
 curl -X POST localhost:8000/runs/abc123/resume -d '{"prompt": "keep going"}'   # suspended/failed only
 curl -X POST "localhost:8000/runs/abc123/abandon?discard_workspace=true"       # human-terminal
 ```
+
+### Control-plane contracts (EDF, idempotent launch, event replay)
+
+For an external control plane (MiraRun), the executor tier also speaks three
+substrate contracts (design record:
+[docs/design/mirarun-substrate-contracts.md](docs/design/mirarun-substrate-contracts.md)):
+
+- **`POST /profiles/resolve`** — strictly validates a `mirarun.io/v1alpha1`
+  Environment Definition File, expands defaults/presets deterministically, and
+  returns the canonical document, its SHA-256, the executable profile, and
+  repository/secret binding plans — without starting a run.
+- **`POST /executor-runs`** — launches one executor run with a caller
+  `idempotency_key` and product `provenance`, persisted durably *before* the
+  launch is acknowledged. A repeated key returns the original run instead of
+  launching twice; if the process dies mid-dispatch, the swept `interrupted`
+  record is what the retried key surfaces. When an EDF is supplied, the
+  immutable resolved snapshot is persisted per run (`GET /runs/{id}/snapshot`).
+- **`GET /runs/{id}/events?after=N`** — cursor-based replay over the same
+  durable event stream: every event carries a per-run monotonic `seq` and a
+  schema version, so a projector can page, deduplicate by `(run_id, seq)`, and
+  rebuild from `after=0` at any time. Plain tail reads work unchanged.
+
+`GET /health` advertises the installed version and the served contract
+capabilities for client feature detection.
 
 ---
 

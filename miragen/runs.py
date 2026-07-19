@@ -8,7 +8,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from miragen.models import RunRecord, RunSummary, RunUsage, ToolCallRecord
+from miragen.models import (
+    RepositoryRevision,
+    RunProvenance,
+    RunRecord,
+    RunSummary,
+    RunUsage,
+    ToolCallRecord,
+)
 
 _PROMPT_MAX = 20_000
 _OUTPUT_MAX = 100_000
@@ -36,7 +43,19 @@ class RunStore:
         self.root = Path(root)
         self.retention = retention
 
-    def start(self, *, agent_name: str, trigger: str, prompt: str, use_history: bool = False) -> RunRecord:
+    def start(
+        self,
+        *,
+        agent_name: str,
+        trigger: str,
+        prompt: str,
+        use_history: bool = False,
+        executor: str | None = None,
+        model: str | None = None,
+        snapshot_sha256: str | None = None,
+        provenance: RunProvenance | None = None,
+        repositories: list[RepositoryRevision] | None = None,
+    ) -> RunRecord:
         record = RunRecord(
             run_id=_new_run_id(),
             agent_name=agent_name,
@@ -45,9 +64,28 @@ class RunStore:
             prompt=prompt[:_PROMPT_MAX],
             started_at=datetime.now(timezone.utc),
             use_history=use_history,
+            executor=executor,
+            model=model,
+            snapshot_sha256=snapshot_sha256,
+            provenance=provenance,
+            repositories=repositories,
         )
         self._write(record)
         return record
+
+    def find_by_idempotency_key(self, key: str) -> RunRecord | None:
+        """Newest run whose provenance carries `key`. This is the launch
+        dedupe lookup: POST /executor-runs persists the key inside provenance
+        before acknowledging, so a retried launch (including one retried after
+        an ambiguous response or a process crash) recovers the original run
+        instead of launching twice."""
+        for path in sorted(self._existing_files(), reverse=True):
+            record = _read_record(path)
+            if record is None or record.provenance is None:
+                continue
+            if record.provenance.idempotency_key == key:
+                return record
+        return None
 
     def finish(
         self,
@@ -144,6 +182,31 @@ class RunStore:
                 self._write(updated)
                 count += 1
         return count
+
+    # ── Run snapshots ─────────────────────────────────────────────────────────
+    #
+    # The immutable resolved EDF snapshot for a launched run (issue #33 Phase
+    # A). Stored under a subdirectory so the `*.json` run-record glob (and its
+    # retention prune) never sees snapshot files. Like events.jsonl, snapshots
+    # are not pruned with run records — they are cheap and provenance-bearing.
+
+    def write_snapshot(self, run_id: str, snapshot: dict) -> Path:
+        snapshot_dir = self.root / "snapshots"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        path = snapshot_dir / f"{run_id}.json"
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(snapshot))
+        os.replace(tmp, path)
+        return path
+
+    def read_snapshot(self, run_id: str) -> dict | None:
+        path = self.root / "snapshots" / f"{run_id}.json"
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
 
     # ── Internals ─────────────────────────────────────────────────────────────
 

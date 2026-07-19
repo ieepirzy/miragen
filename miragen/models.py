@@ -65,11 +65,44 @@ RunStatus = Literal[
     "suspended", "abandoned",
 ]
 
+# "launch" = POST /executor-runs: an idempotent, provenance-carrying launch
+# from an external control plane (issue #33 Phase B).
+RunTrigger = Literal["cron", "http", "http_async", "launch"]
+
+
+class RunProvenance(BaseModel):
+    """Caller/product provenance persisted with a run BEFORE launch is
+    acknowledged. miragen stores and returns these verbatim; it never
+    interprets them — product entities stay authoritative in the control
+    plane. extra="allow" so product-side fields survive the round trip."""
+
+    model_config = ConfigDict(extra="allow")
+
+    idempotency_key: Optional[str] = None
+    environment_id: Optional[str] = None
+    environment_revision: Optional[str] = None
+    routine_id: Optional[str] = None
+    trigger_id: Optional[str] = None
+    invocation_id: Optional[str] = None
+    requested_by: Optional[str] = None
+    edf_api_version: Optional[str] = None
+
+
+class RepositoryRevision(BaseModel):
+    """A repository the run's workspace plan includes. `commit` stays None
+    until workspace preparation resolves the ref (issue #33 Phase D)."""
+
+    name: str
+    ref: str
+    mount_path: Optional[str] = None
+    writable: bool = False
+    commit: Optional[str] = None
+
 
 class RunRecord(BaseModel):
     run_id: str  # uuid4 hex
     agent_name: str
-    trigger: Literal["cron", "http", "http_async"]
+    trigger: RunTrigger
     status: RunStatus
     prompt: str  # truncated to 20_000 chars
     output: Optional[str] = None  # truncated to 100_000 chars
@@ -91,13 +124,21 @@ class RunRecord(BaseModel):
     # None = no sink configured / not applicable; True/False = sink outcome.
     # Advisory only — the diff on disk is the source of truth either way.
     artifact_stored: Optional[bool] = None
+    # Execution provenance (issue #33 Phases A/B) — None for runs launched
+    # outside POST /executor-runs. snapshot_sha256 is the canonical EDF hash;
+    # the full snapshot document lives beside the record (RunStore snapshots).
+    executor: Optional[str] = None
+    model: Optional[str] = None
+    snapshot_sha256: Optional[str] = None
+    provenance: Optional[RunProvenance] = None
+    repositories: Optional[list[RepositoryRevision]] = None
 
 
 class RunSummary(BaseModel):
     # Everything in RunRecord except prompt/output/tool_calls, plus previews.
     run_id: str
     agent_name: str
-    trigger: Literal["cron", "http", "http_async"]
+    trigger: RunTrigger
     status: RunStatus
     prompt_preview: str  # first 200 chars of prompt
     output_preview: Optional[str] = None  # first 200 chars of output
@@ -107,6 +148,7 @@ class RunSummary(BaseModel):
     duration_s: Optional[float] = None
     usage: Optional[RunUsage] = None
     use_history: bool = False
+    snapshot_sha256: Optional[str] = None
 
     @classmethod
     def from_record(cls, record: RunRecord) -> RunSummary:
@@ -123,6 +165,7 @@ class RunSummary(BaseModel):
             duration_s=record.duration_s,
             usage=record.usage,
             use_history=record.use_history,
+            snapshot_sha256=record.snapshot_sha256,
         )
 
 

@@ -18,14 +18,21 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger as APIntervalTrigger
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
 
 from miragen.broker import PendingApproval, get_broker
+from miragen.edf import (
+    EDFValidationError,
+    ResolutionContext,
+    ResolvedEDF,
+    build_run_snapshot,
+    resolve_edf,
+)
 from miragen.executor import ExecutorBackend, ExecutorResult, build_executor
 from miragen.executor.sink import build_sink
 from miragen.factory import build_agent, registered_handlers
@@ -35,6 +42,8 @@ from miragen.models import (
     ApprovalResponse,
     CronTrigger as ProfileCronTrigger,
     IntervalTrigger as ProfileIntervalTrigger,
+    RepositoryRevision,
+    RunProvenance,
     RunRecord,
     RunSummary,
     StartupTrigger as ProfileStartupTrigger,
@@ -540,6 +549,26 @@ _internal_auth = Depends(_require_internal_token)
 
 # ── Routes ───────────────────────────────────────────────────────────────────────────
 
+# Contract capabilities this build serves, for client feature detection
+# (miragen-mcp / MiraRun): each entry is a versioned surface a caller may
+# rely on. Additions are backwards-compatible; removals/renames are breaking.
+CONTRACT_CAPABILITIES = [
+    "edf-resolve/mirarun.io-v1alpha1",   # POST /profiles/resolve
+    "executor-launch/v1",                # POST /executor-runs (idempotency + provenance)
+    "run-snapshot/v1",                   # GET /runs/{id}/snapshot
+    "events-cursor/v1",                  # GET /runs/{id}/events?after=
+]
+
+
+def _installed_version() -> str | None:
+    try:
+        from importlib.metadata import version
+
+        return version("miragen")
+    except Exception:
+        return None
+
+
 @app.get("/health")
 async def health():
     last_run = None
@@ -551,6 +580,8 @@ async def health():
         "agent": _profile.name if _profile else None,
         "last_run": last_run,
         "pending_approvals": len(get_broker().pending()),
+        "version": _installed_version(),
+        "capabilities": CONTRACT_CAPABILITIES,
     }
 
 
@@ -743,12 +774,228 @@ async def get_run_diff(run_id: str):
 
 
 @app.get("/runs/{run_id}/events", dependencies=[_internal_auth])
-async def get_run_events(run_id: str, limit: int = 200):
-    """The executor event stream (turn events, item/tool events, errors) —
-    what this tier owes the layers above, alongside the exit reason."""
+async def get_run_events(run_id: str, limit: int = 200, after: Optional[int] = None):
+    """The executor event stream (turn events, item/tool events, lifecycle
+    timing, errors) — what this tier owes the layers above, alongside the
+    exit reason.
+
+    Two read modes over the same durable sequenced stream:
+    - without `after`: tail read (newest `limit` events), original contract;
+    - with `after`: cursor replay — events with seq > after, oldest first,
+      plus `next_after`/`has_more` for paging. (run_id, seq) is the
+      deduplication key; replaying any cursor is idempotent, so a projector
+      can rebuild its projection from after=0 at any time.
+    """
     record = _get_executor_record(run_id)
-    events = _executor.read_events(record.run_id, limit=min(limit, 1000))
+    limit = min(limit, 1000)
+    if after is not None:
+        page = _executor.read_events_page(record.run_id, after=after, limit=limit)
+        return {
+            "run_id": record.run_id,
+            "count": len(page.events),
+            "events": page.events,
+            "next_after": page.next_after,
+            "has_more": page.has_more,
+        }
+    events = _executor.read_events(record.run_id, limit=limit)
     return {"run_id": record.run_id, "count": len(events), "events": events}
+
+
+@app.get("/runs/{run_id}/snapshot", dependencies=[_internal_auth])
+async def get_run_snapshot(run_id: str):
+    """The immutable resolved-EDF snapshot persisted when the run was
+    launched via POST /executor-runs — canonical document, hash, resolved
+    profile, and repository/secret plans. 404 for runs launched without an
+    EDF."""
+    record = _get_executor_record(run_id)
+    snapshot = _run_store.read_snapshot(record.run_id)
+    if snapshot is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"run '{record.run_id}' has no resolved snapshot (launched without an EDF)",
+        )
+    return snapshot
+
+
+# ── EDF resolution + provenance-carrying launch (issue #33 Phases A/B) ───────
+
+
+class ResolveRequest(BaseModel):
+    edf: dict
+    context: Optional[ResolutionContext] = None
+
+
+class ExecutorLaunchRequest(BaseModel):
+    prompt: str = Field(
+        description="COMPLETED prompt — persisted and dispatched verbatim: no "
+        "timestamp stamping, no header_prompt. Prompt rendering is a "
+        "control-plane concern.",
+    )
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    edf: Optional[dict] = None
+    context: Optional[ResolutionContext] = None
+    expected_sha256: Optional[str] = Field(
+        default=None,
+        description="Caller's previously resolved canonical hash; launch is "
+        "refused (409) if re-resolution at this trust boundary disagrees.",
+    )
+    provenance: Optional[RunProvenance] = None
+
+
+def _edf_compatibility(resolved: ResolvedEDF) -> dict | None:
+    """Compare a resolved EDF against the agent this service actually runs.
+    Informational on /profiles/resolve; enforced (409) on /executor-runs —
+    Stage 1 keeps the current one-agent-per-service topology, so a launch
+    executes with the CONFIGURED executor spec and an EDF that resolves to a
+    different executor/model/sandbox belongs to a different deployment."""
+    if _profile is None:
+        return None
+    issues: list[str] = []
+    if _profile.executor is None:
+        issues.append("configured agent is model-tier; EDF launches require an executor-tier agent")
+    else:
+        want = resolved.resolved_profile["executor"]
+        have = _profile.executor
+        if want["executor"] != have.executor:
+            issues.append(f"EDF resolves to executor '{want['executor']}' but this agent runs '{have.executor}'")
+        if want["model"] is not None and want["model"] != have.model:
+            issues.append(f"EDF resolves to model '{want['model']}' but this agent is configured for '{have.model}'")
+        if want["sandbox_mode"] != have.sandbox_mode:
+            issues.append(
+                f"EDF resolves to sandbox_mode '{want['sandbox_mode']}' but this agent "
+                f"runs '{have.sandbox_mode}'"
+            )
+    return {"compatible": not issues, "issues": issues}
+
+
+@app.post("/profiles/resolve", dependencies=[_internal_auth])
+async def resolve_profile(request: ResolveRequest):
+    """Validate and resolve an EDF WITHOUT starting a run: strict validation,
+    deterministic default/preset expansion, canonical document + SHA-256, the
+    resolved executable profile, and repository/secret binding plans. Pure and
+    deterministic — safe to call repeatedly to reproduce a hash."""
+    try:
+        resolved = resolve_edf(request.edf, context=request.context)
+    except EDFValidationError as e:
+        raise HTTPException(status_code=422, detail={"error": "invalid EDF", "errors": e.errors})
+    body = resolved.model_dump(mode="json")
+    body["agent_compatibility"] = _edf_compatibility(resolved)
+    return body
+
+
+@app.post("/executor-runs", status_code=202, dependencies=[_internal_auth])
+async def launch_executor_run(request: ExecutorLaunchRequest, response: Response):
+    """Idempotent, provenance-carrying executor launch.
+
+    Acceptance is DURABLE-FIRST: the run record (with provenance and, when an
+    EDF is supplied, the resolved snapshot + hash) is persisted before this
+    endpoint acknowledges — and before dispatch. Recovery contract for the
+    ambiguity window: if the process dies after acceptance but before/while
+    dispatching, the startup sweep marks the record 'interrupted'; retrying
+    the same idempotency_key then returns that original run (200, duplicate:
+    true) instead of launching twice, and the caller decides how to proceed
+    with full knowledge of its status.
+    """
+    if _executor is None:
+        raise HTTPException(
+            status_code=400,
+            detail="this agent is not executor-backed; /executor-runs requires an executor-tier profile",
+        )
+    if _run_store is None or _profile is None:
+        raise HTTPException(status_code=503, detail="Run store not ready")
+
+    existing = _run_store.find_by_idempotency_key(request.idempotency_key)
+    if existing is not None:
+        response.status_code = 200
+        return {
+            "run_id": existing.run_id,
+            "status": existing.status,
+            "snapshot_sha256": existing.snapshot_sha256,
+            "duplicate": True,
+        }
+
+    _raise_if_daily_budget_exceeded()
+
+    resolved: ResolvedEDF | None = None
+    if request.edf is not None:
+        try:
+            resolved = resolve_edf(request.edf, context=request.context)
+        except EDFValidationError as e:
+            raise HTTPException(status_code=422, detail={"error": "invalid EDF", "errors": e.errors})
+        if request.expected_sha256 is not None and resolved.sha256 != request.expected_sha256:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "canonical snapshot hash mismatch",
+                    "expected_sha256": request.expected_sha256,
+                    "resolved_sha256": resolved.sha256,
+                },
+            )
+        compatibility = _edf_compatibility(resolved)
+        if compatibility is not None and not compatibility["compatible"]:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "EDF incompatible with the configured agent", "issues": compatibility["issues"]},
+            )
+    elif request.expected_sha256 is not None:
+        raise HTTPException(status_code=422, detail="expected_sha256 requires an edf to resolve")
+
+    provenance = (request.provenance or RunProvenance()).model_copy(
+        update={
+            "idempotency_key": request.idempotency_key,
+            **(
+                {"edf_api_version": resolved.api_version}
+                if resolved is not None
+                else {}
+            ),
+        }
+    )
+
+    # Durable acceptance point — no awaits between the idempotency lookup
+    # above and this write, so a same-key race cannot slip between them.
+    record = _run_store.start(
+        agent_name=_profile.name,
+        trigger="launch",
+        prompt=request.prompt,
+        executor=_profile.executor.executor,
+        model=_profile.executor.model,
+        snapshot_sha256=resolved.sha256 if resolved is not None else None,
+        provenance=provenance,
+        repositories=[
+            RepositoryRevision(
+                name=entry.name,
+                ref=entry.ref,
+                mount_path=entry.mount_path,
+                writable=entry.writable,
+                commit=entry.commit,
+            )
+            for entry in resolved.repository_plan
+        ]
+        if resolved is not None
+        else None,
+    )
+    if resolved is not None:
+        _run_store.write_snapshot(
+            record.run_id,
+            build_run_snapshot(resolved, run_id=record.run_id, created_at=record.started_at.isoformat()),
+        )
+
+    async def _background_run() -> None:
+        try:
+            await run_agent(request.prompt, record=record)
+        except Exception as e:
+            # run_agent already wrote the failure to the record; this is just
+            # so a launch exception never propagates into a bare task error.
+            logger.error(f"[{_profile.name}] launched run failed: {e}", exc_info=True)
+
+    _spawn_background(_background_run())
+
+    return {
+        "run_id": record.run_id,
+        "status": "running",
+        "snapshot_sha256": record.snapshot_sha256,
+        "duplicate": False,
+    }
 
 
 @app.get("/history", response_model=HistoryResponse, dependencies=[_internal_auth])
