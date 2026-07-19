@@ -278,8 +278,13 @@ async def test_events_are_persisted_jsonl(tmp_path):
     await executor.run_job("task", "run5")
     events = executor.read_events("run5")
     kinds = [e["type"] for e in events]
-    assert kinds[0] == "thread.started" and kinds[-1] == "turn.completed"
+    # base-tier lifecycle events bracket the adapter's own stream
+    assert kinds[0] == "lifecycle.setup.started" and kinds[-1] == "lifecycle.harvest.completed"
+    assert "thread.started" in kinds and "turn.completed" in kinds
     assert all("ts" in e for e in events)
+    # envelope: per-run monotonic 1-based sequence + schema version
+    assert [e["seq"] for e in events] == list(range(1, len(events) + 1))
+    assert all(e["schema"] == "miragen/executor-event/v1" for e in events)
 
 
 # ── App wiring: dispatch + executor endpoints ─────────────────────────────────

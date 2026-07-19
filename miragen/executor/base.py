@@ -42,10 +42,12 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Iterator
 
 from miragen.models import AgentProfile, ExecutorSpec, RunUsage, sum_usage
 
@@ -54,6 +56,80 @@ logger = logging.getLogger("miragen.executor")
 _DIFF_NAME = "diff.patch"
 _EVENTS_SUFFIX = ".events.jsonl"
 _BASELINE_TAG = "miragen-baseline"
+
+# Event envelope version (issue #33 Phase C). Every persisted event carries
+# `seq` (per-run monotonic, 1-based), `schema`, `ts`, and `type` alongside its
+# payload fields. The envelope is flat — new keys on the same JSONL object —
+# so existing tail readers keep working unchanged.
+EVENT_SCHEMA = "miragen/executor-event/v1"
+
+
+def _iter_event_lines(path: Path) -> Iterator[tuple[int, dict[str, Any] | None]]:
+    """Yield (line_no, parsed | None) for every non-blank line. Unparsable
+    lines yield None but still occupy a line number, so sequence assignment
+    stays stable no matter who reads the file."""
+    with path.open() as f:
+        line_no = 0
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            line_no += 1
+            try:
+                yield line_no, json.loads(line)
+            except ValueError:
+                yield line_no, None
+
+
+def _effective_seq(line_no: int, event: dict[str, Any]) -> int:
+    """Explicit seq when the writer stamped one; the 1-based line number for
+    legacy pre-envelope lines (writers have always been append-only and
+    single-writer per run, so line order IS event order)."""
+    seq = event.get("seq")
+    return seq if isinstance(seq, int) else line_no
+
+
+class _EventWriter:
+    """Append-only events.jsonl sink owning the per-run monotonic sequence.
+
+    On open, scans the existing file (resume case) and continues numbering
+    after the last effective sequence — a resumed turn's events extend the
+    same ordered stream rather than restarting at 1. Each write is flushed so
+    cursor/tail readers and crash forensics see events promptly.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._last_seq = 0
+        if path.exists():
+            for line_no, event in _iter_event_lines(path):
+                self._last_seq = _effective_seq(line_no, event) if event is not None else line_no
+        self._fh = path.open("a")
+
+    def write(self, payload: dict[str, Any]) -> None:
+        self._last_seq += 1
+        payload.setdefault("ts", datetime.now(timezone.utc).isoformat())
+        payload["seq"] = self._last_seq
+        payload["schema"] = EVENT_SCHEMA
+        self._fh.write(json.dumps(payload, default=str) + "\n")
+        self._fh.flush()
+
+    def __enter__(self) -> "_EventWriter":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._fh.close()
+
+
+@dataclass
+class EventPage:
+    """One page of a cursor read: events with seq > `after`, in order.
+    Replay contract: (run_id, seq) is the deduplication key; re-reading any
+    cursor returns the same events."""
+
+    events: list[dict[str, Any]] = field(default_factory=list)
+    next_after: int = 0  # pass as `after` to get the next page
+    has_more: bool = False
 
 
 class ExecutorResult:
@@ -148,12 +224,19 @@ class ExecutorBackend(ABC):
         turn_failed = False
 
         try:
-            # Inside the try: a bad workspace_root, missing git, or a
-            # permission error here must still produce a 'failed' result
+            # Inside the try: a bad workspace_root, missing git, a permission
+            # error, or a failed harvest must still produce a 'failed' result
             # (and thus a RunStore.finish() call) rather than an unhandled
             # exception that leaves the run record stuck at 'running'.
-            self._prepare_workspace(ws)
-            with events_path.open("a") as sink:
+            with _EventWriter(events_path) as sink:
+                setup_t0 = time.monotonic()
+                sink.write({"type": "lifecycle.setup.started", "phase": "workspace", "first_turn": first_turn})
+                self._prepare_workspace(ws)
+                sink.write({
+                    "type": "lifecycle.setup.completed",
+                    "phase": "workspace",
+                    "duration_ms": int((time.monotonic() - setup_t0) * 1000),
+                })
                 async for payload in self._stream_turn(
                     prompt,
                     run_id=run_id,
@@ -161,8 +244,7 @@ class ExecutorBackend(ABC):
                     workspace=ws,
                     first_turn=first_turn,
                 ):
-                    payload.setdefault("ts", datetime.now(timezone.utc).isoformat())
-                    sink.write(json.dumps(payload, default=str) + "\n")
+                    sink.write(payload)
 
                     kind = payload.get("type")
                     if kind == "thread.started":
@@ -176,6 +258,38 @@ class ExecutorBackend(ABC):
                         item = payload.get("item") or {}
                         if item.get("type") in ("agent_message", "agent-message"):
                             output = item.get("text") or output
+
+                if turn_failed:
+                    return ExecutorResult(
+                        status="failed",
+                        exit_reason="crash",
+                        thread_id=observed_thread_id,
+                        error=error,
+                        usage=usage,
+                    )
+
+                if self._budget_exhausted(sum_usage(prior_usage, usage)):
+                    # Turn completed but blew the per-run budget: suspend, keep
+                    # the partial diff as resume state, do not harvest. Checked
+                    # against the run's cumulative usage (prior turns + this
+                    # one) — a resumed run must not be able to sneak back under
+                    # a per-run cap just because a single resumed turn's own
+                    # usage looks small.
+                    return ExecutorResult(
+                        status="suspended",
+                        exit_reason="budget",
+                        thread_id=observed_thread_id,
+                        output=output,
+                        usage=usage,
+                    )
+
+                harvest_t0 = time.monotonic()
+                diff_path = await self._harvest_diff(ws)
+                sink.write({
+                    "type": "lifecycle.harvest.completed",
+                    "duration_ms": int((time.monotonic() - harvest_t0) * 1000),
+                    "diff_bytes": Path(diff_path).stat().st_size,
+                })
         except Exception as e:
             # Crash / API error: resumable. Partial workspace changes are
             # neither harvested nor discarded — they are resume state.
@@ -190,30 +304,6 @@ class ExecutorBackend(ABC):
                 usage=usage,
             )
 
-        if turn_failed:
-            return ExecutorResult(
-                status="failed",
-                exit_reason="crash",
-                thread_id=observed_thread_id,
-                error=error,
-                usage=usage,
-            )
-
-        if self._budget_exhausted(sum_usage(prior_usage, usage)):
-            # Turn completed but blew the per-run budget: suspend, keep the
-            # partial diff as resume state, do not harvest. Checked against
-            # the run's cumulative usage (prior turns + this one) — a resumed
-            # run must not be able to sneak back under a per-run cap just
-            # because a single resumed turn's own usage looks small.
-            return ExecutorResult(
-                status="suspended",
-                exit_reason="budget",
-                thread_id=observed_thread_id,
-                output=output,
-                usage=usage,
-            )
-
-        diff_path = await self._harvest_diff(ws)
         return ExecutorResult(
             status="succeeded",
             thread_id=observed_thread_id,
@@ -227,20 +317,39 @@ class ExecutorBackend(ABC):
     def _events_path(self, run_id: str) -> Path:
         return self.runs_root / f"{run_id}{_EVENTS_SUFFIX}"
 
-    def read_events(self, run_id: str, limit: int = 200) -> list[dict[str, Any]]:
+    def _parsed_events(self, run_id: str) -> list[dict[str, Any]]:
+        """All parseable events with an effective `seq` stamped — explicit for
+        envelope-era lines, line-number-derived for legacy pre-envelope files,
+        so replay/dedup by (run_id, seq) works across both."""
         path = self._events_path(run_id)
         if not path.exists():
             return []
         events = []
-        with path.open() as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        events.append(json.loads(line))
-                    except ValueError:
-                        continue
-        return events[-limit:]
+        for line_no, event in _iter_event_lines(path):
+            if event is None:
+                continue
+            event.setdefault("seq", _effective_seq(line_no, event))
+            events.append(event)
+        return events
+
+    def read_events(self, run_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        """Tail read (newest `limit` events, in order) — the original polling
+        contract, preserved."""
+        return self._parsed_events(run_id)[-limit:]
+
+    def read_events_page(self, run_id: str, *, after: int = 0, limit: int = 200) -> EventPage:
+        """Cursor read: up to `limit` events with seq > `after`, oldest first.
+        Feed `next_after` back as `after` to continue; a cursor past the end
+        returns an empty page with has_more=False. Reads are pure — replaying
+        the same cursor yields the same page, and a projector can rebuild its
+        projection from after=0 at any time."""
+        newer = [e for e in self._parsed_events(run_id) if e["seq"] > after]
+        page = newer[:limit]
+        return EventPage(
+            events=page,
+            next_after=page[-1]["seq"] if page else after,
+            has_more=len(newer) > limit,
+        )
 
     def latest_thread_id(self, run_id: str) -> str | None:
         """Recover the resume handle from the persisted event stream — used by
@@ -254,17 +363,9 @@ class ExecutorBackend(ABC):
         if not path.exists():
             return None
         thread_id: str | None = None
-        with path.open() as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except ValueError:
-                    continue
-                if event.get("type") == "thread.started" and event.get("thread_id"):
-                    thread_id = event["thread_id"]
+        for _line_no, event in _iter_event_lines(path):
+            if event is not None and event.get("type") == "thread.started" and event.get("thread_id"):
+                thread_id = event["thread_id"]
         return thread_id
 
     # ── Workspace + harvest ────────────────────────────────────────────────
