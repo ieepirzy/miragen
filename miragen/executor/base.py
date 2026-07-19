@@ -132,6 +132,46 @@ class EventPage:
     has_more: bool = False
 
 
+@dataclass
+class RepositoryCheckout:
+    """One repository to prepare in the run's workspace (issue #33 Phase D).
+
+    `clone_url` is the EPHEMERAL authorized binding — consumed during
+    preparation, redacted from any error, stripped from the clone's git
+    config, and never persisted. On resume the workspace already exists, so
+    checkouts are rebuilt from the run record with clone_url="" and
+    preparation only re-reads the recorded state."""
+
+    name: str
+    ref: str
+    mount_path: str
+    writable: bool = False
+    clone_url: str = ""
+
+
+def _sanitize_url(url: str) -> str:
+    """Strip userinfo (user:token@) from a URL so it never rests in a clone's
+    .git/config or appears in an error message."""
+    if "://" in url and "@" in url:
+        scheme, rest = url.split("://", 1)
+        if "@" in rest.split("/", 1)[0]:
+            rest = rest.split("@", 1)[1]
+        return f"{scheme}://{rest}"
+    return url
+
+
+def _redact(text: str, checkouts: "list[RepositoryCheckout] | None") -> str:
+    """Replace every binding URL (and its credentialed userinfo) in `text`
+    with a stable placeholder — git error output embeds remote URLs."""
+    for co in checkouts or []:
+        if co.clone_url:
+            text = text.replace(co.clone_url, f"<clone-url:{co.name}>")
+            sanitized = _sanitize_url(co.clone_url)
+            if sanitized != co.clone_url:
+                text = text.replace(sanitized, f"<clone-url:{co.name}>")
+    return text
+
+
 class ExecutorResult:
     """Terminal outcome of one executor turn bound to an agent-run."""
 
@@ -145,6 +185,7 @@ class ExecutorResult:
         error: str | None = None,
         usage: RunUsage | None = None,
         diff_path: str | None = None,
+        repositories: list[dict[str, Any]] | None = None,
     ):
         self.status = status
         self.exit_reason = exit_reason
@@ -153,6 +194,9 @@ class ExecutorResult:
         self.error = error
         self.usage = usage
         self.diff_path = diff_path
+        # Concrete prepared-repository state (name/ref/mount_path/writable/
+        # commit) — filled by workspace preparation, no credentials ever.
+        self.repositories = repositories
 
 
 class ExecutorBackend(ABC):
@@ -200,6 +244,7 @@ class ExecutorBackend(ABC):
         workspace: str | None = None,
         first_turn: bool = True,
         prior_usage: RunUsage | None = None,
+        repositories: list[RepositoryCheckout] | None = None,
     ) -> ExecutorResult:
         """Execute one turn of a job bound to an agent-run.
 
@@ -207,7 +252,9 @@ class ExecutorBackend(ABC):
         prepended. Resume: existing workspace + adapter-side thread resume.
         `prior_usage` is the run's accumulated usage from earlier turns —
         needed so a per-run budget check on resume sees the true total, not
-        just this turn's usage.
+        just this turn's usage. `repositories` is the run's checkout plan
+        (with ephemeral bindings on the first turn, binding-less on resume);
+        None keeps the classic single-baseline empty workspace.
         """
         ws = Path(workspace) if workspace else Path(self.spec.workspace_root) / run_id
 
@@ -222,16 +269,20 @@ class ExecutorBackend(ABC):
         error: str | None = None
         observed_thread_id: str | None = thread_id
         turn_failed = False
+        prepared: list[dict[str, Any]] | None = None
 
         try:
-            # Inside the try: a bad workspace_root, missing git, a permission
-            # error, or a failed harvest must still produce a 'failed' result
-            # (and thus a RunStore.finish() call) rather than an unhandled
-            # exception that leaves the run record stuck at 'running'.
+            # Inside the try: a bad workspace_root, missing git, a failed
+            # clone/fetch, a permission error, or a failed harvest must still
+            # produce a 'failed' result (and thus a RunStore.finish() call)
+            # rather than an unhandled exception that leaves the run record
+            # stuck at 'running'. Setup failures are resumable crashes:
+            # preparation is idempotent (already-prepared repositories are
+            # skipped), so a resumed turn re-runs it safely.
             with _EventWriter(events_path) as sink:
                 setup_t0 = time.monotonic()
                 sink.write({"type": "lifecycle.setup.started", "phase": "workspace", "first_turn": first_turn})
-                self._prepare_workspace(ws)
+                prepared = self._prepare_workspace(ws, repositories, sink=sink)
                 sink.write({
                     "type": "lifecycle.setup.completed",
                     "phase": "workspace",
@@ -266,6 +317,7 @@ class ExecutorBackend(ABC):
                         thread_id=observed_thread_id,
                         error=error,
                         usage=usage,
+                        repositories=prepared,
                     )
 
                 if self._budget_exhausted(sum_usage(prior_usage, usage)):
@@ -281,10 +333,11 @@ class ExecutorBackend(ABC):
                         thread_id=observed_thread_id,
                         output=output,
                         usage=usage,
+                        repositories=prepared,
                     )
 
                 harvest_t0 = time.monotonic()
-                diff_path = await self._harvest_diff(ws)
+                diff_path = await self._harvest_diff(ws, repositories)
                 sink.write({
                     "type": "lifecycle.harvest.completed",
                     "duration_ms": int((time.monotonic() - harvest_t0) * 1000),
@@ -293,15 +346,19 @@ class ExecutorBackend(ABC):
         except Exception as e:
             # Crash / API error: resumable. Partial workspace changes are
             # neither harvested nor discarded — they are resume state.
+            # Binding URLs (which may carry credentials) are redacted from the
+            # recorded error — git embeds remote URLs in its stderr.
             # (CancelledError is a BaseException and deliberately NOT caught:
             # the app-tier timeout owns that path.)
-            logger.error(f"[{self.profile.name}] executor crashed: {e}", exc_info=True)
+            message = _redact(str(e), repositories)
+            logger.error(f"[{self.profile.name}] executor crashed: {message}", exc_info=True)
             return ExecutorResult(
                 status="failed",
                 exit_reason="crash",
                 thread_id=observed_thread_id,
-                error=str(e),
+                error=message,
                 usage=usage,
+                repositories=prepared,
             )
 
         return ExecutorResult(
@@ -310,6 +367,7 @@ class ExecutorBackend(ABC):
             output=output,
             usage=usage,
             diff_path=diff_path,
+            repositories=prepared,
         )
 
     # ── Events ─────────────────────────────────────────────────────────────
@@ -370,34 +428,151 @@ class ExecutorBackend(ABC):
 
     # ── Workspace + harvest ────────────────────────────────────────────────
 
-    def _prepare_workspace(self, ws: Path) -> None:
-        ws.mkdir(parents=True, exist_ok=True)
-        if not (ws / ".git").exists():
-            # The diff IS the deliverable; a git baseline makes harvest exact.
-            # Tagged (not just left as a loose commit) so harvest can diff
-            # against it even after the executor makes its own commits —
-            # the tag lives in .git, so the executor's own `git add -A` /
-            # commits never touch or shadow it.
-            _git(ws, "init", "-q")
-            _git(ws, "add", "-A")
-            _git(ws, "-c", "user.email=miragen@local", "-c", "user.name=miragen",
-                 "commit", "-q", "--allow-empty", "-m", "miragen: workspace baseline")
-            _git(ws, "tag", "-f", _BASELINE_TAG)
+    def _prepare_workspace(
+        self,
+        ws: Path,
+        repositories: list[RepositoryCheckout] | None = None,
+        *,
+        sink: "_EventWriter | None" = None,
+    ) -> list[dict[str, Any]] | None:
+        """Prepare the run's workspace. Idempotent — safe to re-run on resume.
 
-    async def _harvest_diff(self, ws: Path) -> str:
+        Without a repository plan (the classic layout): the workspace root
+        itself becomes a git repo with the baseline tag.
+
+        With a plan: each repository is fetched into its mount path as its own
+        git repo; writable ones get the baseline tag; the workspace root stays
+        a plain directory (a root git repo would record the nested clones as
+        gitlinks and silently swallow their diffs). Returns the concrete
+        prepared state (name/ref/mount_path/writable/commit) — never bindings.
+        """
+        ws.mkdir(parents=True, exist_ok=True)
+        if not repositories:
+            if not (ws / ".git").exists():
+                # The diff IS the deliverable; a git baseline makes harvest
+                # exact. Tagged (not just left as a loose commit) so harvest
+                # can diff against it even after the executor makes its own
+                # commits — the tag lives in .git, so the executor's own
+                # `git add -A` / commits never touch or shadow it.
+                _git(ws, "init", "-q")
+                _git(ws, "add", "-A")
+                _git(ws, "-c", "user.email=miragen@local", "-c", "user.name=miragen",
+                     "commit", "-q", "--allow-empty", "-m", "miragen: workspace baseline")
+                _git(ws, "tag", "-f", _BASELINE_TAG)
+            return None
+
+        prepared: list[dict[str, Any]] = []
+        for co in repositories:
+            repo_t0 = time.monotonic()
+            try:
+                commit = self._prepare_repository(ws, co)
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(_redact(
+                    f"preparing repository '{co.name}' (ref {co.ref}) failed: "
+                    f"{(e.stderr or e.stdout or str(e)).strip()}",
+                    repositories,
+                )) from None
+            prepared.append({
+                "name": co.name,
+                "ref": co.ref,
+                "mount_path": co.mount_path,
+                "writable": co.writable,
+                "commit": commit,
+            })
+            if sink is not None:
+                sink.write({
+                    "type": "lifecycle.repo.prepared",
+                    "name": co.name,
+                    "ref": co.ref,
+                    "mount_path": co.mount_path,
+                    "writable": co.writable,
+                    "commit": commit,
+                    "duration_ms": int((time.monotonic() - repo_t0) * 1000),
+                })
+        return prepared
+
+    def _prepare_repository(self, ws: Path, co: RepositoryCheckout) -> str:
+        """Fetch one repository into its mount path and return the concrete
+        commit SHA. Credentials stay ephemeral: after checkout the remote URL
+        is rewritten without userinfo so nothing credentialed rests in
+        .git/config, and callers redact binding URLs from any failure."""
+        dest = ws / co.mount_path
+        if (dest / ".git").exists():
+            # Resume / retried setup: already prepared — report its state.
+            return _git(dest, "rev-parse", "HEAD").strip()
+        if not co.clone_url:
+            raise RuntimeError(
+                f"repository '{co.name}' is not prepared at '{co.mount_path}' and no "
+                "binding is available — bindings are ephemeral launch-time state and "
+                "cannot be re-minted by miragen (was the workspace discarded?)"
+            )
+        dest.mkdir(parents=True, exist_ok=True)
+        _git(dest, "init", "-q")
+        _git(dest, "remote", "add", "origin", co.clone_url)
+        try:
+            # Shallow fetch of exactly the requested ref (branch, tag, or SHA
+            # where the server allows it)...
+            _git(dest, "fetch", "-q", "--depth", "1", "origin", co.ref)
+            _git(dest, "checkout", "-q", "--detach", "FETCH_HEAD")
+        except subprocess.CalledProcessError:
+            try:
+                # ...then full-depth fetch of the same explicit ref...
+                _git(dest, "fetch", "-q", "origin", co.ref)
+                _git(dest, "checkout", "-q", "--detach", "FETCH_HEAD")
+            except subprocess.CalledProcessError:
+                # ...then an unqualified full fetch for refs no direct fetch
+                # can serve (e.g. an arbitrary reachable SHA the server won't
+                # advertise), which the checkout can then resolve locally.
+                _git(dest, "fetch", "-q", "origin")
+                _git(dest, "checkout", "-q", "--detach", co.ref)
+        # Ephemeral credentials: the binding URL must not rest in .git/config.
+        _git(dest, "remote", "set-url", "origin", _sanitize_url(co.clone_url))
+        commit = _git(dest, "rev-parse", "HEAD").strip()
+        if co.writable:
+            _git(dest, "tag", "-f", _BASELINE_TAG)
+        return commit
+
+    async def _harvest_diff(
+        self, ws: Path, repositories: list[RepositoryCheckout] | None = None
+    ) -> str:
         """git-diff harvest, exactly once, on terminal success (§293 decision 3).
 
         Diffs against the baseline tag, not HEAD: if the executor committed
         mid-turn, HEAD has moved past the baseline, and `git diff --cached`
         with no revision arg would only show the *uncommitted* remainder,
         silently dropping everything the executor already committed.
+
+        Multi-repo artifact contract: only WRITABLE repositories are
+        harvested (non-writable mounts are reference material — changes there
+        are deliberately not part of the deliverable). Each writable repo
+        yields `.miragen/diffs/<name>.patch` (apply with `git apply` inside
+        that repo); `.miragen/diff.patch` is a human-readable bundle of all
+        of them with `# === miragen repository: ...` section markers, and is
+        what diff_path / GET /runs/{id}/diff serve.
         """
-        _git(ws, "add", "-A")  # stage everything so new files appear in the diff
-        diff = _git(ws, "diff", "--cached", "--binary", _BASELINE_TAG)
         marker_dir = ws / ".miragen"
         marker_dir.mkdir(exist_ok=True)
         diff_path = marker_dir / _DIFF_NAME
-        diff_path.write_text(diff)
+
+        if not repositories:
+            _git(ws, "add", "-A")  # stage everything so new files appear in the diff
+            diff_path.write_text(_git(ws, "diff", "--cached", "--binary", _BASELINE_TAG))
+            return str(diff_path)
+
+        diffs_dir = marker_dir / "diffs"
+        diffs_dir.mkdir(exist_ok=True)
+        sections: list[str] = []
+        for co in repositories:
+            if not co.writable:
+                continue
+            repo_dir = ws / co.mount_path
+            _git(repo_dir, "add", "-A")
+            diff = _git(repo_dir, "diff", "--cached", "--binary", _BASELINE_TAG)
+            (diffs_dir / f"{co.name}.patch").write_text(diff)
+            sections.append(
+                f"# === miragen repository: {co.name} (mount: {co.mount_path}) ===\n{diff}"
+            )
+        diff_path.write_text("\n".join(sections))
         return str(diff_path)
 
     # ── Budget ─────────────────────────────────────────────────────────────

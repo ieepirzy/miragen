@@ -197,6 +197,14 @@ class EDFWorkspace(_EDFModel):
         for a, b in combinations(mounts, 2):
             if a.startswith(b + "/") or b.startswith(a + "/"):
                 raise ValueError(f"repository mountPaths overlap: '{a}' and '{b}'")
+        for mount in mounts:
+            # .miragen at the workspace root holds harvest output (diff.patch,
+            # per-repo diffs) — a repository mounted there would collide with it.
+            if mount == ".miragen" or mount.startswith(".miragen/"):
+                raise ValueError(
+                    f"mountPath '{mount}' is reserved: '.miragen' holds miragen's "
+                    "harvest output at the workspace root"
+                )
         return self
 
 
@@ -399,6 +407,23 @@ def canonical_sha256(document: Any) -> str:
 
 # ── Resolution ───────────────────────────────────────────────────────────────
 
+class RepositoryBinding(BaseModel):
+    """An authorized runtime binding for one opaque connectionRef: where to
+    actually fetch from, minted by the control plane just-in-time.
+
+    Ephemeral by contract: bindings are consumed during workspace preparation
+    and never persisted — not in profiles, snapshots, run records, or events —
+    and any credentialed URL is redacted from errors and stripped from the
+    clone's git config."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    clone_url: str = Field(
+        min_length=1,
+        description="Git URL or local path to fetch from; may carry a short-lived credential.",
+    )
+
+
 class ResolutionContext(BaseModel):
     """Caller-supplied resolution inputs. Deliberately narrow: opaque product
     references are NOT dereferenced here — miragen never calls provider APIs
@@ -410,6 +435,14 @@ class ResolutionContext(BaseModel):
         default=None,
         min_length=1,
         description="Executor task framing; DEFAULT_INSTRUCTIONS when omitted.",
+    )
+    repositories: dict[str, RepositoryBinding] = Field(
+        default_factory=dict,
+        description=(
+            "connectionRef → authorized runtime binding. Ignored by pure "
+            "resolution (bindings are launch-time state, never desired state, "
+            "never hashed); consumed by workspace preparation at launch."
+        ),
     )
 
 
@@ -555,11 +588,6 @@ def resolve_edf(
         )
         for repo in spec.workspace.repositories
     ]
-    if repository_plan:
-        warnings.append(
-            "repository checkout is not yet performed by miragen (issue #33 Phase D); "
-            "the repository plan is validated and recorded on the run snapshot"
-        )
     if spec.lifecycle.workspace_setup or spec.lifecycle.before_run or spec.lifecycle.after_run:
         warnings.append(
             "lifecycle phases are validated and recorded but not yet executed by miragen "

@@ -33,7 +33,7 @@ from miragen.edf import (
     build_run_snapshot,
     resolve_edf,
 )
-from miragen.executor import ExecutorBackend, ExecutorResult, build_executor
+from miragen.executor import ExecutorBackend, ExecutorResult, RepositoryCheckout, build_executor
 from miragen.executor.sink import build_sink
 from miragen.factory import build_agent, registered_handlers
 from miragen.load import load_profile
@@ -150,7 +150,12 @@ def _append_history_sidecar(run_id: str | None, message_count: int) -> None:
         logger.warning("Failed to append history sidecar entry")
 
 
-async def run_agent(prompt: str, use_history: bool = False, record: RunRecord | None = None) -> str:
+async def run_agent(
+    prompt: str,
+    use_history: bool = False,
+    record: RunRecord | None = None,
+    repositories: list[RepositoryCheckout] | None = None,
+) -> str:
     """
     Core agent execution. Called by cron/interval/startup and HTTP triggers.
 
@@ -160,10 +165,11 @@ async def run_agent(prompt: str, use_history: bool = False, record: RunRecord | 
 
     Executor-tier profiles dispatch to the executor backend instead of the
     pydantic-ai agent; `use_history` does not apply there (the executor thread
-    is the history).
+    is the history). `repositories` (executor tier only) is the launch-time
+    checkout plan carrying ephemeral bindings.
     """
     if _executor is not None:
-        return await _run_executor_turn(prompt, record)
+        return await _run_executor_turn(prompt, record, repositories=repositories)
 
     assert _agent is not None, "Agent not initialized"
 
@@ -205,6 +211,7 @@ async def _run_executor_turn(
     record: RunRecord | None,
     *,
     resume: bool = False,
+    repositories: list[RepositoryCheckout] | None = None,
 ) -> str:
     """One executor turn bound to an agent-run. Terminal-state bookkeeping:
     succeeded harvests the diff; suspended (budget) and failed (crash) keep
@@ -213,6 +220,21 @@ async def _run_executor_turn(
     assert _executor is not None
     run_id = record.run_id if record is not None else uuid.uuid4().hex
 
+    if repositories is None and record is not None and record.repositories:
+        # Resume (or a retried turn) of a multi-repo run: bindings are
+        # ephemeral and gone, but the workspace is already prepared —
+        # binding-less checkouts let preparation re-read recorded state and
+        # keep the multi-repo harvest semantics.
+        repositories = [
+            RepositoryCheckout(
+                name=r.name,
+                ref=r.ref,
+                mount_path=r.mount_path or r.name,
+                writable=r.writable,
+            )
+            for r in record.repositories
+        ]
+
     turn = _executor.run_job(
         prompt,
         run_id,
@@ -220,6 +242,7 @@ async def _run_executor_turn(
         workspace=record.workspace if record is not None else None,
         first_turn=not resume,
         prior_usage=record.usage if record is not None else None,
+        repositories=repositories,
     )
     timeout_s = _executor.spec.turn_timeout_s
     try:
@@ -240,6 +263,11 @@ async def _run_executor_turn(
 
     if record is not None and _run_store is not None:
         usage = sum_usage(record.usage, result.usage)
+        prepared_revisions = (
+            [RepositoryRevision(**entry) for entry in result.repositories]
+            if result.repositories
+            else None
+        )
         record = _run_store.finish(
             record,
             status=result.status,
@@ -251,7 +279,10 @@ async def _run_executor_turn(
             if record.workspace is None else record.workspace,
             exit_reason=result.exit_reason,
             diff_path=result.diff_path,
+            repositories=prepared_revisions,
         )
+        if prepared_revisions:
+            _record_snapshot_commits(record.run_id, prepared_revisions)
 
     if result.status == "succeeded" and _executor.spec.artifact_sink is not None:
         await _store_artifact(result, run_id, record)
@@ -264,6 +295,27 @@ async def _run_executor_turn(
             f"resume via POST /runs/{run_id}/resume"
         )
     return result.output or ""
+
+
+def _record_snapshot_commits(run_id: str, revisions: list[RepositoryRevision]) -> None:
+    """Fill the concrete commit SHAs into the run snapshot's repository plan
+    once workspace preparation has resolved the refs — this is the 'concrete
+    revisions used by one run' half of the snapshot contract. Best effort:
+    the run record already carries the same revisions authoritatively."""
+    if _run_store is None:
+        return
+    snapshot = _run_store.read_snapshot(run_id)
+    if snapshot is None:
+        return
+    commits = {r.name: r.commit for r in revisions}
+    changed = False
+    for entry in snapshot.get("repository_plan", []):
+        commit = commits.get(entry.get("name"))
+        if commit and entry.get("commit") != commit:
+            entry["commit"] = commit
+            changed = True
+    if changed:
+        _run_store.write_snapshot(run_id, snapshot)
 
 
 async def _store_artifact(result: "ExecutorResult", run_id: str, record: RunRecord | None) -> None:
@@ -757,8 +809,12 @@ async def abandon_run(run_id: str, discard_workspace: bool = False):
 
 
 @app.get("/runs/{run_id}/diff", dependencies=[_internal_auth])
-async def get_run_diff(run_id: str):
-    """The harvested diff — set exactly once, on terminal success."""
+async def get_run_diff(run_id: str, repository: Optional[str] = None):
+    """The harvested diff — set exactly once, on terminal success.
+
+    Multi-repo runs: without `repository`, the bundle (all writable repos with
+    section markers); with `?repository=<name>`, that repository's own
+    apply-able patch from .miragen/diffs/<name>.patch."""
     record = _get_executor_record(run_id)
     if record.diff_path is None:
         raise HTTPException(
@@ -766,6 +822,19 @@ async def get_run_diff(run_id: str):
             detail=f"run '{record.run_id}' has no harvested diff (status: {record.status})",
         )
     path = Path(record.diff_path)
+    if repository is not None:
+        known = {
+            r.name for r in (record.repositories or []) if r.writable
+        }
+        if repository not in known:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": f"no harvested per-repository diff for '{repository}'",
+                    "writable_repositories": sorted(known),
+                },
+            )
+        path = path.parent / "diffs" / f"{repository}.patch"
     if not path.exists():
         raise HTTPException(status_code=404, detail="diff file missing from workspace volume")
     from fastapi.responses import PlainTextResponse
@@ -940,6 +1009,38 @@ async def launch_executor_run(request: ExecutorLaunchRequest, response: Response
     elif request.expected_sha256 is not None:
         raise HTTPException(status_code=422, detail="expected_sha256 requires an edf to resolve")
 
+    checkouts: list[RepositoryCheckout] | None = None
+    if resolved is not None and resolved.repository_plan:
+        # Workspace preparation needs an authorized runtime binding for every
+        # opaque connectionRef. Refusing up front beats a mid-run clone
+        # failure — and bindings are ephemeral, so they must arrive with the
+        # launch. They are consumed here and never persisted.
+        bindings = request.context.repositories if request.context is not None else {}
+        missing = [
+            entry.connection_ref
+            for entry in resolved.repository_plan
+            if entry.connection_ref not in bindings
+        ]
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "missing repository bindings",
+                    "missing_connection_refs": sorted(set(missing)),
+                    "hint": "supply context.repositories[connectionRef].clone_url for each repository",
+                },
+            )
+        checkouts = [
+            RepositoryCheckout(
+                name=entry.name,
+                ref=entry.ref,
+                mount_path=entry.mount_path,
+                writable=entry.writable,
+                clone_url=bindings[entry.connection_ref].clone_url,
+            )
+            for entry in resolved.repository_plan
+        ]
+
     provenance = (request.provenance or RunProvenance()).model_copy(
         update={
             "idempotency_key": request.idempotency_key,
@@ -982,7 +1083,7 @@ async def launch_executor_run(request: ExecutorLaunchRequest, response: Response
 
     async def _background_run() -> None:
         try:
-            await run_agent(request.prompt, record=record)
+            await run_agent(request.prompt, record=record, repositories=checkouts)
         except Exception as e:
             # run_agent already wrote the failure to the record; this is just
             # so a launch exception never propagates into a bare task error.

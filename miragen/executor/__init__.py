@@ -8,13 +8,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from miragen.executor.base import ExecutorBackend, ExecutorResult
+from miragen.executor.base import ExecutorBackend, ExecutorResult, RepositoryCheckout
 from miragen.executor.codex import CodexExecutor
 from miragen.models import AgentProfile
 
 __all__ = [
     "ExecutorBackend",
     "ExecutorResult",
+    "RepositoryCheckout",
     "CodexExecutor",
     "build_executor",
 ]

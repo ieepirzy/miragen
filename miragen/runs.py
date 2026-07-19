@@ -100,6 +100,7 @@ class RunStore:
         workspace: str | None = None,
         exit_reason: str | None = None,
         diff_path: str | None = None,
+        repositories: list[RepositoryRevision] | None = None,
     ) -> RunRecord:
         finished_at = datetime.now(timezone.utc)
         updated = record.model_copy(update={
@@ -116,6 +117,7 @@ class RunStore:
             "workspace": workspace or record.workspace,
             "exit_reason": exit_reason,
             "diff_path": diff_path or record.diff_path,
+            "repositories": repositories or record.repositories,
         })
         self._write(updated)
         self._prune()

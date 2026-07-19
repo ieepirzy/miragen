@@ -205,7 +205,7 @@ async def test_workspace_prep_failure_is_resumable_crash(tmp_path):
     other crash — not an unhandled exception that skips RunStore.finish() and
     leaves the run record stuck at 'running'."""
     executor = make_executor(_executor_profile(), tmp_path)
-    executor._prepare_workspace = lambda ws: (_ for _ in ()).throw(OSError("permission denied"))
+    executor._prepare_workspace = lambda ws, *a, **kw: (_ for _ in ()).throw(OSError("permission denied"))
 
     result = await executor.run_job("try", "run-prep-fail")
     assert result.status == "failed"

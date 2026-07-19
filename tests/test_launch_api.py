@@ -95,11 +95,15 @@ async def test_resolve_reports_agent_incompatibility(executor_client):
 
 
 async def test_launch_persists_snapshot_and_provenance(executor_client):
-    resolved = (await executor_client.post("/profiles/resolve", json={"edf": default_dev_edf()})).json()
+    # Repository-less EDF: the provenance/snapshot flow needs no bindings.
+    # Repository launches (bindings, commits, per-repo diffs) are covered in
+    # tests/test_multi_repo.py.
+    edf = minimal_edf()
+    resolved = (await executor_client.post("/profiles/resolve", json={"edf": edf})).json()
     resp = await executor_client.post("/executor-runs", json={
         "prompt": "fix the flaky test",
         "idempotency_key": "mirarun:run-intent-001",
-        "edf": default_dev_edf(),
+        "edf": edf,
         "expected_sha256": resolved["sha256"],
         "provenance": {
             "environment_id": "env_42",
@@ -124,7 +128,6 @@ async def test_launch_persists_snapshot_and_provenance(executor_client):
     assert record.provenance.edf_api_version == "mirarun.io/v1alpha1"
     # extra="allow": product-side fields survive the round trip verbatim
     assert record.provenance.model_dump()["custom_product_field"] == "kept-verbatim"
-    assert [(r.name, r.commit) for r in record.repositories] == [("app", None), ("contracts", None)]
 
     # the immutable snapshot is retrievable and self-consistent
     resp = await executor_client.get(f"/runs/{body['run_id']}/snapshot")
