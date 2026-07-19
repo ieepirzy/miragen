@@ -70,8 +70,10 @@ RunStatus = Literal[
 ]
 
 # "launch" = POST /executor-runs: an idempotent, provenance-carrying launch
-# from an external control plane (issue #33 Phase B).
-RunTrigger = Literal["cron", "http", "http_async", "launch"]
+# from an external control plane (issue #33 Phase B). "managed" = a fire
+# from an API-owned schedule binding (Phase F), distinct from profile-driven
+# "cron" so projections can tell them apart.
+RunTrigger = Literal["cron", "http", "http_async", "launch", "managed"]
 
 
 class RunProvenance(BaseModel):

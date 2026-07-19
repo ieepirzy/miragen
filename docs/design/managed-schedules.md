@@ -1,7 +1,7 @@
 # Managed schedules and trigger provenance (issue #33 Phase F)
 
-**Status:** proposed — design only, no implementation yet
-**Depends on:** the Phase B provenance model (`RunProvenance`) and the Phase C event envelope, both on `main` once #37 merges.
+**Status:** implemented (`miragen/schedules.py`, `/schedules` API in `miragen/app.py`)
+**Depends on:** the Phase B provenance model (`RunProvenance`) and the Phase C event envelope.
 
 ## 1. Goal and constraints
 
@@ -88,9 +88,8 @@ same 409 semantics.
 ## 5. Firing semantics
 
 - A fire goes through the existing `run_agent_scheduled` path — same daily
-  budget skip, same suspension handling, same executor/model-tier dispatch.
-  **(Decision 3, recommended: yes, budget applies — a managed schedule is
-  not a budget bypass.)**
+  budget skip, same suspension handling, same `on_complete` dispatch, same
+  executor/model-tier dispatch (decisions 1 and 3 in §6).
 - The run record gets `trigger: "managed"` (new `RunTrigger` literal — not
   `"cron"`, so projections can tell profile-driven fires from control-plane
   bindings) and the binding's `provenance` + `metadata` merged onto
@@ -100,23 +99,22 @@ same 409 semantics.
   carries `(schedule_name, fired_at)`; the control plane deduplicates via
   run records/events as it already must for cron.
 
-## 6. Open decisions (flagged for the owner)
+## 6. Settled decisions (owner, 2026-07-19)
 
-1. **`on_complete` on managed fires — recommended: skip.** A control plane
-   that installed the binding is already observing runs; dispatching the
-   profile's `log_to`/`notify`/`post_to` as well double-reports every fire.
-   Counter-argument: an operator mixing hand-authored `on_complete` with
-   managed bindings might expect uniformity. If skip is accepted, the
-   behavior is documented on the binding API, not configurable per binding
-   (a `dispatch_on_complete` flag can be added later without breaking).
-2. **Interactive-mode agents — recommended: reject.** The profile rule
-   ("interactive agents cannot have cron triggers") exists because
-   self-activation contradicts the declared mode; a managed binding is still
+1. **`on_complete` on managed fires — DISPATCH AS USUAL.** Managed fires go
+   through the same `on_complete` dispatch as profile cron/interval fires,
+   so an operator mixing hand-authored hooks with managed bindings sees one
+   uniform behavior. A control plane that finds this double-reports can
+   leave the profile's `on_complete` unset; a per-binding
+   `dispatch_on_complete` flag can be added later without breaking.
+2. **Interactive-mode agents — REJECT.** The profile rule ("interactive
+   agents cannot have cron triggers") exists because self-activation
+   contradicts the declared mode; a managed binding is still
    self-activation. `PUT /schedules` on an interactive-mode agent → 409
    telling the caller to run the agent in hybrid mode. Managed bindings are
    allowed on autonomous and hybrid agents.
-3. **Daily budget — recommended: applies** (folded into §5). The
-   `on_exceeded: notify` path fires as today.
+3. **Daily budget — APPLIES** (folded into §5). The `on_exceeded: notify`
+   path fires as today.
 
 ## 7. Failure and restart semantics
 

@@ -444,6 +444,9 @@ Every agent container exposes:
 | `/runs/{run_id}/diff` | GET | Harvested diff (executor tier, 404 until success) |
 | `/runs/{run_id}/resume` | POST | Give a suspended/failed executor run another turn |
 | `/runs/{run_id}/abandon` | POST | Human-terminal state; `?discard_workspace=true` to drop the workspace |
+| `/schedules` | GET | List managed schedule bindings with versions and next fire times |
+| `/schedules/{name}` | PUT | Create/update a managed binding (compare-and-swap via `expected_version`) |
+| `/schedules/{name}` | DELETE | Remove a binding and unregister its job (optional `?expected_version=`) |
 
 **Request**
 ```json

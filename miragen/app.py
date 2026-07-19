@@ -57,6 +57,12 @@ from miragen.runs import (
     simplify_history_messages,
     tokens_used_since,
 )
+from miragen.schedules import (
+    BindingConflictError,
+    ScheduleBinding,
+    ScheduleSpec,
+    ScheduleStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +74,7 @@ _limits: UsageLimits | None = None
 _scheduler: AsyncIOScheduler = AsyncIOScheduler()
 _run_store: RunStore | None = None
 _executor: "ExecutorBackend | None" = None
+_schedule_store: ScheduleStore | None = None
 
 HISTORY_FILE = Path("/agent/history.json")
 HISTORY_SIDECAR = Path("/agent/history.runs.jsonl")
@@ -379,10 +386,20 @@ async def _notify_budget_exceeded(used: int, limit: int) -> None:
         await handler(_profile.name, message)
 
 
-async def run_agent_scheduled(prompt: str) -> None:
-    """Scheduler-triggered run (cron, interval, or startup). Handles on_complete side effects."""
+async def run_agent_scheduled(
+    prompt: str,
+    *,
+    trigger: str = "cron",
+    provenance: RunProvenance | None = None,
+    stamp: bool = True,
+) -> None:
+    """Scheduler-triggered run (cron, interval, startup, or a managed
+    binding). Handles on_complete side effects — for managed fires too, by
+    decision: uniform with profile fires. The daily budget applies to every
+    trigger source; `stamp=False` (managed fires) keeps completed prompts
+    verbatim."""
     assert _profile is not None
-    logger.info(f"[{_profile.name}] scheduled run triggered")
+    logger.info(f"[{_profile.name}] scheduled run triggered ({trigger})")
 
     budget = _daily_budget_status()
     if budget is not None and budget[0] >= budget[1]:
@@ -395,11 +412,11 @@ async def run_agent_scheduled(prompt: str) -> None:
                 logger.error(f"[{_profile.name}] budget-exceeded notify failed: {e}", exc_info=True)
         return
 
-    if _profile.inject_timestamp:
+    if stamp and _profile.inject_timestamp:
         prompt = _stamp_prompt(prompt)
 
     record = (
-        _run_store.start(agent_name=_profile.name, trigger="cron", prompt=prompt)
+        _run_store.start(agent_name=_profile.name, trigger=trigger, prompt=prompt, provenance=provenance)
         if _run_store is not None
         else None
     )
@@ -433,6 +450,87 @@ async def run_agent_scheduled(prompt: str) -> None:
 
 # Alias — kept so existing imports of `run_agent_cron` (e.g. in tests) don't break.
 run_agent_cron = run_agent_scheduled
+
+
+# ── Managed schedules (issue #33 Phase F) ────────────────────────────────────
+#
+# API-owned schedule bindings, reconciled by a control plane. Distinct
+# APScheduler job namespace (managed:<name>) so profile-trigger jobs can
+# never collide. Design record: docs/design/managed-schedules.md.
+
+
+def _managed_job_id(name: str) -> str:
+    return f"managed:{name}"
+
+
+def _apscheduler_trigger(spec: ScheduleSpec):
+    if spec.cron is not None:
+        # Managed cron is UTC by contract — timezone rendering is the
+        # control plane's problem, not a per-binding knob.
+        return CronTrigger.from_crontab(spec.cron, timezone=timezone.utc)
+    return APIntervalTrigger(seconds=spec.every_s)
+
+
+async def _run_managed_schedule(name: str) -> None:
+    """One fire of a managed binding. Reads the binding fresh so a
+    just-disabled or just-deleted binding never fires stale."""
+    if _schedule_store is None:
+        return
+    binding = _schedule_store.get(name)
+    if binding is None or not binding.enabled:
+        return
+    prov = binding.provenance.model_dump() if binding.provenance is not None else {}
+    prov["schedule_name"] = name
+    prov["fired_at"] = datetime.now(timezone.utc).isoformat()
+    if binding.metadata:
+        prov["schedule_metadata"] = dict(binding.metadata)
+    await run_agent_scheduled(
+        binding.prompt,
+        trigger="managed",
+        provenance=RunProvenance.model_validate(prov),
+        stamp=False,  # completed prompt, dispatched verbatim
+    )
+
+
+def _reconcile_managed_job(binding: ScheduleBinding) -> None:
+    """Make the scheduler match one binding: enabled → (re)registered job,
+    disabled → no job. Raises on scheduler failure (callers roll back)."""
+    if binding.enabled:
+        _scheduler.add_job(
+            _run_managed_schedule,
+            _apscheduler_trigger(binding.schedule),
+            args=[binding.name],
+            id=_managed_job_id(binding.name),
+            replace_existing=True,
+        )
+    else:
+        _drop_managed_job(binding.name)
+
+
+def _drop_managed_job(name: str) -> None:
+    if _scheduler.get_job(_managed_job_id(name)) is not None:
+        _scheduler.remove_job(_managed_job_id(name))
+
+
+def _register_managed_schedules() -> int:
+    """Startup reconciliation: register every enabled binding from disk.
+    Unparsable files were already skipped (loudly) by the store."""
+    if _schedule_store is None:
+        return 0
+    count = 0
+    for binding in _schedule_store.list():
+        try:
+            _reconcile_managed_job(binding)
+            count += binding.enabled
+        except Exception as e:
+            logger.error(f"failed to register managed schedule '{binding.name}': {e}", exc_info=True)
+    return count
+
+
+def _next_fire_at(name: str) -> str | None:
+    job = _scheduler.get_job(_managed_job_id(name))
+    next_run = getattr(job, "next_run_time", None) if job is not None else None
+    return next_run.isoformat() if next_run else None
 
 
 async def _handle_on_complete(output: str) -> None:
@@ -490,7 +588,7 @@ def _load_file_secrets() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _profile, _agent, _limits, _run_store, _executor
+    global _profile, _agent, _limits, _run_store, _executor, _schedule_store
 
     _load_file_secrets()
 
@@ -549,6 +647,11 @@ async def lifespan(app: FastAPI):
             )
             logger.info(f"Registered startup trigger: delay {trigger.delay_s}s")
             startup_i += 1
+
+    _schedule_store = ScheduleStore()
+    managed = _register_managed_schedules()
+    if managed:
+        logger.info(f"Registered {managed} managed schedule binding(s)")
 
     _scheduler.start()
     logger.info("Scheduler started")
@@ -620,6 +723,7 @@ CONTRACT_CAPABILITIES = [
     "executor-launch/v1",                # POST /executor-runs (idempotency + provenance)
     "run-snapshot/v1",                   # GET /runs/{id}/snapshot
     "events-cursor/v1",                  # GET /runs/{id}/events?after=
+    "managed-schedules/v1",              # GET/PUT/DELETE /schedules (CAS reconciliation)
 ]
 
 
@@ -1108,6 +1212,127 @@ async def launch_executor_run(request: ExecutorLaunchRequest, response: Response
         "snapshot_sha256": record.snapshot_sha256,
         "duplicate": False,
     }
+
+
+# ── Managed schedule reconciliation API (issue #33 Phase F) ──────────────────
+
+
+class ScheduleBindingRequest(BaseModel):
+    schedule: ScheduleSpec
+    prompt: str = Field(min_length=1)
+    enabled: bool = True
+    provenance: Optional[RunProvenance] = None
+    metadata: dict[str, str] = Field(default_factory=dict)
+    expected_version: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Omit to CREATE (409 if the binding exists); pass the last-read "
+        "version to UPDATE (409 on mismatch, carrying current state).",
+    )
+
+
+def _binding_response(binding: ScheduleBinding) -> dict:
+    body = binding.model_dump(mode="json")
+    body["next_fire_at"] = _next_fire_at(binding.name)
+    return body
+
+
+def _require_schedule_store() -> ScheduleStore:
+    if _schedule_store is None:
+        raise HTTPException(status_code=503, detail="Schedule store not ready")
+    return _schedule_store
+
+
+@app.get("/schedules", dependencies=[_internal_auth])
+async def list_schedules():
+    store = _require_schedule_store()
+    bindings = [_binding_response(b) for b in store.list()]
+    return {"count": len(bindings), "schedules": bindings}
+
+
+@app.get("/schedules/{name}", dependencies=[_internal_auth])
+async def get_schedule(name: str):
+    store = _require_schedule_store()
+    binding = store.get(name)
+    if binding is None:
+        raise HTTPException(status_code=404, detail=f"unknown schedule binding '{name}'")
+    return _binding_response(binding)
+
+
+@app.put("/schedules/{name}", dependencies=[_internal_auth])
+async def put_schedule(name: str, request: ScheduleBindingRequest, response: Response):
+    """Create (no expected_version) or update (compare-and-swap) one managed
+    schedule binding, then reconcile the scheduler job. File first, scheduler
+    second — a scheduler failure rolls the file back so the store never
+    claims a binding the scheduler doesn't hold."""
+    store = _require_schedule_store()
+    if _profile is not None and _profile.mode == "interactive":
+        # Same rule as profile triggers: a managed binding is still
+        # self-activation. Hybrid mode is the intended shape.
+        raise HTTPException(
+            status_code=409,
+            detail="interactive agents cannot have schedule bindings; run the agent in hybrid mode",
+        )
+
+    prior = store.get(name)
+    try:
+        binding = store.upsert(
+            name,
+            schedule=request.schedule,
+            prompt=request.prompt,
+            enabled=request.enabled,
+            provenance=request.provenance,
+            metadata=request.metadata,
+            expected_version=request.expected_version,
+        )
+    except BindingConflictError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": str(e),
+                "current": e.current.model_dump(mode="json") if e.current else None,
+            },
+        )
+    except ValueError as e:  # binding name pattern violations etc.
+        raise HTTPException(status_code=422, detail=str(e))
+
+    try:
+        _reconcile_managed_job(binding)
+    except Exception as e:
+        # roll the store back to what the scheduler still holds
+        if prior is not None:
+            store.save(prior)
+        else:
+            try:
+                store.delete(name)
+            except KeyError:
+                pass
+        logger.error(f"scheduler reconciliation failed for '{name}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"scheduler rejected the binding: {e}")
+
+    response.status_code = 200 if prior is not None else 201
+    return _binding_response(binding)
+
+
+@app.delete("/schedules/{name}", dependencies=[_internal_auth])
+async def delete_schedule(name: str, expected_version: Optional[int] = None):
+    """Remove a binding and unregister its job. In-flight runs it fired are
+    untouched — deletion only stops future firings."""
+    store = _require_schedule_store()
+    try:
+        removed = store.delete(name, expected_version=expected_version)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"unknown schedule binding '{name}'")
+    except BindingConflictError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": str(e),
+                "current": e.current.model_dump(mode="json") if e.current else None,
+            },
+        )
+    _drop_managed_job(name)
+    return {"deleted": removed.model_dump(mode="json")}
 
 
 @app.get("/history", response_model=HistoryResponse, dependencies=[_internal_auth])
