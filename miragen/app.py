@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -380,7 +381,8 @@ async def _handle_on_complete(output: str) -> None:
 
     if oc.post_to:
         async with httpx.AsyncClient() as client:
-            await client.post(str(oc.post_to), json={"output": output})
+            resp = await client.post(str(oc.post_to), json={"output": output})
+            resp.raise_for_status()
             logger.info(f"[{_profile.name}] posted output to {oc.post_to}")
 
 
@@ -529,7 +531,7 @@ def _require_internal_token(x_miragen_token: Optional[str] = Header(default=None
     a matching X-Miragen-Token header. Unset (the default) means no enforcement,
     keeping single-container deployments zero-config."""
     expected = os.environ.get("MIRAGEN_INTERNAL_TOKEN")
-    if expected and x_miragen_token != expected:
+    if expected and not hmac.compare_digest(x_miragen_token or "", expected):
         raise HTTPException(status_code=401, detail={"error": "unauthorized"})
 
 
