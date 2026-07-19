@@ -463,6 +463,27 @@ class TestHandleOnComplete:
 
         mock_http.__aenter__.return_value.post.assert_awaited_once()
 
+    async def test_post_to_raises_on_webhook_http_error(self):
+        """A 4xx/5xx from the webhook must surface, not be silently treated as success."""
+        import httpx
+
+        profile = _make_profile()
+        profile.__dict__["on_complete"] = OnComplete(post_to="https://example.com/hook")
+        app_module._profile = profile
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "500 error", request=MagicMock(), response=mock_response
+        )
+        mock_http = AsyncMock()
+        mock_http.__aenter__ = AsyncMock(return_value=MagicMock(post=AsyncMock(return_value=mock_response)))
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("miragen.app.registered_handlers", return_value={}), \
+             patch("miragen.app.httpx.AsyncClient", return_value=mock_http):
+            with pytest.raises(httpx.HTTPStatusError):
+                await _handle_on_complete("payload")
+
     async def test_unregistered_handler_skipped(self):
         profile = _make_profile()
         profile.__dict__["on_complete"] = OnComplete(log_to="unknown_handler")
