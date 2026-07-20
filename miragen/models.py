@@ -105,6 +105,72 @@ class RepositoryRevision(BaseModel):
     commit: Optional[str] = None
 
 
+# ── Structured interventions (issue #33 Phase G) ─────────────────────────────
+#
+# The executor-emitted question and the human's structured answer. Wire
+# models, lenient (extra="allow"): the question file is agent-authored and
+# the answer may carry product-side fields miragen stores verbatim.
+
+class InterventionOption(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: str = Field(min_length=1)
+    label: Optional[str] = None
+    description: Optional[str] = None
+
+
+class InterventionRequest(BaseModel):
+    """A structured question that suspended a run (exit_reason
+    'intervention'). `intervention_id`/`requested_at` are miragen-assigned;
+    everything else comes from the executor's .miragen/intervention.json."""
+
+    model_config = ConfigDict(extra="allow")
+
+    intervention_id: str
+    question: str = Field(min_length=1)
+    kind: Optional[str] = None  # e.g. 'architecture-decision', 'confirmation'
+    options: list[InterventionOption] = Field(default_factory=list)
+    evidence: Optional[str] = None
+    affected_repositories: Optional[list[str]] = None
+    requested_at: str  # ISO-8601 UTC
+
+
+class InterventionAnswer(BaseModel):
+    """The structured answer/resume payload, bound to the pending
+    intervention by id. `approval_ref` is the server-side authorization
+    hook: recorded immutably in the event stream, never inferred from
+    prompt text."""
+
+    model_config = ConfigDict(extra="allow")
+
+    intervention_id: str = Field(min_length=1)
+    decision: Optional[str] = Field(default=None, description="Chosen option id, when options were offered.")
+    text: Optional[str] = Field(default=None, description="Free-text answer/guidance.")
+    approval_ref: Optional[str] = None
+    answered_by: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_has_content(self) -> "InterventionAnswer":
+        if self.decision is None and self.text is None:
+            raise ValueError("an intervention answer requires at least one of `decision` or `text`")
+        return self
+
+
+class TargetOperationProvenance(BaseModel):
+    """Target-operation provenance an event MAY carry under its `target` key
+    (issue #33 Phases C/G). Defined now so the envelope contract is stable;
+    targets themselves are not required (or provisioned) in v1 — emitters
+    arrive with the target adapters."""
+
+    model_config = ConfigDict(extra="allow")
+
+    target_id: str = Field(min_length=1)
+    target_name: Optional[str] = None
+    operation_class: Literal["inspect", "read", "write", "destructive"]
+    credential_grant_ref: Optional[str] = None
+    approval_ref: Optional[str] = None
+
+
 class RunRecord(BaseModel):
     run_id: str  # uuid4 hex
     agent_name: str
@@ -151,6 +217,10 @@ class RunRecord(BaseModel):
     setup_s: Optional[float] = None
     tool_call_count: Optional[int] = None
     tool_call_failures: Optional[int] = None
+    # The structured question this run is suspended on (exit_reason
+    # 'intervention'), cleared when the run is resumed. History lives in the
+    # event stream (intervention.requested/answered/superseded).
+    pending_intervention: Optional[InterventionRequest] = None
 
 
 class RunSummary(BaseModel):

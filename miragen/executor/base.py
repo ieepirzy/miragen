@@ -43,13 +43,16 @@ import json
 import logging
 import subprocess
 import time
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
 
-from miragen.models import AgentProfile, ExecutorSpec, RunUsage, sum_usage
+from pydantic import ValidationError
+
+from miragen.models import AgentProfile, ExecutorSpec, InterventionRequest, RunUsage, sum_usage
 
 logger = logging.getLogger("miragen.executor")
 
@@ -189,6 +192,7 @@ class ExecutorResult:
         setup_s: float | None = None,
         tool_call_count: int | None = None,
         tool_call_failures: int | None = None,
+        intervention: dict[str, Any] | None = None,
     ):
         self.status = status
         self.exit_reason = exit_reason
@@ -205,6 +209,9 @@ class ExecutorResult:
         self.setup_s = setup_s
         self.tool_call_count = tool_call_count
         self.tool_call_failures = tool_call_failures
+        # Structured question that suspended this turn (exit_reason
+        # 'intervention') — the parsed, id-stamped InterventionRequest dump.
+        self.intervention = intervention
 
 
 class ExecutorBackend(ABC):
@@ -344,6 +351,25 @@ class ExecutorBackend(ABC):
                         tool_call_failures=tool_failures,
                     )
 
+                intervention = self._consume_intervention(ws, sink)
+                if intervention is not None:
+                    # A structured question beats harvest AND the budget
+                    # check this turn — the question must be recorded either
+                    # way, and the cumulative budget check guards the next
+                    # turn regardless. Partial work stays as resume state.
+                    return ExecutorResult(
+                        status="suspended",
+                        exit_reason="intervention",
+                        thread_id=observed_thread_id,
+                        output=output,
+                        usage=usage,
+                        repositories=prepared,
+                        setup_s=setup_s,
+                        tool_call_count=tool_calls,
+                        tool_call_failures=tool_failures,
+                        intervention=intervention,
+                    )
+
                 if self._budget_exhausted(sum_usage(prior_usage, usage)):
                     # Turn completed but blew the per-run budget: suspend, keep
                     # the partial diff as resume state, do not harvest. Checked
@@ -441,6 +467,16 @@ class ExecutorBackend(ABC):
             next_after=page[-1]["seq"] if page else after,
             has_more=len(newer) > limit,
         )
+
+    def append_event(self, run_id: str, payload: dict[str, Any]) -> None:
+        """Append one event to a run's durable stream from OUTSIDE a turn —
+        used by the app tier for intervention answered/superseded events.
+        Safe because a suspended/failed run has no writer holding the file;
+        the sequence continues from the last effective seq."""
+        path = self._events_path(run_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _EventWriter(path) as sink:
+            sink.write(payload)
 
     def latest_thread_id(self, run_id: str) -> str | None:
         """Recover the resume handle from the persisted event stream — used by
@@ -607,6 +643,48 @@ class ExecutorBackend(ABC):
             )
         diff_path.write_text("\n".join(sections))
         return str(diff_path)
+
+    # ── Structured interventions (issue #33 Phase G) ───────────────────────
+
+    _INTERVENTION_NAME = "intervention.json"
+
+    def _consume_intervention(self, ws: Path, sink: _EventWriter) -> dict[str, Any] | None:
+        """The v1 structured-question mechanism (executor-agnostic sentinel
+        file, per the settled ADR-009 decision): if the turn left a valid
+        `.miragen/intervention.json`, stamp an id + timestamp, archive the
+        file (so a resumed turn never re-triggers it), emit
+        `intervention.requested`, and return the parsed request.
+
+        A malformed file is NOT a prose-parsing fallback: it is set aside as
+        `intervention.invalid.json`, an `intervention.invalid` event records
+        why, and the turn proceeds normally — the schema is the contract.
+        """
+        marker_dir = ws / ".miragen"
+        path = marker_dir / self._INTERVENTION_NAME
+        if not path.exists():
+            return None
+        try:
+            raw = json.loads(path.read_text())
+            if not isinstance(raw, dict):
+                raise ValueError("intervention file must be a JSON object")
+            raw.pop("intervention_id", None)  # miragen-assigned, never agent-chosen
+            raw.pop("requested_at", None)
+            request = InterventionRequest.model_validate({
+                **raw,
+                "intervention_id": uuid.uuid4().hex,
+                "requested_at": datetime.now(timezone.utc).isoformat(),
+            })
+        except (ValueError, ValidationError) as e:
+            sink.write({"type": "intervention.invalid", "error": str(e)})
+            path.replace(marker_dir / "intervention.invalid.json")
+            return None
+
+        archive = marker_dir / "interventions"
+        archive.mkdir(exist_ok=True)
+        path.replace(archive / f"{request.intervention_id}.json")
+        payload = request.model_dump(mode="json")
+        sink.write({"type": "intervention.requested", **payload})
+        return payload
 
     # ── Budget ─────────────────────────────────────────────────────────────
 

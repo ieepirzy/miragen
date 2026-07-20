@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from miragen.models import (
+    InterventionRequest,
     RepositoryRevision,
     RunProvenance,
     RunRecord,
@@ -104,6 +105,7 @@ class RunStore:
         setup_s: float | None = None,
         tool_call_count: int | None = None,
         tool_call_failures: int | None = None,
+        pending_intervention: InterventionRequest | None = None,
     ) -> RunRecord:
         """Telemetry params (`setup_s`, tool-call counts) are the run's
         ACCUMULATED values — callers sum across turns before passing; None
@@ -132,6 +134,9 @@ class RunStore:
             "setup_s": setup_s if setup_s is not None else record.setup_s,
             "tool_call_count": tool_call_count if tool_call_count is not None else record.tool_call_count,
             "tool_call_failures": tool_call_failures if tool_call_failures is not None else record.tool_call_failures,
+            # set on suspension (exit_reason 'intervention'); cleared by reopen()
+            "pending_intervention": pending_intervention
+            if pending_intervention is not None else record.pending_intervention,
         })
         self._write(updated)
         self._prune()
@@ -163,6 +168,8 @@ class RunStore:
             "exit_reason": None,
             "resume_count": record.resume_count + 1,
             "blocked_s": blocked_s,
+            # answered or superseded either way — the event stream keeps history
+            "pending_intervention": None,
         })
         self._write(updated)
         return updated

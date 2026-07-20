@@ -43,10 +43,18 @@ RESOLVER_VERSION = "1"
 
 # ExecutorSpec.instructions is required; an EDF carries no instructions (the
 # task arrives as the launch prompt), so resolution supplies this unless the
-# caller passes its own via ResolutionContext.
+# caller passes its own via ResolutionContext. The second sentence is the
+# structured-intervention protocol (issue #33 Phase G): the sentinel file is
+# the mechanism, so the default instructions must teach it.
 DEFAULT_INSTRUCTIONS = (
     "You are an autonomous execution agent operating in a prepared workspace. "
-    "Complete the task described in the prompt."
+    "Complete the task described in the prompt. "
+    "If you reach a decision only a human operator can make, write a JSON object to "
+    ".miragen/intervention.json in the workspace root — "
+    '{"question": "...", "kind": "architecture-decision", '
+    '"options": [{"id": "a", "label": "..."}], "evidence": "..."} '
+    "(only \"question\" is required) — then end your turn; the run suspends until "
+    "a human answers, and the answer arrives in your next prompt."
 )
 
 # Versioned tool presets: expansion happens BEFORE hashing, so the canonical

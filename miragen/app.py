@@ -20,7 +20,7 @@ from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger as APIntervalTrigger
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
@@ -41,6 +41,8 @@ from miragen.models import (
     AgentProfile,
     ApprovalResponse,
     CronTrigger as ProfileCronTrigger,
+    InterventionAnswer,
+    InterventionRequest,
     IntervalTrigger as ProfileIntervalTrigger,
     RepositoryRevision,
     RunProvenance,
@@ -298,6 +300,8 @@ async def _run_executor_turn(
             setup_s=_accumulate(record.setup_s, result.setup_s),
             tool_call_count=_accumulate(record.tool_call_count, result.tool_call_count),
             tool_call_failures=_accumulate(record.tool_call_failures, result.tool_call_failures),
+            pending_intervention=InterventionRequest.model_validate(result.intervention)
+            if result.intervention is not None else None,
         )
         if prepared_revisions:
             _record_snapshot_commits(record.run_id, prepared_revisions)
@@ -724,6 +728,7 @@ CONTRACT_CAPABILITIES = [
     "run-snapshot/v1",                   # GET /runs/{id}/snapshot
     "events-cursor/v1",                  # GET /runs/{id}/events?after=
     "managed-schedules/v1",              # GET/PUT/DELETE /schedules (CAS reconciliation)
+    "interventions/v1",                  # structured question suspension + answered resume
 ]
 
 
@@ -855,7 +860,35 @@ async def get_run(run_id: str):
 # workspace-in / diff-and-events-out contract to the layers above.
 
 class ResumeRequest(BaseModel):
-    prompt: str
+    prompt: Optional[str] = Field(default=None, min_length=1)
+    answer: Optional[InterventionAnswer] = Field(
+        default=None,
+        description="Structured answer to the run's pending intervention; bound by "
+        "intervention_id. May accompany or replace `prompt`.",
+    )
+
+    @model_validator(mode="after")
+    def validate_has_input(self) -> "ResumeRequest":
+        if self.prompt is None and self.answer is None:
+            raise ValueError("resume requires `prompt`, `answer`, or both")
+        return self
+
+
+def _render_intervention_answer(pending: InterventionRequest, answer: InterventionAnswer) -> str:
+    """Deterministic rendering of a structured answer into the resume prompt
+    when the caller supplies no prompt of their own. Mechanical, not
+    templated — real prompt rendering stays in the control plane."""
+    lines = [f"Your question (intervention {answer.intervention_id}) has been answered."]
+    if answer.decision is not None:
+        label = next(
+            (opt.label for opt in pending.options if opt.id == answer.decision and opt.label),
+            None,
+        )
+        lines.append(f"Decision: {answer.decision}" + (f" ({label})" if label else ""))
+    if answer.text is not None:
+        lines.append(answer.text)
+    lines.append("Continue the task accordingly.")
+    return "\n".join(lines)
 
 
 def _get_executor_record(run_id: str) -> RunRecord:
@@ -878,7 +911,15 @@ def _get_executor_record(run_id: str) -> RunRecord:
 @app.post("/runs/{run_id}/resume", response_model=RunRecord, dependencies=[_internal_auth])
 async def resume_run(run_id: str, request: ResumeRequest):
     """Re-open the executor thread bound to a suspended/failed run and give it
-    another turn. The workspace (with any partial diff) is the resume state."""
+    another turn. The workspace (with any partial diff) is the resume state.
+
+    Structured interventions (issue #33 Phase G): a run suspended with
+    exit_reason 'intervention' carries `pending_intervention`; answering it
+    means passing `answer` bound to that intervention_id — recorded as an
+    `intervention.answered` event (with any approval_ref) before the turn
+    runs, so authorization evidence is durable API state, never prompt text.
+    A plain-prompt resume of such a run records `intervention.superseded`.
+    """
     record = _get_executor_record(run_id)
     if record.status not in ("suspended", "failed"):
         raise HTTPException(
@@ -892,9 +933,39 @@ async def resume_run(run_id: str, request: ResumeRequest):
         )
     _raise_if_daily_budget_exceeded()
 
+    pending = record.pending_intervention
+    if request.answer is not None:
+        if pending is None:
+            raise HTTPException(
+                status_code=409,
+                detail="run has no pending intervention to answer; resume with `prompt` instead",
+            )
+        if request.answer.intervention_id != pending.intervention_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": f"answer targets intervention '{request.answer.intervention_id}' "
+                    f"but the pending intervention is '{pending.intervention_id}'",
+                    "pending_intervention_id": pending.intervention_id,
+                },
+            )
+        _executor.append_event(record.run_id, {
+            "type": "intervention.answered",
+            "intervention_id": pending.intervention_id,
+            "answer": request.answer.model_dump(mode="json", exclude_none=True),
+        })
+        prompt = request.prompt or _render_intervention_answer(pending, request.answer)
+    else:
+        prompt = request.prompt
+        if pending is not None:
+            _executor.append_event(record.run_id, {
+                "type": "intervention.superseded",
+                "intervention_id": pending.intervention_id,
+            })
+
     record = _run_store.reopen(record)
     try:
-        await _run_executor_turn(request.prompt, record, resume=True)
+        await _run_executor_turn(prompt, record, resume=True)
     except RuntimeError:
         pass  # outcome (failed:crash) is already on the record; return it
     return _run_store.get(record.run_id)
