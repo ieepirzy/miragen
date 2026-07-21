@@ -187,6 +187,24 @@ async def test_delete_removes_binding_and_job(schedule_client):
     assert (await c.delete("/schedules/nightly")).status_code == 404
 
 
+async def test_interactive_mode_skips_startup_registration(tmp_path, monkeypatch):
+    """Startup reconciliation must honor the mode contract too: a stale
+    schedules volume on an interactive redeploy is left on disk but not run."""
+    scheduler = AsyncIOScheduler()
+    scheduler.start(paused=True)
+    monkeypatch.setattr(app_module, "_scheduler", scheduler)
+    app_module._profile = _interactive_profile()
+    store = ScheduleStore(root=tmp_path / "schedules")
+    store.upsert("nightly", schedule=ScheduleSpec(cron="0 3 * * *"), prompt="p")
+    app_module._schedule_store = store
+    try:
+        assert app_module._register_managed_schedules() == 0
+        assert scheduler.get_job("managed:nightly") is None
+        assert store.get("nightly") is not None  # left on disk, not deleted
+    finally:
+        scheduler.shutdown(wait=False)
+
+
 async def test_interactive_mode_rejected(schedule_client):
     c, _ = schedule_client
     app_module._profile = _interactive_profile()

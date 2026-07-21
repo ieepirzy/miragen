@@ -180,7 +180,9 @@ class EDFRepositorySource(_EDFModel):
 
 
 class EDFRepository(_EDFModel):
-    name: str = Field(min_length=1)
+    # Names are used as filesystem components for per-repo patch files, so
+    # they must be safe single components (no separators, no '.'/'..').
+    name: str = Field(min_length=1, pattern=r"^[a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?$")
     source: EDFRepositorySource
     ref: str = Field(min_length=1)
     mount_path: str

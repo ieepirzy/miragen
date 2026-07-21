@@ -173,6 +173,20 @@ async def test_duplicate_idempotency_key_returns_original_run(executor_client):
     assert len(app_module._run_store.list()) == 1  # no second record
 
 
+async def test_idempotency_key_ignores_non_launch_runs(executor_client):
+    """A non-launch run whose (verbatim) provenance echoes an idempotency key
+    must not shadow a real launch using that key."""
+    app_module._run_store.start(
+        agent_name="codex-worker", trigger="http", prompt="unrelated",
+        provenance=RunProvenance(idempotency_key="shared-key"),
+    )
+    resp = await executor_client.post("/executor-runs", json={
+        "prompt": "the real launch", "idempotency_key": "shared-key",
+    })
+    assert resp.status_code == 202
+    assert resp.json()["duplicate"] is False
+
+
 async def test_recovery_after_crash_between_acceptance_and_dispatch(executor_client):
     """The ambiguity-window contract: acceptance is durable before dispatch.
     If the process dies before the background task completes, the startup

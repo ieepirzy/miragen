@@ -521,6 +521,19 @@ def _register_managed_schedules() -> int:
     Unparsable files were already skipped (loudly) by the store."""
     if _schedule_store is None:
         return 0
+    if _profile is not None and _profile.mode == "interactive":
+        # The live PUT /schedules path rejects interactive agents, but a stale
+        # schedules volume could still carry bindings from a prior deployment.
+        # Honor the mode contract on startup too: an interactive agent must not
+        # self-activate. Bindings are left on disk (not deleted), just not run.
+        pending = [b.name for b in _schedule_store.list() if b.enabled]
+        if pending:
+            logger.warning(
+                f"[{_profile.name}] mode is interactive — not registering "
+                f"{len(pending)} managed schedule binding(s): {pending}. "
+                "Redeploy as hybrid to run them."
+            )
+        return 0
     count = 0
     for binding in _schedule_store.list():
         try:

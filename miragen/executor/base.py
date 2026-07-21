@@ -152,6 +152,12 @@ class RepositoryCheckout:
     clone_url: str = ""
 
 
+def _is_safe_component(name: str) -> bool:
+    """A single, non-traversing path component — used as a filename for a
+    repository's per-repo patch. Rejects separators and '.'/'..'."""
+    return bool(name) and name not in (".", "..") and "/" not in name and "\\" not in name
+
+
 def _sanitize_url(url: str) -> str:
     """Strip userinfo (user:token@) from a URL so it never rests in a clone's
     .git/config or appears in an error message."""
@@ -524,6 +530,18 @@ class ExecutorBackend(ABC):
                 # commits — the tag lives in .git, so the executor's own
                 # `git add -A` / commits never touch or shadow it.
                 _git(ws, "init", "-q")
+                # miragen's own control metadata (harvested diff, intervention
+                # archive, malformed sentinels) lives under .miragen/. Exclude
+                # it from the repo so a `git add -A` at harvest never stages it
+                # into the user patch — otherwise a resumed run, or a
+                # malformed-intervention run that later succeeds, would leak
+                # that metadata into diff.patch and any artifact sink. Uses
+                # .git/info/exclude (untracked) so the rule itself never shows
+                # in the diff either.
+                exclude = ws / ".git" / "info" / "exclude"
+                exclude.parent.mkdir(parents=True, exist_ok=True)
+                with exclude.open("a") as f:
+                    f.write("\n# miragen control metadata — never part of the harvest\n.miragen/\n")
                 _git(ws, "add", "-A")
                 _git(ws, "-c", "user.email=miragen@local", "-c", "user.name=miragen",
                      "commit", "-q", "--allow-empty", "-m", "miragen: workspace baseline")
@@ -532,6 +550,11 @@ class ExecutorBackend(ABC):
 
         prepared: list[dict[str, Any]] = []
         for co in repositories:
+            if not _is_safe_component(co.name):
+                raise RuntimeError(
+                    f"unsafe repository name '{co.name}': must be a single path "
+                    "component (no '/', '\\', '.' or '..') — it names the per-repo patch file"
+                )
             repo_t0 = time.monotonic()
             try:
                 commit = self._prepare_repository(ws, co)
@@ -579,23 +602,27 @@ class ExecutorBackend(ABC):
         _git(dest, "init", "-q")
         _git(dest, "remote", "add", "origin", co.clone_url)
         try:
-            # Shallow fetch of exactly the requested ref (branch, tag, or SHA
-            # where the server allows it)...
-            _git(dest, "fetch", "-q", "--depth", "1", "origin", co.ref)
-            _git(dest, "checkout", "-q", "--detach", "FETCH_HEAD")
-        except subprocess.CalledProcessError:
             try:
-                # ...then full-depth fetch of the same explicit ref...
-                _git(dest, "fetch", "-q", "origin", co.ref)
+                # Shallow fetch of exactly the requested ref (branch, tag, or
+                # SHA where the server allows it)...
+                _git(dest, "fetch", "-q", "--depth", "1", "origin", co.ref)
                 _git(dest, "checkout", "-q", "--detach", "FETCH_HEAD")
             except subprocess.CalledProcessError:
-                # ...then an unqualified full fetch for refs no direct fetch
-                # can serve (e.g. an arbitrary reachable SHA the server won't
-                # advertise), which the checkout can then resolve locally.
-                _git(dest, "fetch", "-q", "origin")
-                _git(dest, "checkout", "-q", "--detach", co.ref)
-        # Ephemeral credentials: the binding URL must not rest in .git/config.
-        _git(dest, "remote", "set-url", "origin", _sanitize_url(co.clone_url))
+                try:
+                    # ...then full-depth fetch of the same explicit ref...
+                    _git(dest, "fetch", "-q", "origin", co.ref)
+                    _git(dest, "checkout", "-q", "--detach", "FETCH_HEAD")
+                except subprocess.CalledProcessError:
+                    # ...then an unqualified full fetch for refs no direct
+                    # fetch can serve (e.g. an arbitrary reachable SHA the
+                    # server won't advertise), resolved locally by checkout.
+                    _git(dest, "fetch", "-q", "origin")
+                    _git(dest, "checkout", "-q", "--detach", co.ref)
+        finally:
+            # Ephemeral credentials: the binding URL must never rest in
+            # .git/config — scrub it even when a fetch/checkout attempt fails,
+            # since failed-run workspaces are kept for resume/forensics.
+            _git(dest, "remote", "set-url", "origin", _sanitize_url(co.clone_url))
         commit = _git(dest, "rev-parse", "HEAD").strip()
         if co.writable:
             _git(dest, "tag", "-f", _BASELINE_TAG)

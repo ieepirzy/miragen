@@ -199,6 +199,24 @@ async def test_harvest_diff_includes_executors_own_mid_turn_commit(tmp_path):
     assert "uncommitted.py" in diff
 
 
+async def test_miragen_metadata_excluded_from_classic_diff(tmp_path):
+    """P2 regression: internal .miragen files (harvest output, intervention
+    archive, malformed sentinels left by a prior turn) must never leak into
+    the classic-workspace diff on a later successful harvest."""
+    executor = make_executor(_executor_profile(), tmp_path)
+    ws = Path(executor.spec.workspace_root) / "run-hygiene"
+    executor._prepare_workspace(ws)
+    (ws / "real.py").write_text("print('work')\n")
+    # leftover control metadata from a prior (suspended/intervention) turn
+    (ws / ".miragen" / "interventions").mkdir(parents=True, exist_ok=True)
+    (ws / ".miragen" / "interventions" / "abc.json").write_text('{"question": "?"}')
+    (ws / ".miragen" / "intervention.invalid.json").write_text("garbage")
+
+    diff = Path(await executor._harvest_diff(ws)).read_text()
+    assert "real.py" in diff
+    assert ".miragen" not in diff and "intervention" not in diff
+
+
 async def test_workspace_prep_failure_is_resumable_crash(tmp_path):
     """Regression: a workspace-prep failure (bad workspace_root, missing git,
     permission error) must surface as a 'failed' ExecutorResult — same as any

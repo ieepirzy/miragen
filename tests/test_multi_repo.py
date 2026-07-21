@@ -156,6 +156,48 @@ async def test_clone_failure_redacts_credentialed_binding_url(tmp_path):
     assert secret_url not in events_text
 
 
+async def test_clone_failure_scrubs_credential_from_git_config(tmp_path):
+    """P1 regression: a failed fetch must not leave the token-bearing binding
+    URL in the kept (resumable) workspace's .git/config."""
+    executor = make_executor(_executor_profile(), tmp_path)
+    creds_url = "https://x-token:s3cr3t@localhost:1/nope.git"  # refused → fetch fails
+    checkouts = [
+        RepositoryCheckout(
+            name="app", ref="refs/heads/main", mount_path="app",
+            writable=True, clone_url=creds_url,
+        ),
+    ]
+    result = await executor.run_job("go", "mr-failscrub", repositories=checkouts)
+    assert result.status == "failed"
+    config = (
+        Path(executor.spec.workspace_root) / "mr-failscrub" / "app" / ".git" / "config"
+    ).read_text()
+    assert "s3cr3t" not in config and "@" not in config
+
+
+def test_unsafe_repository_name_rejected_by_edf():
+    edf = minimal_edf()
+    edf["spec"]["workspace"]["repositories"] = [{
+        "name": "owner/repo",  # a '/' would escape the .miragen/diffs dir
+        "source": {"provider": "github", "connectionRef": "c1"},
+        "ref": "refs/heads/main", "mountPath": "app",
+    }]
+    with pytest.raises(EDFValidationError):
+        validate_edf(edf)
+
+
+async def test_unsafe_repository_name_rejected_at_prepare(tmp_path):
+    """Defense in depth below the EDF layer: a RepositoryCheckout with an
+    unsafe name fails at setup, not mid-harvest."""
+    executor = make_executor(_executor_profile(), tmp_path)
+    checkouts = [
+        RepositoryCheckout(name="../escape", ref="r", mount_path="app", writable=True, clone_url="x"),
+    ]
+    result = await executor.run_job("go", "mr-badname", repositories=checkouts)
+    assert result.status == "failed"
+    assert "unsafe repository name" in result.error
+
+
 def test_sanitize_url_strips_userinfo():
     assert _sanitize_url("https://x-token:s3cret@github.com/a/b.git") == "https://github.com/a/b.git"
     assert _sanitize_url("https://github.com/a/b.git") == "https://github.com/a/b.git"

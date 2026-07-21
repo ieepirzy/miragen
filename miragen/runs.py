@@ -84,6 +84,12 @@ class RunStore:
             record = _read_record(path)
             if record is None or record.provenance is None:
                 continue
+            # Only launch runs own the idempotency namespace. Managed-schedule
+            # (and other) provenance is stored verbatim and may echo a key it
+            # doesn't own; matching those would let an unrelated run shadow a
+            # real launch and make it return duplicate:true without dispatching.
+            if record.trigger != "launch":
+                continue
             if record.provenance.idempotency_key == key:
                 return record
         return None
