@@ -349,7 +349,8 @@ async def test_spawn_success_harvests_diff_and_keeps_stdout(tmp_path):
     assert "produced.txt" in Path(result.diff_path).read_text()
 
     kinds = [e["type"] for e in executor.read_events("sp-run1")]
-    assert "item.completed" in kinds and kinds[-1] == "turn.completed"
+    assert "item.completed" in kinds and "turn.completed" in kinds
+    assert kinds[-1] == "lifecycle.harvest.completed"
 
 
 async def test_spawn_nonzero_exit_is_resumable_crash(tmp_path):

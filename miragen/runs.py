@@ -8,7 +8,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from miragen.models import RunRecord, RunSummary, RunUsage, ToolCallRecord
+from miragen.models import (
+    InterventionRequest,
+    RepositoryRevision,
+    RunProvenance,
+    RunRecord,
+    RunSummary,
+    RunUsage,
+    ToolCallRecord,
+)
 
 _PROMPT_MAX = 20_000
 _OUTPUT_MAX = 100_000
@@ -36,7 +44,19 @@ class RunStore:
         self.root = Path(root)
         self.retention = retention
 
-    def start(self, *, agent_name: str, trigger: str, prompt: str, use_history: bool = False) -> RunRecord:
+    def start(
+        self,
+        *,
+        agent_name: str,
+        trigger: str,
+        prompt: str,
+        use_history: bool = False,
+        executor: str | None = None,
+        model: str | None = None,
+        snapshot_sha256: str | None = None,
+        provenance: RunProvenance | None = None,
+        repositories: list[RepositoryRevision] | None = None,
+    ) -> RunRecord:
         record = RunRecord(
             run_id=_new_run_id(),
             agent_name=agent_name,
@@ -45,9 +65,34 @@ class RunStore:
             prompt=prompt[:_PROMPT_MAX],
             started_at=datetime.now(timezone.utc),
             use_history=use_history,
+            executor=executor,
+            model=model,
+            snapshot_sha256=snapshot_sha256,
+            provenance=provenance,
+            repositories=repositories,
         )
         self._write(record)
         return record
+
+    def find_by_idempotency_key(self, key: str) -> RunRecord | None:
+        """Newest run whose provenance carries `key`. This is the launch
+        dedupe lookup: POST /executor-runs persists the key inside provenance
+        before acknowledging, so a retried launch (including one retried after
+        an ambiguous response or a process crash) recovers the original run
+        instead of launching twice."""
+        for path in sorted(self._existing_files(), reverse=True):
+            record = _read_record(path)
+            if record is None or record.provenance is None:
+                continue
+            # Only launch runs own the idempotency namespace. Managed-schedule
+            # (and other) provenance is stored verbatim and may echo a key it
+            # doesn't own; matching those would let an unrelated run shadow a
+            # real launch and make it return duplicate:true without dispatching.
+            if record.trigger != "launch":
+                continue
+            if record.provenance.idempotency_key == key:
+                return record
+        return None
 
     def finish(
         self,
@@ -62,14 +107,27 @@ class RunStore:
         workspace: str | None = None,
         exit_reason: str | None = None,
         diff_path: str | None = None,
+        repositories: list[RepositoryRevision] | None = None,
+        setup_s: float | None = None,
+        tool_call_count: int | None = None,
+        tool_call_failures: int | None = None,
+        pending_intervention: InterventionRequest | None = None,
     ) -> RunRecord:
+        """Telemetry params (`setup_s`, tool-call counts) are the run's
+        ACCUMULATED values — callers sum across turns before passing; None
+        keeps whatever the record already carries (an executor that can't
+        report a metric never zeroes it)."""
         finished_at = datetime.now(timezone.utc)
+        duration_s = (finished_at - record.started_at).total_seconds()
         updated = record.model_copy(update={
             "status": status,
             "output": output[:_OUTPUT_MAX] if output is not None else None,
             "error": error,
             "finished_at": finished_at,
-            "duration_s": (finished_at - record.started_at).total_seconds(),
+            "duration_s": duration_s,
+            # active = wall clock minus time spent suspended awaiting a human
+            # (blocked_s accumulates in reopen()).
+            "active_s": duration_s - (record.blocked_s or 0),
             "usage": usage,
             "tool_calls": list(tool_calls),
             # Executor-tier handles: never clear an already-recorded value —
@@ -78,6 +136,13 @@ class RunStore:
             "workspace": workspace or record.workspace,
             "exit_reason": exit_reason,
             "diff_path": diff_path or record.diff_path,
+            "repositories": repositories or record.repositories,
+            "setup_s": setup_s if setup_s is not None else record.setup_s,
+            "tool_call_count": tool_call_count if tool_call_count is not None else record.tool_call_count,
+            "tool_call_failures": tool_call_failures if tool_call_failures is not None else record.tool_call_failures,
+            # set on suspension (exit_reason 'intervention'); cleared by reopen()
+            "pending_intervention": pending_intervention
+            if pending_intervention is not None else record.pending_intervention,
         })
         self._write(updated)
         self._prune()
@@ -92,13 +157,25 @@ class RunStore:
 
     def reopen(self, record: RunRecord) -> RunRecord:
         """Executor resume: transition a suspended/failed run back to running,
-        preserving its thread/workspace bindings and accumulated usage."""
+        preserving its thread/workspace bindings and accumulated usage.
+        Telemetry: counts the resume and accumulates the blocked interval —
+        the time this run sat suspended/failed awaiting a human decision."""
+        blocked_s = record.blocked_s
+        if record.finished_at is not None:
+            blocked_s = (blocked_s or 0) + (
+                datetime.now(timezone.utc) - record.finished_at
+            ).total_seconds()
         updated = record.model_copy(update={
             "status": "running",
             "finished_at": None,
             "duration_s": None,
+            "active_s": None,
             "error": None,
             "exit_reason": None,
+            "resume_count": record.resume_count + 1,
+            "blocked_s": blocked_s,
+            # answered or superseded either way — the event stream keeps history
+            "pending_intervention": None,
         })
         self._write(updated)
         return updated
@@ -144,6 +221,31 @@ class RunStore:
                 self._write(updated)
                 count += 1
         return count
+
+    # ── Run snapshots ─────────────────────────────────────────────────────────
+    #
+    # The immutable resolved EDF snapshot for a launched run (issue #33 Phase
+    # A). Stored under a subdirectory so the `*.json` run-record glob (and its
+    # retention prune) never sees snapshot files. Like events.jsonl, snapshots
+    # are not pruned with run records — they are cheap and provenance-bearing.
+
+    def write_snapshot(self, run_id: str, snapshot: dict) -> Path:
+        snapshot_dir = self.root / "snapshots"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        path = snapshot_dir / f"{run_id}.json"
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(snapshot))
+        os.replace(tmp, path)
+        return path
+
+    def read_snapshot(self, run_id: str) -> dict | None:
+        path = self.root / "snapshots" / f"{run_id}.json"
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
 
     # ── Internals ─────────────────────────────────────────────────────────────
 

@@ -18,15 +18,22 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger as APIntervalTrigger
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
 
 from miragen.broker import PendingApproval, get_broker
-from miragen.executor import ExecutorBackend, ExecutorResult, build_executor
+from miragen.edf import (
+    EDFValidationError,
+    ResolutionContext,
+    ResolvedEDF,
+    build_run_snapshot,
+    resolve_edf,
+)
+from miragen.executor import ExecutorBackend, ExecutorResult, RepositoryCheckout, build_executor
 from miragen.executor.sink import build_sink
 from miragen.factory import build_agent, registered_handlers
 from miragen.load import load_profile
@@ -34,7 +41,11 @@ from miragen.models import (
     AgentProfile,
     ApprovalResponse,
     CronTrigger as ProfileCronTrigger,
+    InterventionAnswer,
+    InterventionRequest,
     IntervalTrigger as ProfileIntervalTrigger,
+    RepositoryRevision,
+    RunProvenance,
     RunRecord,
     RunSummary,
     StartupTrigger as ProfileStartupTrigger,
@@ -48,6 +59,12 @@ from miragen.runs import (
     simplify_history_messages,
     tokens_used_since,
 )
+from miragen.schedules import (
+    BindingConflictError,
+    ScheduleBinding,
+    ScheduleSpec,
+    ScheduleStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +76,7 @@ _limits: UsageLimits | None = None
 _scheduler: AsyncIOScheduler = AsyncIOScheduler()
 _run_store: RunStore | None = None
 _executor: "ExecutorBackend | None" = None
+_schedule_store: ScheduleStore | None = None
 
 HISTORY_FILE = Path("/agent/history.json")
 HISTORY_SIDECAR = Path("/agent/history.runs.jsonl")
@@ -141,7 +159,12 @@ def _append_history_sidecar(run_id: str | None, message_count: int) -> None:
         logger.warning("Failed to append history sidecar entry")
 
 
-async def run_agent(prompt: str, use_history: bool = False, record: RunRecord | None = None) -> str:
+async def run_agent(
+    prompt: str,
+    use_history: bool = False,
+    record: RunRecord | None = None,
+    repositories: list[RepositoryCheckout] | None = None,
+) -> str:
     """
     Core agent execution. Called by cron/interval/startup and HTTP triggers.
 
@@ -151,10 +174,11 @@ async def run_agent(prompt: str, use_history: bool = False, record: RunRecord | 
 
     Executor-tier profiles dispatch to the executor backend instead of the
     pydantic-ai agent; `use_history` does not apply there (the executor thread
-    is the history).
+    is the history). `repositories` (executor tier only) is the launch-time
+    checkout plan carrying ephemeral bindings.
     """
     if _executor is not None:
-        return await _run_executor_turn(prompt, record)
+        return await _run_executor_turn(prompt, record, repositories=repositories)
 
     assert _agent is not None, "Agent not initialized"
 
@@ -196,6 +220,7 @@ async def _run_executor_turn(
     record: RunRecord | None,
     *,
     resume: bool = False,
+    repositories: list[RepositoryCheckout] | None = None,
 ) -> str:
     """One executor turn bound to an agent-run. Terminal-state bookkeeping:
     succeeded harvests the diff; suspended (budget) and failed (crash) keep
@@ -204,6 +229,21 @@ async def _run_executor_turn(
     assert _executor is not None
     run_id = record.run_id if record is not None else uuid.uuid4().hex
 
+    if repositories is None and record is not None and record.repositories:
+        # Resume (or a retried turn) of a multi-repo run: bindings are
+        # ephemeral and gone, but the workspace is already prepared —
+        # binding-less checkouts let preparation re-read recorded state and
+        # keep the multi-repo harvest semantics.
+        repositories = [
+            RepositoryCheckout(
+                name=r.name,
+                ref=r.ref,
+                mount_path=r.mount_path or r.name,
+                writable=r.writable,
+            )
+            for r in record.repositories
+        ]
+
     turn = _executor.run_job(
         prompt,
         run_id,
@@ -211,6 +251,7 @@ async def _run_executor_turn(
         workspace=record.workspace if record is not None else None,
         first_turn=not resume,
         prior_usage=record.usage if record is not None else None,
+        repositories=repositories,
     )
     timeout_s = _executor.spec.turn_timeout_s
     try:
@@ -231,6 +272,19 @@ async def _run_executor_turn(
 
     if record is not None and _run_store is not None:
         usage = sum_usage(record.usage, result.usage)
+        prepared_revisions = (
+            [RepositoryRevision(**entry) for entry in result.repositories]
+            if result.repositories
+            else None
+        )
+
+        def _accumulate(prior, this_turn):
+            # None + None stays None (metric not reportable); any reported
+            # value starts/extends the accumulated total.
+            if this_turn is None:
+                return prior
+            return (prior or 0) + this_turn
+
         record = _run_store.finish(
             record,
             status=result.status,
@@ -242,7 +296,15 @@ async def _run_executor_turn(
             if record.workspace is None else record.workspace,
             exit_reason=result.exit_reason,
             diff_path=result.diff_path,
+            repositories=prepared_revisions,
+            setup_s=_accumulate(record.setup_s, result.setup_s),
+            tool_call_count=_accumulate(record.tool_call_count, result.tool_call_count),
+            tool_call_failures=_accumulate(record.tool_call_failures, result.tool_call_failures),
+            pending_intervention=InterventionRequest.model_validate(result.intervention)
+            if result.intervention is not None else None,
         )
+        if prepared_revisions:
+            _record_snapshot_commits(record.run_id, prepared_revisions)
 
     if result.status == "succeeded" and _executor.spec.artifact_sink is not None:
         await _store_artifact(result, run_id, record)
@@ -255,6 +317,27 @@ async def _run_executor_turn(
             f"resume via POST /runs/{run_id}/resume"
         )
     return result.output or ""
+
+
+def _record_snapshot_commits(run_id: str, revisions: list[RepositoryRevision]) -> None:
+    """Fill the concrete commit SHAs into the run snapshot's repository plan
+    once workspace preparation has resolved the refs — this is the 'concrete
+    revisions used by one run' half of the snapshot contract. Best effort:
+    the run record already carries the same revisions authoritatively."""
+    if _run_store is None:
+        return
+    snapshot = _run_store.read_snapshot(run_id)
+    if snapshot is None:
+        return
+    commits = {r.name: r.commit for r in revisions}
+    changed = False
+    for entry in snapshot.get("repository_plan", []):
+        commit = commits.get(entry.get("name"))
+        if commit and entry.get("commit") != commit:
+            entry["commit"] = commit
+            changed = True
+    if changed:
+        _run_store.write_snapshot(run_id, snapshot)
 
 
 async def _store_artifact(result: "ExecutorResult", run_id: str, record: RunRecord | None) -> None:
@@ -307,10 +390,20 @@ async def _notify_budget_exceeded(used: int, limit: int) -> None:
         await handler(_profile.name, message)
 
 
-async def run_agent_scheduled(prompt: str) -> None:
-    """Scheduler-triggered run (cron, interval, or startup). Handles on_complete side effects."""
+async def run_agent_scheduled(
+    prompt: str,
+    *,
+    trigger: str = "cron",
+    provenance: RunProvenance | None = None,
+    stamp: bool = True,
+) -> None:
+    """Scheduler-triggered run (cron, interval, startup, or a managed
+    binding). Handles on_complete side effects — for managed fires too, by
+    decision: uniform with profile fires. The daily budget applies to every
+    trigger source; `stamp=False` (managed fires) keeps completed prompts
+    verbatim."""
     assert _profile is not None
-    logger.info(f"[{_profile.name}] scheduled run triggered")
+    logger.info(f"[{_profile.name}] scheduled run triggered ({trigger})")
 
     budget = _daily_budget_status()
     if budget is not None and budget[0] >= budget[1]:
@@ -323,11 +416,11 @@ async def run_agent_scheduled(prompt: str) -> None:
                 logger.error(f"[{_profile.name}] budget-exceeded notify failed: {e}", exc_info=True)
         return
 
-    if _profile.inject_timestamp:
+    if stamp and _profile.inject_timestamp:
         prompt = _stamp_prompt(prompt)
 
     record = (
-        _run_store.start(agent_name=_profile.name, trigger="cron", prompt=prompt)
+        _run_store.start(agent_name=_profile.name, trigger=trigger, prompt=prompt, provenance=provenance)
         if _run_store is not None
         else None
     )
@@ -361,6 +454,100 @@ async def run_agent_scheduled(prompt: str) -> None:
 
 # Alias — kept so existing imports of `run_agent_cron` (e.g. in tests) don't break.
 run_agent_cron = run_agent_scheduled
+
+
+# ── Managed schedules (issue #33 Phase F) ────────────────────────────────────
+#
+# API-owned schedule bindings, reconciled by a control plane. Distinct
+# APScheduler job namespace (managed:<name>) so profile-trigger jobs can
+# never collide. Design record: docs/design/managed-schedules.md.
+
+
+def _managed_job_id(name: str) -> str:
+    return f"managed:{name}"
+
+
+def _apscheduler_trigger(spec: ScheduleSpec):
+    if spec.cron is not None:
+        # Managed cron is UTC by contract — timezone rendering is the
+        # control plane's problem, not a per-binding knob.
+        return CronTrigger.from_crontab(spec.cron, timezone=timezone.utc)
+    return APIntervalTrigger(seconds=spec.every_s)
+
+
+async def _run_managed_schedule(name: str) -> None:
+    """One fire of a managed binding. Reads the binding fresh so a
+    just-disabled or just-deleted binding never fires stale."""
+    if _schedule_store is None:
+        return
+    binding = _schedule_store.get(name)
+    if binding is None or not binding.enabled:
+        return
+    prov = binding.provenance.model_dump() if binding.provenance is not None else {}
+    prov["schedule_name"] = name
+    prov["fired_at"] = datetime.now(timezone.utc).isoformat()
+    if binding.metadata:
+        prov["schedule_metadata"] = dict(binding.metadata)
+    await run_agent_scheduled(
+        binding.prompt,
+        trigger="managed",
+        provenance=RunProvenance.model_validate(prov),
+        stamp=False,  # completed prompt, dispatched verbatim
+    )
+
+
+def _reconcile_managed_job(binding: ScheduleBinding) -> None:
+    """Make the scheduler match one binding: enabled → (re)registered job,
+    disabled → no job. Raises on scheduler failure (callers roll back)."""
+    if binding.enabled:
+        _scheduler.add_job(
+            _run_managed_schedule,
+            _apscheduler_trigger(binding.schedule),
+            args=[binding.name],
+            id=_managed_job_id(binding.name),
+            replace_existing=True,
+        )
+    else:
+        _drop_managed_job(binding.name)
+
+
+def _drop_managed_job(name: str) -> None:
+    if _scheduler.get_job(_managed_job_id(name)) is not None:
+        _scheduler.remove_job(_managed_job_id(name))
+
+
+def _register_managed_schedules() -> int:
+    """Startup reconciliation: register every enabled binding from disk.
+    Unparsable files were already skipped (loudly) by the store."""
+    if _schedule_store is None:
+        return 0
+    if _profile is not None and _profile.mode == "interactive":
+        # The live PUT /schedules path rejects interactive agents, but a stale
+        # schedules volume could still carry bindings from a prior deployment.
+        # Honor the mode contract on startup too: an interactive agent must not
+        # self-activate. Bindings are left on disk (not deleted), just not run.
+        pending = [b.name for b in _schedule_store.list() if b.enabled]
+        if pending:
+            logger.warning(
+                f"[{_profile.name}] mode is interactive — not registering "
+                f"{len(pending)} managed schedule binding(s): {pending}. "
+                "Redeploy as hybrid to run them."
+            )
+        return 0
+    count = 0
+    for binding in _schedule_store.list():
+        try:
+            _reconcile_managed_job(binding)
+            count += binding.enabled
+        except Exception as e:
+            logger.error(f"failed to register managed schedule '{binding.name}': {e}", exc_info=True)
+    return count
+
+
+def _next_fire_at(name: str) -> str | None:
+    job = _scheduler.get_job(_managed_job_id(name))
+    next_run = getattr(job, "next_run_time", None) if job is not None else None
+    return next_run.isoformat() if next_run else None
 
 
 async def _handle_on_complete(output: str) -> None:
@@ -418,7 +605,7 @@ def _load_file_secrets() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _profile, _agent, _limits, _run_store, _executor
+    global _profile, _agent, _limits, _run_store, _executor, _schedule_store
 
     _load_file_secrets()
 
@@ -477,6 +664,11 @@ async def lifespan(app: FastAPI):
             )
             logger.info(f"Registered startup trigger: delay {trigger.delay_s}s")
             startup_i += 1
+
+    _schedule_store = ScheduleStore()
+    managed = _register_managed_schedules()
+    if managed:
+        logger.info(f"Registered {managed} managed schedule binding(s)")
 
     _scheduler.start()
     logger.info("Scheduler started")
@@ -540,6 +732,28 @@ _internal_auth = Depends(_require_internal_token)
 
 # ── Routes ───────────────────────────────────────────────────────────────────────────
 
+# Contract capabilities this build serves, for client feature detection
+# (miragen-mcp / MiraRun): each entry is a versioned surface a caller may
+# rely on. Additions are backwards-compatible; removals/renames are breaking.
+CONTRACT_CAPABILITIES = [
+    "edf-resolve/mirarun.io-v1alpha1",   # POST /profiles/resolve
+    "executor-launch/v1",                # POST /executor-runs (idempotency + provenance)
+    "run-snapshot/v1",                   # GET /runs/{id}/snapshot
+    "events-cursor/v1",                  # GET /runs/{id}/events?after=
+    "managed-schedules/v1",              # GET/PUT/DELETE /schedules (CAS reconciliation)
+    "interventions/v1",                  # structured question suspension + answered resume
+]
+
+
+def _installed_version() -> str | None:
+    try:
+        from importlib.metadata import version
+
+        return version("miragen")
+    except Exception:
+        return None
+
+
 @app.get("/health")
 async def health():
     last_run = None
@@ -551,6 +765,8 @@ async def health():
         "agent": _profile.name if _profile else None,
         "last_run": last_run,
         "pending_approvals": len(get_broker().pending()),
+        "version": _installed_version(),
+        "capabilities": CONTRACT_CAPABILITIES,
     }
 
 
@@ -657,7 +873,35 @@ async def get_run(run_id: str):
 # workspace-in / diff-and-events-out contract to the layers above.
 
 class ResumeRequest(BaseModel):
-    prompt: str
+    prompt: Optional[str] = Field(default=None, min_length=1)
+    answer: Optional[InterventionAnswer] = Field(
+        default=None,
+        description="Structured answer to the run's pending intervention; bound by "
+        "intervention_id. May accompany or replace `prompt`.",
+    )
+
+    @model_validator(mode="after")
+    def validate_has_input(self) -> "ResumeRequest":
+        if self.prompt is None and self.answer is None:
+            raise ValueError("resume requires `prompt`, `answer`, or both")
+        return self
+
+
+def _render_intervention_answer(pending: InterventionRequest, answer: InterventionAnswer) -> str:
+    """Deterministic rendering of a structured answer into the resume prompt
+    when the caller supplies no prompt of their own. Mechanical, not
+    templated — real prompt rendering stays in the control plane."""
+    lines = [f"Your question (intervention {answer.intervention_id}) has been answered."]
+    if answer.decision is not None:
+        label = next(
+            (opt.label for opt in pending.options if opt.id == answer.decision and opt.label),
+            None,
+        )
+        lines.append(f"Decision: {answer.decision}" + (f" ({label})" if label else ""))
+    if answer.text is not None:
+        lines.append(answer.text)
+    lines.append("Continue the task accordingly.")
+    return "\n".join(lines)
 
 
 def _get_executor_record(run_id: str) -> RunRecord:
@@ -680,7 +924,15 @@ def _get_executor_record(run_id: str) -> RunRecord:
 @app.post("/runs/{run_id}/resume", response_model=RunRecord, dependencies=[_internal_auth])
 async def resume_run(run_id: str, request: ResumeRequest):
     """Re-open the executor thread bound to a suspended/failed run and give it
-    another turn. The workspace (with any partial diff) is the resume state."""
+    another turn. The workspace (with any partial diff) is the resume state.
+
+    Structured interventions (issue #33 Phase G): a run suspended with
+    exit_reason 'intervention' carries `pending_intervention`; answering it
+    means passing `answer` bound to that intervention_id — recorded as an
+    `intervention.answered` event (with any approval_ref) before the turn
+    runs, so authorization evidence is durable API state, never prompt text.
+    A plain-prompt resume of such a run records `intervention.superseded`.
+    """
     record = _get_executor_record(run_id)
     if record.status not in ("suspended", "failed"):
         raise HTTPException(
@@ -694,9 +946,39 @@ async def resume_run(run_id: str, request: ResumeRequest):
         )
     _raise_if_daily_budget_exceeded()
 
+    pending = record.pending_intervention
+    if request.answer is not None:
+        if pending is None:
+            raise HTTPException(
+                status_code=409,
+                detail="run has no pending intervention to answer; resume with `prompt` instead",
+            )
+        if request.answer.intervention_id != pending.intervention_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": f"answer targets intervention '{request.answer.intervention_id}' "
+                    f"but the pending intervention is '{pending.intervention_id}'",
+                    "pending_intervention_id": pending.intervention_id,
+                },
+            )
+        _executor.append_event(record.run_id, {
+            "type": "intervention.answered",
+            "intervention_id": pending.intervention_id,
+            "answer": request.answer.model_dump(mode="json", exclude_none=True),
+        })
+        prompt = request.prompt or _render_intervention_answer(pending, request.answer)
+    else:
+        prompt = request.prompt
+        if pending is not None:
+            _executor.append_event(record.run_id, {
+                "type": "intervention.superseded",
+                "intervention_id": pending.intervention_id,
+            })
+
     record = _run_store.reopen(record)
     try:
-        await _run_executor_turn(request.prompt, record, resume=True)
+        await _run_executor_turn(prompt, record, resume=True)
     except RuntimeError:
         pass  # outcome (failed:crash) is already on the record; return it
     return _run_store.get(record.run_id)
@@ -726,8 +1008,12 @@ async def abandon_run(run_id: str, discard_workspace: bool = False):
 
 
 @app.get("/runs/{run_id}/diff", dependencies=[_internal_auth])
-async def get_run_diff(run_id: str):
-    """The harvested diff — set exactly once, on terminal success."""
+async def get_run_diff(run_id: str, repository: Optional[str] = None):
+    """The harvested diff — set exactly once, on terminal success.
+
+    Multi-repo runs: without `repository`, the bundle (all writable repos with
+    section markers); with `?repository=<name>`, that repository's own
+    apply-able patch from .miragen/diffs/<name>.patch."""
     record = _get_executor_record(run_id)
     if record.diff_path is None:
         raise HTTPException(
@@ -735,6 +1021,19 @@ async def get_run_diff(run_id: str):
             detail=f"run '{record.run_id}' has no harvested diff (status: {record.status})",
         )
     path = Path(record.diff_path)
+    if repository is not None:
+        known = {
+            r.name for r in (record.repositories or []) if r.writable
+        }
+        if repository not in known:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": f"no harvested per-repository diff for '{repository}'",
+                    "writable_repositories": sorted(known),
+                },
+            )
+        path = path.parent / "diffs" / f"{repository}.patch"
     if not path.exists():
         raise HTTPException(status_code=404, detail="diff file missing from workspace volume")
     from fastapi.responses import PlainTextResponse
@@ -743,12 +1042,381 @@ async def get_run_diff(run_id: str):
 
 
 @app.get("/runs/{run_id}/events", dependencies=[_internal_auth])
-async def get_run_events(run_id: str, limit: int = 200):
-    """The executor event stream (turn events, item/tool events, errors) —
-    what this tier owes the layers above, alongside the exit reason."""
+async def get_run_events(run_id: str, limit: int = 200, after: Optional[int] = None):
+    """The executor event stream (turn events, item/tool events, lifecycle
+    timing, errors) — what this tier owes the layers above, alongside the
+    exit reason.
+
+    Two read modes over the same durable sequenced stream:
+    - without `after`: tail read (newest `limit` events), original contract;
+    - with `after`: cursor replay — events with seq > after, oldest first,
+      plus `next_after`/`has_more` for paging. (run_id, seq) is the
+      deduplication key; replaying any cursor is idempotent, so a projector
+      can rebuild its projection from after=0 at any time.
+    """
     record = _get_executor_record(run_id)
-    events = _executor.read_events(record.run_id, limit=min(limit, 1000))
+    limit = min(limit, 1000)
+    if after is not None:
+        page = _executor.read_events_page(record.run_id, after=after, limit=limit)
+        return {
+            "run_id": record.run_id,
+            "count": len(page.events),
+            "events": page.events,
+            "next_after": page.next_after,
+            "has_more": page.has_more,
+        }
+    events = _executor.read_events(record.run_id, limit=limit)
     return {"run_id": record.run_id, "count": len(events), "events": events}
+
+
+@app.get("/runs/{run_id}/snapshot", dependencies=[_internal_auth])
+async def get_run_snapshot(run_id: str):
+    """The immutable resolved-EDF snapshot persisted when the run was
+    launched via POST /executor-runs — canonical document, hash, resolved
+    profile, and repository/secret plans. 404 for runs launched without an
+    EDF."""
+    record = _get_executor_record(run_id)
+    snapshot = _run_store.read_snapshot(record.run_id)
+    if snapshot is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"run '{record.run_id}' has no resolved snapshot (launched without an EDF)",
+        )
+    return snapshot
+
+
+# ── EDF resolution + provenance-carrying launch (issue #33 Phases A/B) ───────
+
+
+class ResolveRequest(BaseModel):
+    edf: dict
+    context: Optional[ResolutionContext] = None
+
+
+class ExecutorLaunchRequest(BaseModel):
+    prompt: str = Field(
+        description="COMPLETED prompt — persisted and dispatched verbatim: no "
+        "timestamp stamping, no header_prompt. Prompt rendering is a "
+        "control-plane concern.",
+    )
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    edf: Optional[dict] = None
+    context: Optional[ResolutionContext] = None
+    expected_sha256: Optional[str] = Field(
+        default=None,
+        description="Caller's previously resolved canonical hash; launch is "
+        "refused (409) if re-resolution at this trust boundary disagrees.",
+    )
+    provenance: Optional[RunProvenance] = None
+
+
+def _edf_compatibility(resolved: ResolvedEDF) -> dict | None:
+    """Compare a resolved EDF against the agent this service actually runs.
+    Informational on /profiles/resolve; enforced (409) on /executor-runs —
+    Stage 1 keeps the current one-agent-per-service topology, so a launch
+    executes with the CONFIGURED executor spec and an EDF that resolves to a
+    different executor/model/sandbox belongs to a different deployment."""
+    if _profile is None:
+        return None
+    issues: list[str] = []
+    if _profile.executor is None:
+        issues.append("configured agent is model-tier; EDF launches require an executor-tier agent")
+    else:
+        want = resolved.resolved_profile["executor"]
+        have = _profile.executor
+        if want["executor"] != have.executor:
+            issues.append(f"EDF resolves to executor '{want['executor']}' but this agent runs '{have.executor}'")
+        if want["model"] is not None and want["model"] != have.model:
+            issues.append(f"EDF resolves to model '{want['model']}' but this agent is configured for '{have.model}'")
+        if want["sandbox_mode"] != have.sandbox_mode:
+            issues.append(
+                f"EDF resolves to sandbox_mode '{want['sandbox_mode']}' but this agent "
+                f"runs '{have.sandbox_mode}'"
+            )
+    return {"compatible": not issues, "issues": issues}
+
+
+@app.post("/profiles/resolve", dependencies=[_internal_auth])
+async def resolve_profile(request: ResolveRequest):
+    """Validate and resolve an EDF WITHOUT starting a run: strict validation,
+    deterministic default/preset expansion, canonical document + SHA-256, the
+    resolved executable profile, and repository/secret binding plans. Pure and
+    deterministic — safe to call repeatedly to reproduce a hash."""
+    try:
+        resolved = resolve_edf(request.edf, context=request.context)
+    except EDFValidationError as e:
+        raise HTTPException(status_code=422, detail={"error": "invalid EDF", "errors": e.errors})
+    body = resolved.model_dump(mode="json")
+    body["agent_compatibility"] = _edf_compatibility(resolved)
+    return body
+
+
+@app.post("/executor-runs", status_code=202, dependencies=[_internal_auth])
+async def launch_executor_run(request: ExecutorLaunchRequest, response: Response):
+    """Idempotent, provenance-carrying executor launch.
+
+    Acceptance is DURABLE-FIRST: the run record (with provenance and, when an
+    EDF is supplied, the resolved snapshot + hash) is persisted before this
+    endpoint acknowledges — and before dispatch. Recovery contract for the
+    ambiguity window: if the process dies after acceptance but before/while
+    dispatching, the startup sweep marks the record 'interrupted'; retrying
+    the same idempotency_key then returns that original run (200, duplicate:
+    true) instead of launching twice, and the caller decides how to proceed
+    with full knowledge of its status.
+    """
+    if _executor is None:
+        raise HTTPException(
+            status_code=400,
+            detail="this agent is not executor-backed; /executor-runs requires an executor-tier profile",
+        )
+    if _run_store is None or _profile is None:
+        raise HTTPException(status_code=503, detail="Run store not ready")
+
+    existing = _run_store.find_by_idempotency_key(request.idempotency_key)
+    if existing is not None:
+        response.status_code = 200
+        return {
+            "run_id": existing.run_id,
+            "status": existing.status,
+            "snapshot_sha256": existing.snapshot_sha256,
+            "duplicate": True,
+        }
+
+    _raise_if_daily_budget_exceeded()
+
+    resolved: ResolvedEDF | None = None
+    if request.edf is not None:
+        try:
+            resolved = resolve_edf(request.edf, context=request.context)
+        except EDFValidationError as e:
+            raise HTTPException(status_code=422, detail={"error": "invalid EDF", "errors": e.errors})
+        if request.expected_sha256 is not None and resolved.sha256 != request.expected_sha256:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "canonical snapshot hash mismatch",
+                    "expected_sha256": request.expected_sha256,
+                    "resolved_sha256": resolved.sha256,
+                },
+            )
+        compatibility = _edf_compatibility(resolved)
+        if compatibility is not None and not compatibility["compatible"]:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "EDF incompatible with the configured agent", "issues": compatibility["issues"]},
+            )
+    elif request.expected_sha256 is not None:
+        raise HTTPException(status_code=422, detail="expected_sha256 requires an edf to resolve")
+
+    checkouts: list[RepositoryCheckout] | None = None
+    if resolved is not None and resolved.repository_plan:
+        # Workspace preparation needs an authorized runtime binding for every
+        # opaque connectionRef. Refusing up front beats a mid-run clone
+        # failure — and bindings are ephemeral, so they must arrive with the
+        # launch. They are consumed here and never persisted.
+        bindings = request.context.repositories if request.context is not None else {}
+        missing = [
+            entry.connection_ref
+            for entry in resolved.repository_plan
+            if entry.connection_ref not in bindings
+        ]
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "missing repository bindings",
+                    "missing_connection_refs": sorted(set(missing)),
+                    "hint": "supply context.repositories[connectionRef].clone_url for each repository",
+                },
+            )
+        checkouts = [
+            RepositoryCheckout(
+                name=entry.name,
+                ref=entry.ref,
+                mount_path=entry.mount_path,
+                writable=entry.writable,
+                clone_url=bindings[entry.connection_ref].clone_url,
+            )
+            for entry in resolved.repository_plan
+        ]
+
+    provenance = (request.provenance or RunProvenance()).model_copy(
+        update={
+            "idempotency_key": request.idempotency_key,
+            **(
+                {"edf_api_version": resolved.api_version}
+                if resolved is not None
+                else {}
+            ),
+        }
+    )
+
+    # Durable acceptance point — no awaits between the idempotency lookup
+    # above and this write, so a same-key race cannot slip between them.
+    record = _run_store.start(
+        agent_name=_profile.name,
+        trigger="launch",
+        prompt=request.prompt,
+        executor=_profile.executor.executor,
+        model=_profile.executor.model,
+        snapshot_sha256=resolved.sha256 if resolved is not None else None,
+        provenance=provenance,
+        repositories=[
+            RepositoryRevision(
+                name=entry.name,
+                ref=entry.ref,
+                mount_path=entry.mount_path,
+                writable=entry.writable,
+                commit=entry.commit,
+            )
+            for entry in resolved.repository_plan
+        ]
+        if resolved is not None
+        else None,
+    )
+    if resolved is not None:
+        _run_store.write_snapshot(
+            record.run_id,
+            build_run_snapshot(resolved, run_id=record.run_id, created_at=record.started_at.isoformat()),
+        )
+
+    async def _background_run() -> None:
+        try:
+            await run_agent(request.prompt, record=record, repositories=checkouts)
+        except Exception as e:
+            # run_agent already wrote the failure to the record; this is just
+            # so a launch exception never propagates into a bare task error.
+            logger.error(f"[{_profile.name}] launched run failed: {e}", exc_info=True)
+
+    _spawn_background(_background_run())
+
+    return {
+        "run_id": record.run_id,
+        "status": "running",
+        "snapshot_sha256": record.snapshot_sha256,
+        "duplicate": False,
+    }
+
+
+# ── Managed schedule reconciliation API (issue #33 Phase F) ──────────────────
+
+
+class ScheduleBindingRequest(BaseModel):
+    schedule: ScheduleSpec
+    prompt: str = Field(min_length=1)
+    enabled: bool = True
+    provenance: Optional[RunProvenance] = None
+    metadata: dict[str, str] = Field(default_factory=dict)
+    expected_version: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Omit to CREATE (409 if the binding exists); pass the last-read "
+        "version to UPDATE (409 on mismatch, carrying current state).",
+    )
+
+
+def _binding_response(binding: ScheduleBinding) -> dict:
+    body = binding.model_dump(mode="json")
+    body["next_fire_at"] = _next_fire_at(binding.name)
+    return body
+
+
+def _require_schedule_store() -> ScheduleStore:
+    if _schedule_store is None:
+        raise HTTPException(status_code=503, detail="Schedule store not ready")
+    return _schedule_store
+
+
+@app.get("/schedules", dependencies=[_internal_auth])
+async def list_schedules():
+    store = _require_schedule_store()
+    bindings = [_binding_response(b) for b in store.list()]
+    return {"count": len(bindings), "schedules": bindings}
+
+
+@app.get("/schedules/{name}", dependencies=[_internal_auth])
+async def get_schedule(name: str):
+    store = _require_schedule_store()
+    binding = store.get(name)
+    if binding is None:
+        raise HTTPException(status_code=404, detail=f"unknown schedule binding '{name}'")
+    return _binding_response(binding)
+
+
+@app.put("/schedules/{name}", dependencies=[_internal_auth])
+async def put_schedule(name: str, request: ScheduleBindingRequest, response: Response):
+    """Create (no expected_version) or update (compare-and-swap) one managed
+    schedule binding, then reconcile the scheduler job. File first, scheduler
+    second — a scheduler failure rolls the file back so the store never
+    claims a binding the scheduler doesn't hold."""
+    store = _require_schedule_store()
+    if _profile is not None and _profile.mode == "interactive":
+        # Same rule as profile triggers: a managed binding is still
+        # self-activation. Hybrid mode is the intended shape.
+        raise HTTPException(
+            status_code=409,
+            detail="interactive agents cannot have schedule bindings; run the agent in hybrid mode",
+        )
+
+    prior = store.get(name)
+    try:
+        binding = store.upsert(
+            name,
+            schedule=request.schedule,
+            prompt=request.prompt,
+            enabled=request.enabled,
+            provenance=request.provenance,
+            metadata=request.metadata,
+            expected_version=request.expected_version,
+        )
+    except BindingConflictError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": str(e),
+                "current": e.current.model_dump(mode="json") if e.current else None,
+            },
+        )
+    except ValueError as e:  # binding name pattern violations etc.
+        raise HTTPException(status_code=422, detail=str(e))
+
+    try:
+        _reconcile_managed_job(binding)
+    except Exception as e:
+        # roll the store back to what the scheduler still holds
+        if prior is not None:
+            store.save(prior)
+        else:
+            try:
+                store.delete(name)
+            except KeyError:
+                pass
+        logger.error(f"scheduler reconciliation failed for '{name}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"scheduler rejected the binding: {e}")
+
+    response.status_code = 200 if prior is not None else 201
+    return _binding_response(binding)
+
+
+@app.delete("/schedules/{name}", dependencies=[_internal_auth])
+async def delete_schedule(name: str, expected_version: Optional[int] = None):
+    """Remove a binding and unregister its job. In-flight runs it fired are
+    untouched — deletion only stops future firings."""
+    store = _require_schedule_store()
+    try:
+        removed = store.delete(name, expected_version=expected_version)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"unknown schedule binding '{name}'")
+    except BindingConflictError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": str(e),
+                "current": e.current.model_dump(mode="json") if e.current else None,
+            },
+        )
+    _drop_managed_job(name)
+    return {"deleted": removed.model_dump(mode="json")}
 
 
 @app.get("/history", response_model=HistoryResponse, dependencies=[_internal_auth])

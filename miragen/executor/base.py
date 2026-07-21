@@ -42,18 +42,143 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import time
+import uuid
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Iterator
 
-from miragen.models import AgentProfile, ExecutorSpec, RunUsage, sum_usage
+from pydantic import ValidationError
+
+from miragen.models import AgentProfile, ExecutorSpec, InterventionRequest, RunUsage, sum_usage
 
 logger = logging.getLogger("miragen.executor")
 
 _DIFF_NAME = "diff.patch"
 _EVENTS_SUFFIX = ".events.jsonl"
 _BASELINE_TAG = "miragen-baseline"
+
+# Event envelope version (issue #33 Phase C). Every persisted event carries
+# `seq` (per-run monotonic, 1-based), `schema`, `ts`, and `type` alongside its
+# payload fields. The envelope is flat — new keys on the same JSONL object —
+# so existing tail readers keep working unchanged.
+EVENT_SCHEMA = "miragen/executor-event/v1"
+
+
+def _iter_event_lines(path: Path) -> Iterator[tuple[int, dict[str, Any] | None]]:
+    """Yield (line_no, parsed | None) for every non-blank line. Unparsable
+    lines yield None but still occupy a line number, so sequence assignment
+    stays stable no matter who reads the file."""
+    with path.open() as f:
+        line_no = 0
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            line_no += 1
+            try:
+                yield line_no, json.loads(line)
+            except ValueError:
+                yield line_no, None
+
+
+def _effective_seq(line_no: int, event: dict[str, Any]) -> int:
+    """Explicit seq when the writer stamped one; the 1-based line number for
+    legacy pre-envelope lines (writers have always been append-only and
+    single-writer per run, so line order IS event order)."""
+    seq = event.get("seq")
+    return seq if isinstance(seq, int) else line_no
+
+
+class _EventWriter:
+    """Append-only events.jsonl sink owning the per-run monotonic sequence.
+
+    On open, scans the existing file (resume case) and continues numbering
+    after the last effective sequence — a resumed turn's events extend the
+    same ordered stream rather than restarting at 1. Each write is flushed so
+    cursor/tail readers and crash forensics see events promptly.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._last_seq = 0
+        if path.exists():
+            for line_no, event in _iter_event_lines(path):
+                self._last_seq = _effective_seq(line_no, event) if event is not None else line_no
+        self._fh = path.open("a")
+
+    def write(self, payload: dict[str, Any]) -> None:
+        self._last_seq += 1
+        payload.setdefault("ts", datetime.now(timezone.utc).isoformat())
+        payload["seq"] = self._last_seq
+        payload["schema"] = EVENT_SCHEMA
+        self._fh.write(json.dumps(payload, default=str) + "\n")
+        self._fh.flush()
+
+    def __enter__(self) -> "_EventWriter":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._fh.close()
+
+
+@dataclass
+class EventPage:
+    """One page of a cursor read: events with seq > `after`, in order.
+    Replay contract: (run_id, seq) is the deduplication key; re-reading any
+    cursor returns the same events."""
+
+    events: list[dict[str, Any]] = field(default_factory=list)
+    next_after: int = 0  # pass as `after` to get the next page
+    has_more: bool = False
+
+
+@dataclass
+class RepositoryCheckout:
+    """One repository to prepare in the run's workspace (issue #33 Phase D).
+
+    `clone_url` is the EPHEMERAL authorized binding — consumed during
+    preparation, redacted from any error, stripped from the clone's git
+    config, and never persisted. On resume the workspace already exists, so
+    checkouts are rebuilt from the run record with clone_url="" and
+    preparation only re-reads the recorded state."""
+
+    name: str
+    ref: str
+    mount_path: str
+    writable: bool = False
+    clone_url: str = ""
+
+
+def _is_safe_component(name: str) -> bool:
+    """A single, non-traversing path component — used as a filename for a
+    repository's per-repo patch. Rejects separators and '.'/'..'."""
+    return bool(name) and name not in (".", "..") and "/" not in name and "\\" not in name
+
+
+def _sanitize_url(url: str) -> str:
+    """Strip userinfo (user:token@) from a URL so it never rests in a clone's
+    .git/config or appears in an error message."""
+    if "://" in url and "@" in url:
+        scheme, rest = url.split("://", 1)
+        if "@" in rest.split("/", 1)[0]:
+            rest = rest.split("@", 1)[1]
+        return f"{scheme}://{rest}"
+    return url
+
+
+def _redact(text: str, checkouts: "list[RepositoryCheckout] | None") -> str:
+    """Replace every binding URL (and its credentialed userinfo) in `text`
+    with a stable placeholder — git error output embeds remote URLs."""
+    for co in checkouts or []:
+        if co.clone_url:
+            text = text.replace(co.clone_url, f"<clone-url:{co.name}>")
+            sanitized = _sanitize_url(co.clone_url)
+            if sanitized != co.clone_url:
+                text = text.replace(sanitized, f"<clone-url:{co.name}>")
+    return text
 
 
 class ExecutorResult:
@@ -69,6 +194,11 @@ class ExecutorResult:
         error: str | None = None,
         usage: RunUsage | None = None,
         diff_path: str | None = None,
+        repositories: list[dict[str, Any]] | None = None,
+        setup_s: float | None = None,
+        tool_call_count: int | None = None,
+        tool_call_failures: int | None = None,
+        intervention: dict[str, Any] | None = None,
     ):
         self.status = status
         self.exit_reason = exit_reason
@@ -77,6 +207,17 @@ class ExecutorResult:
         self.error = error
         self.usage = usage
         self.diff_path = diff_path
+        # Concrete prepared-repository state (name/ref/mount_path/writable/
+        # commit) — filled by workspace preparation, no credentials ever.
+        self.repositories = repositories
+        # This TURN's telemetry (the app tier accumulates across turns).
+        # None = not reportable this turn, never a claimed zero.
+        self.setup_s = setup_s
+        self.tool_call_count = tool_call_count
+        self.tool_call_failures = tool_call_failures
+        # Structured question that suspended this turn (exit_reason
+        # 'intervention') — the parsed, id-stamped InterventionRequest dump.
+        self.intervention = intervention
 
 
 class ExecutorBackend(ABC):
@@ -124,6 +265,7 @@ class ExecutorBackend(ABC):
         workspace: str | None = None,
         first_turn: bool = True,
         prior_usage: RunUsage | None = None,
+        repositories: list[RepositoryCheckout] | None = None,
     ) -> ExecutorResult:
         """Execute one turn of a job bound to an agent-run.
 
@@ -131,7 +273,9 @@ class ExecutorBackend(ABC):
         prepended. Resume: existing workspace + adapter-side thread resume.
         `prior_usage` is the run's accumulated usage from earlier turns —
         needed so a per-run budget check on resume sees the true total, not
-        just this turn's usage.
+        just this turn's usage. `repositories` is the run's checkout plan
+        (with ephemeral bindings on the first turn, binding-less on resume);
+        None keeps the classic single-baseline empty workspace.
         """
         ws = Path(workspace) if workspace else Path(self.spec.workspace_root) / run_id
 
@@ -146,14 +290,31 @@ class ExecutorBackend(ABC):
         error: str | None = None
         observed_thread_id: str | None = thread_id
         turn_failed = False
+        prepared: list[dict[str, Any]] | None = None
+        setup_s: float | None = None
+        # None until the first item.completed arrives: an adapter that emits
+        # no item events cannot report tool metrics (nullable, not zero).
+        tool_calls: int | None = None
+        tool_failures: int | None = None
 
         try:
-            # Inside the try: a bad workspace_root, missing git, or a
-            # permission error here must still produce a 'failed' result
-            # (and thus a RunStore.finish() call) rather than an unhandled
-            # exception that leaves the run record stuck at 'running'.
-            self._prepare_workspace(ws)
-            with events_path.open("a") as sink:
+            # Inside the try: a bad workspace_root, missing git, a failed
+            # clone/fetch, a permission error, or a failed harvest must still
+            # produce a 'failed' result (and thus a RunStore.finish() call)
+            # rather than an unhandled exception that leaves the run record
+            # stuck at 'running'. Setup failures are resumable crashes:
+            # preparation is idempotent (already-prepared repositories are
+            # skipped), so a resumed turn re-runs it safely.
+            with _EventWriter(events_path) as sink:
+                setup_t0 = time.monotonic()
+                sink.write({"type": "lifecycle.setup.started", "phase": "workspace", "first_turn": first_turn})
+                prepared = self._prepare_workspace(ws, repositories, sink=sink)
+                setup_s = time.monotonic() - setup_t0
+                sink.write({
+                    "type": "lifecycle.setup.completed",
+                    "phase": "workspace",
+                    "duration_ms": int(setup_s * 1000),
+                })
                 async for payload in self._stream_turn(
                     prompt,
                     run_id=run_id,
@@ -161,8 +322,7 @@ class ExecutorBackend(ABC):
                     workspace=ws,
                     first_turn=first_turn,
                 ):
-                    payload.setdefault("ts", datetime.now(timezone.utc).isoformat())
-                    sink.write(json.dumps(payload, default=str) + "\n")
+                    sink.write(payload)
 
                     kind = payload.get("type")
                     if kind == "thread.started":
@@ -176,50 +336,103 @@ class ExecutorBackend(ABC):
                         item = payload.get("item") or {}
                         if item.get("type") in ("agent_message", "agent-message"):
                             output = item.get("text") or output
+                        if item.get("type") not in _NON_TOOL_ITEM_TYPES:
+                            tool_calls = (tool_calls or 0) + 1
+                            tool_failures = (tool_failures or 0) + (1 if _item_is_failure(item) else 0)
+                        elif tool_calls is None:
+                            # item events flow, so tool metrics ARE reportable
+                            # for this adapter — start the counters at zero.
+                            tool_calls, tool_failures = 0, 0
+
+                if turn_failed:
+                    return ExecutorResult(
+                        status="failed",
+                        exit_reason="crash",
+                        thread_id=observed_thread_id,
+                        error=error,
+                        usage=usage,
+                        repositories=prepared,
+                        setup_s=setup_s,
+                        tool_call_count=tool_calls,
+                        tool_call_failures=tool_failures,
+                    )
+
+                intervention = self._consume_intervention(ws, sink)
+                if intervention is not None:
+                    # A structured question beats harvest AND the budget
+                    # check this turn — the question must be recorded either
+                    # way, and the cumulative budget check guards the next
+                    # turn regardless. Partial work stays as resume state.
+                    return ExecutorResult(
+                        status="suspended",
+                        exit_reason="intervention",
+                        thread_id=observed_thread_id,
+                        output=output,
+                        usage=usage,
+                        repositories=prepared,
+                        setup_s=setup_s,
+                        tool_call_count=tool_calls,
+                        tool_call_failures=tool_failures,
+                        intervention=intervention,
+                    )
+
+                if self._budget_exhausted(sum_usage(prior_usage, usage)):
+                    # Turn completed but blew the per-run budget: suspend, keep
+                    # the partial diff as resume state, do not harvest. Checked
+                    # against the run's cumulative usage (prior turns + this
+                    # one) — a resumed run must not be able to sneak back under
+                    # a per-run cap just because a single resumed turn's own
+                    # usage looks small.
+                    return ExecutorResult(
+                        status="suspended",
+                        exit_reason="budget",
+                        thread_id=observed_thread_id,
+                        output=output,
+                        usage=usage,
+                        repositories=prepared,
+                        setup_s=setup_s,
+                        tool_call_count=tool_calls,
+                        tool_call_failures=tool_failures,
+                    )
+
+                harvest_t0 = time.monotonic()
+                diff_path = await self._harvest_diff(ws, repositories)
+                sink.write({
+                    "type": "lifecycle.harvest.completed",
+                    "duration_ms": int((time.monotonic() - harvest_t0) * 1000),
+                    "diff_bytes": Path(diff_path).stat().st_size,
+                })
         except Exception as e:
             # Crash / API error: resumable. Partial workspace changes are
             # neither harvested nor discarded — they are resume state.
+            # Binding URLs (which may carry credentials) are redacted from the
+            # recorded error — git embeds remote URLs in its stderr.
             # (CancelledError is a BaseException and deliberately NOT caught:
             # the app-tier timeout owns that path.)
-            logger.error(f"[{self.profile.name}] executor crashed: {e}", exc_info=True)
+            message = _redact(str(e), repositories)
+            logger.error(f"[{self.profile.name}] executor crashed: {message}", exc_info=True)
             return ExecutorResult(
                 status="failed",
                 exit_reason="crash",
                 thread_id=observed_thread_id,
-                error=str(e),
+                error=message,
                 usage=usage,
+                repositories=prepared,
+                setup_s=setup_s,
+                tool_call_count=tool_calls,
+                tool_call_failures=tool_failures,
             )
 
-        if turn_failed:
-            return ExecutorResult(
-                status="failed",
-                exit_reason="crash",
-                thread_id=observed_thread_id,
-                error=error,
-                usage=usage,
-            )
-
-        if self._budget_exhausted(sum_usage(prior_usage, usage)):
-            # Turn completed but blew the per-run budget: suspend, keep the
-            # partial diff as resume state, do not harvest. Checked against
-            # the run's cumulative usage (prior turns + this one) — a resumed
-            # run must not be able to sneak back under a per-run cap just
-            # because a single resumed turn's own usage looks small.
-            return ExecutorResult(
-                status="suspended",
-                exit_reason="budget",
-                thread_id=observed_thread_id,
-                output=output,
-                usage=usage,
-            )
-
-        diff_path = await self._harvest_diff(ws)
         return ExecutorResult(
             status="succeeded",
             thread_id=observed_thread_id,
             output=output,
             usage=usage,
             diff_path=diff_path,
+            repositories=prepared,
+            setup_s=setup_s,
+            tool_call_count=tool_calls,
+            tool_call_failures=tool_failures,
         )
 
     # ── Events ─────────────────────────────────────────────────────────────
@@ -227,20 +440,49 @@ class ExecutorBackend(ABC):
     def _events_path(self, run_id: str) -> Path:
         return self.runs_root / f"{run_id}{_EVENTS_SUFFIX}"
 
-    def read_events(self, run_id: str, limit: int = 200) -> list[dict[str, Any]]:
+    def _parsed_events(self, run_id: str) -> list[dict[str, Any]]:
+        """All parseable events with an effective `seq` stamped — explicit for
+        envelope-era lines, line-number-derived for legacy pre-envelope files,
+        so replay/dedup by (run_id, seq) works across both."""
         path = self._events_path(run_id)
         if not path.exists():
             return []
         events = []
-        with path.open() as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        events.append(json.loads(line))
-                    except ValueError:
-                        continue
-        return events[-limit:]
+        for line_no, event in _iter_event_lines(path):
+            if event is None:
+                continue
+            event.setdefault("seq", _effective_seq(line_no, event))
+            events.append(event)
+        return events
+
+    def read_events(self, run_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        """Tail read (newest `limit` events, in order) — the original polling
+        contract, preserved."""
+        return self._parsed_events(run_id)[-limit:]
+
+    def read_events_page(self, run_id: str, *, after: int = 0, limit: int = 200) -> EventPage:
+        """Cursor read: up to `limit` events with seq > `after`, oldest first.
+        Feed `next_after` back as `after` to continue; a cursor past the end
+        returns an empty page with has_more=False. Reads are pure — replaying
+        the same cursor yields the same page, and a projector can rebuild its
+        projection from after=0 at any time."""
+        newer = [e for e in self._parsed_events(run_id) if e["seq"] > after]
+        page = newer[:limit]
+        return EventPage(
+            events=page,
+            next_after=page[-1]["seq"] if page else after,
+            has_more=len(newer) > limit,
+        )
+
+    def append_event(self, run_id: str, payload: dict[str, Any]) -> None:
+        """Append one event to a run's durable stream from OUTSIDE a turn —
+        used by the app tier for intervention answered/superseded events.
+        Safe because a suspended/failed run has no writer holding the file;
+        the sequence continues from the last effective seq."""
+        path = self._events_path(run_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _EventWriter(path) as sink:
+            sink.write(payload)
 
     def latest_thread_id(self, run_id: str) -> str | None:
         """Recover the resume handle from the persisted event stream — used by
@@ -254,50 +496,222 @@ class ExecutorBackend(ABC):
         if not path.exists():
             return None
         thread_id: str | None = None
-        with path.open() as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except ValueError:
-                    continue
-                if event.get("type") == "thread.started" and event.get("thread_id"):
-                    thread_id = event["thread_id"]
+        for _line_no, event in _iter_event_lines(path):
+            if event is not None and event.get("type") == "thread.started" and event.get("thread_id"):
+                thread_id = event["thread_id"]
         return thread_id
 
     # ── Workspace + harvest ────────────────────────────────────────────────
 
-    def _prepare_workspace(self, ws: Path) -> None:
-        ws.mkdir(parents=True, exist_ok=True)
-        if not (ws / ".git").exists():
-            # The diff IS the deliverable; a git baseline makes harvest exact.
-            # Tagged (not just left as a loose commit) so harvest can diff
-            # against it even after the executor makes its own commits —
-            # the tag lives in .git, so the executor's own `git add -A` /
-            # commits never touch or shadow it.
-            _git(ws, "init", "-q")
-            _git(ws, "add", "-A")
-            _git(ws, "-c", "user.email=miragen@local", "-c", "user.name=miragen",
-                 "commit", "-q", "--allow-empty", "-m", "miragen: workspace baseline")
-            _git(ws, "tag", "-f", _BASELINE_TAG)
+    def _prepare_workspace(
+        self,
+        ws: Path,
+        repositories: list[RepositoryCheckout] | None = None,
+        *,
+        sink: "_EventWriter | None" = None,
+    ) -> list[dict[str, Any]] | None:
+        """Prepare the run's workspace. Idempotent — safe to re-run on resume.
 
-    async def _harvest_diff(self, ws: Path) -> str:
+        Without a repository plan (the classic layout): the workspace root
+        itself becomes a git repo with the baseline tag.
+
+        With a plan: each repository is fetched into its mount path as its own
+        git repo; writable ones get the baseline tag; the workspace root stays
+        a plain directory (a root git repo would record the nested clones as
+        gitlinks and silently swallow their diffs). Returns the concrete
+        prepared state (name/ref/mount_path/writable/commit) — never bindings.
+        """
+        ws.mkdir(parents=True, exist_ok=True)
+        if not repositories:
+            if not (ws / ".git").exists():
+                # The diff IS the deliverable; a git baseline makes harvest
+                # exact. Tagged (not just left as a loose commit) so harvest
+                # can diff against it even after the executor makes its own
+                # commits — the tag lives in .git, so the executor's own
+                # `git add -A` / commits never touch or shadow it.
+                _git(ws, "init", "-q")
+                # miragen's own control metadata (harvested diff, intervention
+                # archive, malformed sentinels) lives under .miragen/. Exclude
+                # it from the repo so a `git add -A` at harvest never stages it
+                # into the user patch — otherwise a resumed run, or a
+                # malformed-intervention run that later succeeds, would leak
+                # that metadata into diff.patch and any artifact sink. Uses
+                # .git/info/exclude (untracked) so the rule itself never shows
+                # in the diff either.
+                exclude = ws / ".git" / "info" / "exclude"
+                exclude.parent.mkdir(parents=True, exist_ok=True)
+                with exclude.open("a") as f:
+                    f.write("\n# miragen control metadata — never part of the harvest\n.miragen/\n")
+                _git(ws, "add", "-A")
+                _git(ws, "-c", "user.email=miragen@local", "-c", "user.name=miragen",
+                     "commit", "-q", "--allow-empty", "-m", "miragen: workspace baseline")
+                _git(ws, "tag", "-f", _BASELINE_TAG)
+            return None
+
+        prepared: list[dict[str, Any]] = []
+        for co in repositories:
+            if not _is_safe_component(co.name):
+                raise RuntimeError(
+                    f"unsafe repository name '{co.name}': must be a single path "
+                    "component (no '/', '\\', '.' or '..') — it names the per-repo patch file"
+                )
+            repo_t0 = time.monotonic()
+            try:
+                commit = self._prepare_repository(ws, co)
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(_redact(
+                    f"preparing repository '{co.name}' (ref {co.ref}) failed: "
+                    f"{(e.stderr or e.stdout or str(e)).strip()}",
+                    repositories,
+                )) from None
+            prepared.append({
+                "name": co.name,
+                "ref": co.ref,
+                "mount_path": co.mount_path,
+                "writable": co.writable,
+                "commit": commit,
+            })
+            if sink is not None:
+                sink.write({
+                    "type": "lifecycle.repo.prepared",
+                    "name": co.name,
+                    "ref": co.ref,
+                    "mount_path": co.mount_path,
+                    "writable": co.writable,
+                    "commit": commit,
+                    "duration_ms": int((time.monotonic() - repo_t0) * 1000),
+                })
+        return prepared
+
+    def _prepare_repository(self, ws: Path, co: RepositoryCheckout) -> str:
+        """Fetch one repository into its mount path and return the concrete
+        commit SHA. Credentials stay ephemeral: after checkout the remote URL
+        is rewritten without userinfo so nothing credentialed rests in
+        .git/config, and callers redact binding URLs from any failure."""
+        dest = ws / co.mount_path
+        if (dest / ".git").exists():
+            # Resume / retried setup: already prepared — report its state.
+            return _git(dest, "rev-parse", "HEAD").strip()
+        if not co.clone_url:
+            raise RuntimeError(
+                f"repository '{co.name}' is not prepared at '{co.mount_path}' and no "
+                "binding is available — bindings are ephemeral launch-time state and "
+                "cannot be re-minted by miragen (was the workspace discarded?)"
+            )
+        dest.mkdir(parents=True, exist_ok=True)
+        _git(dest, "init", "-q")
+        _git(dest, "remote", "add", "origin", co.clone_url)
+        try:
+            try:
+                # Shallow fetch of exactly the requested ref (branch, tag, or
+                # SHA where the server allows it)...
+                _git(dest, "fetch", "-q", "--depth", "1", "origin", co.ref)
+                _git(dest, "checkout", "-q", "--detach", "FETCH_HEAD")
+            except subprocess.CalledProcessError:
+                try:
+                    # ...then full-depth fetch of the same explicit ref...
+                    _git(dest, "fetch", "-q", "origin", co.ref)
+                    _git(dest, "checkout", "-q", "--detach", "FETCH_HEAD")
+                except subprocess.CalledProcessError:
+                    # ...then an unqualified full fetch for refs no direct
+                    # fetch can serve (e.g. an arbitrary reachable SHA the
+                    # server won't advertise), resolved locally by checkout.
+                    _git(dest, "fetch", "-q", "origin")
+                    _git(dest, "checkout", "-q", "--detach", co.ref)
+        finally:
+            # Ephemeral credentials: the binding URL must never rest in
+            # .git/config — scrub it even when a fetch/checkout attempt fails,
+            # since failed-run workspaces are kept for resume/forensics.
+            _git(dest, "remote", "set-url", "origin", _sanitize_url(co.clone_url))
+        commit = _git(dest, "rev-parse", "HEAD").strip()
+        if co.writable:
+            _git(dest, "tag", "-f", _BASELINE_TAG)
+        return commit
+
+    async def _harvest_diff(
+        self, ws: Path, repositories: list[RepositoryCheckout] | None = None
+    ) -> str:
         """git-diff harvest, exactly once, on terminal success (§293 decision 3).
 
         Diffs against the baseline tag, not HEAD: if the executor committed
         mid-turn, HEAD has moved past the baseline, and `git diff --cached`
         with no revision arg would only show the *uncommitted* remainder,
         silently dropping everything the executor already committed.
+
+        Multi-repo artifact contract: only WRITABLE repositories are
+        harvested (non-writable mounts are reference material — changes there
+        are deliberately not part of the deliverable). Each writable repo
+        yields `.miragen/diffs/<name>.patch` (apply with `git apply` inside
+        that repo); `.miragen/diff.patch` is a human-readable bundle of all
+        of them with `# === miragen repository: ...` section markers, and is
+        what diff_path / GET /runs/{id}/diff serve.
         """
-        _git(ws, "add", "-A")  # stage everything so new files appear in the diff
-        diff = _git(ws, "diff", "--cached", "--binary", _BASELINE_TAG)
         marker_dir = ws / ".miragen"
         marker_dir.mkdir(exist_ok=True)
         diff_path = marker_dir / _DIFF_NAME
-        diff_path.write_text(diff)
+
+        if not repositories:
+            _git(ws, "add", "-A")  # stage everything so new files appear in the diff
+            diff_path.write_text(_git(ws, "diff", "--cached", "--binary", _BASELINE_TAG))
+            return str(diff_path)
+
+        diffs_dir = marker_dir / "diffs"
+        diffs_dir.mkdir(exist_ok=True)
+        sections: list[str] = []
+        for co in repositories:
+            if not co.writable:
+                continue
+            repo_dir = ws / co.mount_path
+            _git(repo_dir, "add", "-A")
+            diff = _git(repo_dir, "diff", "--cached", "--binary", _BASELINE_TAG)
+            (diffs_dir / f"{co.name}.patch").write_text(diff)
+            sections.append(
+                f"# === miragen repository: {co.name} (mount: {co.mount_path}) ===\n{diff}"
+            )
+        diff_path.write_text("\n".join(sections))
         return str(diff_path)
+
+    # ── Structured interventions (issue #33 Phase G) ───────────────────────
+
+    _INTERVENTION_NAME = "intervention.json"
+
+    def _consume_intervention(self, ws: Path, sink: _EventWriter) -> dict[str, Any] | None:
+        """The v1 structured-question mechanism (executor-agnostic sentinel
+        file, per the settled ADR-009 decision): if the turn left a valid
+        `.miragen/intervention.json`, stamp an id + timestamp, archive the
+        file (so a resumed turn never re-triggers it), emit
+        `intervention.requested`, and return the parsed request.
+
+        A malformed file is NOT a prose-parsing fallback: it is set aside as
+        `intervention.invalid.json`, an `intervention.invalid` event records
+        why, and the turn proceeds normally — the schema is the contract.
+        """
+        marker_dir = ws / ".miragen"
+        path = marker_dir / self._INTERVENTION_NAME
+        if not path.exists():
+            return None
+        try:
+            raw = json.loads(path.read_text())
+            if not isinstance(raw, dict):
+                raise ValueError("intervention file must be a JSON object")
+            raw.pop("intervention_id", None)  # miragen-assigned, never agent-chosen
+            raw.pop("requested_at", None)
+            request = InterventionRequest.model_validate({
+                **raw,
+                "intervention_id": uuid.uuid4().hex,
+                "requested_at": datetime.now(timezone.utc).isoformat(),
+            })
+        except (ValueError, ValidationError) as e:
+            sink.write({"type": "intervention.invalid", "error": str(e)})
+            path.replace(marker_dir / "intervention.invalid.json")
+            return None
+
+        archive = marker_dir / "interventions"
+        archive.mkdir(exist_ok=True)
+        path.replace(archive / f"{request.intervention_id}.json")
+        payload = request.model_dump(mode="json")
+        sink.write({"type": "intervention.requested", **payload})
+        return payload
 
     # ── Budget ─────────────────────────────────────────────────────────────
 
@@ -325,11 +739,32 @@ def event_payload(event: Any) -> dict[str, Any]:
 def _usage_from_payload(raw: Any) -> RunUsage | None:
     if not isinstance(raw, dict):
         return None
+    # Cached tokens where the adapter reports them: either normalized flat
+    # (cached_input_tokens) or OpenAI-style nested details. Absent → None,
+    # never a claimed zero.
+    cached = raw.get("cached_input_tokens")
+    if cached is None:
+        details = raw.get("input_tokens_details")
+        if isinstance(details, dict):
+            cached = details.get("cached_tokens")
     return RunUsage(
         requests=1,
         input_tokens=raw.get("input_tokens"),
         output_tokens=raw.get("output_tokens"),
+        cached_input_tokens=cached,
     )
+
+
+# item.completed types that are NOT tool work — everything else counts toward
+# the tool-call summary.
+_NON_TOOL_ITEM_TYPES = {"agent_message", "agent-message", "reasoning"}
+
+
+def _item_is_failure(item: dict[str, Any]) -> bool:
+    exit_code = item.get("exit_code")
+    if isinstance(exit_code, int) and exit_code != 0:
+        return True
+    return item.get("status") in ("failed", "error")
 
 
 def _git(ws: Path, *args: str) -> str:

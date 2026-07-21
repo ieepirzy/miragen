@@ -41,6 +41,9 @@ class RunUsage(BaseModel):
     requests: int
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
+    # Prompt-cache reads, where the adapter reports them (issue #33 Phase E).
+    # None = the executor cannot report this metric; never coerced to 0.
+    cached_input_tokens: Optional[int] = None
 
 
 def sum_usage(a: Optional[RunUsage], b: Optional[RunUsage]) -> Optional[RunUsage]:
@@ -55,6 +58,7 @@ def sum_usage(a: Optional[RunUsage], b: Optional[RunUsage]) -> Optional[RunUsage
         requests=a.requests + b.requests,
         input_tokens=(a.input_tokens or 0) + (b.input_tokens or 0) or None,
         output_tokens=(a.output_tokens or 0) + (b.output_tokens or 0) or None,
+        cached_input_tokens=(a.cached_input_tokens or 0) + (b.cached_input_tokens or 0) or None,
     )
 
 
@@ -65,11 +69,112 @@ RunStatus = Literal[
     "suspended", "abandoned",
 ]
 
+# "launch" = POST /executor-runs: an idempotent, provenance-carrying launch
+# from an external control plane (issue #33 Phase B). "managed" = a fire
+# from an API-owned schedule binding (Phase F), distinct from profile-driven
+# "cron" so projections can tell them apart.
+RunTrigger = Literal["cron", "http", "http_async", "launch", "managed"]
+
+
+class RunProvenance(BaseModel):
+    """Caller/product provenance persisted with a run BEFORE launch is
+    acknowledged. miragen stores and returns these verbatim; it never
+    interprets them — product entities stay authoritative in the control
+    plane. extra="allow" so product-side fields survive the round trip."""
+
+    model_config = ConfigDict(extra="allow")
+
+    idempotency_key: Optional[str] = None
+    environment_id: Optional[str] = None
+    environment_revision: Optional[str] = None
+    routine_id: Optional[str] = None
+    trigger_id: Optional[str] = None
+    invocation_id: Optional[str] = None
+    requested_by: Optional[str] = None
+    edf_api_version: Optional[str] = None
+
+
+class RepositoryRevision(BaseModel):
+    """A repository the run's workspace plan includes. `commit` stays None
+    until workspace preparation resolves the ref (issue #33 Phase D)."""
+
+    name: str
+    ref: str
+    mount_path: Optional[str] = None
+    writable: bool = False
+    commit: Optional[str] = None
+
+
+# ── Structured interventions (issue #33 Phase G) ─────────────────────────────
+#
+# The executor-emitted question and the human's structured answer. Wire
+# models, lenient (extra="allow"): the question file is agent-authored and
+# the answer may carry product-side fields miragen stores verbatim.
+
+class InterventionOption(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: str = Field(min_length=1)
+    label: Optional[str] = None
+    description: Optional[str] = None
+
+
+class InterventionRequest(BaseModel):
+    """A structured question that suspended a run (exit_reason
+    'intervention'). `intervention_id`/`requested_at` are miragen-assigned;
+    everything else comes from the executor's .miragen/intervention.json."""
+
+    model_config = ConfigDict(extra="allow")
+
+    intervention_id: str
+    question: str = Field(min_length=1)
+    kind: Optional[str] = None  # e.g. 'architecture-decision', 'confirmation'
+    options: list[InterventionOption] = Field(default_factory=list)
+    evidence: Optional[str] = None
+    affected_repositories: Optional[list[str]] = None
+    requested_at: str  # ISO-8601 UTC
+
+
+class InterventionAnswer(BaseModel):
+    """The structured answer/resume payload, bound to the pending
+    intervention by id. `approval_ref` is the server-side authorization
+    hook: recorded immutably in the event stream, never inferred from
+    prompt text."""
+
+    model_config = ConfigDict(extra="allow")
+
+    intervention_id: str = Field(min_length=1)
+    decision: Optional[str] = Field(default=None, description="Chosen option id, when options were offered.")
+    text: Optional[str] = Field(default=None, description="Free-text answer/guidance.")
+    approval_ref: Optional[str] = None
+    answered_by: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_has_content(self) -> "InterventionAnswer":
+        if self.decision is None and self.text is None:
+            raise ValueError("an intervention answer requires at least one of `decision` or `text`")
+        return self
+
+
+class TargetOperationProvenance(BaseModel):
+    """Target-operation provenance an event MAY carry under its `target` key
+    (issue #33 Phases C/G). Defined now so the envelope contract is stable;
+    targets themselves are not required (or provisioned) in v1 — emitters
+    arrive with the target adapters."""
+
+    model_config = ConfigDict(extra="allow")
+
+    target_id: str = Field(min_length=1)
+    target_name: Optional[str] = None
+    operation_class: Literal["inspect", "read", "write", "destructive"]
+    credential_grant_ref: Optional[str] = None
+    approval_ref: Optional[str] = None
+
 
 class RunRecord(BaseModel):
     run_id: str  # uuid4 hex
     agent_name: str
-    trigger: Literal["cron", "http", "http_async"]
+    trigger: RunTrigger
     status: RunStatus
     prompt: str  # truncated to 20_000 chars
     output: Optional[str] = None  # truncated to 100_000 chars
@@ -91,13 +196,38 @@ class RunRecord(BaseModel):
     # None = no sink configured / not applicable; True/False = sink outcome.
     # Advisory only — the diff on disk is the source of truth either way.
     artifact_stored: Optional[bool] = None
+    # Execution provenance (issue #33 Phases A/B) — None for runs launched
+    # outside POST /executor-runs. snapshot_sha256 is the canonical EDF hash;
+    # the full snapshot document lives beside the record (RunStore snapshots).
+    executor: Optional[str] = None
+    model: Optional[str] = None
+    snapshot_sha256: Optional[str] = None
+    provenance: Optional[RunProvenance] = None
+    repositories: Optional[list[RepositoryRevision]] = None
+    # Timing/telemetry intervals (issue #33 Phase E). Formulas:
+    #   wall clock  = duration_s = finished_at - started_at (includes blocked)
+    #   blocked_s   = Σ (resume time - previous finished_at) across reopens
+    #   active_s    = duration_s - blocked_s
+    #   setup_s     = Σ per-turn workspace-preparation time
+    # resume_count counts reopen transitions. Tool-call summaries come from
+    # normalized item events; all stay None where an executor can't report.
+    resume_count: int = 0
+    blocked_s: Optional[float] = None
+    active_s: Optional[float] = None
+    setup_s: Optional[float] = None
+    tool_call_count: Optional[int] = None
+    tool_call_failures: Optional[int] = None
+    # The structured question this run is suspended on (exit_reason
+    # 'intervention'), cleared when the run is resumed. History lives in the
+    # event stream (intervention.requested/answered/superseded).
+    pending_intervention: Optional[InterventionRequest] = None
 
 
 class RunSummary(BaseModel):
     # Everything in RunRecord except prompt/output/tool_calls, plus previews.
     run_id: str
     agent_name: str
-    trigger: Literal["cron", "http", "http_async"]
+    trigger: RunTrigger
     status: RunStatus
     prompt_preview: str  # first 200 chars of prompt
     output_preview: Optional[str] = None  # first 200 chars of output
@@ -107,6 +237,8 @@ class RunSummary(BaseModel):
     duration_s: Optional[float] = None
     usage: Optional[RunUsage] = None
     use_history: bool = False
+    snapshot_sha256: Optional[str] = None
+    resume_count: int = 0
 
     @classmethod
     def from_record(cls, record: RunRecord) -> RunSummary:
@@ -123,6 +255,8 @@ class RunSummary(BaseModel):
             duration_s=record.duration_s,
             usage=record.usage,
             use_history=record.use_history,
+            snapshot_sha256=record.snapshot_sha256,
+            resume_count=record.resume_count,
         )
 
 

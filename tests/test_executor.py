@@ -199,13 +199,31 @@ async def test_harvest_diff_includes_executors_own_mid_turn_commit(tmp_path):
     assert "uncommitted.py" in diff
 
 
+async def test_miragen_metadata_excluded_from_classic_diff(tmp_path):
+    """P2 regression: internal .miragen files (harvest output, intervention
+    archive, malformed sentinels left by a prior turn) must never leak into
+    the classic-workspace diff on a later successful harvest."""
+    executor = make_executor(_executor_profile(), tmp_path)
+    ws = Path(executor.spec.workspace_root) / "run-hygiene"
+    executor._prepare_workspace(ws)
+    (ws / "real.py").write_text("print('work')\n")
+    # leftover control metadata from a prior (suspended/intervention) turn
+    (ws / ".miragen" / "interventions").mkdir(parents=True, exist_ok=True)
+    (ws / ".miragen" / "interventions" / "abc.json").write_text('{"question": "?"}')
+    (ws / ".miragen" / "intervention.invalid.json").write_text("garbage")
+
+    diff = Path(await executor._harvest_diff(ws)).read_text()
+    assert "real.py" in diff
+    assert ".miragen" not in diff and "intervention" not in diff
+
+
 async def test_workspace_prep_failure_is_resumable_crash(tmp_path):
     """Regression: a workspace-prep failure (bad workspace_root, missing git,
     permission error) must surface as a 'failed' ExecutorResult — same as any
     other crash — not an unhandled exception that skips RunStore.finish() and
     leaves the run record stuck at 'running'."""
     executor = make_executor(_executor_profile(), tmp_path)
-    executor._prepare_workspace = lambda ws: (_ for _ in ()).throw(OSError("permission denied"))
+    executor._prepare_workspace = lambda ws, *a, **kw: (_ for _ in ()).throw(OSError("permission denied"))
 
     result = await executor.run_job("try", "run-prep-fail")
     assert result.status == "failed"
@@ -278,8 +296,13 @@ async def test_events_are_persisted_jsonl(tmp_path):
     await executor.run_job("task", "run5")
     events = executor.read_events("run5")
     kinds = [e["type"] for e in events]
-    assert kinds[0] == "thread.started" and kinds[-1] == "turn.completed"
+    # base-tier lifecycle events bracket the adapter's own stream
+    assert kinds[0] == "lifecycle.setup.started" and kinds[-1] == "lifecycle.harvest.completed"
+    assert "thread.started" in kinds and "turn.completed" in kinds
     assert all("ts" in e for e in events)
+    # envelope: per-run monotonic 1-based sequence + schema version
+    assert [e["seq"] for e in events] == list(range(1, len(events) + 1))
+    assert all(e["schema"] == "miragen/executor-event/v1" for e in events)
 
 
 # ── App wiring: dispatch + executor endpoints ─────────────────────────────────
