@@ -50,8 +50,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
 
+import threading
+
 from pydantic import ValidationError
 
+from miragen.executor.leash import GateDecision, GateOperation, LeashPolicy
 from miragen.models import AgentProfile, ExecutorSpec, InterventionRequest, RunUsage, sum_usage
 
 logger = logging.getLogger("miragen.executor")
@@ -234,6 +237,39 @@ class ExecutorBackend(ABC):
         self.profile = profile
         self.spec: ExecutorSpec = profile.executor
         self.runs_root = Path(runs_root)
+        # Host-imposed leash (issue #38): None unless the profile opts in.
+        self._leash: LeashPolicy | None = (
+            LeashPolicy(self.spec.leash, mode=profile.mode) if self.spec.leash else None
+        )
+        # Operations the gate blocked this turn. Written from the backend's
+        # approval hook (which may run in the SDK's offload thread) and drained
+        # on the main loop after the turn — hence the lock. In-process only;
+        # no file, no serialization (the cross-process agent channel uses the
+        # sentinel file, this in-process one does not).
+        self._gate_lock = threading.Lock()
+        self._gate_blocks: list[GateOperation] = []
+
+    @property
+    def leash_enabled(self) -> bool:
+        return self._leash is not None
+
+    def gate_decide(self, op: GateOperation) -> GateDecision:
+        """Evaluate one operation against the leash. Allow-all when no leash is
+        configured. On a block, the operation is recorded for post-turn
+        escalation — call this from the adapter's approval hook and reject the
+        action when `allow` is False."""
+        if self._leash is None:
+            return GateDecision(allow=True)
+        decision = self._leash.evaluate(op)
+        if not decision.allow:
+            with self._gate_lock:
+                self._gate_blocks.append(op)
+        return decision
+
+    def _drain_gate_blocks(self) -> list[GateOperation]:
+        with self._gate_lock:
+            blocks, self._gate_blocks = self._gate_blocks, []
+        return blocks
 
     # ── Startup ────────────────────────────────────────────────────────────
 
@@ -357,12 +393,13 @@ class ExecutorBackend(ABC):
                         tool_call_failures=tool_failures,
                     )
 
-                intervention = self._consume_intervention(ws, sink)
+                # A structured question suspends the run, whether the agent
+                # raised it (the sentinel file, cross-process) or the host
+                # leash blocked an action (in-process gate). Either way the
+                # question beats harvest and the budget check this turn.
+                intervention = self._consume_intervention(ws, sink) or self._consume_gate_intervention(sink)
                 if intervention is not None:
-                    # A structured question beats harvest AND the budget
-                    # check this turn — the question must be recorded either
-                    # way, and the cumulative budget check guards the next
-                    # turn regardless. Partial work stays as resume state.
+                    # Partial work stays as resume state.
                     return ExecutorResult(
                         status="suspended",
                         exit_reason="intervention",
@@ -711,6 +748,35 @@ class ExecutorBackend(ABC):
         path.replace(archive / f"{request.intervention_id}.json")
         payload = request.model_dump(mode="json")
         sink.write({"type": "intervention.requested", **payload})
+        return payload
+
+    def _consume_gate_intervention(self, sink: _EventWriter) -> dict[str, Any] | None:
+        """Host-leash counterpart to `_consume_intervention` (issue #38): if the
+        gate blocked any action this turn, raise ONE intervention summarizing
+        the blocked operation(s) so a human authorizes before the run
+        continues. The blocked actions never ran — this is review, not undo.
+
+        In-process: the blocks came from `gate_decide` via the backend's
+        approval hook, not from a file. `kind: "host-gate"` distinguishes it
+        from an agent-raised question, and each block is offered as evidence.
+        """
+        blocks = self._drain_gate_blocks()
+        if not blocks:
+            return None
+        lines = [f"- [{op.op_class}] {op.summary or op.command or ''}".rstrip() for op in blocks]
+        request = InterventionRequest(
+            intervention_id=uuid.uuid4().hex,
+            kind="host-gate",
+            question=(
+                f"The action leash blocked {len(blocks)} operation(s) that need human "
+                "authorization before this run continues."
+            ),
+            options=[{"id": "approve"}, {"id": "deny"}],  # type: ignore[list-item]
+            evidence="\n".join(lines),
+            requested_at=datetime.now(timezone.utc).isoformat(),
+        )
+        payload = request.model_dump(mode="json")
+        sink.write({"type": "intervention.requested", "source": "host-gate", **payload})
         return payload
 
     # ── Budget ─────────────────────────────────────────────────────────────

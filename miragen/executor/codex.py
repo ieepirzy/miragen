@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
 from miragen.executor.base import ExecutorBackend
+from miragen.executor.leash import GateOperation
 from miragen.models import AgentProfile
 
 logger = logging.getLogger("miragen.executor")
@@ -162,7 +163,14 @@ class CodexExecutor(ExecutorBackend):
         async with AsyncCodex(config) as codex:
             await self._login(codex)
             sandbox = Sandbox(options["sandbox"])
-            approval = ApprovalMode(options["approval_mode"])
+            if self.leash_enabled:
+                # Leash on: request per-action approval and answer it with the
+                # host gate. deny_all (never-ask) can't gate; auto_review sets
+                # on-request. See _install_gate re: reviewer authority.
+                self._install_gate(codex)
+                approval = ApprovalMode("auto_review")
+            else:
+                approval = ApprovalMode(options["approval_mode"])
             if thread_id:
                 thread = await codex.thread_resume(
                     thread_id, approval_mode=approval, cwd=options["cwd"],
@@ -193,6 +201,45 @@ class CodexExecutor(ExecutorBackend):
         key = os.environ.get("CODEX_API_KEY") or os.environ.get("OPENAI_API_KEY")
         if key:
             await codex.login_api_key(key)
+
+    # ── Host leash (issue #38) ───────────────────────────────────────────────
+
+    def _install_gate(self, codex: Any) -> None:
+        """Route the app-server's per-action approval requests to miragen's
+        leash. Reaches into one SDK internal (the async wrappers don't forward
+        approval_handler; only the sync CodexClient takes it) — isolated here.
+
+        NOTE: for the handler to be authoritative, the turn must run with
+        approval_policy=on-request and NO server-side auto-reviewer. That exact
+        combination is the one seam unit tests can't exercise (no app-server);
+        it is verified by the gated live smoke test.
+        """
+        try:
+            codex._client._sync._approval_handler = self._approval_decision
+        except AttributeError:  # pragma: no cover — SDK shape drift
+            logger.warning(f"[{self.profile.name}] could not install leash approval handler")
+
+    def _approval_decision(self, method: str, params: dict[str, Any] | None) -> dict[str, Any]:
+        """Sync approval handler (runs in the SDK's offload thread). Maps the
+        request to a GateOperation, asks the leash, and answers the app-server.
+        A block is recorded by `gate_decide` for post-turn escalation."""
+        op = self._gate_operation(method, params or {})
+        if op is None:
+            return {"decision": "accept"}  # unclassifiable → fail-open (never stall)
+        decision = self.gate_decide(op)
+        return {"decision": "accept"} if decision.allow else {"decision": "denied"}
+
+    @staticmethod
+    def _gate_operation(method: str, params: dict[str, Any]) -> GateOperation | None:
+        """Normalize a Codex approval request into a GateOperation. Field
+        access is best-effort against the app-server payload shape."""
+        if method == "item/fileChange/requestApproval":
+            return GateOperation(op_class="write", summary="file change outside the trusted set")
+        if method == "item/commandExecution/requestApproval":
+            item = params.get("item") if isinstance(params.get("item"), dict) else {}
+            command = params.get("command") or item.get("command") or ""
+            return GateOperation(op_class="command", command=command, summary=command[:120])
+        return None
 
 
 def _config_overrides(options: dict[str, Any]) -> tuple[str, ...]:
