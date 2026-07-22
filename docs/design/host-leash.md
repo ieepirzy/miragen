@@ -98,12 +98,31 @@ passive one.
 - **The command-danger classifier** (Phase 3) for the ambiguous shell
   residue.
 
-## 6. The one live-verified seam
+## 6. Routing approvals to the client (the Codex reviewer)
+
+The Codex app server routes each approval request to one of three
+*reviewers* (`ApprovalsReviewer`): `auto_review` (a server-side subagent
+decides), `guardian_subagent`, or `user` (the request is sent to the
+connected client). Only `user` reaches miragen's injected
+`_approval_handler` — under `auto_review` the leash would be silently
+bypassed by the app server's own reviewer.
+
+The public `ApprovalMode` enum can't select the `user` reviewer
+(`auto_review` → `on-request` + auto-reviewer; `deny_all` → `never`), so a
+leashed thread is opened one level down (`codex.py._open_leashed_thread`)
+with `approval_policy=on-request` + `approvals_reviewer=user` directly. This
+is the sole low-level SDK coupling; if the lifecycle-param shape drifts, that
+one helper is where it's fixed.
+
+The reject decision returned to the app server is `{"decision": "decline"}`
+(the verb that yields a `declined` item status) — not `denied`, which is an
+unrelated guardian-review *status*, not a client decision value.
+
+## 7. The one live-verified seam
 
 Everything above is unit-tested with the SDKs stubbed — the policy, the
-escalation, and the per-backend request→`GateOperation` mapping. The single
-piece unit tests can't exercise (no app-server / no Claude runtime) is that
-driving Codex with `approval_policy=on-request` + **no** server-side
-auto-reviewer routes every approval to miragen's handler (rather than the
-app-server auto-deciding). That is marked in `codex.py._install_gate` and is
-confirmed by the gated live smoke test.
+escalation, the per-backend request→`GateOperation` mapping, and the
+reviewer/decision wiring against the pinned SDK's own types. The single piece
+unit tests can't exercise (no app-server / no Claude runtime) is that a live
+Codex app server, driven with the `user` reviewer, actually delivers each
+`requestApproval` to this client handler. That is the gated live smoke test.

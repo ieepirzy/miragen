@@ -168,23 +168,29 @@ class CodexExecutor(ExecutorBackend):
             await self._login(codex)
             sandbox = Sandbox(options["sandbox"])
             if self.leash_enabled:
-                # Leash on: request per-action approval and answer it with the
-                # host gate. deny_all (never-ask) can't gate; auto_review sets
-                # on-request. See _install_gate re: reviewer authority.
+                # Leash on: every consequential action must reach miragen's
+                # approval handler. That means on-request approvals routed to
+                # the *client/user* reviewer — the public ApprovalMode can't
+                # express it (auto_review routes to a server-side subagent that
+                # would decide instead of us), so build the thread with that
+                # policy one level down. See _install_gate / host-leash.md.
                 self._install_gate(codex)
-                approval = ApprovalMode("auto_review")
+                thread = await self._open_leashed_thread(
+                    codex, thread_id=thread_id, cwd=options["cwd"],
+                    model=options["model"], sandbox=sandbox,
+                )
             else:
                 approval = ApprovalMode(options["approval_mode"])
-            if thread_id:
-                thread = await codex.thread_resume(
-                    thread_id, approval_mode=approval, cwd=options["cwd"],
-                    model=options["model"], sandbox=sandbox,
-                )
-            else:
-                thread = await codex.thread_start(
-                    approval_mode=approval, cwd=options["cwd"],
-                    model=options["model"], sandbox=sandbox,
-                )
+                if thread_id:
+                    thread = await codex.thread_resume(
+                        thread_id, approval_mode=approval, cwd=options["cwd"],
+                        model=options["model"], sandbox=sandbox,
+                    )
+                else:
+                    thread = await codex.thread_start(
+                        approval_mode=approval, cwd=options["cwd"],
+                        model=options["model"], sandbox=sandbox,
+                    )
             # thread.id is the resume handle; emit it before streaming so a
             # cancelled (timed-out) turn still recovers it (same reasoning as
             # the legacy adapter).
@@ -198,6 +204,41 @@ class CodexExecutor(ExecutorBackend):
                     yield note
             finally:
                 await stream.aclose()
+
+    async def _open_leashed_thread(
+        self, codex: Any, *, thread_id: str | None, cwd: str, model: str | None, sandbox: Any
+    ) -> Any:
+        """Start/resume a thread whose per-action approvals route to miragen's
+        client handler: on-request policy + the `user` reviewer. The public
+        thread_start/thread_resume only accept an ApprovalMode, which can select
+        the auto-review subagent but never the user reviewer, so construct the
+        lifecycle params one level down. Isolated low-level SDK coupling — if the
+        param shape drifts this is the only spot to fix (see host-leash.md)."""
+        from openai_codex import AsyncThread
+        from openai_codex._sandbox import _sandbox_mode
+        from openai_codex.generated.v2_all import (
+            ApprovalsReviewer,
+            AskForApproval,
+            AskForApprovalValue,
+            ThreadResumeParams,
+            ThreadStartParams,
+        )
+
+        approvals = dict(
+            approval_policy=AskForApproval(root=AskForApprovalValue.on_request),
+            approvals_reviewer=ApprovalsReviewer.user,
+            cwd=cwd,
+            model=model,
+            sandbox=_sandbox_mode(sandbox),
+        )
+        await codex._ensure_initialized()
+        if thread_id:
+            resumed = await codex._client.thread_resume(
+                thread_id, ThreadResumeParams(thread_id=thread_id, **approvals)
+            )
+            return AsyncThread(codex, resumed.thread.id)
+        started = await codex._client.thread_start(ThreadStartParams(**approvals))
+        return AsyncThread(codex, started.thread.id)
 
     async def _login(self, codex: Any) -> None:
         """Log in with an API key when one is configured; otherwise rely on the
@@ -213,10 +254,11 @@ class CodexExecutor(ExecutorBackend):
         leash. Reaches into one SDK internal (the async wrappers don't forward
         approval_handler; only the sync CodexClient takes it) — isolated here.
 
-        NOTE: for the handler to be authoritative, the turn must run with
-        approval_policy=on-request and NO server-side auto-reviewer. That exact
-        combination is the one seam unit tests can't exercise (no app-server);
-        it is verified by the gated live smoke test.
+        Authority comes from the thread being opened with on-request approvals +
+        the `user` reviewer (`_open_leashed_thread`); with that policy the app-
+        server sends each requestApproval to this client handler rather than a
+        server-side subagent. That the live app-server honors it is the one seam
+        unit tests can't exercise (no app-server) — the gated live smoke test.
         """
         try:
             codex._client._sync._approval_handler = self._approval_decision
@@ -231,7 +273,10 @@ class CodexExecutor(ExecutorBackend):
         if op is None:
             return {"decision": "accept"}  # unclassifiable → fail-open (never stall)
         decision = self.gate_decide(op)
-        return {"decision": "accept"} if decision.allow else {"decision": "denied"}
+        # "decline" is the app-server's reject verb (yields a `declined` item
+        # status); "denied" is the unrelated guardian-review status, not a
+        # client decision value.
+        return {"decision": "accept"} if decision.allow else {"decision": "decline"}
 
     @staticmethod
     def _gate_operation(method: str, params: dict[str, Any]) -> GateOperation | None:

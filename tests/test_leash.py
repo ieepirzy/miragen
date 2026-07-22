@@ -160,7 +160,7 @@ def test_codex_approval_decision(tmp_path):
     accept = executor._approval_decision("item/commandExecution/requestApproval", {"command": "ls"})
     deny = executor._approval_decision("item/commandExecution/requestApproval", {"command": "rm -rf /"})
     assert accept == {"decision": "accept"}
-    assert deny == {"decision": "denied"}
+    assert deny == {"decision": "decline"}
     # unclassifiable request → fail-open (never stall the run)
     assert executor._approval_decision("mystery/request", {}) == {"decision": "accept"}
     # the two blocked ops are now queued for escalation
