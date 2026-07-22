@@ -39,42 +39,38 @@ def _executor_profile(**kw):
     return AgentProfile.model_validate(body)
 
 
-# ── Stub thread layer ─────────────────────────────────────────────────────────
-
-
-class StubStreamed:
-    def __init__(self, events):
-        self._events = events
-
-    @property
-    async def events(self):
-        raise AssertionError  # replaced below; kept for symmetry
-
-    async def __aiter__(self):
-        for e in self._events:
-            yield e
+# ── Stub session layer ──────────────────────────────────────────────────────
+#
+# The codex adapter's test seam is `session_factory(prompt, *, thread_id,
+# first_turn, options) -> async iterator of notifications`. In tests the
+# "notifications" are already-normalized payload dicts, which pass straight
+# through `_normalize_notification` — so the base-tier state machine is driven
+# with the same normalized events regardless of the real SDK. StubThread keeps
+# its name/shape (several test modules import it) but is now that callable:
+# it records prompts, optionally touches the workspace mid-turn, and can raise.
 
 
 class StubThread:
-    def __init__(self, events, thread_id="thr_stub123", touch=None):
+    def __init__(self, events, thread_id="thr_stub123", touch=None, raise_exc=None):
         self._events = events
         self.id = thread_id
         self._touch = touch
+        self._raise = raise_exc
         self.prompts: list[str] = []
 
-    async def run_streamed(self, prompt):
+    def __call__(self, prompt, *, thread_id=None, first_turn=True, options=None):
         self.prompts.append(prompt)
-        if self._touch:
-            self._touch()
+        events, touch, raise_exc = self._events, self._touch, self._raise
 
         async def gen():
-            for e in self._events:
+            if raise_exc is not None:
+                raise raise_exc
+            if touch is not None:
+                touch()
+            for e in events:
                 yield e
 
-        class _S:
-            events = gen()
-
-        return _S()
+        return gen()
 
 
 def default_events(thread_id="thr_stub123", tokens=(100, 50), message="done, files changed"):
@@ -91,13 +87,10 @@ def make_executor(profile, tmp_path, events=None, thread=None, raise_exc=None):
     profile.executor.workspace_root = str(tmp_path / "workspaces")
     profile.executor.codex_home = str(tmp_path / "codex-home")
     runs_root = tmp_path / "runs"
-
-    def factory(*, thread_id, options):
-        if raise_exc is not None:
-            raise raise_exc
-        return thread or StubThread(events if events is not None else default_events())
-
-    return CodexExecutor(profile, runs_root=runs_root, thread_factory=factory)
+    session = thread or StubThread(
+        events if events is not None else default_events(), raise_exc=raise_exc
+    )
+    return CodexExecutor(profile, runs_root=runs_root, session_factory=session)
 
 
 # ── Profile validation ────────────────────────────────────────────────────────
@@ -282,7 +275,7 @@ async def test_budget_exhaustion_persists_across_resume(tmp_path):
     result = await executor.run_job("big task", "run-budget-resume")
     assert result.status == "suspended"
 
-    executor._thread_factory = lambda **kw: StubThread(default_events(tokens=(5, 5)))
+    executor._session_factory = StubThread(default_events(tokens=(5, 5)))
     result2 = await executor.run_job(
         "keep going", "run-budget-resume",
         thread_id=result.thread_id, first_turn=False, prior_usage=result.usage,
@@ -382,7 +375,7 @@ async def test_resume_stays_suspended_if_cumulative_budget_still_exceeded(execut
 
     # Resume without raising the budget: this turn's own usage is small, but
     # combined with the prior turn's it's still over the per-run cap.
-    app_module._executor._thread_factory = lambda **kw: StubThread(default_events(tokens=(5, 5)))
+    app_module._executor._session_factory = StubThread(default_events(tokens=(5, 5)))
     resp = await executor_client.post(f"/runs/{run_id}/resume", json={"prompt": "keep going"})
     assert resp.status_code == 200, resp.text
     resumed = resp.json()
@@ -418,7 +411,7 @@ async def test_scheduled_run_skips_on_complete_when_suspended(tmp_path):
 
 
 async def test_abandon_with_workspace_discard(executor_client, tmp_path):
-    app_module._executor._thread_factory = lambda **kw: (_ for _ in ()).throw(RuntimeError("boom"))
+    app_module._executor._session_factory = StubThread(default_events(), raise_exc=RuntimeError("boom"))
     resp = await executor_client.post("/run", json={"prompt": "doomed"})
     assert resp.status_code == 500
     run_id = app_module._run_store.list(limit=1)[0].run_id

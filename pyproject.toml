@@ -42,11 +42,12 @@ dev = [
     "pytest>=9.0",
     "pytest-asyncio>=1.0",
 ]
-# Executor backend tier (self-harnessed executors). NOTE: the official SDK is
-# `openai-codex-sdk` (Author: OpenAI) — `codex-sdk` on PyPI is an unrelated
-# Cleanlab package.
+# Executor backend tier (self-harnessed executors). `openai-codex` is OpenAI's
+# App Server JSON-RPC SDK (AsyncCodex → threads → turns → notifications), which
+# supersedes the legacy `openai-codex-sdk` CLI wrapper: it adds ChatGPT
+# subscription auth and a host-answerable command-approval channel (issue #38).
 codex = [
-    "openai-codex-sdk>=0.1.11",
+    "openai-codex>=0.144",
 ]
 # Claude Code executor backend (claude-agent-sdk is the official Anthropic
 # package; the spawn backend needs no extra at all).

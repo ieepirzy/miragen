@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
 from miragen.executor.base import ExecutorBackend
+from miragen.executor.leash import GateOperation
 from miragen.models import AgentProfile
 
 logger = logging.getLogger("miragen.executor")
@@ -77,11 +78,16 @@ class ClaudeCodeExecutor(ExecutorBackend):
                 yield payload
 
     def _options(self, workspace: Path, thread_id: str | None) -> dict[str, Any]:
+        # Leash on: consult the gate before each tool via can_use_tool, so
+        # permission_mode must be 'default' (bypassPermissions would skip it).
+        permission_mode = "default" if self.leash_enabled else _PERMISSION_MODES[self.spec.approval_policy]
         options: dict[str, Any] = {
             "cwd": str(workspace),
-            "permission_mode": _PERMISSION_MODES[self.spec.approval_policy],
+            "permission_mode": permission_mode,
             "resume": thread_id,
         }
+        if self.leash_enabled:
+            options["can_use_tool"] = self._can_use_tool
         if self.spec.model:
             options["model"] = self.spec.model
         if self.spec.mcp_servers:
@@ -105,6 +111,39 @@ class ClaudeCodeExecutor(ExecutorBackend):
         from claude_agent_sdk import ClaudeAgentOptions, query
 
         return query(prompt=prompt, options=ClaudeAgentOptions(**options))
+
+    # ── Host leash (issue #38) ───────────────────────────────────────────────
+
+    async def _can_use_tool(self, tool_name: str, tool_input: dict[str, Any], context: Any = None) -> Any:
+        """PreToolUse gate: map the tool to a GateOperation, ask the leash, and
+        allow or deny before the tool runs. A block is recorded by gate_decide
+        for post-turn escalation. Async and same-loop — no thread bridge."""
+        from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
+        op = _gate_operation(tool_name, tool_input or {})
+        if op is None:
+            return PermissionResultAllow()
+        decision = self.gate_decide(op)
+        if decision.allow:
+            return PermissionResultAllow()
+        return PermissionResultDeny(message=decision.reason)
+
+
+# Claude Code tool names → leash operation classes.
+_COMMAND_TOOLS = {"Bash", "Shell"}
+_WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+_NETWORK_TOOLS = {"WebFetch", "WebSearch"}
+
+
+def _gate_operation(tool_name: str, tool_input: dict[str, Any]) -> GateOperation | None:
+    if tool_name in _COMMAND_TOOLS:
+        command = tool_input.get("command", "") or ""
+        return GateOperation(op_class="command", command=command, summary=command[:120])
+    if tool_name in _WRITE_TOOLS:
+        return GateOperation(op_class="write", summary=f"{tool_name} {tool_input.get('file_path', '')}".strip())
+    if tool_name in _NETWORK_TOOLS:
+        return GateOperation(op_class="network", summary=f"{tool_name} {tool_input.get('url', '')}".strip())
+    return None
 
 
 def _normalize(message: Any) -> list[dict[str, Any]]:

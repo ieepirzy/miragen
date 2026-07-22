@@ -54,6 +54,56 @@ def run(tools: str, host: str, port: int, reload: bool) -> None:
     )
 
 
+@cli.command(name="codex-login")
+@click.option(
+    "--codex-home", default=None, envvar="CODEX_HOME",
+    help="Codex credential store to populate (default: /agent/codex-home). Point this at "
+         "the SHARED volume every codex agent container mounts (executor.codex_home).",
+)
+def codex_login(codex_home: str | None) -> None:
+    """Authenticate Codex with ChatGPT ONCE, into a shared credential store.
+
+    Runs the device-code flow (open the printed URL, enter the code). The
+    credentials land in CODEX_HOME; mount that same volume into every codex
+    agent container and they all reuse this one login — agent containers never
+    authenticate themselves. Re-run to refresh. See docs/design/codex-auth.md.
+    """
+    home = codex_home or "/agent/codex-home"
+    os.environ["CODEX_HOME"] = home
+    Path(home).mkdir(parents=True, exist_ok=True)
+
+    try:
+        from openai_codex import Codex
+    except ImportError:
+        click.echo(click.style(
+            "The codex extra is not installed — run `pip install miragen[codex]`.", fg="red"))
+        raise SystemExit(1)
+
+    click.echo(f"Authenticating Codex into {home} …")
+    try:
+        with Codex() as codex:
+            handle = codex.login_chatgpt_device_code()
+            click.echo("")
+            click.echo(click.style("  Open:  ", bold=True) + handle.verification_url)
+            click.echo(click.style("  Code:  ", bold=True) + handle.user_code)
+            click.echo("")
+            click.echo("Waiting for you to approve in the browser (Ctrl-C to cancel) …")
+            try:
+                handle.wait()
+            except KeyboardInterrupt:
+                handle.cancel()
+                click.echo(click.style("Login cancelled.", fg="yellow"))
+                raise SystemExit(1)
+    except SystemExit:
+        raise
+    except Exception as e:
+        click.echo(click.style(f"✗ Login failed: {e}", fg="red"))
+        raise SystemExit(1)
+
+    click.echo(click.style(f"✓ Codex authenticated — credentials written to {home}", fg="green"))
+    click.echo("Mount this volume at executor.codex_home in every codex agent container.")
+
+
 @cli.command()
 @click.argument("profile", envvar="AGENT_PROFILE", default="agent.yaml")
 @click.option("--tools", default="tools", envvar="TOOLS",

@@ -97,20 +97,16 @@ def reset_app_state():
     app_module._executor = None
 
 
-class HangingThread:
-    """Emits its resume handle, then wedges — the case turn_timeout_s exists for."""
-
-    id = "thr_hang"
-
-    async def run_streamed(self, prompt):
+def hanging_session(handle="thr_hang"):
+    """A session_factory that emits its resume handle, then wedges — the case
+    turn_timeout_s exists for. The handle is persisted (and thus recoverable)
+    before the wedge."""
+    def _factory(prompt, *, thread_id=None, first_turn=True, options=None):
         async def gen():
-            yield {"type": "thread.started", "thread_id": "thr_hang"}
+            yield {"type": "thread.started", "thread_id": handle}
             await asyncio.sleep(30)
-
-        class _S:
-            events = gen()
-
-        return _S()
+        return gen()
+    return _factory
 
 
 async def test_turn_timeout_suspends_run_resumably(tmp_path):
@@ -118,7 +114,7 @@ async def test_turn_timeout_suspends_run_resumably(tmp_path):
     runs_root = _paths(profile, tmp_path)
     app_module._profile = profile
     app_module._executor = CodexExecutor(
-        profile, runs_root=runs_root, thread_factory=lambda **kw: HangingThread()
+        profile, runs_root=runs_root, session_factory=hanging_session("thr_hang")
     )
     app_module._run_store = RunStore(root=runs_root, retention=50)
 
@@ -137,7 +133,7 @@ async def test_turn_timeout_suspends_run_resumably(tmp_path):
         assert record.diff_path is None  # no harvest on timeout
 
         # suspended + thread handle = resumable; give it a working thread
-        app_module._executor._thread_factory = lambda **kw: StubThread(default_events())
+        app_module._executor._session_factory = StubThread(default_events())
         resp = await client.post(f"/runs/{run_id}/resume", json={"prompt": "unwedge"})
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "succeeded"
@@ -147,7 +143,7 @@ async def test_no_timeout_when_disabled(tmp_path):
     profile = _profile({"executor": "codex", "turn_timeout_s": None})
     runs_root = _paths(profile, tmp_path)
     executor = CodexExecutor(
-        profile, runs_root=runs_root, thread_factory=lambda **kw: StubThread(default_events())
+        profile, runs_root=runs_root, session_factory=StubThread(default_events())
     )
     app_module._profile = profile
     app_module._executor = executor
@@ -159,29 +155,14 @@ async def test_no_timeout_when_disabled(tmp_path):
         assert app_module._run_store.get(resp.json()["run_id"]).status == "succeeded"
 
 
-class SilentHangingThread:
-    """Hangs before emitting ANY event — the id exists only on the thread
-    object. Regression for Codex review: the resume handle must be persisted
-    before streaming, or a timeout here becomes non-resumable."""
-
-    id = "thr_early"
-
-    async def run_streamed(self, prompt):
-        async def gen():
-            await asyncio.sleep(30)
-            yield {}  # pragma: no cover — makes gen() an async generator
-
-        class _S:
-            events = gen()
-
-        return _S()
-
-
-async def test_timeout_before_any_event_still_recovers_thread_id(tmp_path):
+async def test_timeout_after_thread_started_still_recovers_thread_id(tmp_path):
+    """The resume handle is emitted before the turn streams, so a turn that
+    wedges immediately after still leaves a recoverable thread_id in the
+    persisted event stream."""
     profile = _profile({"executor": "codex"})
     runs_root = _paths(profile, tmp_path)
     executor = CodexExecutor(
-        profile, runs_root=runs_root, thread_factory=lambda **kw: SilentHangingThread()
+        profile, runs_root=runs_root, session_factory=hanging_session("thr_early")
     )
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(executor.run_job("wedge", "run-early"), timeout=0.3)
@@ -193,7 +174,7 @@ def test_latest_thread_id_survives_long_event_streams(tmp_path):
     event; a tail-window scan loses it once a long turn pushes it out."""
     profile = _profile({"executor": "codex"})
     runs_root = _paths(profile, tmp_path)
-    executor = CodexExecutor(profile, runs_root=runs_root, thread_factory=lambda **kw: None)
+    executor = CodexExecutor(profile, runs_root=runs_root, session_factory=None)
 
     events_path = executor._events_path("run-long")
     events_path.parent.mkdir(parents=True, exist_ok=True)
@@ -202,6 +183,86 @@ def test_latest_thread_id_survives_long_event_streams(tmp_path):
         for i in range(1500):
             f.write(json.dumps({"type": "item.completed", "item": {"type": "stdout", "text": str(i)}}) + "\n")
     assert executor.latest_thread_id("run-long") == "thr_first"
+
+
+# ── Codex App Server SDK notification mapping (issue #38) ─────────────────────
+#
+# The stub session_factory yields already-normalized dicts (which pass
+# through), so these exercise `_normalize_notification` against stand-in
+# classes matched by name — the real SDK-type → base-payload mapping.
+
+
+class _StubItem:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class ItemCompletedNotification:
+    def __init__(self, item):
+        self.item = item
+
+
+class TurnCompletedNotification:
+    def __init__(self, turn):
+        self.turn = turn
+
+
+class ThreadTokenUsageUpdatedNotification:
+    def __init__(self, token_usage=None):
+        self.token_usage = token_usage
+
+
+def test_normalize_agent_message_item():
+    from miragen.executor.codex import _normalize_notification
+
+    note = ItemCompletedNotification(_StubItem(type="agentMessage", text="all done", phase=None))
+    assert _normalize_notification(note) == [
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "all done"}}
+    ]
+
+
+def test_normalize_command_item_preserves_command_and_exit():
+    from miragen.executor.codex import _normalize_notification
+
+    note = ItemCompletedNotification(
+        _StubItem(type="commandExecution", command="rm -rf build", status="failed", exit_code=1)
+    )
+    (payload,) = _normalize_notification(note)
+    assert payload["item"] == {
+        "type": "command_execution", "command": "rm -rf build", "status": "failed", "exit_code": 1,
+    }
+
+
+def test_normalize_turn_completed_maps_usage_from_last_breakdown():
+    from miragen.executor.codex import _normalize_notification
+
+    breakdown = _StubItem(input_tokens=100, output_tokens=50, cached_input_tokens=80)
+    turn = _StubItem(status="completed", usage=_StubItem(last=breakdown), error=None)
+    (payload,) = _normalize_notification(TurnCompletedNotification(turn))
+    assert payload["type"] == "turn.completed"
+    assert payload["usage"] == {"input_tokens": 100, "output_tokens": 50, "cached_input_tokens": 80}
+
+
+def test_normalize_turn_failed():
+    from miragen.executor.codex import _normalize_notification
+
+    turn = _StubItem(status="failed", error=_StubItem(message="boom"), usage=None)
+    assert _normalize_notification(TurnCompletedNotification(turn)) == [
+        {"type": "turn.failed", "error": {"message": "boom"}}
+    ]
+
+
+def test_normalize_interim_usage_update_is_dropped():
+    from miragen.executor.codex import _normalize_notification
+
+    assert _normalize_notification(ThreadTokenUsageUpdatedNotification()) == []
+
+
+def test_normalize_passes_plain_dicts_through():
+    from miragen.executor.codex import _normalize_notification
+
+    d = {"type": "thread.started", "thread_id": "t"}
+    assert _normalize_notification(d) == [d]
 
 
 # ── ClaudeCodeExecutor ────────────────────────────────────────────────────────
@@ -489,7 +550,7 @@ async def _run_with_sink(tmp_path, monkeypatch, *, fail):
     runs_root = _paths(profile, tmp_path)
     app_module._profile = profile
     app_module._executor = CodexExecutor(
-        profile, runs_root=runs_root, thread_factory=lambda **kw: StubThread(default_events())
+        profile, runs_root=runs_root, session_factory=StubThread(default_events())
     )
     app_module._run_store = RunStore(root=runs_root, retention=50)
 
@@ -523,7 +584,7 @@ async def test_no_sink_configured_leaves_field_none(tmp_path):
     runs_root = _paths(profile, tmp_path)
     app_module._profile = profile
     app_module._executor = CodexExecutor(
-        profile, runs_root=runs_root, thread_factory=lambda **kw: StubThread(default_events())
+        profile, runs_root=runs_root, session_factory=StubThread(default_events())
     )
     app_module._run_store = RunStore(root=runs_root, retention=50)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

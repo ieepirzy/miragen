@@ -465,6 +465,58 @@ class ArtifactSinkSpec(_ProfileModel):
     )
 
 
+# ── Leash (host-imposed action gate, issue #38) ──────────────────────────────
+
+# Operation classes a leash may gate — the signals reliably recoverable from a
+# backend's approval request: a file write, a shell command, or network
+# egress. Open-ended shell danger (rm -rf, curl | sh) is caught by
+# deny_commands, not a class.
+GateClass = Literal["write", "command", "network"]
+
+
+class LeashSpec(_ProfileModel):
+    """Opt-in host-imposed action gate. When present, miragen answers the
+    executor's per-action approval requests itself: safe actions are accepted
+    instantly (no stall), gated ones are blocked (they never run) and escalate
+    into a Phase-G intervention for human review. Absent = today's behaviour
+    (no gating). The gate lives entirely in miragen — it costs the agent no
+    context. Deterministic and ~free; an optional classifier (later) handles
+    only the ambiguous shell residue."""
+
+    gate: Optional[list[GateClass]] = Field(
+        default=None,
+        description=(
+            "Operation classes to gate. None = default by agent mode: autonomous "
+            "gets a long leash (['network'] only — plus deny_commands); hybrid a "
+            "short one (['write','command','network'] — every escaping action)."
+        ),
+    )
+    deny_commands: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Regex patterns matched against a command string; a match is gated "
+            "regardless of class — the free-form-shell backstop (e.g. 'rm\\\\s+-rf', "
+            "'curl.*\\\\|\\\\s*sh')."
+        ),
+    )
+
+    @field_validator("deny_commands")
+    @classmethod
+    def validate_patterns(cls, v: list[str]) -> list[str]:
+        import re
+        for pattern in v:
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                raise ValueError(f"invalid deny_commands regex {pattern!r}: {e}")
+        return v
+
+    def gated_classes(self, mode: str) -> set[str]:
+        if self.gate is not None:
+            return set(self.gate)
+        return {"network"} if mode == "autonomous" else {"write", "command", "network"}
+
+
 class ExecutorSpec(_ProfileModel):
     executor: Literal["codex", "claude-code", "spawn"] = Field(
         description=(
@@ -542,6 +594,15 @@ class ExecutorSpec(_ProfileModel):
             "Optional post-success artifact sink — pushes the harvested diff "
             "somewhere (Loimi first). Never required, never blocking, never "
             "affects run status."
+        ),
+    )
+    leash: Optional[LeashSpec] = Field(
+        default=None,
+        description=(
+            "Opt-in host-imposed action gate (issue #38). Absent = no gating "
+            "(today's behaviour). Present = miragen answers the executor's "
+            "per-action approval requests, blocking gated operations and "
+            "escalating them into a human intervention."
         ),
     )
 

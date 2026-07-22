@@ -1,27 +1,71 @@
-"""Codex adapter — runs jobs through the official openai-codex-sdk."""
+"""Codex adapter — runs jobs through the official openai-codex App Server SDK.
+
+Migrated from the legacy `openai-codex-sdk` (which wrapped `codex exec` over a
+one-way stdout stream) to `openai-codex`, the App Server JSON-RPC SDK
+(`AsyncCodex` → threads → turns → notifications). The move buys three things
+the old wrapper could not offer (issue #38): subscription-backed auth via
+ChatGPT login, and — for the follow-up leash layer — a bidirectional,
+host-answerable command-approval channel (`approval_handler`).
+
+The base-tier contract is unchanged: this adapter still yields NORMALIZED
+event payload dicts (`thread.started`, `turn.completed`, `turn.failed`,
+`item.completed`) and the base class owns everything else. `_normalize_notification`
+maps the SDK's typed notifications onto those payloads and passes plain dicts
+through untouched, so tests drive the state machine with normalized dicts (as
+before) without importing the SDK.
+
+Auth: the App Server reads Codex's credential store under CODEX_HOME. Either
+`miragen codex-login` writes ChatGPT OAuth credentials there ONCE (subscription
+path — agent containers then mount that shared store and never log in), or the
+deployment sets CODEX_API_KEY/OPENAI_API_KEY (metered, per session). MCP
+servers are still declared via config.toml in CODEX_HOME, written at startup.
+Full model: docs/design/codex-auth.md.
+"""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
-from miragen.executor.base import ExecutorBackend, event_payload
+from miragen.executor.base import ExecutorBackend
+from miragen.executor.leash import GateOperation
 from miragen.models import AgentProfile
 
 logger = logging.getLogger("miragen.executor")
 
+# miragen's sandbox_mode strings → the SDK's Sandbox enum values. Not a direct
+# construction: the SDK spells full access "full-access", miragen "danger-full-access".
+_SANDBOX_VALUES = {
+    "read-only": "read-only",
+    "workspace-write": "workspace-write",
+    "danger-full-access": "full-access",
+}
+
+# miragen approval_policy → the SDK's coarse ApprovalMode. 'never' (the
+# unattended default) maps to deny_all, which sets AskForApproval=never: Codex
+# runs within the sandbox without pausing to ask — today's behavior exactly.
+# Everything else asks and is auto-reviewed. The custom per-command gate
+# (issue #38 Phase 2) rides `approval_handler`, a separate seam.
+_APPROVAL_MODES = {
+    "never": "deny_all",
+    "on-request": "auto_review",
+    "on-failure": "auto_review",
+    "untrusted": "auto_review",
+}
+
+# item.completed item types that carry the agent's final message text.
+_MESSAGE_ITEM_TYPES = {"agentMessage", "agent_message"}
+
 
 class CodexExecutor(ExecutorBackend):
-    """Runs jobs through the official openai-codex-sdk.
+    """Runs jobs through the openai-codex App Server SDK (`pip install miragen[codex]`).
 
-    The SDK wraps the bundled `codex` CLI (`codex exec --experimental-json`,
-    `... resume <thread_id>`) and yields typed Pydantic events — verified
-    against openai-codex-sdk 0.1.11. `thread_factory` exists for tests: it
-    receives (thread_id | None, options) and returns a Thread-compatible
-    object with `.id` and `.run_streamed(prompt)`.
+    `session_factory` is the test seam: it receives
+    `(prompt, *, thread_id, first_turn, options)` and returns an async iterator
+    of notifications — SDK objects in production, or plain normalized payload
+    dicts in tests (which pass straight through `_normalize_notification`).
     """
 
     def __init__(
@@ -29,21 +73,18 @@ class CodexExecutor(ExecutorBackend):
         profile: AgentProfile,
         *,
         runs_root: Path = Path("/agent/runs"),
-        thread_factory: Callable[..., Any] | None = None,
+        session_factory: Callable[..., AsyncIterator[Any]] | None = None,
     ):
         super().__init__(profile, runs_root=runs_root)
-        self._thread_factory = thread_factory or self._sdk_thread
+        self._session_factory = session_factory or self._default_session
 
     # ── Startup ────────────────────────────────────────────────────────────
 
     def prepare(self) -> None:
-        """Write the executor's config (MCP servers, trust settings) into
-        CODEX_HOME. Idempotent; called once at container startup.
-
-        auth.json is NOT written here — it must be volume-mounted into
-        CODEX_HOME by the deployment (per-agent Origo/Codex credentials are
-        spawn-time secrets, never profile content).
-        """
+        """Write the executor's MCP/config into CODEX_HOME (idempotent, once at
+        startup). The App Server reads CODEX_HOME's config.toml and credential
+        store; auth is provisioned by the deployment (mounted ChatGPT creds or
+        CODEX_API_KEY), never profile content."""
         codex_home = Path(self.spec.codex_home)
         codex_home.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("CODEX_HOME", str(codex_home))
@@ -52,26 +93,25 @@ class CodexExecutor(ExecutorBackend):
         config_path.write_text(self._render_config())
         logger.info(f"[{self.profile.name}] executor config written: {config_path}")
 
-        if not (codex_home / "auth.json").exists() and not os.environ.get("CODEX_API_KEY"):
+        has_creds = (codex_home / "auth.json").exists()
+        has_key = bool(os.environ.get("CODEX_API_KEY") or os.environ.get("OPENAI_API_KEY"))
+        if not has_creds and not has_key:
             logger.warning(
-                f"[{self.profile.name}] no auth.json in {codex_home} and CODEX_API_KEY unset — "
-                "executor spawns will fail auth. Mount auth.json into CODEX_HOME."
+                f"[{self.profile.name}] no credentials in {codex_home} and no "
+                "CODEX_API_KEY/OPENAI_API_KEY — executor turns will fail auth. Run "
+                "`miragen codex-login --codex-home <shared volume>` once (subscription) "
+                "or set an API key. Agent containers never log in — they mount the "
+                "shared store. See docs/design/codex-auth.md."
             )
 
     def _render_config(self) -> str:
         lines = [
             "# Generated by miragen at startup — do not edit; edit the agent profile instead.",
-            f'# agent: {self.profile.name}',
+            f"# agent: {self.profile.name}",
         ]
         for server in self.spec.mcp_servers or []:
-            lines += [
-                "",
-                f"[mcp_servers.{server.name}]",
-                f'url = "{server.url}"',
-            ]
+            lines += ["", f"[mcp_servers.{server.name}]", f'url = "{server.url}"']
             if server.bearer_token_env:
-                # Reference by NAME: the per-agent credential is injected into the
-                # container environment at spawn, not stored in config.
                 lines.append(f'bearer_token_env_var = "{server.bearer_token_env}"')
         return "\n".join(lines) + "\n"
 
@@ -86,69 +126,270 @@ class CodexExecutor(ExecutorBackend):
         workspace: Path,
         first_turn: bool,
     ) -> AsyncIterator[dict[str, Any]]:
-        thread = self._thread_factory(
+        session = self._session_factory(
+            prompt,
             thread_id=thread_id,
-            options=self._thread_options(workspace),
+            first_turn=first_turn,
+            options=self._options(workspace),
         )
-        # Some SDK paths only expose the id on the thread object. Persist it
-        # BEFORE streaming when it's already known: a turn that hangs and gets
-        # cancelled (turn_timeout_s) never reaches any post-stream code, and a
-        # resume handle that only exists after the stream ends is a resume
-        # handle the timeout path can't recover. Duplicate thread.started
-        # events are harmless — the parser just re-records the same id.
-        emitted_early = getattr(thread, "id", None)
-        if emitted_early:
-            yield {"type": "thread.started", "thread_id": emitted_early, "synthetic": True}
-        streamed = await thread.run_streamed(prompt)
-        saw_thread_started = False
-        async for event in self._iter_events(streamed):
-            payload = event_payload(event)
-            if payload.get("type") == "thread.started":
-                saw_thread_started = True
-            yield payload
-        if not saw_thread_started and not emitted_early and getattr(thread, "id", None):
-            # Fallback for SDK paths where the id appears only after streaming.
-            yield {"type": "thread.started", "thread_id": thread.id, "synthetic": True}
+        async for note in session:
+            for payload in _normalize_notification(note):
+                yield payload
 
-    # ── Pieces ─────────────────────────────────────────────────────────────
+    def _options(self, workspace: Path) -> dict[str, Any]:
+        """Backend-agnostic turn options, resolved from the profile. Kept as a
+        dict so the test seam sees the same inputs the SDK path does."""
+        return {
+            "cwd": str(workspace),
+            "sandbox": _SANDBOX_VALUES[self.spec.sandbox_mode],
+            "approval_mode": _APPROVAL_MODES[self.spec.approval_policy],
+            "model": self.spec.model,
+            "reasoning_effort": self.spec.reasoning_effort,
+            "network_access": self.spec.network_access,
+            "web_search": self.spec.web_search,
+        }
 
-    def _sdk_thread(self, *, thread_id: str | None, options: Any):
-        from openai_codex_sdk import Codex
+    # ── Real SDK session (default seam) ──────────────────────────────────────
 
-        codex = Codex()
+    async def _default_session(
+        self,
+        prompt: str,
+        *,
+        thread_id: str | None,
+        first_turn: bool,
+        options: dict[str, Any],
+    ) -> AsyncIterator[Any]:
+        """Drive one turn through the App Server SDK, yielding a synthetic
+        thread.started dict followed by the turn's raw notifications."""
+        from openai_codex import AsyncCodex, ApprovalMode, CodexConfig, ReasoningEffort, Sandbox
+
+        config = CodexConfig(config_overrides=_config_overrides(options))
+        async with AsyncCodex(config) as codex:
+            await self._login(codex)
+            sandbox = Sandbox(options["sandbox"])
+            if self.leash_enabled:
+                # Leash on: every consequential action must reach miragen's
+                # approval handler. That means on-request approvals routed to
+                # the *client/user* reviewer — the public ApprovalMode can't
+                # express it (auto_review routes to a server-side subagent that
+                # would decide instead of us), so build the thread with that
+                # policy one level down. See _install_gate / host-leash.md.
+                self._install_gate(codex)
+                thread = await self._open_leashed_thread(
+                    codex, thread_id=thread_id, cwd=options["cwd"],
+                    model=options["model"], sandbox=sandbox,
+                )
+            else:
+                approval = ApprovalMode(options["approval_mode"])
+                if thread_id:
+                    thread = await codex.thread_resume(
+                        thread_id, approval_mode=approval, cwd=options["cwd"],
+                        model=options["model"], sandbox=sandbox,
+                    )
+                else:
+                    thread = await codex.thread_start(
+                        approval_mode=approval, cwd=options["cwd"],
+                        model=options["model"], sandbox=sandbox,
+                    )
+            # thread.id is the resume handle; emit it before streaming so a
+            # cancelled (timed-out) turn still recovers it (same reasoning as
+            # the legacy adapter).
+            yield {"type": "thread.started", "thread_id": thread.id}
+
+            effort = ReasoningEffort(options["reasoning_effort"]) if options["reasoning_effort"] else None
+            turn = await thread.turn(prompt, effort=effort)
+            stream = turn.stream()
+            try:
+                async for note in stream:
+                    yield note
+            finally:
+                await stream.aclose()
+
+    async def _open_leashed_thread(
+        self, codex: Any, *, thread_id: str | None, cwd: str, model: str | None, sandbox: Any
+    ) -> Any:
+        """Start/resume a thread whose per-action approvals route to miragen's
+        client handler: on-request policy + the `user` reviewer. The public
+        thread_start/thread_resume only accept an ApprovalMode, which can select
+        the auto-review subagent but never the user reviewer, so construct the
+        lifecycle params one level down. Isolated low-level SDK coupling — if the
+        param shape drifts this is the only spot to fix (see host-leash.md)."""
+        from openai_codex import AsyncThread
+        from openai_codex._sandbox import _sandbox_mode
+        from openai_codex.generated.v2_all import (
+            ApprovalsReviewer,
+            AskForApproval,
+            AskForApprovalValue,
+            ThreadResumeParams,
+            ThreadStartParams,
+        )
+
+        approvals = dict(
+            approval_policy=AskForApproval(root=AskForApprovalValue.on_request),
+            approvals_reviewer=ApprovalsReviewer.user,
+            cwd=cwd,
+            model=model,
+            sandbox=_sandbox_mode(sandbox),
+        )
+        await codex._ensure_initialized()
         if thread_id:
-            return codex.resume_thread(thread_id, options)
-        return codex.start_thread(options)
+            resumed = await codex._client.thread_resume(
+                thread_id, ThreadResumeParams(thread_id=thread_id, **approvals)
+            )
+            return AsyncThread(codex, resumed.thread.id)
+        started = await codex._client.thread_start(ThreadStartParams(**approvals))
+        return AsyncThread(codex, started.thread.id)
 
-    def _thread_options(self, workspace: Path) -> Any:
+    async def _login(self, codex: Any) -> None:
+        """Log in with an API key when one is configured; otherwise rely on the
+        mounted ChatGPT credential store (the subscription path)."""
+        key = os.environ.get("CODEX_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        if key:
+            await codex.login_api_key(key)
+
+    # ── Host leash (issue #38) ───────────────────────────────────────────────
+
+    def _install_gate(self, codex: Any) -> None:
+        """Route the app-server's per-action approval requests to miragen's
+        leash. Reaches into one SDK internal (the async wrappers don't forward
+        approval_handler; only the sync CodexClient takes it) — isolated here.
+
+        Authority comes from the thread being opened with on-request approvals +
+        the `user` reviewer (`_open_leashed_thread`); with that policy the app-
+        server sends each requestApproval to this client handler rather than a
+        server-side subagent. That the live app-server honors it is the one seam
+        unit tests can't exercise (no app-server) — the gated live smoke test.
+        """
         try:
-            from openai_codex_sdk.types import ThreadOptions
-        except ImportError:  # tests with a stub factory never reach the SDK
-            return {
-                "working_directory": str(workspace),
-                "sandbox_mode": self.spec.sandbox_mode,
-                "approval_policy": self.spec.approval_policy,
-            }
-        return ThreadOptions(
-            model=self.spec.model,
-            sandbox_mode=self.spec.sandbox_mode,
-            working_directory=str(workspace),
-            skip_git_repo_check=True,  # miragen initializes the repo itself
-            model_reasoning_effort=self.spec.reasoning_effort,
-            network_access_enabled=self.spec.network_access,
-            web_search_enabled=self.spec.web_search,
-            # Explicit ALWAYS: an unattended executor waiting on interactive
-            # approval stalls the job (operational gotcha, miradb #293).
-            approval_policy=self.spec.approval_policy,
-        )
+            codex._client._sync._approval_handler = self._approval_decision
+        except AttributeError:  # pragma: no cover — SDK shape drift
+            logger.warning(f"[{self.profile.name}] could not install leash approval handler")
+
+    def _approval_decision(self, method: str, params: dict[str, Any] | None) -> dict[str, Any]:
+        """Sync approval handler (runs in the SDK's offload thread). Maps the
+        request to a GateOperation, asks the leash, and answers the app-server.
+        A block is recorded by `gate_decide` for post-turn escalation."""
+        op = self._gate_operation(method, params or {})
+        if op is None:
+            return {"decision": "accept"}  # unclassifiable → fail-open (never stall)
+        decision = self.gate_decide(op)
+        # "decline" is the app-server's reject verb (yields a `declined` item
+        # status); "denied" is the unrelated guardian-review status, not a
+        # client decision value.
+        return {"decision": "accept"} if decision.allow else {"decision": "decline"}
 
     @staticmethod
-    async def _iter_events(streamed: Any) -> AsyncIterator[Any]:
-        events = getattr(streamed, "events", streamed)
-        if hasattr(events, "__aiter__"):
-            async for event in events:
-                yield event
-        else:  # pragma: no cover — sync iterable stubs
-            for event in events:
-                yield event
-                await asyncio.sleep(0)
+    def _gate_operation(method: str, params: dict[str, Any]) -> GateOperation | None:
+        """Normalize a Codex approval request into a GateOperation. Field
+        access is best-effort against the app-server payload shape."""
+        if method == "item/fileChange/requestApproval":
+            return GateOperation(op_class="write", summary="file change outside the trusted set")
+        if method == "item/commandExecution/requestApproval":
+            item = params.get("item") if isinstance(params.get("item"), dict) else {}
+            command = params.get("command") or item.get("command") or ""
+            return GateOperation(op_class="command", command=command, summary=command[:120])
+        return None
+
+
+def _config_overrides(options: dict[str, Any]) -> tuple[str, ...]:
+    """`-c key=value` app-server overrides for knobs the high-level thread API
+    doesn't expose directly (network access, web search)."""
+    overrides: list[str] = []
+    if options.get("network_access"):
+        overrides.append("sandbox_workspace_write.network_access=true")
+    if options.get("web_search"):
+        overrides.append("features.web_search_request=true")
+    return tuple(overrides)
+
+
+# ── Notification normalization ───────────────────────────────────────────────
+
+def _normalize_notification(note: Any) -> list[dict[str, Any]]:
+    """Map one SDK notification onto zero or more normalized base-tier payloads.
+
+    Matches on class name (not isinstance) so tests can drive it with plain
+    stand-in classes, and passes plain dicts straight through so the state
+    machine can be tested with normalized payloads directly — the same seam
+    the Claude Code adapter uses.
+    """
+    if isinstance(note, dict):  # test seam / synthetic thread.started
+        return [note]
+
+    payload = getattr(note, "payload", note)
+    name = type(payload).__name__
+
+    if name == "ItemCompletedNotification":
+        return _normalize_item(getattr(payload, "item", None))
+
+    if name == "TurnCompletedNotification":
+        turn = getattr(payload, "turn", None)
+        status = _enum_value(getattr(turn, "status", None))
+        if status == "failed":
+            error = getattr(turn, "error", None)
+            message = getattr(error, "message", None) or "turn failed"
+            return [{"type": "turn.failed", "error": {"message": message}}]
+        return [{"type": "turn.completed", "usage": _usage_from_turn(turn)}]
+
+    if name == "ThreadTokenUsageUpdatedNotification":
+        # Usage is folded into the turn.completed payload; the interim
+        # updates need no separate normalized event.
+        return []
+
+    return []  # TurnStarted, reasoning deltas, and anything unrecognized
+
+
+def _normalize_item(item: Any) -> list[dict[str, Any]]:
+    if item is None:
+        return []
+    thread_item = getattr(item, "root", item)  # ThreadItem is a RootModel union
+    item_type = _enum_value(getattr(thread_item, "type", None))
+
+    if item_type in _MESSAGE_ITEM_TYPES:
+        return [{
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": getattr(thread_item, "text", "") or ""},
+        }]
+
+    # Everything else (commandExecution, fileChange, mcpToolCall, reasoning,
+    # webSearch, …) is a tool/work item. Preserve the type and the command +
+    # exit_code / status so the base tier's tool-call telemetry and the future
+    # approval gate have what they need.
+    normalized: dict[str, Any] = {"type": _snake(item_type)}
+    for attr in ("command", "status", "exit_code"):
+        value = getattr(thread_item, attr, None)
+        if value is not None:
+            normalized[attr] = _enum_value(value)
+    return [{"type": "item.completed", "item": normalized}]
+
+
+def _usage_from_turn(turn: Any) -> dict[str, Any] | None:
+    usage = getattr(turn, "usage", None)
+    breakdown = getattr(usage, "last", None) if usage is not None else None
+    if breakdown is None:
+        return None
+    return {
+        "input_tokens": getattr(breakdown, "input_tokens", None),
+        "output_tokens": getattr(breakdown, "output_tokens", None),
+        "cached_input_tokens": getattr(breakdown, "cached_input_tokens", None),
+    }
+
+
+def _enum_value(value: Any) -> Any:
+    """Unwrap str-Enum members (SDK types) to their string value; pass other
+    values through."""
+    return getattr(value, "value", value)
+
+
+def _snake(camel: Any) -> str:
+    """commandExecution → command_execution, so item types match the names the
+    base tier and tests already use."""
+    if not isinstance(camel, str):
+        return str(camel)
+    out = []
+    for ch in camel:
+        if ch.isupper():
+            out.append("_")
+            out.append(ch.lower())
+        else:
+            out.append(ch)
+    return "".join(out)

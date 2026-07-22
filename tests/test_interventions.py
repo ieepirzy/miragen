@@ -78,7 +78,7 @@ async def test_valid_sentinel_suspends_with_intervention(tmp_path):
     assert (ws / ".miragen" / "interventions" / f"{intervention['intervention_id']}.json").exists()
 
     # resume with a turn that asks nothing further
-    executor._thread_factory = lambda **kw: StubThread(default_events())
+    executor._session_factory = StubThread(default_events())
     resumed = await executor.run_job(
         "continue", "iv-1", thread_id=result.thread_id, first_turn=False,
     )
@@ -140,7 +140,7 @@ async def _suspend_on_question(client, tmp_path):
     # rebuild the touch closure around the actual run workspace
     profile = app_module._profile
     thread = StubThread(default_events())
-    app_module._executor._thread_factory = lambda **kw: thread
+    app_module._executor._session_factory = thread
 
     async def run_and_intervene():
         resp = await client.post("/run", json={"prompt": "decide the queue"})
@@ -178,7 +178,7 @@ async def test_answer_resume_binds_id_and_records_event(intervention_client, tmp
 
     # matching answer resumes on the same thread; miragen renders the prompt
     thread = StubThread(default_events())
-    app_module._executor._thread_factory = lambda **kw: thread
+    app_module._executor._session_factory = thread
     resp = await intervention_client.post(f"/runs/{record.run_id}/resume", json={
         "answer": {
             "intervention_id": pending_id,
@@ -214,7 +214,7 @@ async def test_plain_prompt_resume_supersedes_pending_question(intervention_clie
     record = await _suspend_on_question(intervention_client, tmp_path)
     pending_id = record.pending_intervention.intervention_id
 
-    app_module._executor._thread_factory = lambda **kw: StubThread(default_events())
+    app_module._executor._session_factory = StubThread(default_events())
     resp = await intervention_client.post(f"/runs/{record.run_id}/resume", json={
         "prompt": "Forget the question, just ship it with Postgres.",
     })
@@ -231,7 +231,7 @@ async def test_answer_without_pending_intervention_is_409(intervention_client, t
         **json.loads(app_module._profile.model_dump_json()),
         "limits": {"tokens_per_run": 1},
     }).limits
-    app_module._executor._thread_factory = lambda **kw: StubThread(default_events())
+    app_module._executor._session_factory = StubThread(default_events())
     resp = await intervention_client.post("/run", json={"prompt": "big"})
     run_id = resp.json()["run_id"]
     assert app_module._run_store.get(run_id).status == "suspended"
