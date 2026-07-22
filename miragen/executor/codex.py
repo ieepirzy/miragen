@@ -14,10 +14,12 @@ maps the SDK's typed notifications onto those payloads and passes plain dicts
 through untouched, so tests drive the state machine with normalized dicts (as
 before) without importing the SDK.
 
-Auth: the App Server uses Codex's own credential store under CODEX_HOME. The
-deployment either mounts existing ChatGPT credentials there (subscription
-path) or sets CODEX_API_KEY/OPENAI_API_KEY (logged in per session). MCP
+Auth: the App Server reads Codex's credential store under CODEX_HOME. Either
+`miragen codex-login` writes ChatGPT OAuth credentials there ONCE (subscription
+path — agent containers then mount that shared store and never log in), or the
+deployment sets CODEX_API_KEY/OPENAI_API_KEY (metered, per session). MCP
 servers are still declared via config.toml in CODEX_HOME, written at startup.
+Full model: docs/design/codex-auth.md.
 """
 
 from __future__ import annotations
@@ -96,8 +98,10 @@ class CodexExecutor(ExecutorBackend):
         if not has_creds and not has_key:
             logger.warning(
                 f"[{self.profile.name}] no credentials in {codex_home} and no "
-                "CODEX_API_KEY/OPENAI_API_KEY — executor turns will fail auth. Mount "
-                "ChatGPT credentials into CODEX_HOME (subscription) or set an API key."
+                "CODEX_API_KEY/OPENAI_API_KEY — executor turns will fail auth. Run "
+                "`miragen codex-login --codex-home <shared volume>` once (subscription) "
+                "or set an API key. Agent containers never log in — they mount the "
+                "shared store. See docs/design/codex-auth.md."
             )
 
     def _render_config(self) -> str:

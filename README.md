@@ -635,11 +635,11 @@ A second backend tier for self-harnessed executors: the executor owns its own ag
 
 Three backends implement the contract (`executor.executor`):
 
-- **`codex`** — via openai-codex-sdk. Install with `pip install miragen[codex]`.
+- **`codex`** — via the openai-codex App Server SDK. Install with `pip install miragen[codex]`.
 - **`claude-code`** — via claude-agent-sdk. Install with `pip install miragen[claude-code]`.
 - **`spawn`** — no-SDK fallback: an argv template (`executor.command`) is spawned in the workspace, stdout becomes the event stream, exit 0 harvests. No resume, no usage reporting.
 
-Auth is per backend and always spawn-time state, never profile content. Codex: `codex_home` must contain `auth.json` — an ephemeral container with an empty `codex_home` fails auth on spawn. Claude Code: set `ANTHROPIC_API_KEY` in the container environment (or mount Claude Code OAuth credentials at `~/.claude`). Both cases plus `workspace_root` (keeps suspended/failed runs resumable across container restarts) mean mounting persistent volumes; see the `codex-executor` service in [compose.example.yml](compose.example.yml) for a working example.
+Auth is per backend and always spawn-time state, never profile content. Codex: `codex_home` must contain `auth.json` — an ephemeral container with an empty `codex_home` fails auth on spawn. Authenticate **once** with `miragen codex-login --codex-home <shared volume>` (ChatGPT subscription, device-code flow) or set `CODEX_API_KEY`/`OPENAI_API_KEY` (metered); agent containers mount the shared store read-mostly and never log in themselves — full model in [docs/design/codex-auth.md](docs/design/codex-auth.md). Claude Code: set `ANTHROPIC_API_KEY` in the container environment (or mount Claude Code OAuth credentials at `~/.claude`). Both cases plus `workspace_root` (keeps suspended/failed runs resumable across container restarts) mean mounting persistent volumes; see the `codex-executor` service in [compose.example.yml](compose.example.yml) for a working example.
 
 Optionally, `executor.artifact_sink` names a place to *also* put the harvested diff after a successful run (Loimi `store_document` with `kind="executor_diff"` is the first sink). It is advisory by construction: sink failures mark `artifact_stored: false` on the run record but never change run status — the diff on disk stays the source of truth. Full reference: [docs/executor-tier.md](docs/executor-tier.md).
 
