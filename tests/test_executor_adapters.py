@@ -939,17 +939,6 @@ async def test_loimi_sink_raises_on_tool_error():
         await sink.store(diff="d", metadata={})
 
 
-class _StubSink:
-    def __init__(self, *, fail=False):
-        self.fail = fail
-        self.stored = []
-
-    async def store(self, *, diff, metadata):
-        if self.fail:
-            raise RuntimeError("sink unreachable")
-        self.stored.append((diff, metadata))
-
-
 async def test_success_does_not_auto_publish_even_with_sink_configured(tmp_path, monkeypatch):
     """Reviewed publication only: executor success must not call the backend."""
     profile = _profile({
