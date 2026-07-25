@@ -11,7 +11,11 @@ COPY . /build/
 # publish.yml builds this on main + v* tags → ghcr.io/.../miragen.
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && GROK_BIN_DIR=/usr/local/bin curl -fsSL https://x.ai/cli/install.sh | bash \
+    && set -o pipefail \
+    && curl -fsSL https://x.ai/cli/install.sh -o /tmp/grok-install.sh \
+    && GROK_BIN_DIR=/usr/local/bin bash /tmp/grok-install.sh \
+    && rm -f /tmp/grok-install.sh \
+    && command -v grok \
     && pip install --no-cache-dir "/build[codex,claude-code,kimi-code]" \
     && adduser --disabled-password --gecos "" agentuser \
     && chown agentuser /agent

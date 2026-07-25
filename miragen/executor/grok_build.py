@@ -189,9 +189,14 @@ class GrokBuildExecutor(ExecutorBackend):
                 "item": {"type": "agent_message", "text": "".join(text_parts)},
             }
         if not saw_terminal:
-            # Process exited without end/error — treat as success if we got text,
-            # else a soft failure is still better than hanging as 'running'.
-            yield {"type": "turn.completed", "usage": {}}
+            # No end/error event (empty output, only unknown types, or non-JSON
+            # noise) — must not harvest as success (Codex review #41).
+            yield {
+                "type": "turn.failed",
+                "error": {
+                    "message": "grok exited without a terminal streaming-json event (end/error)",
+                },
+            }
 
     def _options(
         self, workspace: Path, *, thread_id: str | None, first_turn: bool
@@ -236,6 +241,8 @@ class GrokBuildExecutor(ExecutorBackend):
         env = os.environ.copy()
         env["GROK_HOME"] = str(options["grok_home"])
 
+        # Limit well above the default 64 KiB so large tool/result NDJSON lines
+        # do not raise ValueError mid-stream (which would leak the process).
         proc = await asyncio.create_subprocess_exec(
             *argv,
             cwd=options["cwd"],
@@ -244,9 +251,15 @@ class GrokBuildExecutor(ExecutorBackend):
             stderr=asyncio.subprocess.STDOUT,
             env=env,
             start_new_session=True,
+            limit=16 * 1024 * 1024,
         )
 
         lines: list[str] = []
+
+        def _kill_tree() -> None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
+
         try:
             assert proc.stdout is not None
             while True:
@@ -260,14 +273,20 @@ class GrokBuildExecutor(ExecutorBackend):
                 try:
                     event = json.loads(text)
                 except ValueError:
-                    # Non-JSON noise (warnings) — surface as stdout item later via tail.
+                    # Non-JSON noise (warnings) — surface via exit-code tail.
                     continue
                 if isinstance(event, dict):
                     yield event
             returncode = await proc.wait()
         except asyncio.CancelledError:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(proc.pid, signal.SIGKILL)
+            _kill_tree()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            raise
+        except Exception:
+            # ValueError (line too long), decode errors, etc. — reap the tree
+            # so resume/abandon does not race a still-running grok (Codex #41).
+            _kill_tree()
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(proc.wait(), timeout=5)
             raise

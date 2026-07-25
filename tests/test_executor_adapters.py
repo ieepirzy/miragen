@@ -749,6 +749,15 @@ async def test_grok_build_leash_fails_loud(tmp_path):
     assert "leash" in (result.error or "").lower()
 
 
+async def test_grok_build_no_terminal_event_fails(tmp_path):
+    """Empty / non-JSON stream must not harvest as success."""
+    _, executor = _grok_executor(tmp_path, events=[])
+    result = await executor.run_job("go", "gb-empty")
+    assert result.status == "failed"
+    assert "terminal" in (result.error or "").lower()
+    assert result.diff_path is None
+
+
 async def test_grok_build_prepare_overrides_inherited_home(tmp_path, monkeypatch):
     monkeypatch.setenv("GROK_HOME", "/wrong/inherited")
     profile, executor = _grok_executor(tmp_path)
