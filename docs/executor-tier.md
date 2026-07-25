@@ -126,9 +126,12 @@ executor:
   turn_timeout_s: 600
 ```
 
-The artifact sink is **not a primary channel**: it never gates success, and a
-sink failure only marks `artifact_stored: false` on the run record while the
-run stays `succeeded` — the diff on disk is the source of truth.
+`executor.artifact_sink` is the **publication backend** for
+`POST /runs/{id}/publications` only — never auto-fired on success. The
+harvested diff on disk stays local until an orchestrator publishes after
+review. Capability `reviewed-publication/v1` means the endpoint exists;
+`GET /health` → `publication.backend_configured` means a backend is set.
+See [design/reviewed-publication.md](design/reviewed-publication.md).
 
 Model-tier-only fields (`tools`, `approval_required`, `approval_webhook`,
 `history_max_messages`) are rejected on executor profiles: the executor's

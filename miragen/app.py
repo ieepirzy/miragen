@@ -722,6 +722,10 @@ _internal_auth = Depends(_require_internal_token)
 # Contract capabilities this build serves, for client feature detection
 # (miragen-mcp / MiraRun): each entry is a versioned surface a caller may
 # rely on. Additions are backwards-compatible; removals/renames are breaking.
+#
+# reviewed-publication/v1 means the HTTP endpoint exists in this build.
+# A successful publish still requires executor.artifact_sink on the profile
+# (otherwise POST returns 400). See health["publication"] for config readiness.
 CONTRACT_CAPABILITIES = [
     "edf-resolve/mirarun.io-v1alpha1",   # POST /profiles/resolve
     "executor-launch/v1",                # POST /executor-runs (idempotency + provenance)
@@ -729,7 +733,7 @@ CONTRACT_CAPABILITIES = [
     "events-cursor/v1",                  # GET /runs/{id}/events?after=
     "managed-schedules/v1",              # GET/PUT/DELETE /schedules (CAS reconciliation)
     "interventions/v1",                  # structured question suspension + answered resume
-    "reviewed-publication/v1",           # POST /runs/{id}/publications (explicit graduation)
+    "reviewed-publication/v1",           # POST /runs/{id}/publications (endpoint; backend config required)
 ]
 
 
@@ -740,6 +744,26 @@ def _installed_version() -> str | None:
         return version("miragen")
     except Exception:
         return None
+
+
+def _publication_health() -> dict:
+    """Honest readiness for reviewed publication (capability ≠ configured)."""
+    configured = bool(
+        _executor is not None
+        and _executor.spec is not None
+        and _executor.spec.artifact_sink is not None
+    )
+    return {
+        # Endpoint is always present when this capability string is advertised.
+        "endpoint_supported": True,
+        # Backend profile config required for a non-4xx publish.
+        "backend_configured": configured,
+        "backend_kind": (
+            _executor.spec.artifact_sink.kind
+            if configured and _executor is not None and _executor.spec.artifact_sink is not None
+            else None
+        ),
+    }
 
 
 @app.get("/health")
@@ -755,6 +779,7 @@ async def health():
         "pending_approvals": len(get_broker().pending()),
         "version": _installed_version(),
         "capabilities": CONTRACT_CAPABILITIES,
+        "publication": _publication_health(),
     }
 
 

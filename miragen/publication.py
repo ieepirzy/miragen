@@ -6,8 +6,10 @@ miragen reads its authoritative run/diff and hands the package to a configured
 **publication backend** (first implementation: Loimi over MCP).
 
 This is deliberately *not* auto-fired on executor success. The legacy
-`artifact_sink` auto-push path is retired; the same profile field now names
-the backend used only by the reviewed-publication endpoint.
+auto-push path is retired; `executor.artifact_sink` only configures the
+backend used by the reviewed-publication endpoint.
+`miragen.executor.sink` is a low-level store_document helper only — do not
+re-wire it into the executor finish path.
 
 Idempotency lives in miragen (per idempotency_key → PublicationRecord). Retry
 after Loimi/network failure re-enters the backend; duplicate keys return the

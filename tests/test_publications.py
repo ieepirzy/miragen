@@ -188,6 +188,33 @@ async def test_health_advertises_reviewed_publication(pub_env):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         body = (await c.get("/health")).json()
     assert "reviewed-publication/v1" in body["capabilities"]
+    # Capability = endpoint supported; readiness is separate.
+    assert body["publication"]["endpoint_supported"] is True
+    assert body["publication"]["backend_configured"] is True
+    assert body["publication"]["backend_kind"] == "loimi"
+
+
+async def test_health_publication_not_configured_without_sink(tmp_path, monkeypatch):
+    monkeypatch.delenv("MIRAGEN_INTERNAL_TOKEN", raising=False)
+    profile = AgentProfile.model_validate({
+        "name": "no-pub",
+        "mode": "interactive",
+        "triggers": [{"type": "http"}],
+        "executor": {"executor": "codex", "instructions": "hi."},
+    })
+    profile.executor.workspace_root = str(tmp_path / "ws")
+    profile.executor.codex_home = str(tmp_path / "ch")
+    app_module._profile = profile
+    app_module._executor = CodexExecutor(
+        profile, runs_root=tmp_path / "runs", session_factory=StubThread(default_events())
+    )
+    app_module._run_store = RunStore(root=tmp_path / "runs", retention=50)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        body = (await c.get("/health")).json()
+    assert "reviewed-publication/v1" in body["capabilities"]
+    assert body["publication"]["endpoint_supported"] is True
+    assert body["publication"]["backend_configured"] is False
+    assert body["publication"]["backend_kind"] is None
 
 
 async def test_publication_requires_token_when_configured(pub_env, monkeypatch):
