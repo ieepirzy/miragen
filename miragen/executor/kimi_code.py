@@ -55,7 +55,10 @@ class KimiCodeExecutor(ExecutorBackend):
     def prepare(self) -> None:
         home = Path(self.spec.kimi_home)
         home.mkdir(parents=True, exist_ok=True)
-        os.environ.setdefault("KIMI_CODE_HOME", str(home))
+        # Profile home wins over any inherited KIMI_CODE_HOME — setdefault would
+        # leave a host/developer value in place and the SDK would read the wrong
+        # store while we warn against the mounted volume (Codex review on #40).
+        os.environ["KIMI_CODE_HOME"] = str(home)
 
         has_oauth = (home / "config.toml").exists() or any(home.iterdir()) if home.exists() else False
         # OAuth store layout can vary; presence of any home content after login
@@ -179,12 +182,20 @@ class KimiCodeExecutor(ExecutorBackend):
                 yield msg
             yield {"type": "turn.completed", "usage": last_usage}
         except asyncio.CancelledError:
+            # Real task cancellation (app-tier turn_timeout_s / client cancel).
+            # Must propagate as CancelledError so timeout → suspended and the run
+            # record is finished by the app tier — never swallow into 'failed'.
             session.cancel()
             raise
         except RunCancelled as e:
-            # Host cancelled via session.cancel() or product-side cancel — map to
-            # the base/app timeout contract (CancelledError must not become 'failed').
-            raise asyncio.CancelledError() from e
+            # Product-side cancel independent of the outer task (agent hit a
+            # product cancel path). Mapping this to CancelledError would skip
+            # every Exception handler and leave the run record stuck at
+            # 'running' — emit a normalized failure instead (Codex review #40).
+            yield {
+                "type": "turn.failed",
+                "error": {"message": f"kimi run cancelled: {e}"},
+            }
         except Exception as e:
             yield {"type": "turn.failed", "error": {"message": str(e)}}
         finally:

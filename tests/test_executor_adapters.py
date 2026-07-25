@@ -571,6 +571,31 @@ async def test_kimi_code_prepare_sets_kimi_code_home(tmp_path, monkeypatch):
     assert Path(profile.executor.kimi_home).is_dir()
 
 
+async def test_kimi_code_prepare_overrides_inherited_kimi_code_home(tmp_path, monkeypatch):
+    """Profile kimi_home must win over a pre-set env (not setdefault)."""
+    monkeypatch.setenv("KIMI_CODE_HOME", "/wrong/inherited/home")
+    profile, executor = _kimi_executor(tmp_path)
+    executor.prepare()
+    assert os.environ["KIMI_CODE_HOME"] == profile.executor.kimi_home
+    assert os.environ["KIMI_CODE_HOME"] != "/wrong/inherited/home"
+
+
+async def test_kimi_code_product_cancel_is_resumable_failure(tmp_path):
+    """Product-side RunCancelled must not become CancelledError (leaves run
+    stuck at running). Stand-in: a factory that yields thread.started then a
+    synthetic cancel as turn.failed — production maps RunCancelled the same way."""
+    messages = [
+        {"type": "thread.started", "thread_id": "kimi_cancel"},
+        {"type": "turn.failed", "error": {"message": "kimi run cancelled: product"}},
+    ]
+    _, executor = _kimi_executor(tmp_path, messages=messages)
+    result = await executor.run_job("go", "kc-cancel")
+    assert result.status == "failed"
+    assert result.exit_reason == "crash"
+    assert result.thread_id == "kimi_cancel"
+    assert "cancelled" in (result.error or "").lower()
+
+
 # ── SpawnExecutor ─────────────────────────────────────────────────────────────
 
 
