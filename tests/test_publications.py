@@ -380,3 +380,53 @@ async def test_preconditions_helper():
         started_at=datetime.now(timezone.utc),
     )
     assert preconditions_ok(r) is not None
+
+
+async def test_concurrent_same_key_serializes(pub_env):
+    """Two concurrent publications with the same key must not double-write."""
+    import asyncio
+
+    calls = []
+    barrier = asyncio.Event()
+    entered = 0
+
+    class _SlowBackend:
+        async def publish_run(self, **kw):
+            nonlocal entered
+            entered += 1
+            # Let the sibling request hit the claim path while we hold the key.
+            if entered == 1:
+                barrier.set()
+                await asyncio.sleep(0.05)
+            from miragen.publication import PublicationResult
+            calls.append("publish")
+            return PublicationResult(
+                backend="loimi",
+                external_run_id="only-one",
+                external_artifact_ids=["a1"],
+            )
+
+    app_module._publication_backend_override = _SlowBackend()
+    key = "mirarun:publication:concurrent"
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        run_id = await _succeed_run(c)
+
+        async def _pub():
+            return await c.post(f"/runs/{run_id}/publications", json=_pub_body(key))
+
+        t1 = asyncio.create_task(_pub())
+        await barrier.wait()
+        t2 = asyncio.create_task(_pub())
+        r1, r2 = await asyncio.gather(t1, t2)
+
+    statuses = sorted([r1.status_code, r2.status_code])
+    # One 200 published, the other either 200 duplicate or 503 in-progress then
+    # would need retry — under in-process lock both should complete as 200 with
+    # one duplicate.
+    assert statuses == [200, 200]
+    bodies = [r1.json(), r2.json()]
+    assert {b["external_run_id"] for b in bodies} == {"only-one"}
+    assert {b["publication_id"] for b in bodies}  # both have ids
+    assert sum(1 for b in bodies if b["duplicate"]) == 1
+    assert sum(1 for b in bodies if not b["duplicate"]) == 1
+    assert calls.count("publish") == 1

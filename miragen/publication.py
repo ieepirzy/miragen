@@ -16,11 +16,14 @@ prior opaque references without writing again.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import uuid
+import contextlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol
@@ -33,6 +36,11 @@ from miragen.models import ArtifactSinkSpec, RunRecord
 logger = logging.getLogger("miragen.publication")
 
 _PROTOCOL_VERSION = "2025-03-26"
+
+# In-process locks per idempotency key — serializes concurrent claims inside
+# one agent process. Cross-process safety uses O_EXCL claim files on disk.
+_key_locks: dict[str, asyncio.Lock] = {}
+_key_locks_guard = asyncio.Lock()
 
 
 # ── Contract models ──────────────────────────────────────────────────────────
@@ -236,7 +244,13 @@ class McpStreamableClient:
             )
         except httpx.HTTPError as e:
             raise PublicationUnavailableError(f"MCP transport error on {method}: {e}") from e
-        body = _parse_body(response)
+        try:
+            body = _parse_body(response)
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            # Successful HTTP with garbage body — treat as retryable upstream flake.
+            raise PublicationUnavailableError(
+                f"malformed MCP response to {method}: {e}"
+            ) from e
         if body is None:
             raise PublicationUnavailableError(f"empty response to {method}")
         if "error" in body:
@@ -290,6 +304,7 @@ def _parse_body(response: httpx.Response) -> dict | None:
         return body
     if not response.content:
         return None
+    # May raise JSONDecodeError / ValueError — callers map to PublicationUnavailableError.
     return response.json()
 
 
@@ -480,15 +495,65 @@ class PublicationStore:
         payload = record.model_dump_json(indent=2)
         key_path = self._key_path(record.idempotency_key)
         id_path = self.root / f"id-{record.publication_id}.json"
+        claim_path = self._claim_path(record.idempotency_key)
         tmp = key_path.with_suffix(".tmp")
         tmp.write_text(payload)
         tmp.replace(key_path)
         id_path.write_text(payload)
+        # Drop in-flight claim once the durable record is in place.
+        with contextlib.suppress(FileNotFoundError):
+            claim_path.unlink()
         return record
+
+    def try_begin(self, key: str, run_id: str) -> PublicationRecord | None:
+        """Atomically claim `key` for an in-flight publication.
+
+        Returns an existing completed record if the key was already published.
+        Returns None if this caller now holds the claim and should proceed.
+        Raises PublicationUnavailableError if another publication is in flight
+        for the same key (caller should retry).
+        """
+        existing = self.get_by_idempotency_key(key)
+        if existing is not None:
+            return existing
+        self.root.mkdir(parents=True, exist_ok=True)
+        claim_path = self._claim_path(key)
+        payload = json.dumps({"run_id": run_id, "started_at": datetime.now(timezone.utc).isoformat()})
+        try:
+            fd = os.open(str(claim_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            # Another worker holds the claim, or a crashed claim was left behind.
+            # If a completed record appeared, return it; else ask the client to retry.
+            existing = self.get_by_idempotency_key(key)
+            if existing is not None:
+                return existing
+            raise PublicationUnavailableError(
+                f"publication for idempotency_key already in progress for run {run_id}"
+            )
+        try:
+            os.write(fd, payload.encode())
+        finally:
+            os.close(fd)
+        # Re-check after claim in case a complete record raced in (shouldn't, but cheap).
+        existing = self.get_by_idempotency_key(key)
+        if existing is not None:
+            with contextlib.suppress(FileNotFoundError):
+                claim_path.unlink()
+            return existing
+        return None
+
+    def release_claim(self, key: str) -> None:
+        """Drop an in-flight claim after a failed backend attempt so retries work."""
+        with contextlib.suppress(FileNotFoundError):
+            self._claim_path(key).unlink()
 
     def _key_path(self, key: str) -> Path:
         digest = hashlib.sha256(key.encode()).hexdigest()[:32]
         return self.root / f"key-{digest}.json"
+
+    def _claim_path(self, key: str) -> Path:
+        digest = hashlib.sha256(key.encode()).hexdigest()[:32]
+        return self.root / f"key-{digest}.claim"
 
 
 def preconditions_ok(run: RunRecord) -> str | None:
@@ -502,6 +567,15 @@ def preconditions_ok(run: RunRecord) -> str | None:
     return None
 
 
+async def _lock_for_key(key: str) -> asyncio.Lock:
+    async with _key_locks_guard:
+        lock = _key_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _key_locks[key] = lock
+        return lock
+
+
 async def publish_reviewed_run(
     *,
     run: RunRecord,
@@ -511,49 +585,52 @@ async def publish_reviewed_run(
     annotate_run: Callable[..., RunRecord],
 ) -> PublicationResponse:
     """Idempotent reviewed publication. Does not mutate run.status."""
-    existing = store.get_by_idempotency_key(request.idempotency_key)
-    if existing is not None:
-        if existing.run_id != run.run_id:
-            raise PublicationConfigError(
-                f"idempotency_key already bound to run {existing.run_id}, not {run.run_id}"
-            )
-        return PublicationResponse.from_record(existing, duplicate=True)
-
     reason = preconditions_ok(run)
     if reason:
         raise PublicationConfigError(reason)
 
-    diff = Path(run.diff_path).read_text()  # type: ignore[arg-type]
-    result = await backend.publish_run(
-        diff=diff,
-        run=run,
-        provenance=request.provenance.model_dump(exclude_none=True),
-    )
+    lock = await _lock_for_key(request.idempotency_key)
+    async with lock:
+        claimed = store.try_begin(request.idempotency_key, run.run_id)
+        if claimed is not None:
+            if claimed.run_id != run.run_id:
+                raise PublicationConfigError(
+                    f"idempotency_key already bound to run {claimed.run_id}, not {run.run_id}"
+                )
+            return PublicationResponse.from_record(claimed, duplicate=True)
 
-    record = PublicationRecord(
-        publication_id=uuid.uuid4().hex,
-        run_id=run.run_id,
-        idempotency_key=request.idempotency_key,
-        status="published",
-        backend=result.backend,
-        external_run_id=result.external_run_id,
-        external_artifact_ids=list(result.external_artifact_ids),
-        provenance=request.provenance.model_dump(exclude_none=True),
-        created_at=datetime.now(timezone.utc),
-    )
-    # Atomic-ish: save publication first; then annotate run. A crash between
-    # leaves a publication record that idempotent retry will return without
-    # re-writing the backend (key already stored after successful backend call).
-    # If backend succeeded but save fails, retry may double-write backend —
-    # acceptable until a two-phase outbox lands; callers must use stable keys.
-    store.save(record)
-    try:
-        annotate_run(run, artifact_stored=True)
-    except Exception:
-        logger.warning(
-            "publication %s saved but run annotate failed for %s",
-            record.publication_id,
-            run.run_id,
-            exc_info=True,
-        )
-    return PublicationResponse.from_record(record, duplicate=False)
+        try:
+            diff = Path(run.diff_path).read_text()  # type: ignore[arg-type]
+            result = await backend.publish_run(
+                diff=diff,
+                run=run,
+                provenance=request.provenance.model_dump(exclude_none=True),
+            )
+
+            record = PublicationRecord(
+                publication_id=uuid.uuid4().hex,
+                run_id=run.run_id,
+                idempotency_key=request.idempotency_key,
+                status="published",
+                backend=result.backend,
+                external_run_id=result.external_run_id,
+                external_artifact_ids=list(result.external_artifact_ids),
+                provenance=request.provenance.model_dump(exclude_none=True),
+                created_at=datetime.now(timezone.utc),
+            )
+            store.save(record)
+        except Exception:
+            # Allow a retry of the same key after a failed attempt.
+            store.release_claim(request.idempotency_key)
+            raise
+
+        try:
+            annotate_run(run, artifact_stored=True)
+        except Exception:
+            logger.warning(
+                "publication %s saved but run annotate failed for %s",
+                record.publication_id,
+                run.run_id,
+                exc_info=True,
+            )
+        return PublicationResponse.from_record(record, duplicate=False)
