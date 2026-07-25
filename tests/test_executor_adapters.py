@@ -52,12 +52,14 @@ def _paths(profile: AgentProfile, tmp_path) -> Path:
 
 
 def test_factory_dispatches_on_executor_kind(tmp_path):
+    from miragen.executor.grok_build import GrokBuildExecutor
     from miragen.executor.kimi_code import KimiCodeExecutor
 
     cases = {
         "codex": ({"executor": "codex"}, CodexExecutor),
         "claude-code": ({"executor": "claude-code"}, ClaudeCodeExecutor),
         "kimi-code": ({"executor": "kimi-code"}, KimiCodeExecutor),
+        "grok-build": ({"executor": "grok-build"}, GrokBuildExecutor),
         "spawn": ({"executor": "spawn", "command": ["/bin/true"]}, SpawnExecutor),
     }
     for kind, (body, cls) in cases.items():
@@ -73,9 +75,11 @@ def test_kimi_home_defaults_and_rejects_on_other_backends():
         _profile({"executor": "codex", "kimi_home": "/tmp/kimi"})
 
 
-def test_grok_build_rejected_until_implemented():
-    with pytest.raises(ValidationError, match="not implemented yet"):
-        _profile({"executor": "grok-build"})
+def test_grok_home_defaults_and_rejects_on_other_backends():
+    p = _profile({"executor": "grok-build"})
+    assert p.executor.grok_home == "/agent/grok-home"
+    with pytest.raises(ValidationError, match="grok_home"):
+        _profile({"executor": "codex", "grok_home": "/tmp/grok"})
 
 
 def test_spawn_requires_command():
@@ -594,6 +598,163 @@ async def test_kimi_code_product_cancel_is_resumable_failure(tmp_path):
     assert result.exit_reason == "crash"
     assert result.thread_id == "kimi_cancel"
     assert "cancelled" in (result.error or "").lower()
+
+
+# ── GrokBuildExecutor (Phase A headless) ──────────────────────────────────────
+
+
+def _grok_stream_events(session_id="11111111-1111-1111-1111-111111111111"):
+    """CLI streaming-json event sequence (not yet base-normalized)."""
+    return [
+        {"type": "text", "data": "patched "},
+        {"type": "text", "data": "the bug"},
+        {"type": "thought", "data": "done"},
+        {
+            "type": "end",
+            "stopReason": "EndTurn",
+            "sessionId": session_id,
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 40,
+                "cache_read_input_tokens": 20,
+            },
+        },
+    ]
+
+
+def _grok_executor(tmp_path, events=None, executor_body=None, captured=None):
+    from miragen.executor.grok_build import GrokBuildExecutor
+
+    profile = _profile({"executor": "grok-build", **(executor_body or {})})
+    profile.executor.grok_home = str(tmp_path / "grok-home")
+    runs_root = _paths(profile, tmp_path)
+
+    def factory(prompt, *, thread_id=None, first_turn=True, options=None):
+        if captured is not None:
+            captured.append({
+                "prompt": prompt,
+                "thread_id": thread_id,
+                "first_turn": first_turn,
+                "options": options,
+            })
+
+        async def gen():
+            for e in events if events is not None else _grok_stream_events():
+                yield e
+
+        return gen()
+
+    return profile, GrokBuildExecutor(profile, runs_root=runs_root, session_factory=factory)
+
+
+def test_normalize_grok_streaming_events():
+    from miragen.executor.grok_build import _normalize_event
+
+    assert _normalize_event({"type": "text", "data": "hi"}) == [
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "hi"}}
+    ]
+    assert _normalize_event({"type": "thought", "data": "hmm"}) == [
+        {"type": "item.completed", "item": {"type": "reasoning", "text": "hmm"}}
+    ]
+    end = _normalize_event({
+        "type": "end",
+        "sessionId": "s1",
+        "usage": {"input_tokens": 1, "output_tokens": 2, "cache_read_input_tokens": 3},
+    })
+    assert end[0] == {"type": "thread.started", "thread_id": "s1"}
+    assert end[1]["type"] == "turn.completed"
+    assert end[1]["usage"] == {
+        "input_tokens": 1, "output_tokens": 2, "cached_input_tokens": 3,
+    }
+    assert _normalize_event({"type": "error", "message": "boom"}) == [
+        {"type": "turn.failed", "error": {"message": "boom", "tail": None}}
+    ]
+
+
+def test_build_argv_new_vs_resume():
+    from miragen.executor.grok_build import _build_argv
+
+    new_opts = {
+        "cwd": "/ws", "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "resume": False, "always_approve": True, "model": None,
+        "reasoning_effort": None, "web_search": False,
+    }
+    argv = _build_argv("grok", "do it", new_opts)
+    assert "-s" in argv and "-r" not in argv
+    assert "--always-approve" in argv
+    assert "--disable-web-search" in argv
+    assert "--output-format" in argv and "streaming-json" in argv
+
+    resume_opts = {**new_opts, "resume": True, "always_approve": False, "web_search": True}
+    argv_r = _build_argv("grok", "more", resume_opts)
+    assert "-r" in argv_r and "-s" not in argv_r
+    assert "--always-approve" not in argv_r
+    assert "--disable-web-search" not in argv_r
+
+
+async def test_grok_build_success_harvests_diff(tmp_path):
+    captured = []
+    profile, executor = _grok_executor(tmp_path, captured=captured)
+
+    run_id = "gb-run1"
+    ws = Path(profile.executor.workspace_root) / run_id
+    executor._prepare_workspace(ws)
+    (ws / "fix.py").write_text("print('fixed')\n")
+
+    result = await executor.run_job("fix the bug", run_id)
+    assert result.status == "succeeded"
+    assert result.thread_id is not None  # minted UUID
+    assert result.output == "patched the bug"
+    assert result.usage.input_tokens == 100 and result.usage.output_tokens == 40
+    assert result.usage.cached_input_tokens == 20
+    assert "+print('fixed')" in Path(result.diff_path).read_text()
+
+    call = captured[0]
+    assert call["prompt"].startswith("hi.")
+    assert call["options"]["cwd"] == str(ws)
+    assert call["options"]["always_approve"] is True
+    assert call["options"]["resume"] is False
+    assert call["first_turn"] is True
+
+
+async def test_grok_build_resume_uses_session_id(tmp_path):
+    captured = []
+    sid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    _, executor = _grok_executor(tmp_path, captured=captured)
+    await executor.run_job("continue", "gb-run2", thread_id=sid, first_turn=False)
+    call = captured[0]
+    assert call["prompt"] == "continue"
+    assert call["options"]["session_id"] == sid
+    assert call["options"]["resume"] is True
+    assert call["first_turn"] is False
+
+
+async def test_grok_build_error_is_resumable_crash(tmp_path):
+    events = [{"type": "error", "message": "auth failed"}]
+    profile, executor = _grok_executor(tmp_path, events=events)
+    result = await executor.run_job("go", "gb-err")
+    assert result.status == "failed"
+    assert result.exit_reason == "crash"
+    assert "auth failed" in result.error
+    assert result.thread_id is not None  # still minted before stream
+    assert result.diff_path is None
+
+
+async def test_grok_build_leash_fails_loud(tmp_path):
+    profile, executor = _grok_executor(
+        tmp_path, executor_body={"leash": {"gate": ["command"]}}
+    )
+    result = await executor.run_job("go", "gb-leash")
+    assert result.status == "failed"
+    assert "leash" in (result.error or "").lower()
+
+
+async def test_grok_build_prepare_overrides_inherited_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("GROK_HOME", "/wrong/inherited")
+    profile, executor = _grok_executor(tmp_path)
+    executor.prepare()
+    assert os.environ["GROK_HOME"] == profile.executor.grok_home
+    assert (Path(profile.executor.grok_home) / "config.toml").exists()
 
 
 # ── SpawnExecutor ─────────────────────────────────────────────────────────────

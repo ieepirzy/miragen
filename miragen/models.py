@@ -522,7 +522,7 @@ class ExecutorSpec(_ProfileModel):
         description=(
             "Executor backend. 'codex' (openai-codex), 'claude-code' "
             "(claude-agent-sdk), 'kimi-code' (kimi-agent-sdk), 'grok-build' "
-            "(Grok Build CLI; planned), or 'spawn' (argv-template fallback). "
+            "(Grok Build CLI headless), or 'spawn' (argv-template fallback). "
             "The contract is executor-agnostic."
         ),
     )
@@ -581,8 +581,8 @@ class ExecutorSpec(_ProfileModel):
         description=(
             "grok-build only: GROK_HOME for OAuth/config/sessions (default "
             "/agent/grok-home when executor is grok-build). Mount a shared volume "
-            "populated once via `miragen grok-login`. Reserved until the grok-build "
-            "adapter ships — setting it on other backends is a validation error."
+            "populated once via `miragen grok-login`. See "
+            "docs/design/subscription-homes.md."
         ),
     )
     mcp_servers: Optional[list[ExecutorMCPServer]] = Field(
@@ -650,11 +650,6 @@ class ExecutorSpec(_ProfileModel):
         if self.executor == "grok-build":
             if self.grok_home is None:
                 self.grok_home = "/agent/grok-home"
-            # Adapter not yet shipped — fail loud so profiles aren't silently inert.
-            raise ValueError(
-                "grok-build executor is not implemented yet "
-                "(see docs/design/kimi-and-grok-executors.md)"
-            )
         elif self.grok_home is not None:
             raise ValueError(f"`grok_home` only applies to the grok-build executor, not '{self.executor}'")
 

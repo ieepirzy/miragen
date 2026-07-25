@@ -18,8 +18,8 @@ event payloads. Adapters:
 | `codex` | openai-codex (`miragen[codex]`) | thread id | yes |
 | `claude-code` | claude-agent-sdk (`miragen[claude-code]`) | session id | yes |
 | `kimi-code` | kimi-agent-sdk (`miragen[kimi-code]`) | session id | yes |
+| `grok-build` | Grok Build CLI headless (`grok`) | session id | yes (from `end`) |
 | `spawn` | argv template, no SDK | none | none |
-| `grok-build` | Grok Build CLI — **planned** | session id | planned |
 
 Design record: miradb #293 (2026-07-12); refinement plan:
 [design/executor-tier-refinement.md](design/executor-tier-refinement.md);
@@ -95,6 +95,21 @@ executor:
     - name: loimi
       url: https://loimi.mesh/mcp/
       bearer_token_env: LOIMI_TOKEN
+```
+
+A `grok-build` profile uses `grok_home` (maps to `GROK_HOME`) — authenticate
+once with `miragen grok-login --grok-home <volume>` (device-code). Phase A is
+headless `streaming-json`; host leash is not supported yet (fails loud):
+
+```yaml
+executor:
+  executor: grok-build
+  instructions: |
+    You operate on the repository mounted in your workspace.
+  approval_policy: never       # -> --always-approve
+  grok_home: /agent/grok-home
+  turn_timeout_s: 1800
+  # mcp_servers: configure under GROK_HOME / project .grok (not injected)
 ```
 
 The spawn backend swaps `mcp_servers` (rejected — a spawned CLI reads its own
@@ -189,6 +204,14 @@ subscription-first via a shared `kimi_home` (`KIMI_CODE_HOME`) or metered
 `KIMI_API_KEY` / `MOONSHOT_API_KEY`. See
 [design/subscription-homes.md](design/subscription-homes.md).
 
+**Grok Build** — no pip extra; requires the `grok` binary on PATH (published
+image installs it). Phase A shells headless `-p` with
+`--output-format streaming-json`. First turn mints a UUID (`-s`); resume uses
+`-r`. Auth is subscription-first via shared `grok_home` (`GROK_HOME`,
+`miragen grok-login --device-auth`) or metered `XAI_API_KEY`. Host leash is
+**not** supported on Phase A (turn fails if configured). MCP is not injected
+— configure under `GROK_HOME` / project `.grok/`.
+
 **Spawn** — no extra needed; the fallback for CLIs with no SDK. stdout
 lines become raw `item.completed` events and the whole stdout doubles as the
 run output. Exit 0 harvests, non-zero is a resumable `failed` — but with no
@@ -215,9 +238,13 @@ thread handle, resume in practice means abandon-and-rerun.
    image (`ghcr.io/ieepirzy/miragen`, built by `publish.yml` from
    `Dockerfile`) installs `miragen[kimi-code]` so the SDK/runtime is present
    without a custom image.
-6. **A cancelled turn must not leak its process** — `turn_timeout_s` kills
-   the turn via asyncio cancellation; the spawn adapter kills its subprocess
-   on the way out, the SDK adapters rely on their SDK's cleanup
+6. **Grok Build: mount `grok_home` or set `XAI_API_KEY`** — run
+   `miragen grok-login --grok-home <volume>` once (device-code) or set the
+   key. Published image installs the `grok` CLI at build time. Do not enable
+   `executor.leash` until ACP Phase B.
+7. **A cancelled turn must not leak its process** — `turn_timeout_s` kills
+   the turn via asyncio cancellation; spawn and grok-build kill the process
+   group on the way out; SDK adapters rely on their SDK's cleanup
    (`session.cancel()` + `close()` for Kimi).
 
 ## Identity & provenance

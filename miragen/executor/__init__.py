@@ -41,9 +41,7 @@ def build_executor(profile: AgentProfile, *, runs_root: Path) -> ExecutorBackend
 
         return SpawnExecutor(profile, runs_root=runs_root)
     if kind == "grok-build":
-        # Profile validation already rejects this until the adapter ships.
-        raise ValueError(
-            "grok-build executor is not implemented yet "
-            "(see docs/design/kimi-and-grok-executors.md)"
-        )
+        from miragen.executor.grok_build import GrokBuildExecutor
+
+        return GrokBuildExecutor(profile, runs_root=runs_root)
     raise ValueError(f"unknown executor backend: {kind}")  # unreachable via the Literal
