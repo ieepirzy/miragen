@@ -939,18 +939,8 @@ async def test_loimi_sink_raises_on_tool_error():
         await sink.store(diff="d", metadata={})
 
 
-class _StubSink:
-    def __init__(self, *, fail=False):
-        self.fail = fail
-        self.stored = []
-
-    async def store(self, *, diff, metadata):
-        if self.fail:
-            raise RuntimeError("sink unreachable")
-        self.stored.append((diff, metadata))
-
-
-async def _run_with_sink(tmp_path, monkeypatch, *, fail):
+async def test_success_does_not_auto_publish_even_with_sink_configured(tmp_path, monkeypatch):
+    """Reviewed publication only: executor success must not call the backend."""
     profile = _profile({
         "executor": "codex",
         "artifact_sink": {"url": "https://loimi.mesh/mcp/", "bearer_token_env": "LOIMI_TOKEN"},
@@ -961,31 +951,13 @@ async def _run_with_sink(tmp_path, monkeypatch, *, fail):
         profile, runs_root=runs_root, session_factory=StubThread(default_events())
     )
     app_module._run_store = RunStore(root=runs_root, retention=50)
-
-    stub = _StubSink(fail=fail)
-    monkeypatch.setattr(app_module, "build_sink", lambda spec, *, bearer_token=None: stub)
-
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post("/run", json={"prompt": "fix it"})
     assert resp.status_code == 200, resp.text
-    return stub, app_module._run_store.get(resp.json()["run_id"])
-
-
-async def test_sink_success_marks_artifact_stored(tmp_path, monkeypatch):
-    stub, record = await _run_with_sink(tmp_path, monkeypatch, fail=False)
+    record = app_module._run_store.get(resp.json()["run_id"])
     assert record.status == "succeeded"
-    assert record.artifact_stored is True
-    (diff, metadata) = stub.stored[0]
-    assert metadata["run_id"] == record.run_id
-    assert metadata["thread_id"] == "thr_stub123"
-
-
-async def test_sink_failure_never_touches_run_status(tmp_path, monkeypatch):
-    _, record = await _run_with_sink(tmp_path, monkeypatch, fail=True)
-    assert record.status == "succeeded"  # sink is advisory, run outcome untouched
-    assert record.artifact_stored is False
-    assert record.diff_path  # the diff on disk stays the source of truth
-
+    assert record.artifact_stored is None  # no automatic store_document
+    assert record.diff_path  # local harvest remains the source of truth
 
 async def test_no_sink_configured_leaves_field_none(tmp_path):
     profile = _profile({"executor": "codex"})

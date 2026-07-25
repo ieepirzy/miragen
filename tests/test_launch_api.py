@@ -270,3 +270,4 @@ async def test_health_advertises_version_and_contract_capabilities(executor_clie
     assert "executor-launch/v1" in body["capabilities"]
     assert "events-cursor/v1" in body["capabilities"]
     assert "run-snapshot/v1" in body["capabilities"]
+    assert "reviewed-publication/v1" in body["capabilities"]

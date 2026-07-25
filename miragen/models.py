@@ -439,20 +439,28 @@ class ExecutorMCPServer(_ProfileModel):
 
 
 class ArtifactSinkSpec(_ProfileModel):
-    """Optional "put things that were produced somewhere" hook.
+    """Publication backend configuration (reviewed graduation only).
 
-    Not a primary channel: when configured, a successfully harvested diff is
-    ALSO pushed to the sink after the run finishes. Sink failures are logged
-    and recorded on the run (`artifact_stored=False`) but never change run
-    status — the diff on disk stays the source of truth.
+    Names the external document/provenance store used by
+    ``POST /runs/{id}/publications`` after human review. It is **not**
+    auto-invoked on executor success — miragen keeps the harvested diff as
+    the local source of truth until an orchestrator explicitly publishes.
+
+    Backend-agnostic: ``kind`` selects the implementation (first: Loimi over
+    MCP). miragen does not hard-code product flows beyond the registered
+    backends; new kinds plug in without changing the HTTP contract.
     """
 
     kind: Literal["loimi"] = Field(
         default="loimi",
-        description="Sink implementation. Loimi (store_document over MCP) is the first.",
+        description=(
+            "Publication backend implementation. 'loimi' speaks open_run / "
+            "store_document / close_run over streamable-HTTP MCP. Additional "
+            "kinds may be added without changing the /publications contract."
+        ),
     )
     url: str = Field(
-        description="Streamable-HTTP MCP endpoint URL of the sink service.",
+        description="Streamable-HTTP MCP endpoint URL of the publication backend.",
         min_length=1,
     )
     bearer_token_env: Optional[str] = Field(
@@ -461,7 +469,7 @@ class ArtifactSinkSpec(_ProfileModel):
     )
     document_kind: str = Field(
         default="executor_diff",
-        description="`kind` stamped on stored documents (Loimi store_document argument).",
+        description="`kind` stamped on stored documents (backend-specific; Loimi store_document).",
     )
 
 
@@ -619,9 +627,10 @@ class ExecutorSpec(_ProfileModel):
     artifact_sink: Optional[ArtifactSinkSpec] = Field(
         default=None,
         description=(
-            "Optional post-success artifact sink — pushes the harvested diff "
-            "somewhere (Loimi first). Never required, never blocking, never "
-            "affects run status."
+            "Publication backend for POST /runs/{id}/publications (reviewed "
+            "graduation). Not auto-called on success — the harvested diff stays "
+            "local until an orchestrator explicitly publishes. Required for the "
+            "reviewed-publication/v1 capability to be usable."
         ),
     )
     leash: Optional[LeashSpec] = Field(

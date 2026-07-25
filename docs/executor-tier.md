@@ -55,8 +55,8 @@ executor:
     - name: loimi
       url: https://loimi.mesh/mcp/
       bearer_token_env: LOIMI_TOKEN   # env var NAME; value injected at spawn
-  artifact_sink:               # optional: ALSO push harvested diffs somewhere.
-    kind: loimi                # store_document with kind=executor_diff.
+  artifact_sink:               # publication backend for reviewed graduation only
+    kind: loimi                # POST /runs/{id}/publications — never auto on success
     url: https://loimi.mesh/mcp/
     bearer_token_env: LOIMI_TOKEN
 ```
