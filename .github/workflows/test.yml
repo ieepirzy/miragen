@@ -21,7 +21,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install
-        run: pip install -e ".[dev]"
+        run: |
+          pip install -e ./packages/grok-build-client
+          pip install -e ".[dev]"
 
       - name: Test
-        run: pytest
+        run: pytest packages/grok-build-client/tests tests
