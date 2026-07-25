@@ -93,7 +93,40 @@ services:
     ports:
       - "8004:8000"
 
+  # Executor-tier (Kimi Code) — subscription OAuth in a shared home volume.
+  # Seed once: miragen kimi-login --kimi-home <volume> (or set KIMI_API_KEY).
+  kimi-code-executor:
+    build: .
+    container_name: kimi-code-executor
+    restart: unless-stopped
+    environment:
+      AGENT_PROFILE: agents/kimi-code-executor.yaml
+    volumes:
+      - kimi-home:/agent/kimi-home
+      - kimi-workspaces:/agent/workspaces
+    ports:
+      - "8005:8000"
+
+  # Executor-tier (Grok Build) — subscription OAuth in a shared home volume.
+  # Seed once: miragen grok-login --grok-home <volume> (device-code), or set
+  # XAI_API_KEY. Use grok_transport: acp in the profile for host leash / MCP inject.
+  grok-build-executor:
+    build: .
+    container_name: grok-build-executor
+    restart: unless-stopped
+    environment:
+      AGENT_PROFILE: agents/grok-build-executor.yaml
+    volumes:
+      - grok-home:/agent/grok-home
+      - grok-workspaces:/agent/workspaces
+    ports:
+      - "8006:8000"
+
 volumes:
   codex-home:
   codex-workspaces:
   claude-workspaces:
+  kimi-home:
+  kimi-workspaces:
+  grok-home:
+  grok-workspaces:

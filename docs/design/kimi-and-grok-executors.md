@@ -190,12 +190,12 @@ start (loud) until ACP lands, or run without auto-approve only if a
 documented non-interactive approval path exists (unlikely for headless).
 Document the gap; do not pretend the host gate works.
 
-### Phase B — ACP (parity path)
+### Phase B — ACP + MIT client (shipped)
 
-`grok agent stdio`: `initialize` → `authenticate` (`cached_token` for
-subscription, `xai.api_key` for metered) → `session/new` → `session/prompt`
-streaming `session/update`. Prefer extracting this transport into the MIT
-client package once stable.
+In-repo MIT package `packages/grok-build-client` (import `grok_build_client`):
+headless + ACP stdio transports. miragen's `GrokBuildExecutor` selects via
+`grok_transport: headless | acp`. ACP supports host leash
+(`session/request_permission`) and MCP on `session/new`.
 
 Login helper:
 

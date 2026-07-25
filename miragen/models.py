@@ -585,6 +585,14 @@ class ExecutorSpec(_ProfileModel):
             "docs/design/subscription-homes.md."
         ),
     )
+    grok_transport: Optional[Literal["headless", "acp"]] = Field(
+        default=None,
+        description=(
+            "grok-build only: 'headless' (default, streaming-json one-shot) or "
+            "'acp' (grok agent stdio — required for host leash and preferred for "
+            "MCP injection). See packages/grok-build-client."
+        ),
+    )
     mcp_servers: Optional[list[ExecutorMCPServer]] = Field(
         default=None,
         description="MCP servers injected into the executor's config at startup (e.g. Loimi via Origo).",
@@ -650,8 +658,20 @@ class ExecutorSpec(_ProfileModel):
         if self.executor == "grok-build":
             if self.grok_home is None:
                 self.grok_home = "/agent/grok-home"
-        elif self.grok_home is not None:
-            raise ValueError(f"`grok_home` only applies to the grok-build executor, not '{self.executor}'")
+            if self.grok_transport is None:
+                self.grok_transport = "headless"
+            if self.leash is not None and self.grok_transport == "headless":
+                raise ValueError(
+                    "grok-build host leash requires grok_transport: acp "
+                    "(headless has no pre-tool approval seam)"
+                )
+        else:
+            if self.grok_home is not None:
+                raise ValueError(f"`grok_home` only applies to the grok-build executor, not '{self.executor}'")
+            if self.grok_transport is not None:
+                raise ValueError(
+                    f"`grok_transport` only applies to the grok-build executor, not '{self.executor}'"
+                )
 
         return self
 

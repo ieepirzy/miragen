@@ -667,7 +667,7 @@ def test_normalize_grok_streaming_events():
         "input_tokens": 1, "output_tokens": 2, "cached_input_tokens": 3,
     }
     assert _normalize_event({"type": "error", "message": "boom"}) == [
-        {"type": "turn.failed", "error": {"message": "boom", "tail": None}}
+        {"type": "turn.failed", "error": {"message": "boom"}}
     ]
 
 
@@ -740,13 +740,28 @@ async def test_grok_build_error_is_resumable_crash(tmp_path):
     assert result.diff_path is None
 
 
-async def test_grok_build_leash_fails_loud(tmp_path):
-    profile, executor = _grok_executor(
-        tmp_path, executor_body={"leash": {"gate": ["command"]}}
+def test_grok_build_leash_requires_acp_transport():
+    with pytest.raises(ValidationError, match="grok_transport: acp"):
+        _profile({"executor": "grok-build", "leash": {"gate": ["command"]}})
+
+
+async def test_grok_build_acp_transport_options(tmp_path):
+    captured = []
+    _, executor = _grok_executor(
+        tmp_path,
+        executor_body={"grok_transport": "acp"},
+        captured=captured,
+        events=[
+            {"type": "session", "sessionId": "acp-sess-1"},
+            {"type": "text", "data": "hi"},
+            {"type": "end", "sessionId": "acp-sess-1", "usage": {"input_tokens": 1, "output_tokens": 1}},
+        ],
     )
-    result = await executor.run_job("go", "gb-leash")
-    assert result.status == "failed"
-    assert "leash" in (result.error or "").lower()
+    result = await executor.run_job("go", "gb-acp")
+    assert result.status == "succeeded"
+    assert captured[0]["options"]["transport"] == "acp"
+    assert result.thread_id == "acp-sess-1"
+    assert result.output == "hi"
 
 
 async def test_grok_build_no_terminal_event_fails(tmp_path):
@@ -756,6 +771,18 @@ async def test_grok_build_no_terminal_event_fails(tmp_path):
     assert result.status == "failed"
     assert "terminal" in (result.error or "").lower()
     assert result.diff_path is None
+
+
+def test_codex_prepare_overrides_inherited_codex_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", "/wrong/inherited")
+    profile = _profile({"executor": "codex"})
+    profile.executor.codex_home = str(tmp_path / "codex-home")
+    profile.executor.workspace_root = str(tmp_path / "workspaces")
+    from miragen.executor.codex import CodexExecutor
+
+    CodexExecutor(profile, runs_root=tmp_path / "runs", session_factory=None).prepare()
+    assert os.environ["CODEX_HOME"] == profile.executor.codex_home
+
 
 
 async def test_grok_build_prepare_overrides_inherited_home(tmp_path, monkeypatch):

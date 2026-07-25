@@ -1,8 +1,9 @@
-"""Grok Build adapter — Phase A headless CLI (streaming-json).
+"""Grok Build adapter — headless + ACP via the MIT `grok-build-client` package.
 
-Self-harnessed coding agent via the `grok` binary. No first-party agent SDK;
-this adapter shells headless mode and normalizes NDJSON events onto the shared
-executor contract. ACP + optional MIT client package are Phase B (later).
+Self-harnessed coding agent via the `grok` CLI. Transport is pluggable:
+
+  - headless (default): one `grok -p` process per turn, streaming-json.
+  - acp: long-lived `grok agent stdio` (JSON-RPC). Required for host leash.
 
 Auth (subscription-first, see docs/design/subscription-homes.md):
   - Primary: SuperGrok / X Premium+ OAuth under GROK_HOME (profile grok_home),
@@ -11,45 +12,33 @@ Auth (subscription-first, see docs/design/subscription-homes.md):
 Agent containers never log in; they mount the shared home.
 
 Session / resume:
-  - First turn mints a UUID and passes `-s <uuid>` (new session only).
-  - Resume passes `-r <uuid>`.
-  thread.started is emitted with that id before the process streams, so a
-  timed-out turn still recovers a resume handle.
-
-Leash: Phase A uses `--always-approve` when unattended. Host leash has no
-pre-tool seam on headless streaming-json — if leash is configured, the turn
-fails loud rather than pretending the gate works (ACP later).
+  - Headless: mint UUID (`-s`) / resume (`-r`).
+  - ACP: session/new or session/load; session id is the resume handle.
 """
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
-import json
 import logging
 import os
-import shutil
-import signal
 import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
 from miragen.executor.base import ExecutorBackend
+from miragen.executor.leash import GateOperation
 from miragen.models import AgentProfile
 
 logger = logging.getLogger("miragen.executor")
 
-_ERROR_TAIL_LINES = 20
 _API_KEY_ENVS = ("XAI_API_KEY", "GROK_CODE_XAI_API_KEY")
 
 
 class GrokBuildExecutor(ExecutorBackend):
-    """Runs jobs through the Grok Build CLI headless mode.
+    """Runs jobs through Grok Build (headless or ACP).
 
     `session_factory` is the test seam: `(prompt, *, thread_id, first_turn,
-    options) -> AsyncIterator` of already-normalized payload dicts, or of
-    plain NDJSON event dicts (with a `type` field from the CLI) which are
-    passed through `_normalize_event`.
+    options) -> AsyncIterator` of client events or already-normalized base
+    payloads.
     """
 
     def __init__(
@@ -64,15 +53,17 @@ class GrokBuildExecutor(ExecutorBackend):
         self._session_factory = session_factory or self._default_session
         self._grok_bin = grok_bin
 
+    @property
+    def transport(self) -> str:
+        return self.spec.grok_transport or "headless"
+
     # ── Startup ────────────────────────────────────────────────────────────
 
     def prepare(self) -> None:
         home = Path(self.spec.grok_home)
         home.mkdir(parents=True, exist_ok=True)
-        # Profile home wins over inherited GROK_HOME (same as kimi_home fix).
         os.environ["GROK_HOME"] = str(home)
 
-        # Persist no-auto-update for headless fleets (also passed per-turn).
         config_path = home / "config.toml"
         if not config_path.exists():
             config_path.write_text(
@@ -82,21 +73,22 @@ class GrokBuildExecutor(ExecutorBackend):
                 "auto_update = false\n"
             )
 
-        if self.spec.mcp_servers:
+        if self.spec.mcp_servers and self.transport == "headless":
             logger.warning(
-                f"[{self.profile.name}] grok-build Phase A cannot inject "
-                "`mcp_servers` into the CLI — configure MCP under GROK_HOME "
-                "or the project `.grok/` tree instead"
+                f"[{self.profile.name}] grok-build headless cannot inject "
+                "`mcp_servers` — use transport: acp, or configure MCP under "
+                "GROK_HOME / project `.grok/`"
             )
 
-        if self.leash_enabled:
+        if self.leash_enabled and self.transport == "headless":
             logger.warning(
-                f"[{self.profile.name}] host leash is configured but grok-build "
-                "Phase A (headless) has no pre-tool approval seam — turns will "
-                "fail until ACP lands. Remove executor.leash or wait for Phase B."
+                f"[{self.profile.name}] host leash requires grok_transport: acp; "
+                "headless turns will fail. Set executor.grok_transport: acp."
             )
 
-        bin_path = self._resolve_bin()
+        from grok_build_client import resolve_grok_bin
+
+        bin_path = resolve_grok_bin(self._grok_bin)
         has_auth = (home / "auth.json").exists()
         has_key = any(os.environ.get(k) for k in _API_KEY_ENVS)
         if bin_path is None:
@@ -114,14 +106,6 @@ class GrokBuildExecutor(ExecutorBackend):
                 "log in. See docs/design/subscription-homes.md."
             )
 
-    def _resolve_bin(self) -> str | None:
-        if self._grok_bin:
-            return self._grok_bin
-        env_bin = os.environ.get("GROK_BIN")
-        if env_bin and Path(env_bin).exists():
-            return env_bin
-        return shutil.which("grok")
-
     # ── Turn streaming ─────────────────────────────────────────────────────
 
     async def _stream_turn(
@@ -133,27 +117,25 @@ class GrokBuildExecutor(ExecutorBackend):
         workspace: Path,
         first_turn: bool,
     ) -> AsyncIterator[dict[str, Any]]:
-        if self.leash_enabled:
+        transport = self.transport
+        if self.leash_enabled and transport == "headless":
             yield {
                 "type": "turn.failed",
                 "error": {
                     "message": (
-                        "grok-build Phase A does not support host leash "
-                        "(no pre-tool approval on headless streaming-json). "
-                        "Remove executor.leash or wait for ACP Phase B."
+                        "grok-build host leash requires grok_transport: acp "
+                        "(headless has no pre-tool approval seam)"
                     ),
                 },
             }
             return
 
-        options = self._options(workspace, thread_id=thread_id, first_turn=first_turn)
-        # Emit resume handle before the process streams so a timeout still
-        # recovers it even if no `end` event arrives.
+        options = self._options(workspace, thread_id=thread_id, first_turn=first_turn, transport=transport)
         yield {"type": "thread.started", "thread_id": options["session_id"]}
 
         session = self._session_factory(
             prompt,
-            thread_id=options["session_id"] if not first_turn and thread_id else None,
+            thread_id=options["session_id"] if options.get("resume") else None,
             first_turn=first_turn,
             options=options,
         )
@@ -163,24 +145,23 @@ class GrokBuildExecutor(ExecutorBackend):
             if isinstance(raw, dict) and raw.get("type") in {
                 "thread.started", "turn.completed", "turn.failed", "item.completed",
             }:
-                # Already-normalized payload (test seam).
-                if raw.get("type") == "thread.started":
-                    continue  # already emitted above
+                # Already-normalized base payloads (test seam).
                 yield raw
                 if raw.get("type") in ("turn.completed", "turn.failed"):
                     saw_terminal = True
                 continue
 
-            for payload in _normalize_event(raw if isinstance(raw, dict) else {}):
+            for payload in _to_base_payload(raw if isinstance(raw, dict) else {}):
                 kind = payload.get("type")
                 if kind == "item.completed":
                     item = payload.get("item") or {}
                     if item.get("type") == "agent_message" and item.get("text"):
-                        # Accumulate streaming text; emit one final message later.
                         text_parts.append(item["text"])
                         continue
                 if kind in ("turn.completed", "turn.failed"):
                     saw_terminal = True
+                # thread.started updates (e.g. real ACP session id) must pass
+                # through so the base can replace a provisional handle.
                 yield payload
 
         if text_parts:
@@ -189,28 +170,35 @@ class GrokBuildExecutor(ExecutorBackend):
                 "item": {"type": "agent_message", "text": "".join(text_parts)},
             }
         if not saw_terminal:
-            # No end/error event (empty output, only unknown types, or non-JSON
-            # noise) — must not harvest as success (Codex review #41).
             yield {
                 "type": "turn.failed",
                 "error": {
-                    "message": "grok exited without a terminal streaming-json event (end/error)",
+                    "message": "grok exited without a terminal event (end/error)",
                 },
             }
 
     def _options(
-        self, workspace: Path, *, thread_id: str | None, first_turn: bool
+        self,
+        workspace: Path,
+        *,
+        thread_id: str | None,
+        first_turn: bool,
+        transport: str,
     ) -> dict[str, Any]:
-        # First turn: mint UUID for -s. Resume: reuse thread_id with -r.
         if first_turn or not thread_id:
-            session_id = str(uuid.uuid4())
+            session_id = str(uuid.uuid4()) if transport == "headless" else (thread_id or "")
             resume = False
         else:
             session_id = thread_id
             resume = True
 
-        yolo = self.spec.approval_policy == "never"
+        # ACP mints session ids server-side on session/new; placeholder until then.
+        if transport == "acp" and not resume:
+            session_id = session_id or "pending"
+
+        yolo = self.spec.approval_policy == "never" and not self.leash_enabled
         return {
+            "transport": transport,
             "cwd": str(workspace),
             "session_id": session_id,
             "resume": resume,
@@ -219,7 +207,22 @@ class GrokBuildExecutor(ExecutorBackend):
             "reasoning_effort": self.spec.reasoning_effort,
             "web_search": self.spec.web_search,
             "grok_home": self.spec.grok_home,
+            "mcp_servers": self._mcp_configs() if transport == "acp" else None,
+            "leash": self.leash_enabled,
         }
+
+    def _mcp_configs(self) -> list[dict[str, Any]] | None:
+        if not self.spec.mcp_servers:
+            return None
+        configs: list[dict[str, Any]] = []
+        for server in self.spec.mcp_servers:
+            cfg: dict[str, Any] = {"name": server.name, "type": "http", "url": server.url}
+            if server.bearer_token_env:
+                token = os.environ.get(server.bearer_token_env)
+                if token:
+                    cfg["headers"] = {"Authorization": f"Bearer {token}"}
+            configs.append(cfg)
+        return configs
 
     async def _default_session(
         self,
@@ -229,171 +232,179 @@ class GrokBuildExecutor(ExecutorBackend):
         first_turn: bool,
         options: dict[str, Any],
     ) -> AsyncIterator[Any]:
-        grok = self._resolve_bin()
-        if not grok:
-            yield {
-                "type": "error",
-                "message": "grok CLI not found on PATH (set GROK_BIN or install Grok Build)",
-            }
-            return
+        transport = options.get("transport") or "headless"
+        if transport == "acp":
+            async for event in self._acp_session(prompt, options):
+                yield event
+        else:
+            async for event in self._headless_session(prompt, options):
+                yield event
 
-        argv = _build_argv(grok, prompt, options)
-        env = os.environ.copy()
-        env["GROK_HOME"] = str(options["grok_home"])
+    async def _headless_session(self, prompt: str, options: dict[str, Any]) -> AsyncIterator[Any]:
+        from grok_build_client import HeadlessSession
 
-        # Limit well above the default 64 KiB so large tool/result NDJSON lines
-        # do not raise ValueError mid-stream (which would leak the process).
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
+        session = HeadlessSession(
+            prompt=prompt,
             cwd=options["cwd"],
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-            limit=16 * 1024 * 1024,
+            session_id=options["session_id"],
+            resume=bool(options.get("resume")),
+            always_approve=bool(options.get("always_approve")),
+            model=options.get("model"),
+            reasoning_effort=options.get("reasoning_effort"),
+            web_search=bool(options.get("web_search")),
+            grok_home=options.get("grok_home"),
+            grok_bin=self._grok_bin,
         )
+        async for event in session.run():
+            yield event
 
-        lines: list[str] = []
+    async def _acp_session(self, prompt: str, options: dict[str, Any]) -> AsyncIterator[Any]:
+        from grok_build_client import AcpSession
 
-        def _kill_tree() -> None:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(proc.pid, signal.SIGKILL)
+        handler = self._permission_handler if options.get("leash") else None
+        async with AcpSession(
+            grok_bin=self._grok_bin,
+            grok_home=options.get("grok_home"),
+            always_approve=bool(options.get("always_approve")),
+            model=options.get("model"),
+            permission_handler=handler,
+        ) as acp:
+            if options.get("resume") and options.get("session_id") not in (None, "", "pending"):
+                session_id = await acp.session_load(options["session_id"], cwd=options["cwd"])
+            else:
+                session_id = await acp.session_new(
+                    options["cwd"],
+                    mcp_servers=options.get("mcp_servers"),
+                    yolo=bool(options.get("always_approve")),
+                )
+            # Real ACP session id (overrides provisional handle from options).
+            yield {"type": "session", "sessionId": session_id}
 
-        try:
-            assert proc.stdout is not None
-            while True:
-                raw = await proc.stdout.readline()
-                if not raw:
-                    break
-                text = raw.decode(errors="replace").rstrip("\n")
-                if not text:
-                    continue
-                lines.append(text)
-                try:
-                    event = json.loads(text)
-                except ValueError:
-                    # Non-JSON noise (warnings) — surface via exit-code tail.
-                    continue
-                if isinstance(event, dict):
-                    yield event
-            returncode = await proc.wait()
-        except asyncio.CancelledError:
-            _kill_tree()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            raise
-        except Exception:
-            # ValueError (line too long), decode errors, etc. — reap the tree
-            # so resume/abandon does not race a still-running grok (Codex #41).
-            _kill_tree()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            raise
+            async for event in acp.prompt(session_id, prompt):
+                if event.get("type") == "end" and not event.get("sessionId"):
+                    event = {**event, "sessionId": session_id}
+                yield event
 
-        if returncode != 0:
-            # Prefer a structured error event if the stream already carried one;
-            # otherwise synthesize from exit code + tail.
-            yield {
-                "type": "error",
-                "message": f"grok exited with code {returncode}",
-                "tail": lines[-_ERROR_TAIL_LINES:],
-            }
+    def _permission_handler(self, params: dict[str, Any]) -> str:
+        """ACP permission callback → host leash."""
+        op = _gate_operation_from_acp(params)
+        if op is None:
+            return "allow"
+        decision = self.gate_decide(op)
+        return "allow" if decision.allow else "deny"
 
 
-def _build_argv(grok: str, prompt: str, options: dict[str, Any]) -> list[str]:
-    argv = [
-        grok,
-        "--no-auto-update",
-        "-p", prompt,
-        "--cwd", options["cwd"],
-        "--output-format", "streaming-json",
-    ]
-    if options.get("always_approve"):
-        argv.append("--always-approve")
-    if options.get("resume"):
-        argv.extend(["-r", options["session_id"]])
-    else:
-        argv.extend(["-s", options["session_id"]])
-    if options.get("model"):
-        argv.extend(["-m", options["model"]])
-    if options.get("reasoning_effort"):
-        argv.extend(["--reasoning-effort", options["reasoning_effort"]])
-    if not options.get("web_search"):
-        argv.append("--disable-web-search")
-    return argv
+def _gate_operation_from_acp(params: dict[str, Any]) -> GateOperation | None:
+    """Best-effort map of ACP permission params to a GateOperation."""
+    # Shapes vary by agent build; probe common fields.
+    tool_call = params.get("toolCall") or params.get("tool_call") or params
+    if not isinstance(tool_call, dict):
+        tool_call = params
+    title = (tool_call.get("title") or tool_call.get("kind") or tool_call.get("toolName") or "")
+    title_l = str(title).lower()
+    raw_input = tool_call.get("rawInput") or tool_call.get("input") or {}
+    if not isinstance(raw_input, dict):
+        raw_input = {}
+    command = raw_input.get("command") or raw_input.get("cmd") or ""
+    summary = (command or title or str(params))[:120]
+
+    if "bash" in title_l or "shell" in title_l or "terminal" in title_l or command:
+        return GateOperation(op_class="command", command=str(command), summary=summary)
+    if any(k in title_l for k in ("edit", "write", "create", "file")):
+        return GateOperation(op_class="write", summary=summary)
+    if any(k in title_l for k in ("fetch", "web", "http", "network")):
+        return GateOperation(op_class="network", summary=summary)
+    return None
 
 
-def _normalize_event(event: dict[str, Any]) -> list[dict[str, Any]]:
-    """Map one Grok streaming-json / json event onto base-tier payloads.
-
-    Documented types: text, thought, end, error. Unknown types are ignored.
-    """
+def _to_base_payload(event: dict[str, Any]) -> list[dict[str, Any]]:
+    """Map grok-build-client events onto miragen base executor payloads."""
     etype = event.get("type")
+
+    if etype == "session":
+        sid = event.get("sessionId")
+        return [{"type": "thread.started", "thread_id": sid}] if sid else []
 
     if etype == "text":
         data = event.get("data") or ""
         if not data:
             return []
-        return [{
-            "type": "item.completed",
-            "item": {"type": "agent_message", "text": data},
-        }]
+        return [{"type": "item.completed", "item": {"type": "agent_message", "text": data}}]
 
     if etype == "thought":
         data = event.get("data") or ""
         if not data:
             return []
+        return [{"type": "item.completed", "item": {"type": "reasoning", "text": data}}]
+
+    if etype == "tool_call":
         return [{
             "type": "item.completed",
-            "item": {"type": "reasoning", "text": data},
+            "item": {"type": "tool_use", "name": event.get("name"), "status": event.get("status")},
         }]
 
     if etype == "end":
-        # sessionId on end can refine the resume handle if we didn't mint -s,
-        # but Phase A always mints; still fold usage.
-        usage = _usage_from_end(event)
+        usage = _usage_from_client(event.get("usage") or {})
         payloads: list[dict[str, Any]] = []
-        sid = event.get("sessionId")
-        if sid:
-            payloads.append({"type": "thread.started", "thread_id": sid})
+        if event.get("sessionId"):
+            payloads.append({"type": "thread.started", "thread_id": event["sessionId"]})
         payloads.append({"type": "turn.completed", "usage": usage})
         return payloads
 
     if etype == "error":
         return [{
             "type": "turn.failed",
-            "error": {
-                "message": event.get("message") or "grok reported an error",
-                "tail": event.get("tail"),
-            },
+            "error": {"message": event.get("message") or "grok reported an error"},
         }]
 
-    # json (non-streaming) shape without type — rare if we always request streaming-json
+    # Raw headless CLI shapes (type/data) that bypassed client normalize
     if etype is None and ("text" in event or "sessionId" in event):
-        payloads = []
-        if event.get("sessionId"):
-            payloads.append({"type": "thread.started", "thread_id": event["sessionId"]})
-        if event.get("text"):
-            payloads.append({
-                "type": "item.completed",
-                "item": {"type": "agent_message", "text": event["text"]},
-            })
-        payloads.append({"type": "turn.completed", "usage": _usage_from_end(event)})
-        return payloads
+        from grok_build_client import normalize_headless_event
+
+        out: list[dict[str, Any]] = []
+        for norm in normalize_headless_event(event):
+            out.extend(_to_base_payload(norm))
+        return out
 
     return []
 
 
-def _usage_from_end(event: dict[str, Any]) -> dict[str, Any]:
-    raw = event.get("usage")
-    if not isinstance(raw, dict):
+def _usage_from_client(raw: dict[str, Any]) -> dict[str, Any]:
+    if not raw:
         return {}
+    # Headless snake_case or ACP camelCase
     usage: dict[str, Any] = {
-        "input_tokens": raw.get("input_tokens"),
-        "output_tokens": raw.get("output_tokens"),
+        "input_tokens": raw.get("input_tokens", raw.get("inputTokens")),
+        "output_tokens": raw.get("output_tokens", raw.get("outputTokens")),
     }
-    cached = raw.get("cache_read_input_tokens")
+    cached = raw.get("cache_read_input_tokens", raw.get("cacheReadInputTokens"))
     if cached is not None:
         usage["cached_input_tokens"] = cached
     return usage
+
+
+# Back-compat for tests that imported private helpers from the Phase A module.
+def _build_argv(grok: str, prompt: str, options: dict[str, Any]) -> list[str]:
+    from grok_build_client import build_headless_argv
+
+    return build_headless_argv(
+        grok,
+        prompt,
+        cwd=options["cwd"],
+        session_id=options.get("session_id"),
+        resume=bool(options.get("resume")),
+        always_approve=bool(options.get("always_approve", True)),
+        model=options.get("model"),
+        reasoning_effort=options.get("reasoning_effort"),
+        web_search=bool(options.get("web_search")),
+    )
+
+
+def _normalize_event(event: dict[str, Any]) -> list[dict[str, Any]]:
+    """Phase A name — normalize headless raw events to base payloads."""
+    from grok_build_client import normalize_headless_event
+
+    out: list[dict[str, Any]] = []
+    for norm in normalize_headless_event(event):
+        out.extend(_to_base_payload(norm))
+    return out
