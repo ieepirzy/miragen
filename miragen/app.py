@@ -34,7 +34,6 @@ from miragen.edf import (
     resolve_edf,
 )
 from miragen.executor import ExecutorBackend, ExecutorResult, RepositoryCheckout, build_executor
-from miragen.executor.sink import build_sink
 from miragen.factory import build_agent, registered_handlers
 from miragen.load import load_profile
 from miragen.models import (
@@ -50,6 +49,16 @@ from miragen.models import (
     RunSummary,
     StartupTrigger as ProfileStartupTrigger,
     sum_usage,
+)
+from miragen.publication import (
+    PublicationConfigError,
+    PublicationError,
+    PublicationRequest,
+    PublicationResponse,
+    PublicationStore,
+    PublicationUnavailableError,
+    build_publication_backend,
+    publish_reviewed_run,
 )
 from miragen.runs import (
     AmbiguousRunIdError,
@@ -77,6 +86,9 @@ _scheduler: AsyncIOScheduler = AsyncIOScheduler()
 _run_store: RunStore | None = None
 _executor: "ExecutorBackend | None" = None
 _schedule_store: ScheduleStore | None = None
+_publication_store: PublicationStore | None = None
+# Test seam: inject a PublicationBackend (or factory) without hitting the network.
+_publication_backend_override: object | None = None
 
 HISTORY_FILE = Path("/agent/history.json")
 HISTORY_SIDECAR = Path("/agent/history.runs.jsonl")
@@ -306,8 +318,10 @@ async def _run_executor_turn(
         if prepared_revisions:
             _record_snapshot_commits(record.run_id, prepared_revisions)
 
-    if result.status == "succeeded" and _executor.spec.artifact_sink is not None:
-        await _store_artifact(result, run_id, record)
+    # Reviewed publication only: do NOT auto-push to the publication backend
+    # on success. Orchestrators call POST /runs/{id}/publications after human
+    # review (capability reviewed-publication/v1). The harvested diff on disk
+    # remains the authoritative local artifact until then.
 
     if result.status == "failed":
         raise RuntimeError(result.error or "executor turn failed")
@@ -338,34 +352,6 @@ def _record_snapshot_commits(run_id: str, revisions: list[RepositoryRevision]) -
             changed = True
     if changed:
         _run_store.write_snapshot(run_id, snapshot)
-
-
-async def _store_artifact(result: "ExecutorResult", run_id: str, record: RunRecord | None) -> None:
-    """Push the harvested diff to the configured artifact sink. Advisory by
-    construction: failure logs and marks artifact_stored=False on the record,
-    but never raises into the run path — the diff on disk is the source of
-    truth either way."""
-    assert _executor is not None and _executor.spec.artifact_sink is not None
-    sink_spec = _executor.spec.artifact_sink
-    stored = False
-    try:
-        diff = Path(result.diff_path).read_text() if result.diff_path else ""
-        token = os.environ.get(sink_spec.bearer_token_env) if sink_spec.bearer_token_env else None
-        sink = build_sink(sink_spec, bearer_token=token)
-        await sink.store(
-            diff=diff,
-            metadata={
-                "run_id": run_id,
-                "agent": _profile.name if _profile else None,
-                "thread_id": result.thread_id,
-            },
-        )
-        stored = True
-        logger.info(f"[{_profile.name}] artifact sink stored diff for run {run_id}")
-    except Exception as e:
-        logger.error(f"[{_profile.name}] artifact sink failed for run {run_id}: {e}", exc_info=True)
-    if record is not None and _run_store is not None:
-        _run_store.annotate(record, artifact_stored=stored)
 
 
 def _daily_budget_status() -> tuple[int, int] | None:
@@ -605,7 +591,7 @@ def _load_file_secrets() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _profile, _agent, _limits, _run_store, _executor, _schedule_store
+    global _profile, _agent, _limits, _run_store, _executor, _schedule_store, _publication_store
 
     _load_file_secrets()
 
@@ -615,6 +601,7 @@ async def lifespan(app: FastAPI):
     _profile = load_profile(profile_path)
 
     _run_store = RunStore(retention=run_retention_from_env())
+    _publication_store = PublicationStore(_run_store.root / "publications")
     interrupted = _run_store.sweep_interrupted()
     if interrupted:
         logger.warning(f"Marked {interrupted} stale 'running' record(s) as interrupted")
@@ -742,6 +729,7 @@ CONTRACT_CAPABILITIES = [
     "events-cursor/v1",                  # GET /runs/{id}/events?after=
     "managed-schedules/v1",              # GET/PUT/DELETE /schedules (CAS reconciliation)
     "interventions/v1",                  # structured question suspension + answered resume
+    "reviewed-publication/v1",           # POST /runs/{id}/publications (explicit graduation)
 ]
 
 
@@ -1039,6 +1027,91 @@ async def get_run_diff(run_id: str, repository: Optional[str] = None):
     from fastapi.responses import PlainTextResponse
 
     return PlainTextResponse(path.read_text())
+
+
+@app.post(
+    "/runs/{run_id}/publications",
+    response_model=PublicationResponse,
+    dependencies=[_internal_auth],
+)
+async def publish_run(run_id: str, request: PublicationRequest):
+    """Reviewed whole-run publication (capability reviewed-publication/v1).
+
+    After human review, an orchestrator asks miragen to graduate one
+    **succeeded** executor run into the configured publication backend
+    (profile ``executor.artifact_sink``). miragen reads its authoritative
+    run/diff, performs the backend writes, and returns **opaque** references
+    only. Orchestrators must not write artifacts/provenance/history to the
+    backend themselves.
+
+    Idempotent on ``idempotency_key``. Backend/network failures are retryable
+    (503) and never change the execution run's status. Validation failures are
+    deterministic 4xx.
+    """
+    if _run_store is None:
+        raise HTTPException(status_code=503, detail="Run store not ready")
+    if _executor is None or _executor.spec.artifact_sink is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "publication backend not configured — set executor.artifact_sink "
+                "on the agent profile (kind + url); publication is never auto-fired"
+            ),
+        )
+    pub_store = _publication_store
+    if pub_store is None:
+        # Tests / partial wiring: create beside the run store.
+        pub_store = PublicationStore(_run_store.root / "publications")
+
+    try:
+        record = _get_executor_record(run_id)
+    except HTTPException:
+        raise
+    except AmbiguousRunIdError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "ambiguous run_id prefix", "candidates": e.candidates},
+        )
+
+    if _publication_backend_override is not None:
+        backend = _publication_backend_override
+    else:
+        sink_spec = _executor.spec.artifact_sink
+        token = (
+            os.environ.get(sink_spec.bearer_token_env)
+            if sink_spec.bearer_token_env
+            else None
+        )
+        try:
+            backend = build_publication_backend(sink_spec, bearer_token=token)
+        except PublicationConfigError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+    def _annotate(run: RunRecord, **kw):
+        assert _run_store is not None
+        return _run_store.annotate(run, **kw)
+
+    try:
+        return await publish_reviewed_run(
+            run=record,
+            request=request,
+            store=pub_store,
+            backend=backend,
+            annotate_run=_annotate,
+        )
+    except PublicationConfigError as e:
+        raise HTTPException(status_code=e.status_code or 400, detail=str(e)) from e
+    except PublicationUnavailableError as e:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": str(e), "retryable": True},
+        ) from e
+    except PublicationError as e:
+        status = e.status_code or (503 if e.retryable else 502)
+        raise HTTPException(
+            status_code=status,
+            detail={"error": str(e), "retryable": e.retryable},
+        ) from e
 
 
 @app.get("/runs/{run_id}/events", dependencies=[_internal_auth])

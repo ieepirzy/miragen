@@ -1,0 +1,559 @@
+"""Reviewed whole-run publication — explicit, backend-agnostic graduation.
+
+Orchestrators (e.g. MiraRun) never write artifacts or provenance to a document
+store themselves. After human review they call POST /runs/{id}/publications;
+miragen reads its authoritative run/diff and hands the package to a configured
+**publication backend** (first implementation: Loimi over MCP).
+
+This is deliberately *not* auto-fired on executor success. The legacy
+`artifact_sink` auto-push path is retired; the same profile field now names
+the backend used only by the reviewed-publication endpoint.
+
+Idempotency lives in miragen (per idempotency_key → PublicationRecord). Retry
+after Loimi/network failure re-enters the backend; duplicate keys return the
+prior opaque references without writing again.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import re
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Literal, Protocol
+
+import httpx
+from pydantic import BaseModel, Field
+
+from miragen.models import ArtifactSinkSpec, RunRecord
+
+logger = logging.getLogger("miragen.publication")
+
+_PROTOCOL_VERSION = "2025-03-26"
+
+
+# ── Contract models ──────────────────────────────────────────────────────────
+
+
+class PublicationProvenance(BaseModel):
+    """Caller-supplied provenance for the *publication request* (not the run).
+
+    Extra fields allowed so orchestrators can evolve without miragen changes;
+    known MiraRun fields are typed for validation when present.
+    """
+
+    model_config = {"extra": "allow"}
+
+    mirarun_run_intent_id: str | None = None
+    environment_id: str | None = None
+    environment_revision: int | None = None
+    requested_by: str | None = None
+
+
+class PublicationRequest(BaseModel):
+    idempotency_key: str = Field(min_length=1, max_length=512)
+    provenance: PublicationProvenance = Field(default_factory=PublicationProvenance)
+
+
+class PublicationResult(BaseModel):
+    """Opaque outcome from a publication backend (before miragen ids are stamped)."""
+
+    backend: str
+    external_run_id: str
+    external_artifact_ids: list[str] = Field(default_factory=list)
+
+
+class PublicationRecord(BaseModel):
+    """Persisted publication — miragen's memory of a reviewed graduation."""
+
+    publication_id: str
+    run_id: str
+    idempotency_key: str
+    status: Literal["published"] = "published"
+    backend: str
+    external_run_id: str
+    external_artifact_ids: list[str] = Field(default_factory=list)
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class PublicationResponse(BaseModel):
+    """HTTP response. Field names stay backend-agnostic; values are opaque.
+
+    MiraRun (and other orchestrators) store only these references — never
+    re-write artifacts into the backend store.
+    """
+
+    publication_id: str
+    run_id: str
+    status: Literal["published"] = "published"
+    duplicate: bool = False
+    backend: str
+    # Opaque backend references (canonical for all backends).
+    external_run_id: str
+    external_artifact_ids: list[str] = Field(default_factory=list)
+    # Convenience aliases when backend == "loimi" (same opaque values).
+    # Kept so MiraRun can keep loimi_* names without forking the contract.
+    loimi_run_id: str | None = None
+    loimi_artifact_ids: list[str] | None = None
+
+    @classmethod
+    def from_record(cls, record: PublicationRecord, *, duplicate: bool) -> "PublicationResponse":
+        loimi_run = record.external_run_id if record.backend == "loimi" else None
+        loimi_arts = list(record.external_artifact_ids) if record.backend == "loimi" else None
+        return cls(
+            publication_id=record.publication_id,
+            run_id=record.run_id,
+            status="published",
+            duplicate=duplicate,
+            backend=record.backend,
+            external_run_id=record.external_run_id,
+            external_artifact_ids=list(record.external_artifact_ids),
+            loimi_run_id=loimi_run,
+            loimi_artifact_ids=loimi_arts,
+        )
+
+
+class PublicationError(Exception):
+    """Base for publication failures. `retryable` drives HTTP 503 vs 4xx/502."""
+
+    def __init__(self, message: str, *, retryable: bool = False, status_code: int | None = None):
+        super().__init__(message)
+        self.retryable = retryable
+        self.status_code = status_code or (503 if retryable else 502)
+
+
+class PublicationConfigError(PublicationError):
+    def __init__(self, message: str):
+        super().__init__(message, retryable=False, status_code=400)
+
+
+class PublicationUnavailableError(PublicationError):
+    def __init__(self, message: str):
+        super().__init__(message, retryable=True, status_code=503)
+
+
+# ── Backend protocol ─────────────────────────────────────────────────────────
+
+
+class PublicationBackend(Protocol):
+    """Pluggable graduation target. miragen never hard-codes product semantics
+    beyond the first built-in Loimi MCP backend; new kinds register here."""
+
+    async def publish_run(
+        self,
+        *,
+        diff: str,
+        run: RunRecord,
+        provenance: dict[str, Any],
+    ) -> PublicationResult:
+        """Publish one whole reviewed run. Raises PublicationError on failure."""
+        ...
+
+
+class McpStreamableClient:
+    """Minimal streamable-HTTP MCP client (initialize + tools/call)."""
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        bearer_token: str | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+        client_name: str = "miragen",
+    ):
+        self.url = url
+        self._bearer_token = bearer_token
+        self._transport = transport
+        self._client_name = client_name
+        self._rpc_id = 0
+
+    def _next_id(self) -> int:
+        self._rpc_id += 1
+        return self._rpc_id
+
+    async def __aenter__(self) -> "McpStreamableClient":
+        headers = {"Authorization": f"Bearer {self._bearer_token}"} if self._bearer_token else {}
+        self._client = httpx.AsyncClient(
+            transport=self._transport, headers=headers, timeout=60.0
+        )
+        self._session_headers = await self._initialize()
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self._client.aclose()
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        result = await self._rpc(
+            method="tools/call",
+            params={"name": name, "arguments": arguments},
+        )
+        if isinstance(result, dict) and result.get("isError"):
+            raise PublicationError(
+                f"tool {name!r} returned an error: {result.get('content')}",
+                retryable=False,
+                status_code=502,
+            )
+        return result
+
+    async def _initialize(self) -> dict[str, str]:
+        response = await self._post(
+            {},
+            {
+                "jsonrpc": "2.0",
+                "id": self._next_id(),
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": _PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": self._client_name, "version": "0"},
+                },
+            },
+        )
+        session_headers: dict[str, str] = {}
+        session_id = response.headers.get("mcp-session-id")
+        if session_id:
+            session_headers["mcp-session-id"] = session_id
+        await self._post(
+            session_headers,
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+        return session_headers
+
+    async def _rpc(self, *, method: str, params: dict[str, Any]) -> Any:
+        try:
+            response = await self._post(
+                self._session_headers,
+                {
+                    "jsonrpc": "2.0",
+                    "id": self._next_id(),
+                    "method": method,
+                    "params": params,
+                },
+            )
+        except httpx.HTTPError as e:
+            raise PublicationUnavailableError(f"MCP transport error on {method}: {e}") from e
+        body = _parse_body(response)
+        if body is None:
+            raise PublicationUnavailableError(f"empty response to {method}")
+        if "error" in body:
+            err = body["error"]
+            # Treat server/internal errors as retryable; application errors not.
+            code = err.get("code") if isinstance(err, dict) else None
+            retryable = isinstance(code, int) and code in (-32000, -32603)
+            raise PublicationError(
+                f"{method} failed: {err}",
+                retryable=retryable,
+                status_code=503 if retryable else 502,
+            )
+        return body.get("result")
+
+    async def _post(
+        self, session_headers: dict[str, str], payload: dict
+    ) -> httpx.Response:
+        response = await self._client.post(
+            self.url,
+            json=payload,
+            headers={
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+                **session_headers,
+            },
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                raise PublicationUnavailableError(
+                    f"MCP HTTP {e.response.status_code} on {self.url}"
+                ) from e
+            raise PublicationError(
+                f"MCP HTTP {e.response.status_code} on {self.url}",
+                retryable=False,
+                status_code=502,
+            ) from e
+        return response
+
+
+def _parse_body(response: httpx.Response) -> dict | None:
+    if "text/event-stream" in response.headers.get("content-type", ""):
+        body = None
+        for line in response.text.splitlines():
+            if line.startswith("data:"):
+                try:
+                    body = json.loads(line[len("data:"):].strip())
+                except ValueError:
+                    continue
+        return body
+    if not response.content:
+        return None
+    return response.json()
+
+
+def _extract_id(result: Any, *keys: str) -> str | None:
+    """Pull an opaque id from a tools/call result (structured or text JSON)."""
+    if result is None:
+        return None
+    if isinstance(result, str) and result.strip():
+        return result.strip()
+    if isinstance(result, dict):
+        for k in keys:
+            v = result.get(k)
+            if isinstance(v, str) and v:
+                return v
+        # MCP content blocks
+        content = result.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                text = block.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                try:
+                    parsed = json.loads(text)
+                except ValueError:
+                    # bare id string
+                    if re.fullmatch(r"[\w.:@/-]+", text.strip()):
+                        return text.strip()
+                    continue
+                if isinstance(parsed, dict):
+                    for k in keys:
+                        v = parsed.get(k)
+                        if isinstance(v, str) and v:
+                            return v
+                elif isinstance(parsed, str) and parsed:
+                    return parsed
+    return None
+
+
+class LoimiPublicationBackend:
+    """Loimi MCP backend: open_run → store_document → close_run.
+
+    Tool names/args are the Loimi-facing contract; miragen only depends on the
+    PublicationBackend protocol. Other backends implement the same protocol
+    without Loimi tool names.
+    """
+
+    kind = "loimi"
+
+    def __init__(
+        self,
+        spec: ArtifactSinkSpec,
+        *,
+        bearer_token: str | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ):
+        self.spec = spec
+        self._bearer_token = bearer_token
+        self._transport = transport
+
+    async def publish_run(
+        self,
+        *,
+        diff: str,
+        run: RunRecord,
+        provenance: dict[str, Any],
+    ) -> PublicationResult:
+        metadata = {
+            "miragen_run_id": run.run_id,
+            "agent": run.agent_name,
+            "thread_id": run.thread_id,
+            "executor": run.executor,
+            "model": run.model,
+            "snapshot_sha256": run.snapshot_sha256,
+            "publication_provenance": provenance,
+        }
+        async with McpStreamableClient(
+            self.spec.url,
+            bearer_token=self._bearer_token,
+            transport=self._transport,
+            client_name="miragen-publication",
+        ) as mcp:
+            open_result = await mcp.call_tool(
+                "open_run",
+                {
+                    "kind": "reviewed_executor_run",
+                    "metadata": metadata,
+                },
+            )
+            external_run_id = _extract_id(
+                open_result, "run_id", "loimi_run_id", "id"
+            )
+            if not external_run_id:
+                raise PublicationError(
+                    f"open_run did not return a run id: {open_result!r}",
+                    retryable=False,
+                    status_code=502,
+                )
+
+            store_result = await mcp.call_tool(
+                "store_document",
+                {
+                    "kind": self.spec.document_kind,
+                    "content": diff,
+                    "run_id": external_run_id,
+                    "metadata": {
+                        **metadata,
+                        "loimi_run_id": external_run_id,
+                        "role": "executor_diff",
+                    },
+                },
+            )
+            artifact_id = _extract_id(
+                store_result, "document_id", "artifact_id", "id", "doc_id"
+            )
+            if not artifact_id:
+                # Fall back to a stable synthetic id only when the backend
+                # acknowledges success without an id (some MCP tools return
+                # plain text "stored"). Prefer an explicit opaque token.
+                text = _extract_id(store_result, "text")
+                artifact_id = text or f"doc:{external_run_id}:diff"
+
+            await mcp.call_tool(
+                "close_run",
+                {
+                    "run_id": external_run_id,
+                    "status": "completed",
+                    "metadata": {"miragen_run_id": run.run_id},
+                },
+            )
+
+        return PublicationResult(
+            backend=self.kind,
+            external_run_id=external_run_id,
+            external_artifact_ids=[artifact_id],
+        )
+
+
+def build_publication_backend(
+    spec: ArtifactSinkSpec,
+    *,
+    bearer_token: str | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> PublicationBackend:
+    if spec.kind == "loimi":
+        return LoimiPublicationBackend(spec, bearer_token=bearer_token, transport=transport)
+    raise PublicationConfigError(f"unknown publication backend kind: {spec.kind!r}")
+
+
+# ── Idempotent store ─────────────────────────────────────────────────────────
+
+
+class PublicationStore:
+    """Append-only publication records keyed by idempotency_key and publication_id.
+
+    Directory creation is deferred to first write so lifespan can construct a
+    store against a default root that may not exist yet (same pattern as
+    RunStore — unit tests that only exercise the scheduler must not require
+    /agent/runs to be writable).
+    """
+
+    def __init__(self, root: Path):
+        self.root = Path(root)
+
+    def get_by_idempotency_key(self, key: str) -> PublicationRecord | None:
+        path = self._key_path(key)
+        if not path.exists():
+            return None
+        try:
+            return PublicationRecord.model_validate_json(path.read_text())
+        except Exception:
+            logger.warning("corrupt publication record at %s", path, exc_info=True)
+            return None
+
+    def get(self, publication_id: str) -> PublicationRecord | None:
+        path = self.root / f"id-{publication_id}.json"
+        if not path.exists():
+            return None
+        try:
+            return PublicationRecord.model_validate_json(path.read_text())
+        except Exception:
+            return None
+
+    def save(self, record: PublicationRecord) -> PublicationRecord:
+        # Dual index: by idempotency key (dedupe) and by publication id (lookup).
+        self.root.mkdir(parents=True, exist_ok=True)
+        payload = record.model_dump_json(indent=2)
+        key_path = self._key_path(record.idempotency_key)
+        id_path = self.root / f"id-{record.publication_id}.json"
+        tmp = key_path.with_suffix(".tmp")
+        tmp.write_text(payload)
+        tmp.replace(key_path)
+        id_path.write_text(payload)
+        return record
+
+    def _key_path(self, key: str) -> Path:
+        digest = hashlib.sha256(key.encode()).hexdigest()[:32]
+        return self.root / f"key-{digest}.json"
+
+
+def preconditions_ok(run: RunRecord) -> str | None:
+    """Return an error message if the run is not eligible for publication, else None."""
+    if run.status != "succeeded":
+        return f"run status is {run.status!r}; only succeeded runs can be published"
+    if not run.diff_path:
+        return "run has no harvested diff_path; incomplete or non-executor success"
+    if not Path(run.diff_path).is_file():
+        return f"diff file missing on disk: {run.diff_path}"
+    return None
+
+
+async def publish_reviewed_run(
+    *,
+    run: RunRecord,
+    request: PublicationRequest,
+    store: PublicationStore,
+    backend: PublicationBackend,
+    annotate_run: Callable[..., RunRecord],
+) -> PublicationResponse:
+    """Idempotent reviewed publication. Does not mutate run.status."""
+    existing = store.get_by_idempotency_key(request.idempotency_key)
+    if existing is not None:
+        if existing.run_id != run.run_id:
+            raise PublicationConfigError(
+                f"idempotency_key already bound to run {existing.run_id}, not {run.run_id}"
+            )
+        return PublicationResponse.from_record(existing, duplicate=True)
+
+    reason = preconditions_ok(run)
+    if reason:
+        raise PublicationConfigError(reason)
+
+    diff = Path(run.diff_path).read_text()  # type: ignore[arg-type]
+    result = await backend.publish_run(
+        diff=diff,
+        run=run,
+        provenance=request.provenance.model_dump(exclude_none=True),
+    )
+
+    record = PublicationRecord(
+        publication_id=uuid.uuid4().hex,
+        run_id=run.run_id,
+        idempotency_key=request.idempotency_key,
+        status="published",
+        backend=result.backend,
+        external_run_id=result.external_run_id,
+        external_artifact_ids=list(result.external_artifact_ids),
+        provenance=request.provenance.model_dump(exclude_none=True),
+        created_at=datetime.now(timezone.utc),
+    )
+    # Atomic-ish: save publication first; then annotate run. A crash between
+    # leaves a publication record that idempotent retry will return without
+    # re-writing the backend (key already stored after successful backend call).
+    # If backend succeeded but save fails, retry may double-write backend —
+    # acceptable until a two-phase outbox lands; callers must use stable keys.
+    store.save(record)
+    try:
+        annotate_run(run, artifact_stored=True)
+    except Exception:
+        logger.warning(
+            "publication %s saved but run annotate failed for %s",
+            record.publication_id,
+            run.run_id,
+            exc_info=True,
+        )
+    return PublicationResponse.from_record(record, duplicate=False)
