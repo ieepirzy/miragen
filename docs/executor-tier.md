@@ -211,8 +211,10 @@ thread handle, resume in practice means abandon-and-rerun.
    `~/.claude`. miragen warns at startup when neither is visible.
 5. **Kimi Code: mount `kimi_home` or set an API key** — same shared-store
    model as Codex. Run `miragen kimi-login --kimi-home <volume>` once
-   (subscription) or set `KIMI_API_KEY`/`MOONSHOT_API_KEY`. The `kimi`
-   binary / SDK runtime must be present in the image for the extra to work.
+   (subscription) or set `KIMI_API_KEY`/`MOONSHOT_API_KEY`. The published
+   image (`ghcr.io/ieepirzy/miragen`, built by `publish.yml` from
+   `Dockerfile`) installs `miragen[kimi-code]` so the SDK/runtime is present
+   without a custom image.
 6. **A cancelled turn must not leak its process** — `turn_timeout_s` kills
    the turn via asyncio cancellation; the spawn adapter kills its subprocess
    on the way out, the SDK adapters rely on their SDK's cleanup
