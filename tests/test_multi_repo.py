@@ -82,6 +82,9 @@ async def test_prepares_repos_resolves_commits_and_harvests_writable_only(tmp_pa
     result = await executor.run_job("edit the app", "mr-run1", repositories=checkouts)
     assert result.status == "succeeded"
     assert {r["name"]: r["commit"] for r in result.repositories} == shas
+    # Only the writable app repo received a non-empty harvest.
+    assert result.affected_repositories == ["app"]
+    assert "code" in (result.change_categories or [])
 
     ws = ws_holder["ws"]
     # multi-repo layout: root is NOT a git repo; each mount is its own

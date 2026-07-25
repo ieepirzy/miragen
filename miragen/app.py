@@ -309,6 +309,8 @@ async def _run_executor_turn(
             exit_reason=result.exit_reason,
             diff_path=result.diff_path,
             repositories=prepared_revisions,
+            affected_repositories=result.affected_repositories,
+            change_categories=result.change_categories,
             setup_s=_accumulate(record.setup_s, result.setup_s),
             tool_call_count=_accumulate(record.tool_call_count, result.tool_call_count),
             tool_call_failures=_accumulate(record.tool_call_failures, result.tool_call_failures),

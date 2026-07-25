@@ -204,6 +204,13 @@ class RunRecord(BaseModel):
     snapshot_sha256: Optional[str] = None
     provenance: Optional[RunProvenance] = None
     repositories: Optional[list[RepositoryRevision]] = None
+    # Whole-run outcome classification from the harvested final diff (backend-
+    # owned path analysis — never model free-text). None = unknown / no harvest;
+    # [] = harvest completed with nothing affected / no categories.
+    affected_repositories: Optional[list[str]] = None
+    change_categories: Optional[
+        list[Literal["documentation", "code", "structural"]]
+    ] = None
     # Timing/telemetry intervals (issue #33 Phase E). Formulas:
     #   wall clock  = duration_s = finished_at - started_at (includes blocked)
     #   blocked_s   = Σ (resume time - previous finished_at) across reopens

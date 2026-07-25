@@ -198,6 +198,8 @@ class ExecutorResult:
         usage: RunUsage | None = None,
         diff_path: str | None = None,
         repositories: list[dict[str, Any]] | None = None,
+        affected_repositories: list[str] | None = None,
+        change_categories: list[str] | None = None,
         setup_s: float | None = None,
         tool_call_count: int | None = None,
         tool_call_failures: int | None = None,
@@ -213,6 +215,10 @@ class ExecutorResult:
         # Concrete prepared-repository state (name/ref/mount_path/writable/
         # commit) — filled by workspace preparation, no credentials ever.
         self.repositories = repositories
+        # Backend-owned classification of the harvested final diff. None when
+        # this turn did not harvest (failed/suspended/budget).
+        self.affected_repositories = affected_repositories
+        self.change_categories = change_categories
         # This TURN's telemetry (the app tier accumulates across turns).
         # None = not reportable this turn, never a claimed zero.
         self.setup_s = setup_s
@@ -433,11 +439,15 @@ class ExecutorBackend(ABC):
                     )
 
                 harvest_t0 = time.monotonic()
-                diff_path = await self._harvest_diff(ws, repositories)
+                diff_path, affected_repositories, change_categories = (
+                    await self._harvest_diff(ws, repositories)
+                )
                 sink.write({
                     "type": "lifecycle.harvest.completed",
                     "duration_ms": int((time.monotonic() - harvest_t0) * 1000),
                     "diff_bytes": Path(diff_path).stat().st_size,
+                    "affected_repositories": affected_repositories,
+                    "change_categories": change_categories,
                 })
         except Exception as e:
             # Crash / API error: resumable. Partial workspace changes are
@@ -467,6 +477,8 @@ class ExecutorBackend(ABC):
             usage=usage,
             diff_path=diff_path,
             repositories=prepared,
+            affected_repositories=affected_repositories,
+            change_categories=change_categories,
             setup_s=setup_s,
             tool_call_count=tool_calls,
             tool_call_failures=tool_failures,
@@ -667,7 +679,7 @@ class ExecutorBackend(ABC):
 
     async def _harvest_diff(
         self, ws: Path, repositories: list[RepositoryCheckout] | None = None
-    ) -> str:
+    ) -> tuple[str, list[str], list[str]]:
         """git-diff harvest, exactly once, on terminal success (§293 decision 3).
 
         Diffs against the baseline tag, not HEAD: if the executor committed
@@ -682,19 +694,27 @@ class ExecutorBackend(ABC):
         that repo); `.miragen/diff.patch` is a human-readable bundle of all
         of them with `# === miragen repository: ...` section markers, and is
         what diff_path / GET /runs/{id}/diff serve.
+
+        Also returns backend-owned outcome classification derived only from
+        the harvested patch paths (never model free-text).
         """
+        from miragen.outcome import classify_harvested_diff
+
         marker_dir = ws / ".miragen"
         marker_dir.mkdir(exist_ok=True)
         diff_path = marker_dir / _DIFF_NAME
 
         if not repositories:
             _git(ws, "add", "-A")  # stage everything so new files appear in the diff
-            diff_path.write_text(_git(ws, "diff", "--cached", "--binary", _BASELINE_TAG))
-            return str(diff_path)
+            bundle = _git(ws, "diff", "--cached", "--binary", _BASELINE_TAG)
+            diff_path.write_text(bundle)
+            affected, categories = classify_harvested_diff(bundle)
+            return str(diff_path), affected, list(categories)
 
         diffs_dir = marker_dir / "diffs"
         diffs_dir.mkdir(exist_ok=True)
         sections: list[str] = []
+        patches_by_name: dict[str, str] = {}
         for co in repositories:
             if not co.writable:
                 continue
@@ -702,11 +722,16 @@ class ExecutorBackend(ABC):
             _git(repo_dir, "add", "-A")
             diff = _git(repo_dir, "diff", "--cached", "--binary", _BASELINE_TAG)
             (diffs_dir / f"{co.name}.patch").write_text(diff)
+            patches_by_name[co.name] = diff
             sections.append(
                 f"# === miragen repository: {co.name} (mount: {co.mount_path}) ===\n{diff}"
             )
-        diff_path.write_text("\n".join(sections))
-        return str(diff_path)
+        bundle = "\n".join(sections)
+        diff_path.write_text(bundle)
+        affected, categories = classify_harvested_diff(
+            bundle, patches_by_name=patches_by_name
+        )
+        return str(diff_path), affected, list(categories)
 
     # ── Structured interventions (issue #33 Phase G) ───────────────────────
 

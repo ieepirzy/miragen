@@ -205,9 +205,12 @@ async def test_miragen_metadata_excluded_from_classic_diff(tmp_path):
     (ws / ".miragen" / "interventions" / "abc.json").write_text('{"question": "?"}')
     (ws / ".miragen" / "intervention.invalid.json").write_text("garbage")
 
-    diff = Path(await executor._harvest_diff(ws)).read_text()
+    path, affected, categories = await executor._harvest_diff(ws)
+    diff = Path(path).read_text()
     assert "real.py" in diff
     assert ".miragen" not in diff and "intervention" not in diff
+    assert affected == []  # classic workspace has no named repositories
+    assert "code" in categories
 
 
 async def test_workspace_prep_failure_is_resumable_crash(tmp_path):

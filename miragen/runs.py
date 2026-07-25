@@ -108,6 +108,8 @@ class RunStore:
         exit_reason: str | None = None,
         diff_path: str | None = None,
         repositories: list[RepositoryRevision] | None = None,
+        affected_repositories: list[str] | None = None,
+        change_categories: list[str] | None = None,
         setup_s: float | None = None,
         tool_call_count: int | None = None,
         tool_call_failures: int | None = None,
@@ -137,6 +139,18 @@ class RunStore:
             "exit_reason": exit_reason,
             "diff_path": diff_path or record.diff_path,
             "repositories": repositories or record.repositories,
+            # Outcome classification is only written when the caller supplies
+            # it (successful harvest). Keep prior values on non-harvest finishes.
+            "affected_repositories": (
+                affected_repositories
+                if affected_repositories is not None
+                else record.affected_repositories
+            ),
+            "change_categories": (
+                change_categories
+                if change_categories is not None
+                else record.change_categories
+            ),
             "setup_s": setup_s if setup_s is not None else record.setup_s,
             "tool_call_count": tool_call_count if tool_call_count is not None else record.tool_call_count,
             "tool_call_failures": tool_call_failures if tool_call_failures is not None else record.tool_call_failures,
