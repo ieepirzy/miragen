@@ -622,7 +622,11 @@ async def test_spawn_success_harvests_diff_and_keeps_stdout(tmp_path):
 
 
 async def test_spawn_nonzero_exit_is_resumable_crash(tmp_path):
-    _, executor = _spawn_executor(tmp_path, ["/bin/sh", "-c", "echo boom >&2; exit 3"])
+    # Consume stdin before failing so a fast-exit shell does not race the
+    # prompt write (BrokenPipe / Connection lost on drain).
+    _, executor = _spawn_executor(
+        tmp_path, ["/bin/sh", "-c", "cat >/dev/null; echo boom >&2; exit 3"]
+    )
     result = await executor.run_job("doomed", "sp-run2")
     assert result.status == "failed"
     assert result.exit_reason == "crash"

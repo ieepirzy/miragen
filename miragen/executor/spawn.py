@@ -54,9 +54,16 @@ class SpawnExecutor(ExecutorBackend):
         lines: list[str] = []
         try:
             if prompt_on_stdin:
-                proc.stdin.write(prompt.encode())
-                await proc.stdin.drain()
-                proc.stdin.close()
+                try:
+                    proc.stdin.write(prompt.encode())
+                    await proc.stdin.drain()
+                    proc.stdin.close()
+                except (BrokenPipeError, ConnectionResetError):
+                    # Process exited before consuming stdin (fast-fail shells).
+                    # Fall through to wait() / returncode handling rather than
+                    # treating a closed pipe as an unexpected adapter crash.
+                    with contextlib.suppress(Exception):
+                        proc.stdin.close()
             while True:
                 raw = await proc.stdout.readline()
                 if not raw:
