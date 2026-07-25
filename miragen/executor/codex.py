@@ -87,7 +87,8 @@ class CodexExecutor(ExecutorBackend):
         CODEX_API_KEY), never profile content."""
         codex_home = Path(self.spec.codex_home)
         codex_home.mkdir(parents=True, exist_ok=True)
-        os.environ.setdefault("CODEX_HOME", str(codex_home))
+        # Profile home wins over any inherited CODEX_HOME (same as kimi/grok).
+        os.environ["CODEX_HOME"] = str(codex_home)
 
         config_path = codex_home / "config.toml"
         config_path.write_text(self._render_config())

@@ -60,6 +60,11 @@ claude-code = [
 kimi-code = [
     "kimi-agent-sdk>=0.0.5",
 ]
+# Grok Build client (MIT, in-repo). Install from monorepo path; also baked into
+# the published Docker image. Optional if you only use other backends.
+grok-build = [
+    "grok-build-client>=0.1.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/ieepirzy/miragen"

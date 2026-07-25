@@ -98,18 +98,19 @@ executor:
 ```
 
 A `grok-build` profile uses `grok_home` (maps to `GROK_HOME`) — authenticate
-once with `miragen grok-login --grok-home <volume>` (device-code). Phase A is
-headless `streaming-json`; host leash is not supported yet (fails loud):
+once with `miragen grok-login --grok-home <volume>` (device-code):
 
 ```yaml
 executor:
   executor: grok-build
   instructions: |
     You operate on the repository mounted in your workspace.
-  approval_policy: never       # -> --always-approve
+  approval_policy: never
   grok_home: /agent/grok-home
+  grok_transport: headless     # or acp (required for leash / MCP inject)
   turn_timeout_s: 1800
-  # mcp_servers: configure under GROK_HOME / project .grok (not injected)
+  # leash:                        # requires grok_transport: acp
+  #   gate: [write, command, network]
 ```
 
 The spawn backend swaps `mcp_servers` (rejected — a spawned CLI reads its own
@@ -204,13 +205,16 @@ subscription-first via a shared `kimi_home` (`KIMI_CODE_HOME`) or metered
 `KIMI_API_KEY` / `MOONSHOT_API_KEY`. See
 [design/subscription-homes.md](design/subscription-homes.md).
 
-**Grok Build** — no pip extra; requires the `grok` binary on PATH (published
-image installs it). Phase A shells headless `-p` with
-`--output-format streaming-json`. First turn mints a UUID (`-s`); resume uses
-`-r`. Auth is subscription-first via shared `grok_home` (`GROK_HOME`,
-`miragen grok-login --device-auth`) or metered `XAI_API_KEY`. Host leash is
-**not** supported on Phase A (turn fails if configured). MCP is not injected
-— configure under `GROK_HOME` / project `.grok/`.
+**Grok Build** — install the in-repo MIT client (`packages/grok-build-client`,
+baked into the image) and the `grok` binary. Transports:
+
+- `grok_transport: headless` (default) — `grok -p` + streaming-json; mint
+  UUID (`-s`) / resume (`-r`). No host leash; MCP not injected.
+- `grok_transport: acp` — `grok agent stdio` via the client; required for
+  host leash, preferred for MCP injection on `session/new`.
+
+Auth is subscription-first via shared `grok_home` (`GROK_HOME`,
+`miragen grok-login --device-auth`) or metered `XAI_API_KEY`.
 
 **Spawn** — no extra needed; the fallback for CLIs with no SDK. stdout
 lines become raw `item.completed` events and the whole stdout doubles as the
@@ -240,8 +244,8 @@ thread handle, resume in practice means abandon-and-rerun.
    without a custom image.
 6. **Grok Build: mount `grok_home` or set `XAI_API_KEY`** — run
    `miragen grok-login --grok-home <volume>` once (device-code) or set the
-   key. Published image installs the `grok` CLI at build time. Do not enable
-   `executor.leash` until ACP Phase B.
+   key. Published image installs the `grok` CLI and `grok-build-client`.
+   Host leash requires `grok_transport: acp`.
 7. **A cancelled turn must not leak its process** — `turn_timeout_s` kills
    the turn via asyncio cancellation; spawn and grok-build kill the process
    group on the way out; SDK adapters rely on their SDK's cleanup

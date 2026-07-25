@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "grok-build-client"
+version = "0.1.0"
+description = "Thin MIT client for xAI Grok Build: headless streaming-json and ACP stdio transports"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.12"
+authors = [
+    { name = "ieepirzy" },
+]
+keywords = ["grok", "xai", "acp", "agent", "coding"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries",
+]
+# Zero hard dependencies — only the `grok` CLI on PATH (or GROK_BIN).
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/ieepirzy/miragen/tree/main/packages/grok-build-client"
+Repository = "https://github.com/ieepirzy/miragen"
+Documentation = "https://github.com/ieepirzy/miragen/blob/main/packages/grok-build-client/README.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["grok_build_client"]
+
+[tool.hatch.build.targets.sdist]
+include = ["grok_build_client", "README.md", "LICENSE", "pyproject.toml"]

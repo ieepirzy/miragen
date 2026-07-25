@@ -16,7 +16,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
     && GROK_BIN_DIR=/usr/local/bin bash /tmp/grok-install.sh \
     && rm -f /tmp/grok-install.sh \
     && command -v grok \
-    && pip install --no-cache-dir "/build[codex,claude-code,kimi-code]" \
+    && pip install --no-cache-dir \
+         /build/packages/grok-build-client \
+         "/build[codex,claude-code,kimi-code]" \
     && adduser --disabled-password --gecos "" agentuser \
     && chown agentuser /agent
 
