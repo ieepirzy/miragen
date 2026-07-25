@@ -633,13 +633,15 @@ A multitude of tutorials exist for hardening docker containers, one I found that
 
 A second backend tier for self-harnessed executors: the executor owns its own agent loop and the contract inverts to **workspace-in / diff-and-events-out**. A profile declares exactly one of `spec` (model tier) or `executor` (executor tier); executor runs land in the same run store with resumable `suspended`/`failed` states, a persistent per-run workspace, a wall-clock `turn_timeout_s` enforced by miragen itself, and a diff harvested exactly once on success.
 
-Three backends implement the contract (`executor.executor`):
+Backends implement the contract (`executor.executor`):
 
 - **`codex`** — via the openai-codex App Server SDK. Install with `pip install miragen[codex]`.
 - **`claude-code`** — via claude-agent-sdk. Install with `pip install miragen[claude-code]`.
+- **`kimi-code`** — via kimi-agent-sdk. Install with `pip install miragen[kimi-code]`.
 - **`spawn`** — no-SDK fallback: an argv template (`executor.command`) is spawned in the workspace, stdout becomes the event stream, exit 0 harvests. No resume, no usage reporting.
+- **`grok-build`** — planned (Grok Build CLI); see [docs/design/kimi-and-grok-executors.md](docs/design/kimi-and-grok-executors.md).
 
-Auth is per backend and always spawn-time state, never profile content. Codex: `codex_home` must contain `auth.json` — an ephemeral container with an empty `codex_home` fails auth on spawn. Authenticate **once** with `miragen codex-login --codex-home <shared volume>` (ChatGPT subscription, device-code flow) or set `CODEX_API_KEY`/`OPENAI_API_KEY` (metered); agent containers mount the shared store read-mostly and never log in themselves — full model in [docs/design/codex-auth.md](docs/design/codex-auth.md). Claude Code: set `ANTHROPIC_API_KEY` in the container environment (or mount Claude Code OAuth credentials at `~/.claude`). Both cases plus `workspace_root` (keeps suspended/failed runs resumable across container restarts) mean mounting persistent volumes; see the `codex-executor` service in [compose.example.yml](compose.example.yml) for a working example.
+Auth is per backend and always spawn-time state, never profile content. **Subscription OAuth is the primary path** for Codex and Kimi (and Grok when it lands): authenticate **once** into a shared home volume; agent containers mount it and never log in. Codex: `miragen codex-login --codex-home <volume>` or `CODEX_API_KEY`/`OPENAI_API_KEY` (metered) — [docs/design/codex-auth.md](docs/design/codex-auth.md). Kimi: `miragen kimi-login --kimi-home <volume>` or `KIMI_API_KEY`/`MOONSHOT_API_KEY` — [docs/design/subscription-homes.md](docs/design/subscription-homes.md). Claude Code: `ANTHROPIC_API_KEY` or mounted `~/.claude`. Persistent volumes for homes + `workspace_root` keep credentials and suspended runs alive across container restarts; see `compose.example.yml`.
 
 Optionally, `executor.artifact_sink` names a place to *also* put the harvested diff after a successful run (Loimi `store_document` with `kind="executor_diff"` is the first sink). It is advisory by construction: sink failures mark `artifact_stored: false` on the run record but never change run status — the diff on disk stays the source of truth. Full reference: [docs/executor-tier.md](docs/executor-tier.md).
 

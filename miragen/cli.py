@@ -104,6 +104,57 @@ def codex_login(codex_home: str | None) -> None:
     click.echo("Mount this volume at executor.codex_home in every codex agent container.")
 
 
+@cli.command(name="kimi-login")
+@click.option(
+    "--kimi-home", default=None, envvar="KIMI_CODE_HOME",
+    help="Kimi Code home to populate (default: /agent/kimi-home). Point this at "
+         "the SHARED volume every kimi-code agent container mounts (executor.kimi_home).",
+)
+def kimi_login(kimi_home: str | None) -> None:
+    """Authenticate Kimi Code ONCE into a shared home (subscription path).
+
+    Sets KIMI_CODE_HOME and runs the product's non-interactive device-code
+    login (`kimi login`). Mount that same volume at executor.kimi_home in every
+    kimi-code agent container — agents never log in themselves. See
+    docs/design/subscription-homes.md.
+    """
+    import shutil
+    import subprocess
+
+    home = kimi_home or "/agent/kimi-home"
+    os.environ["KIMI_CODE_HOME"] = home
+    Path(home).mkdir(parents=True, exist_ok=True)
+
+    kimi_bin = shutil.which("kimi")
+    if not kimi_bin:
+        click.echo(click.style(
+            "The `kimi` CLI was not found on PATH. Install Kimi Code CLI "
+            "(https://github.com/MoonshotAI/kimi-code) and re-run, or set "
+            "KIMI_API_KEY/MOONSHOT_API_KEY for the metered path.",
+            fg="red",
+        ))
+        raise SystemExit(1)
+
+    click.echo(f"Authenticating Kimi Code into {home} …")
+    click.echo("(device-code flow: open the printed URL and enter the code)")
+    try:
+        result = subprocess.run(
+            [kimi_bin, "login"],
+            env={**os.environ, "KIMI_CODE_HOME": home},
+            check=False,
+        )
+    except KeyboardInterrupt:
+        click.echo(click.style("Login cancelled.", fg="yellow"))
+        raise SystemExit(1)
+
+    if result.returncode != 0:
+        click.echo(click.style(f"✗ kimi login exited with code {result.returncode}", fg="red"))
+        raise SystemExit(1)
+
+    click.echo(click.style(f"✓ Kimi authenticated — credentials written under {home}", fg="green"))
+    click.echo("Mount this volume at executor.kimi_home in every kimi-code agent container.")
+
+
 @cli.command()
 @click.argument("profile", envvar="AGENT_PROFILE", default="agent.yaml")
 @click.option("--tools", default="tools", envvar="TOOLS",
