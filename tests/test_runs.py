@@ -167,6 +167,28 @@ class TestRunStoreList:
         assert len(summary.prompt_preview) == 200
         assert len(summary.output_preview) == 200
 
+    def test_filters_by_trigger_and_exposes_provenance(self, tmp_path):
+        from miragen.models import RunProvenance
+
+        store = RunStore(root=tmp_path)
+        managed = store.start(
+            agent_name="a",
+            trigger="managed",
+            prompt="managed fire",
+            provenance=RunProvenance(
+                trigger_id="sched-1",
+                environment_revision="env-rev-1",
+                routine_id="routine-1",
+            ),
+        )
+        store.start(agent_name="a", trigger="http", prompt="manual")
+
+        managed_only = store.list(trigger="managed")
+        assert [item.run_id for item in managed_only] == [managed.run_id]
+        assert managed_only[0].provenance is not None
+        assert managed_only[0].provenance.trigger_id == "sched-1"
+        assert managed_only[0].trigger == "managed"
+
 
 class TestRunStoreRetention:
     def test_prunes_oldest_beyond_retention(self, tmp_path):

@@ -852,10 +852,18 @@ async def run_async(request: RunRequest):
 
 
 @app.get("/runs", response_model=RunListResponse, dependencies=[_internal_auth])
-async def list_runs(limit: int = 20, status: Optional[str] = None):
+async def list_runs(
+    limit: int = 20,
+    status: Optional[str] = None,
+    trigger: Optional[str] = None,
+):
     if _run_store is None:
         raise HTTPException(status_code=503, detail="Run store not ready")
-    runs = _run_store.list(limit=min(limit, 100), status=status)
+    runs = _run_store.list(
+        limit=min(limit, 100),
+        status=status,
+        trigger=trigger,
+    )
     return RunListResponse(count=len(runs), runs=runs)
 
 

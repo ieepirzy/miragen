@@ -246,6 +246,9 @@ class RunSummary(BaseModel):
     use_history: bool = False
     snapshot_sha256: Optional[str] = None
     resume_count: int = 0
+    # Control-plane correlation (managed schedule provenance, etc.). Omitted
+    # fields stay None; extra keys on the stored provenance survive.
+    provenance: Optional[RunProvenance] = None
 
     @classmethod
     def from_record(cls, record: RunRecord) -> RunSummary:
@@ -264,6 +267,7 @@ class RunSummary(BaseModel):
             use_history=record.use_history,
             snapshot_sha256=record.snapshot_sha256,
             resume_count=record.resume_count,
+            provenance=record.provenance,
         )
 
 

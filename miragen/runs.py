@@ -209,14 +209,22 @@ class RunStore:
             raise AmbiguousRunIdError([r.run_id for r in matches])
         return matches[0]
 
-    def list(self, *, limit: int = 20, status: str | None = None) -> list[RunSummary]:
-        """Newest-first run summaries, optionally filtered by status."""
+    def list(
+        self,
+        *,
+        limit: int = 20,
+        status: str | None = None,
+        trigger: str | None = None,
+    ) -> list[RunSummary]:
+        """Newest-first run summaries, optionally filtered by status/trigger."""
         summaries = []
         for path in sorted(self._existing_files(), reverse=True):
             record = _read_record(path)
             if record is None:
                 continue
             if status is not None and record.status != status:
+                continue
+            if trigger is not None and record.trigger != trigger:
                 continue
             summaries.append(RunSummary.from_record(record))
             if len(summaries) >= limit:
