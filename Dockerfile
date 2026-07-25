@@ -6,10 +6,17 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /agent
 
 COPY . /build/
-# Executor extras (codex / claude-code / kimi-code) are baked into the published
-# image so agent containers can run self-harnessed backends without a custom
-# Dockerfile. publish.yml builds this on main + v* tags → ghcr.io/.../miragen.
-RUN pip install --no-cache-dir "/build[codex,claude-code,kimi-code]" \
+# Executor extras + Grok Build CLI are baked into the published image so agent
+# containers can run self-harnessed backends without a custom Dockerfile.
+# publish.yml builds this on main + v* tags → ghcr.io/.../miragen.
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && set -o pipefail \
+    && curl -fsSL https://x.ai/cli/install.sh -o /tmp/grok-install.sh \
+    && GROK_BIN_DIR=/usr/local/bin bash /tmp/grok-install.sh \
+    && rm -f /tmp/grok-install.sh \
+    && command -v grok \
+    && pip install --no-cache-dir "/build[codex,claude-code,kimi-code]" \
     && adduser --disabled-password --gecos "" agentuser \
     && chown agentuser /agent
 

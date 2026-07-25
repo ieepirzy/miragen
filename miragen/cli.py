@@ -155,6 +155,57 @@ def kimi_login(kimi_home: str | None) -> None:
     click.echo("Mount this volume at executor.kimi_home in every kimi-code agent container.")
 
 
+@cli.command(name="grok-login")
+@click.option(
+    "--grok-home", default=None, envvar="GROK_HOME",
+    help="Grok Build home to populate (default: /agent/grok-home). Point this at "
+         "the SHARED volume every grok-build agent container mounts (executor.grok_home).",
+)
+def grok_login(grok_home: str | None) -> None:
+    """Authenticate Grok Build ONCE into a shared home (subscription path).
+
+    Sets GROK_HOME and runs `grok login --device-auth` (device-code flow for
+    headless/remote hosts). Mount that same volume at executor.grok_home in
+    every grok-build agent container — agents never log in themselves. See
+    docs/design/subscription-homes.md.
+    """
+    import shutil
+    import subprocess
+
+    home = grok_home or "/agent/grok-home"
+    os.environ["GROK_HOME"] = home
+    Path(home).mkdir(parents=True, exist_ok=True)
+
+    grok_bin = os.environ.get("GROK_BIN") or shutil.which("grok")
+    if not grok_bin:
+        click.echo(click.style(
+            "The `grok` CLI was not found on PATH. Install Grok Build "
+            "(https://docs.x.ai/build/overview) and re-run, or set XAI_API_KEY "
+            "for the metered path.",
+            fg="red",
+        ))
+        raise SystemExit(1)
+
+    click.echo(f"Authenticating Grok Build into {home} …")
+    click.echo("(device-code flow: open the printed URL and enter the code)")
+    try:
+        result = subprocess.run(
+            [grok_bin, "login", "--device-auth"],
+            env={**os.environ, "GROK_HOME": home},
+            check=False,
+        )
+    except KeyboardInterrupt:
+        click.echo(click.style("Login cancelled.", fg="yellow"))
+        raise SystemExit(1)
+
+    if result.returncode != 0:
+        click.echo(click.style(f"✗ grok login exited with code {result.returncode}", fg="red"))
+        raise SystemExit(1)
+
+    click.echo(click.style(f"✓ Grok authenticated — credentials written under {home}", fg="green"))
+    click.echo("Mount this volume at executor.grok_home in every grok-build agent container.")
+
+
 @cli.command()
 @click.argument("profile", envvar="AGENT_PROFILE", default="agent.yaml")
 @click.option("--tools", default="tools", envvar="TOOLS",
