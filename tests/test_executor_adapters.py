@@ -1,10 +1,10 @@
 """Executor tier refinement — factory dispatch, wall-clock timeout, the
-claude-code and spawn adapters, and the artifact sink.
+claude-code and spawn adapters, and publication/sink helpers.
 
 Design record: docs/design/executor-tier-refinement.md. The Claude SDK is
 stubbed via ClaudeCodeExecutor's query_factory seam and plain stand-in message
-classes; SpawnExecutor runs real subprocesses; LoimiSink runs against an
-httpx.MockTransport speaking just enough MCP streamable-HTTP.
+classes; SpawnExecutor runs real subprocesses. LoimiSink is a low-level
+store_document helper only (not on the executor success path).
 """
 
 import asyncio
@@ -935,7 +935,7 @@ async def test_loimi_sink_raises_on_tool_error():
         "result": {"isError": True, "content": [{"type": "text", "text": "schema mismatch"}]},
     }
     sink = LoimiSink(_sink_spec(), transport=_mcp_transport(calls, store_response=error_response))
-    with pytest.raises(RuntimeError, match="store_document returned an error"):
+    with pytest.raises(RuntimeError, match="store_document returned an error|tool 'store_document'"):
         await sink.store(diff="d", metadata={})
 
 

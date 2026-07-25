@@ -3,6 +3,22 @@
 **Status:** implemented (`miragen/publication.py`, `POST /runs/{id}/publications`)  
 **Capability:** `reviewed-publication/v1` (advertised on `GET /health`)
 
+### Capability semantics
+
+`reviewed-publication/v1` in `capabilities` means: **this build exposes the
+HTTP endpoint**. It does **not** mean a publication backend is configured on
+the running agent profile.
+
+| Signal | Meaning |
+|---|---|
+| `capabilities` contains `reviewed-publication/v1` | Endpoint supported |
+| `publication.backend_configured` (on `/health`) | `executor.artifact_sink` is set; publish can succeed |
+| `POST .../publications` → 400 "not configured" | Endpoint present, backend missing |
+
+Orchestrators should treat the capability as “API available” and still require
+backend configuration (or read `publication.backend_configured`) before
+assuming publishes will work.
+
 ## Why
 
 Orchestrators such as MiraRun must not write artifacts, provenance, or history
@@ -94,6 +110,10 @@ Previously, a successful executor turn called `_store_artifact` whenever
 `artifact_sink` was set. That conflicted with reviewed publication. The auto
 path is **removed**; `artifact_sink` only configures the backend used by this
 endpoint.
+
+`miragen/executor/sink.py` is a **low-level** `store_document` helper only
+(tests / ad-hoc). It is not wired into the executor success path — do not
+reintroduce that call.
 
 ## Ownership
 

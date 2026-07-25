@@ -644,17 +644,16 @@ Backends implement the contract (`executor.executor`):
 Auth is per backend and always spawn-time state, never profile content. **Subscription OAuth is the primary path** for Codex, Kimi, and Grok: authenticate **once** into a shared home volume; agent containers mount it and never log in. Codex: `miragen codex-login --codex-home <volume>` or `CODEX_API_KEY`/`OPENAI_API_KEY` (metered) — [docs/design/codex-auth.md](docs/design/codex-auth.md). Kimi: `miragen kimi-login --kimi-home <volume>` or `KIMI_API_KEY`/`MOONSHOT_API_KEY`. Grok: `miragen grok-login --grok-home <volume>` (device-code) or `XAI_API_KEY` — [docs/design/subscription-homes.md](docs/design/subscription-homes.md). Claude Code: `ANTHROPIC_API_KEY` or mounted `~/.claude`. Persistent volumes for homes + `workspace_root` keep credentials and suspended runs alive across container restarts; see `compose.example.yml`.
 
 Optionally, `executor.artifact_sink` names a **publication backend** for
-reviewed whole-run graduation (`POST /runs/{id}/publications`, capability
-`reviewed-publication/v1`). It is **not** auto-called on executor success —
-the harvested diff stays local until an orchestrator (e.g. MiraRun) publishes
-after human review. The backend is pluggable (`kind`, first: Loimi over MCP);
-miragen returns opaque external references only. Full reference:
-[docs/executor-tier.md](docs/executor-tier.md) and
+reviewed whole-run graduation (`POST /runs/{id}/publications`). Capability
+`reviewed-publication/v1` means the **endpoint is supported** in this build;
+a successful publish still requires the backend configured (otherwise 400).
+`GET /health` exposes `publication.backend_configured` for readiness. Not
+auto-called on executor success. Full reference:
 [docs/design/reviewed-publication.md](docs/design/reviewed-publication.md).
 
 ### Example profiles
 
-A Claude Code worker with a Loimi artifact sink:
+A Claude Code worker with a publication backend (reviewed graduation only):
 
 ```yaml
 name: claude-worker
@@ -675,7 +674,7 @@ executor:
     - name: loimi
       url: https://loimi.mesh/mcp/
       bearer_token_env: LOIMI_TOKEN
-  artifact_sink:               # optional: ALSO push harvested diffs here
+  artifact_sink:               # backend for POST /runs/{id}/publications only
     kind: loimi
     url: https://loimi.mesh/mcp/
     bearer_token_env: LOIMI_TOKEN
