@@ -256,20 +256,20 @@ kimi-code = ["kimi-agent-sdk>=0.0.5"]
 - Making the artifact sink required.
 - Publishing a miragen-owned *Kimi* SDK (upstream exists).
 
-## 10. Open questions (for the owner)
+## 10. Decisions (owner, 2026-07-25)
 
-Recorded so implementation does not invent answers:
-
-1. **Grok MIT package timing** — extract in PR3 only, or scaffold the package
-   repo in parallel with Phase A? Recommendation: Phase A in-tree first.
-2. **`miragen kimi-login` / `grok-login` in PR1/PR2** vs follow-up — Codex
-   shipped login with the auth model; matching that keeps the subscription
-   story complete. Device-code availability for Grok needs a live CLI check.
-3. **Default models** — leave `model: null` = product default, or pin
-   documented IDs in examples only?
-4. **Tier rename** ("executor" → something else) — deferred until after both
-   backends land, unless it becomes painful mid-PR.
-5. **Shared home RW vs RO** — same operational choice as Codex (see
+1. **Grok MIT package** — extract **only later** (after in-tree headless and
+   preferably ACP). No parallel package repo for Phase A.
+2. **Login helpers** — ship with each backend PR (`kimi-login` in PR1;
+   `grok-login` with grok-build). Subscription story stays complete.
+3. **Default models** — leave `model: null` (= product default) for now;
+   examples do not pin IDs.
+4. **Image baking** — executor extras land in the published Docker image.
+   CI: `test.yml` on PR/main; `publish.yml` on main + `v*` tags builds
+   `Dockerfile` → `ghcr.io/ieepirzy/miragen` (semver + `latest` on default
+   branch). `Dockerfile` installs `miragen[codex,claude-code,kimi-code]`.
+5. **Tier rename** — **out of scope** for this workstream.
+6. **Shared home RW vs RO** — same operational choice as Codex (see
    subscription-homes); no broker in v1.
 
 ## 11. Acceptance criteria (per backend)

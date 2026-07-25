@@ -54,6 +54,12 @@ codex = [
 claude-code = [
     "claude-agent-sdk>=0.1.0",
 ]
+# Kimi Code executor backend (kimi-agent-sdk wraps the Kimi Code / kimi-cli
+# runtime; subscription OAuth lives under KIMI_CODE_HOME — see
+# docs/design/subscription-homes.md).
+kimi-code = [
+    "kimi-agent-sdk>=0.0.5",
+]
 
 [project.urls]
 Homepage = "https://github.com/ieepirzy/miragen"

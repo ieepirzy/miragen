@@ -11,16 +11,20 @@ The contract is an ABC (`miragen.executor.base.ExecutorBackend`): the base
 class owns everything backend-agnostic — workspace baseline, events.jsonl
 persistence, payload parsing, budget check, baseline-tag diff harvest —
 and adapters implement `_stream_turn()`, an async generator of normalized
-event payloads. Three adapters ship:
+event payloads. Adapters:
 
 | `executor.executor` | Backed by | Resume | Usage reporting |
 |---|---|---|---|
-| `codex` | openai-codex-sdk (`miragen[codex]`) | thread id | yes |
+| `codex` | openai-codex (`miragen[codex]`) | thread id | yes |
 | `claude-code` | claude-agent-sdk (`miragen[claude-code]`) | session id | yes |
+| `kimi-code` | kimi-agent-sdk (`miragen[kimi-code]`) | session id | yes |
 | `spawn` | argv template, no SDK | none | none |
+| `grok-build` | Grok Build CLI — **planned** | session id | planned |
 
 Design record: miradb #293 (2026-07-12); refinement plan:
-[design/executor-tier-refinement.md](design/executor-tier-refinement.md).
+[design/executor-tier-refinement.md](design/executor-tier-refinement.md);
+Kimi/Grok plan: [design/kimi-and-grok-executors.md](design/kimi-and-grok-executors.md);
+shared subscription homes: [design/subscription-homes.md](design/subscription-homes.md).
 
 ## Profile
 
@@ -68,6 +72,24 @@ executor:
   instructions: |
     You operate on the repository mounted in your workspace.
   approval_policy: never       # -> bypassPermissions
+  turn_timeout_s: 1800
+  mcp_servers:
+    - name: loimi
+      url: https://loimi.mesh/mcp/
+      bearer_token_env: LOIMI_TOKEN
+```
+
+A `kimi-code` profile uses `kimi_home` (maps to `KIMI_CODE_HOME`) for the
+shared subscription store — authenticate once with
+`miragen kimi-login --kimi-home <volume>`:
+
+```yaml
+executor:
+  executor: kimi-code
+  instructions: |
+    You operate on the repository mounted in your workspace.
+  approval_policy: never       # -> yolo=True (unattended)
+  kimi_home: /agent/kimi-home
   turn_timeout_s: 1800
   mcp_servers:
     - name: loimi
@@ -159,6 +181,14 @@ plays the thread_id role; `approval_policy` maps onto permission modes
 `mcp_servers` are injected per-session rather than written to a config file.
 Jobs are atomic: nothing persists between distinct runs.
 
+**Kimi Code** — install the extra: `pip install miragen[kimi-code]`
+(`kimi-agent-sdk`, which pulls the `kimi-cli` runtime). The SDK session id
+plays the thread_id role; `approval_policy: never` maps to `yolo=True`
+unless the host leash is on (then approvals are answered by miragen). Auth is
+subscription-first via a shared `kimi_home` (`KIMI_CODE_HOME`) or metered
+`KIMI_API_KEY` / `MOONSHOT_API_KEY`. See
+[design/subscription-homes.md](design/subscription-homes.md).
+
 **Spawn** — no extra needed; the fallback for CLIs with no SDK. stdout
 lines become raw `item.completed` events and the whole stdout doubles as the
 run output. Exit 0 harvests, non-zero is a resumable `failed` — but with no
@@ -179,9 +209,16 @@ thread handle, resume in practice means abandon-and-rerun.
    `ANTHROPIC_API_KEY` in the container environment (the `*_FILE` secrets
    loader works here too) or mount Claude Code OAuth credentials at
    `~/.claude`. miragen warns at startup when neither is visible.
-5. **A cancelled turn must not leak its process** — `turn_timeout_s` kills
+5. **Kimi Code: mount `kimi_home` or set an API key** — same shared-store
+   model as Codex. Run `miragen kimi-login --kimi-home <volume>` once
+   (subscription) or set `KIMI_API_KEY`/`MOONSHOT_API_KEY`. The published
+   image (`ghcr.io/ieepirzy/miragen`, built by `publish.yml` from
+   `Dockerfile`) installs `miragen[kimi-code]` so the SDK/runtime is present
+   without a custom image.
+6. **A cancelled turn must not leak its process** — `turn_timeout_s` kills
    the turn via asyncio cancellation; the spawn adapter kills its subprocess
-   on the way out, the SDK adapters rely on their SDK's cleanup.
+   on the way out, the SDK adapters rely on their SDK's cleanup
+   (`session.cancel()` + `close()` for Kimi).
 
 ## Identity & provenance
 

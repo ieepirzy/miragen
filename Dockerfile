@@ -6,7 +6,10 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /agent
 
 COPY . /build/
-RUN pip install --no-cache-dir /build \
+# Executor extras (codex / claude-code / kimi-code) are baked into the published
+# image so agent containers can run self-harnessed backends without a custom
+# Dockerfile. publish.yml builds this on main + v* tags → ghcr.io/.../miragen.
+RUN pip install --no-cache-dir "/build[codex,claude-code,kimi-code]" \
     && adduser --disabled-password --gecos "" agentuser \
     && chown agentuser /agent
 

@@ -518,11 +518,12 @@ class LeashSpec(_ProfileModel):
 
 
 class ExecutorSpec(_ProfileModel):
-    executor: Literal["codex", "claude-code", "spawn"] = Field(
+    executor: Literal["codex", "claude-code", "spawn", "kimi-code", "grok-build"] = Field(
         description=(
-            "Executor backend. 'codex' (openai-codex-sdk), 'claude-code' "
-            "(claude-agent-sdk), or 'spawn' (argv-template fallback for CLIs "
-            "with no SDK). The contract is executor-agnostic."
+            "Executor backend. 'codex' (openai-codex), 'claude-code' "
+            "(claude-agent-sdk), 'kimi-code' (kimi-agent-sdk), 'grok-build' "
+            "(Grok Build CLI; planned), or 'spawn' (argv-template fallback). "
+            "The contract is executor-agnostic."
         ),
     )
     instructions: str = Field(
@@ -560,9 +561,28 @@ class ExecutorSpec(_ProfileModel):
     codex_home: str = Field(
         default="/agent/codex-home",
         description=(
-            "CODEX_HOME for the executor. auth.json must be volume-mounted here "
-            "(ephemeral containers fail auth on spawn otherwise); miragen writes "
-            "config.toml (MCP servers, trust settings) into it at startup."
+            "CODEX_HOME for the codex executor (maps to the CODEX_HOME env var "
+            "the App Server / openai-codex SDK inherit — not a CodexConfig field). "
+            "auth.json must be volume-mounted here (ephemeral containers fail auth "
+            "on spawn otherwise); miragen writes config.toml (MCP servers) into it "
+            "at startup. See docs/design/codex-auth.md."
+        ),
+    )
+    kimi_home: Optional[str] = Field(
+        default=None,
+        description=(
+            "kimi-code only: KIMI_CODE_HOME for OAuth/config/sessions (default "
+            "/agent/kimi-home when executor is kimi-code). Mount a shared volume "
+            "populated once via `miragen kimi-login`. See docs/design/subscription-homes.md."
+        ),
+    )
+    grok_home: Optional[str] = Field(
+        default=None,
+        description=(
+            "grok-build only: GROK_HOME for OAuth/config/sessions (default "
+            "/agent/grok-home when executor is grok-build). Mount a shared volume "
+            "populated once via `miragen grok-login`. Reserved until the grok-build "
+            "adapter ships — setting it on other backends is a validation error."
         ),
     )
     mcp_servers: Optional[list[ExecutorMCPServer]] = Field(
@@ -620,6 +640,24 @@ class ExecutorSpec(_ProfileModel):
                 )
         elif self.command is not None:
             raise ValueError(f"`command` only applies to the spawn executor, not '{self.executor}'")
+
+        if self.executor == "kimi-code":
+            if self.kimi_home is None:
+                self.kimi_home = "/agent/kimi-home"
+        elif self.kimi_home is not None:
+            raise ValueError(f"`kimi_home` only applies to the kimi-code executor, not '{self.executor}'")
+
+        if self.executor == "grok-build":
+            if self.grok_home is None:
+                self.grok_home = "/agent/grok-home"
+            # Adapter not yet shipped — fail loud so profiles aren't silently inert.
+            raise ValueError(
+                "grok-build executor is not implemented yet "
+                "(see docs/design/kimi-and-grok-executors.md)"
+            )
+        elif self.grok_home is not None:
+            raise ValueError(f"`grok_home` only applies to the grok-build executor, not '{self.executor}'")
+
         return self
 
 

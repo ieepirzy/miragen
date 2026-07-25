@@ -9,6 +9,7 @@ httpx.MockTransport speaking just enough MCP streamable-HTTP.
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -51,15 +52,30 @@ def _paths(profile: AgentProfile, tmp_path) -> Path:
 
 
 def test_factory_dispatches_on_executor_kind(tmp_path):
+    from miragen.executor.kimi_code import KimiCodeExecutor
+
     cases = {
         "codex": ({"executor": "codex"}, CodexExecutor),
         "claude-code": ({"executor": "claude-code"}, ClaudeCodeExecutor),
+        "kimi-code": ({"executor": "kimi-code"}, KimiCodeExecutor),
         "spawn": ({"executor": "spawn", "command": ["/bin/true"]}, SpawnExecutor),
     }
     for kind, (body, cls) in cases.items():
         backend = build_executor(_profile(body), runs_root=tmp_path / "runs")
         assert type(backend) is cls, kind
         assert isinstance(backend, ExecutorBackend)
+
+
+def test_kimi_home_defaults_and_rejects_on_other_backends():
+    p = _profile({"executor": "kimi-code"})
+    assert p.executor.kimi_home == "/agent/kimi-home"
+    with pytest.raises(ValidationError, match="kimi_home"):
+        _profile({"executor": "codex", "kimi_home": "/tmp/kimi"})
+
+
+def test_grok_build_rejected_until_implemented():
+    with pytest.raises(ValidationError, match="not implemented yet"):
+        _profile({"executor": "grok-build"})
 
 
 def test_spawn_requires_command():
@@ -389,6 +405,197 @@ async def test_claude_code_injects_mcp_servers_with_bearer(tmp_path, monkeypatch
     assert servers["loimi"]["headers"]["Authorization"] == "Bearer tok-123"
 
 
+# ── KimiCodeExecutor ──────────────────────────────────────────────────────────
+#
+# Stand-in Wire types: adapter matches by class NAME (and ApprovalRequest by
+# name in the production path). session_factory yields messages + synthetic
+# thread.started from the factory itself for resume-handle tests.
+
+
+class TextPart:
+    def __init__(self, text):
+        self.text = text
+
+
+class _Fn:
+    def __init__(self, name):
+        self.name = name
+
+
+class ToolCall:
+    def __init__(self, name):
+        self.function = _Fn(name)
+
+
+class _TokenUsage:
+    def __init__(self, input_other, output, input_cache_read=0):
+        self.input_other = input_other
+        self.output = output
+        self.input_cache_read = input_cache_read
+
+
+class StatusUpdate:
+    def __init__(self, token_usage=None):
+        self.token_usage = token_usage
+
+
+class TurnEnd:
+    pass
+
+
+def _kimi_messages(session_id="kimi_sess"):
+    # thread.started is emitted by the factory (mirrors production), not by Wire.
+    return [
+        {"type": "thread.started", "thread_id": session_id},
+        ToolCall("Bash"),
+        TextPart("patched the bug"),
+        StatusUpdate(_TokenUsage(90, 40, input_cache_read=10)),
+        TurnEnd(),
+        {"type": "turn.completed", "usage": {"input_tokens": 90, "output_tokens": 40, "cached_input_tokens": 10}},
+    ]
+
+
+def _kimi_executor(tmp_path, messages=None, executor_body=None, captured=None):
+    from miragen.executor.kimi_code import KimiCodeExecutor
+
+    profile = _profile({"executor": "kimi-code", **(executor_body or {})})
+    profile.executor.kimi_home = str(tmp_path / "kimi-home")
+    runs_root = _paths(profile, tmp_path)
+
+    def factory(prompt, *, thread_id=None, first_turn=True, options=None):
+        if captured is not None:
+            captured.append({
+                "prompt": prompt,
+                "thread_id": thread_id,
+                "first_turn": first_turn,
+                "options": options,
+            })
+
+        async def gen():
+            for m in messages if messages is not None else _kimi_messages():
+                yield m
+
+        return gen()
+
+    return profile, KimiCodeExecutor(profile, runs_root=runs_root, session_factory=factory)
+
+
+def test_normalize_kimi_text_and_tool_and_usage():
+    from miragen.executor.kimi_code import _normalize
+
+    assert _normalize(TextPart("hi")) == [
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "hi"}}
+    ]
+    assert _normalize(ToolCall("Shell")) == [
+        {"type": "item.completed", "item": {"type": "tool_use", "name": "Shell"}}
+    ]
+    assert _normalize(StatusUpdate(_TokenUsage(1, 2, 3))) == [
+        {"type": "turn.completed", "usage": {
+            "input_tokens": 1, "output_tokens": 2, "cached_input_tokens": 3,
+        }}
+    ]
+    assert _normalize(TurnEnd()) == []
+    assert _normalize({"type": "thread.started", "thread_id": "x"}) == [
+        {"type": "thread.started", "thread_id": "x"}
+    ]
+
+
+async def test_kimi_code_success_harvests_diff(tmp_path):
+    captured = []
+    profile, executor = _kimi_executor(tmp_path, captured=captured)
+
+    run_id = "kc-run1"
+    ws = Path(profile.executor.workspace_root) / run_id
+    executor._prepare_workspace(ws)
+    (ws / "fix.py").write_text("print('fixed')\n")
+
+    result = await executor.run_job("fix the bug", run_id)
+    assert result.status == "succeeded"
+    assert result.thread_id == "kimi_sess"
+    assert result.output == "patched the bug"
+    assert result.usage.input_tokens == 90 and result.usage.output_tokens == 40
+    assert "+print('fixed')" in Path(result.diff_path).read_text()
+
+    call = captured[0]
+    assert call["prompt"].startswith("hi.")
+    assert call["options"]["work_dir"] == str(ws)
+    assert call["options"]["yolo"] is True  # approval_policy never, no leash
+    assert call["thread_id"] is None
+
+
+async def test_kimi_code_resume_passes_session_id(tmp_path):
+    captured = []
+    _, executor = _kimi_executor(tmp_path, captured=captured)
+    await executor.run_job("continue", "kc-run2", thread_id="kimi_sess", first_turn=False)
+    call = captured[0]
+    assert call["prompt"] == "continue"
+    assert call["thread_id"] == "kimi_sess"
+    assert call["first_turn"] is False
+
+
+async def test_kimi_code_leash_disables_yolo(tmp_path):
+    captured = []
+    _, executor = _kimi_executor(
+        tmp_path,
+        executor_body={"leash": {"gate": ["command"]}},
+        captured=captured,
+    )
+    await executor.run_job("go", "kc-leash")
+    assert captured[0]["options"]["yolo"] is False
+
+
+async def test_kimi_code_injects_mcp_configs(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOIMI_TOKEN", "tok-kimi")
+    captured = []
+    _, executor = _kimi_executor(
+        tmp_path,
+        executor_body={
+            "mcp_servers": [
+                {"name": "loimi", "url": "https://loimi.mesh/mcp/", "bearer_token_env": "LOIMI_TOKEN"}
+            ]
+        },
+        captured=captured,
+    )
+    await executor.run_job("go", "kc-mcp")
+    configs = captured[0]["options"]["mcp_configs"]
+    assert configs[0]["name"] == "loimi"
+    assert configs[0]["url"] == "https://loimi.mesh/mcp/"
+    assert configs[0]["headers"]["Authorization"] == "Bearer tok-kimi"
+
+
+async def test_kimi_code_prepare_sets_kimi_code_home(tmp_path, monkeypatch):
+    monkeypatch.delenv("KIMI_CODE_HOME", raising=False)
+    profile, executor = _kimi_executor(tmp_path)
+    executor.prepare()
+    assert os.environ["KIMI_CODE_HOME"] == profile.executor.kimi_home
+    assert Path(profile.executor.kimi_home).is_dir()
+
+
+async def test_kimi_code_prepare_overrides_inherited_kimi_code_home(tmp_path, monkeypatch):
+    """Profile kimi_home must win over a pre-set env (not setdefault)."""
+    monkeypatch.setenv("KIMI_CODE_HOME", "/wrong/inherited/home")
+    profile, executor = _kimi_executor(tmp_path)
+    executor.prepare()
+    assert os.environ["KIMI_CODE_HOME"] == profile.executor.kimi_home
+    assert os.environ["KIMI_CODE_HOME"] != "/wrong/inherited/home"
+
+
+async def test_kimi_code_product_cancel_is_resumable_failure(tmp_path):
+    """Product-side RunCancelled must not become CancelledError (leaves run
+    stuck at running). Stand-in: a factory that yields thread.started then a
+    synthetic cancel as turn.failed — production maps RunCancelled the same way."""
+    messages = [
+        {"type": "thread.started", "thread_id": "kimi_cancel"},
+        {"type": "turn.failed", "error": {"message": "kimi run cancelled: product"}},
+    ]
+    _, executor = _kimi_executor(tmp_path, messages=messages)
+    result = await executor.run_job("go", "kc-cancel")
+    assert result.status == "failed"
+    assert result.exit_reason == "crash"
+    assert result.thread_id == "kimi_cancel"
+    assert "cancelled" in (result.error or "").lower()
+
+
 # ── SpawnExecutor ─────────────────────────────────────────────────────────────
 
 
@@ -415,7 +622,11 @@ async def test_spawn_success_harvests_diff_and_keeps_stdout(tmp_path):
 
 
 async def test_spawn_nonzero_exit_is_resumable_crash(tmp_path):
-    _, executor = _spawn_executor(tmp_path, ["/bin/sh", "-c", "echo boom >&2; exit 3"])
+    # Consume stdin before failing so a fast-exit shell does not race the
+    # prompt write (BrokenPipe / Connection lost on drain).
+    _, executor = _spawn_executor(
+        tmp_path, ["/bin/sh", "-c", "cat >/dev/null; echo boom >&2; exit 3"]
+    )
     result = await executor.run_job("doomed", "sp-run2")
     assert result.status == "failed"
     assert result.exit_reason == "crash"
