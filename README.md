@@ -166,7 +166,7 @@ my-swarm/
 >[!WARNING]
 >miragen imposes no security requirements as mandatory, however some good practices are built into this guide.
 
-miragen recommends running agents inside _docker containers_ or similar containerized environments.
+miragen runs agents inside _docker containers_ by default, although other containerized environments may be supported in the future.
 miragen is built with docker-based usage in mind, and recommends _docker secrets_, as well as _non-priviledged users_ within the container to run the application/agent.
 
 Why? [So that this won't be you for real lmao](https://x.com/gilpinskyy/status/2054254470595330363)
