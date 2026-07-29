@@ -10,6 +10,15 @@ COPY . /build/
 # containers can run self-harnessed backends without a custom Dockerfile.
 # publish.yml builds this on main + v* tags → ghcr.io/.../miragen.
 #
+# kimi-code is intentionally NOT baked in here: pydantic-ai-slim's "openai"
+# extra (needed for openai-responses:* model support) requires openai>=2.29,
+# while kimi-code's kosong dependency hard-pins openai<2.15 -- the two can't
+# coexist in one environment (see issue #48). No subscription flow exists
+# for kimi-code yet (API-key only), so it's excluded from the default image
+# for now; still installable standalone via `pip install miragen[kimi-code]`
+# in a custom Dockerfile for anyone who needs it and doesn't need OpenAI
+# model support in the same container.
+#
 # Split into separate RUN layers (issue #45) so a failure in any one step
 # (apt/curl, Grok CLI install, either pip install, or user setup) is
 # attributable to that specific step instead of one opaque mega-layer.
@@ -26,7 +35,7 @@ RUN pip install --no-cache-dir \
     /build/packages/grok-build-client
 
 RUN pip install --no-cache-dir \
-    "/build[codex,claude-code,kimi-code]"
+    "/build[codex,claude-code]"
 
 RUN adduser --disabled-password --gecos "" agentuser \
     && chown agentuser /agent
