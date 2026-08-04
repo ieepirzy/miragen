@@ -735,8 +735,7 @@ capabilities for client feature detection.
 - **Hybrid mode interrupt handler** — When `/run` hits a hybrid agent mid-autonomous-run, the interrupt handler selectively decides what context from the interactive history to inject before resuming.
 - **RAG over history** — Instead of injecting full conversation history into context, the agent retrieves only relevant parts via semantic search. Keeps token usage low for long-running agents.
 - **Session key isolation** — Per-caller conversation history for multi-user deployments. Currently deferred — one global history per agent.
-- **WebFetch capability** — Add `pydantic-ai-slim[web-fetch]` to base image deps so the `WebFetch` capability works out of the box.
-- **Default model updated to `deepseek:deepseek-v4-flash`** — `deepseek-chat` is deprecated July 24 2026, scaffold default should reflect this.
+- **Scaffold/init command default model** — `deepseek-chat` was deprecated July 24 2026. There's no scaffold/init CLI command yet, but when one is added, it should default to `deepseek:deepseek-v4-flash` rather than the deprecated model.
 
 ---
 
