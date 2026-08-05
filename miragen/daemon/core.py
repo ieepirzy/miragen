@@ -846,7 +846,12 @@ class LifecycleCore:
                 tempfile.mkdtemp(dir=self.exports_dir, prefix=f".import-{name}-")
             )
             try:
-                with tarfile.open(full, "r:gz") as tar:
+                # filter="data" (Python 3.12+) is the stdlib mitigation for
+                # exactly this rule's vulnerability class: it rejects absolute
+                # paths, ".." traversal, links, and device files. The archive
+                # path itself is already confined to exports/ by
+                # _safe_export_path above.
+                with tarfile.open(full, "r:gz") as tar:  # nosemgrep: trailofbits.python.tarfile-extractall-traversal.tarfile-extractall-traversal
                     tar.extractall(path=staging, filter="data")
             except (tarfile.TarError, ValueError, OSError) as exc:
                 raise ArchiveInvalid(
