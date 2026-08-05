@@ -9,9 +9,12 @@ agent making a tool call, so it does not go over MCP).
 
 This is deliberately *not* auto-fired on executor success. The legacy
 auto-push path is retired; `executor.artifact_sink` only configures the
-backend used by the reviewed-publication endpoint.
-`miragen.executor.sink` is a low-level store_document helper only — do not
-re-wire it into the executor finish path.
+backend used by the reviewed-publication endpoint. There is no other write
+path — `miragen.executor.sink`'s one-shot `LoimiSink` was removed: unused in
+production, and could never have worked against real Loimi regardless of
+transport (it never opened a run, so it never had a `run_id` to attach an
+artifact to). Tracked for a proper redesign, if one is ever needed, in
+miragen#55.
 
 Idempotency lives in miragen (per idempotency_key → PublicationRecord). Retry
 after Loimi/network failure re-enters the backend; duplicate keys return the
