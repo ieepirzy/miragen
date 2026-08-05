@@ -25,13 +25,6 @@ classifiers = [
 ]
 
 dependencies = [
-    # Pinned exactly: pydantic-ai and pydantic-ai-slim are released in
-    # lockstep (pydantic-ai X.Y.Z requires pydantic-ai-slim==X.Y.Z), and
-    # 1.106.0 is the version verified to provide the web-fetch/duckduckgo/
-    # mcp/openai extras below. Leaving either unpinned lets pip's resolver
-    # backtrack across releases that predate the web-fetch extra, which
-    # blows past resolvelib's max_rounds (see issue #45).
-    "pydantic-ai==1.106.0",
     "markdownify>=0.13",
     "pydantic>=2.0",
     "fastapi>=0.100",
@@ -40,6 +33,16 @@ dependencies = [
     "httpx>=0.27",
     "pyyaml>=6.0",
     "click>=8.0",
+    # Pinned exactly to the version verified to provide the web-fetch/
+    # duckduckgo/mcp/openai extras. Leaving it unpinned lets pip's resolver
+    # backtrack across releases that predate the web-fetch extra, which
+    # blows past resolvelib's max_rounds (see issue #45). We depend on
+    # pydantic-ai-slim directly rather than the bare `pydantic-ai` meta-
+    # package: `pydantic-ai` unconditionally pulls in a fixed 19-extra
+    # bundle (including "fastmcp", which nothing in miragen imports) that
+    # requires fastmcp>=3.3.0, conflicting with kimi-cli's fastmcp==2.12.5
+    # pin (the kimi-code executor backend). pydantic-ai-slim gives us only
+    # the extras we actually use.
     "pydantic-ai-slim[web-fetch,duckduckgo,mcp,openai]==1.106.0",
 ]
 
@@ -71,6 +74,14 @@ kimi-code = [
 grok-build = [
     "grok-build-client>=0.1.0",
 ]
+# miragend — the swarm lifecycle daemon (miragen/daemon/). The only process
+# that holds the Docker socket; miragen-mcp and mirarun are HTTP clients of
+# it. fastapi/uvicorn/apscheduler/httpx are already core dependencies; the
+# extra adds the Docker SDK and sqlalchemy (persistent retrigger job store).
+daemon = [
+    "docker>=7.0",
+    "sqlalchemy>=2.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/ieepirzy/miragen"
@@ -80,6 +91,7 @@ Documentation = "https://github.com/ieepirzy/miragen/blob/main/README.md"
 
 [project.scripts]
 miragen = "miragen.cli:cli"
+miragend = "miragen.daemon.api:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

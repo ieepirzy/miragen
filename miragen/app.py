@@ -176,6 +176,7 @@ async def run_agent(
     use_history: bool = False,
     record: RunRecord | None = None,
     repositories: list[RepositoryCheckout] | None = None,
+    mcp_secret_env: dict[str, str] | None = None,
 ) -> str:
     """
     Core agent execution. Called by cron/interval/startup and HTTP triggers.
@@ -187,10 +188,14 @@ async def run_agent(
     Executor-tier profiles dispatch to the executor backend instead of the
     pydantic-ai agent; `use_history` does not apply there (the executor thread
     is the history). `repositories` (executor tier only) is the launch-time
-    checkout plan carrying ephemeral bindings.
+    checkout plan carrying ephemeral bindings. `mcp_secret_env` (executor tier
+    only) is this launch's ephemeral MCP bearer-token values, keyed by the
+    declared secret's environment_variable name — never persisted.
     """
     if _executor is not None:
-        return await _run_executor_turn(prompt, record, repositories=repositories)
+        return await _run_executor_turn(
+            prompt, record, repositories=repositories, mcp_secret_env=mcp_secret_env
+        )
 
     assert _agent is not None, "Agent not initialized"
 
@@ -233,6 +238,7 @@ async def _run_executor_turn(
     *,
     resume: bool = False,
     repositories: list[RepositoryCheckout] | None = None,
+    mcp_secret_env: dict[str, str] | None = None,
 ) -> str:
     """One executor turn bound to an agent-run. Terminal-state bookkeeping:
     succeeded harvests the diff; suspended (budget) and failed (crash) keep
@@ -264,6 +270,7 @@ async def _run_executor_turn(
         first_turn=not resume,
         prior_usage=record.usage if record is not None else None,
         repositories=repositories,
+        mcp_secret_env=mcp_secret_env,
     )
     timeout_s = _executor.spec.turn_timeout_s
     try:
@@ -1388,9 +1395,29 @@ async def launch_executor_run(request: ExecutorLaunchRequest, response: Response
             build_run_snapshot(resolved, run_id=record.run_id, created_at=record.started_at.isoformat()),
         )
 
+    # Ephemeral per-launch secret values (e.g. a MiraRun-minted MCP bearer
+    # token) map onto the declared secret_bindings' environment_variable
+    # names, exactly like repository bindings map onto connectionRefs. A
+    # secret with no supplied value here is left to whatever the adapter's
+    # existing static os.environ fallback provides — this channel is
+    # additive, not a new required-binding gate.
+    mcp_secret_env: dict[str, str] = {}
+    if resolved is not None and request.context is not None:
+        for binding in resolved.secret_bindings:
+            if not binding.environment_variable:
+                continue
+            value = request.context.secrets.get(binding.name)
+            if value:
+                mcp_secret_env[binding.environment_variable] = value
+
     async def _background_run() -> None:
         try:
-            await run_agent(request.prompt, record=record, repositories=checkouts)
+            await run_agent(
+                request.prompt,
+                record=record,
+                repositories=checkouts,
+                mcp_secret_env=mcp_secret_env or None,
+            )
         except Exception as e:
             # run_agent already wrote the failure to the record; this is just
             # so a launch exception never propagates into a bare task error.

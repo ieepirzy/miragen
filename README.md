@@ -166,7 +166,7 @@ my-swarm/
 >[!WARNING]
 >miragen imposes no security requirements as mandatory, however some good practices are built into this guide.
 
-miragen recommends running agents inside _docker containers_ or similar containerized environments.
+miragen runs agents inside _docker containers_ by default, although other containerized environments may be supported in the future.
 miragen is built with docker-based usage in mind, and recommends _docker secrets_, as well as _non-priviledged users_ within the container to run the application/agent.
 
 Why? [So that this won't be you for real lmao](https://x.com/gilpinskyy/status/2054254470595330363)
@@ -244,6 +244,60 @@ USER agentuser
 EXPOSE 8000
 CMD ["miragen", "run"]
 ```
+
+### miragend — the swarm lifecycle daemon
+
+Hand-writing a compose service per agent works for a static swarm, but it makes
+membership invisible to machines: nothing can enumerate the swarm, and nothing
+can create an agent without editing YAML on the host. **miragend** is the
+answer — the one process that holds the Docker socket and owns the swarm
+workspace (`agents/`, `compose.yml`), exposing agent lifecycle over HTTP so
+control planes ([miragen-mcp](https://github.com/ieepirzy/miragen-mcp) for AI
+clients, [mirarun](https://github.com/ieepirzy/mirarun) for orchestration) can
+create, inspect, and manage agents without ever touching Docker themselves.
+
+This split is deliberate: agents are the *least trusted* processes in the
+system (prompt injection, fetched payloads), so they can neither announce
+themselves into a registry nor discover peers — swarm membership is derived
+exclusively from state the daemon itself maintains, which a compromised agent
+cannot forge. The daemon is also a policy choke point: clients ask for "an
+agent from this profile", never for "a container with these mounts", so no
+client of miragend can request the docker socket, a host bind mount, or an
+arbitrary image.
+
+```console
+pip install miragen[daemon]
+miragend                       # serves on :8000
+```
+
+The published image is `ghcr.io/ieepirzy/miragend:latest`
+(`Dockerfile.miragend`); it detects the docker socket's GID at runtime, so no
+`DOCKER_GID` build argument is needed. Configuration:
+
+| Env var | Meaning |
+| --- | --- |
+| `MIRAGEN_WORKSPACE` | Swarm workspace root (default `/opt/miragen`) |
+| `MIRAGEN_BASE_IMAGE` | Image for created agents (default `ghcr.io/ieepirzy/miragen:latest`) |
+| `MIRAGEN_INTERNAL_TOKEN` | Forwarded to created agents to arm their `/run*` guard; also what daemon clients use as `X-Miragen-Token` toward agents |
+| `MIRAGEND_TOKEN` | Bearer token guarding the daemon's own API. Empty = unguarded, relying on Docker network isolation (logged loudly) |
+| `MIRAGEND_HOST` / `MIRAGEND_PORT` | Bind address (default `0.0.0.0:8000`) |
+
+Surface (all JSON; `Authorization: Bearer $MIRAGEND_TOKEN`; `GET /health` is
+never guarded and advertises `capabilities` for version-skew detection):
+
+- **Registry** — `GET /agents` (name, container status, mode, model, and the
+  agent's `endpoint` on `miragen-net`), `GET /agents/{name}`
+- **Lifecycle** — `POST /agents` (create from a validated profile),
+  `PUT /agents/{name}/config`, `POST /agents/{name}/start|stop|restart`,
+  `DELETE /agents/{name}`, `GET /agents/{name}/logs`
+- **Tools** — `GET/POST /agents/{name}/tools`,
+  `GET/PATCH/DELETE /agents/{name}/tools/{tool}`
+- **Files** — `GET/PUT/PATCH /agents/{name}/files`
+- **Transfer** — `POST /agents/{name}/export`, `POST /agents/import`
+- **Validation** — `POST /validate` (in-process `load_profile`, the same code
+  path `miragen validate` runs)
+- **Schedules** — `POST/GET /schedules`, `DELETE /schedules/{job_id}`
+  (one-shot prompt retriggers, persisted in the workspace across restarts)
 
 ---
 
@@ -735,8 +789,7 @@ capabilities for client feature detection.
 - **Hybrid mode interrupt handler** — When `/run` hits a hybrid agent mid-autonomous-run, the interrupt handler selectively decides what context from the interactive history to inject before resuming.
 - **RAG over history** — Instead of injecting full conversation history into context, the agent retrieves only relevant parts via semantic search. Keeps token usage low for long-running agents.
 - **Session key isolation** — Per-caller conversation history for multi-user deployments. Currently deferred — one global history per agent.
-- **WebFetch capability** — Add `pydantic-ai-slim[web-fetch]` to base image deps so the `WebFetch` capability works out of the box.
-- **Default model updated to `deepseek:deepseek-v4-flash`** — `deepseek-chat` is deprecated July 24 2026, scaffold default should reflect this.
+- **Scaffold/init command default model** — `deepseek-chat` was deprecated July 24 2026. There's no scaffold/init CLI command yet, but when one is added, it should default to `deepseek:deepseek-v4-flash` rather than the deprecated model.
 
 ---
 

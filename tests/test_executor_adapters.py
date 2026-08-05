@@ -409,6 +409,46 @@ async def test_claude_code_injects_mcp_servers_with_bearer(tmp_path, monkeypatch
     assert servers["loimi"]["headers"]["Authorization"] == "Bearer tok-123"
 
 
+async def test_claude_code_mcp_secret_env_overrides_static_token(tmp_path, monkeypatch):
+    # A per-run value supplied through mcp_secret_env (e.g. a MiraRun-minted
+    # run-scoped credential) must win over whatever static token this
+    # deployment's own process environment holds — the static value is
+    # shared across every run and cannot carry per-run/per-routine scoping.
+    monkeypatch.setenv("LOIMI_TOKEN", "static-shared-tok")
+    captured = []
+    _, executor = _claude_executor(
+        tmp_path,
+        executor_body={
+            "mcp_servers": [
+                {"name": "loimi", "url": "https://loimi.mesh/mcp/", "bearer_token_env": "LOIMI_TOKEN"}
+            ]
+        },
+        captured=captured,
+    )
+    await executor.run_job(
+        "go", "cc-run4b", mcp_secret_env={"LOIMI_TOKEN": "run-scoped-tok"}
+    )
+    servers = captured[0][1]["mcp_servers"]
+    assert servers["loimi"]["headers"]["Authorization"] == "Bearer run-scoped-tok"
+
+
+async def test_claude_code_mcp_secret_env_falls_back_to_static(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOIMI_TOKEN", "static-shared-tok")
+    captured = []
+    _, executor = _claude_executor(
+        tmp_path,
+        executor_body={
+            "mcp_servers": [
+                {"name": "loimi", "url": "https://loimi.mesh/mcp/", "bearer_token_env": "LOIMI_TOKEN"}
+            ]
+        },
+        captured=captured,
+    )
+    await executor.run_job("go", "cc-run4c")
+    servers = captured[0][1]["mcp_servers"]
+    assert servers["loimi"]["headers"]["Authorization"] == "Bearer static-shared-tok"
+
+
 # ── KimiCodeExecutor ──────────────────────────────────────────────────────────
 #
 # Stand-in Wire types: adapter matches by class NAME (and ApprovalRequest by

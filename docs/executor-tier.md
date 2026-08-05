@@ -241,10 +241,15 @@ thread handle, resume in practice means abandon-and-rerun.
    `~/.claude`. miragen warns at startup when neither is visible.
 5. **Kimi Code: mount `kimi_home` or set an API key** — same shared-store
    model as Codex. Run `miragen kimi-login --kimi-home <volume>` once
-   (subscription) or set `KIMI_API_KEY`/`MOONSHOT_API_KEY`. The published
-   image (`ghcr.io/ieepirzy/miragen`, built by `publish.yml` from
-   `Dockerfile`) installs `miragen[kimi-code]` so the SDK/runtime is present
-   without a custom image.
+   (subscription) or set `KIMI_API_KEY`/`MOONSHOT_API_KEY`. **Not** baked into
+   the published image (`ghcr.io/ieepirzy/miragen`, built by `publish.yml`
+   from `Dockerfile`): `kimi-agent-sdk`'s `kosong` dependency hard-pins
+   `openai<2.15`, which conflicts with `pydantic-ai-slim[openai]`'s
+   `openai>=2.29` (needed for `openai-responses:*` model support) — the two
+   can't coexist in one environment (issue #48). Until there's a subscription
+   flow for Kimi Code (API-key only today) this stays out of the default
+   image; build a custom image with `pip install miragen[kimi-code]` if you
+   need it and don't need OpenAI model support in the same container.
 6. **Grok Build: mount `grok_home` or set `XAI_API_KEY`** — run
    `miragen grok-login --grok-home <volume>` once (device-code) or set the
    key. Published image installs the `grok` CLI and `grok-build-client`.

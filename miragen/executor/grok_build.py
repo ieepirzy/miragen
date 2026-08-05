@@ -116,6 +116,7 @@ class GrokBuildExecutor(ExecutorBackend):
         thread_id: str | None,
         workspace: Path,
         first_turn: bool,
+        mcp_secret_env: dict[str, str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         transport = self.transport
         if self.leash_enabled and transport == "headless":
@@ -130,7 +131,13 @@ class GrokBuildExecutor(ExecutorBackend):
             }
             return
 
-        options = self._options(workspace, thread_id=thread_id, first_turn=first_turn, transport=transport)
+        options = self._options(
+            workspace,
+            thread_id=thread_id,
+            first_turn=first_turn,
+            transport=transport,
+            mcp_secret_env=mcp_secret_env,
+        )
         yield {"type": "thread.started", "thread_id": options["session_id"]}
 
         session = self._session_factory(
@@ -184,6 +191,7 @@ class GrokBuildExecutor(ExecutorBackend):
         thread_id: str | None,
         first_turn: bool,
         transport: str,
+        mcp_secret_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         if first_turn or not thread_id:
             session_id = str(uuid.uuid4()) if transport == "headless" else (thread_id or "")
@@ -207,18 +215,25 @@ class GrokBuildExecutor(ExecutorBackend):
             "reasoning_effort": self.spec.reasoning_effort,
             "web_search": self.spec.web_search,
             "grok_home": self.spec.grok_home,
-            "mcp_servers": self._mcp_configs() if transport == "acp" else None,
+            "mcp_servers": (
+                self._mcp_configs(mcp_secret_env) if transport == "acp" else None
+            ),
             "leash": self.leash_enabled,
         }
 
-    def _mcp_configs(self) -> list[dict[str, Any]] | None:
+    def _mcp_configs(
+        self,
+        mcp_secret_env: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]] | None:
         if not self.spec.mcp_servers:
             return None
         configs: list[dict[str, Any]] = []
         for server in self.spec.mcp_servers:
             cfg: dict[str, Any] = {"name": server.name, "type": "http", "url": server.url}
             if server.bearer_token_env:
-                token = os.environ.get(server.bearer_token_env)
+                token = (mcp_secret_env or {}).get(
+                    server.bearer_token_env
+                ) or os.environ.get(server.bearer_token_env)
                 if token:
                     cfg["headers"] = {"Authorization": f"Bearer {token}"}
             configs.append(cfg)
