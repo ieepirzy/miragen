@@ -454,6 +454,17 @@ class ResolutionContext(BaseModel):
             "never hashed); consumed by workspace preparation at launch."
         ),
     )
+    secrets: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "declared secret name → ephemeral runtime value, e.g. an MCP "
+            "server bearer token minted for this specific launch. Ignored by "
+            "pure resolution (never hashed, never desired state); consumed "
+            "at launch to fill the named secret's environment_variable for "
+            "this run's turns only, then discarded. Never persisted in a "
+            "run record, snapshot, or profile."
+        ),
+    )
 
 
 class RepositoryPlanEntry(BaseModel):

@@ -84,8 +84,9 @@ class KimiCodeExecutor(ExecutorBackend):
         thread_id: str | None,
         workspace: Path,
         first_turn: bool,
+        mcp_secret_env: dict[str, str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        options = self._options(workspace)
+        options = self._options(workspace, mcp_secret_env)
         session = self._session_factory(
             prompt,
             thread_id=thread_id,
@@ -96,7 +97,11 @@ class KimiCodeExecutor(ExecutorBackend):
             for payload in _normalize(message):
                 yield payload
 
-    def _options(self, workspace: Path) -> dict[str, Any]:
+    def _options(
+        self,
+        workspace: Path,
+        mcp_secret_env: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         # Leash on: must see ApprovalRequests → yolo off. Unattended default
         # (approval_policy never, no leash) uses yolo so the turn never stalls.
         yolo = (not self.leash_enabled) and self.spec.approval_policy == "never"
@@ -115,7 +120,9 @@ class KimiCodeExecutor(ExecutorBackend):
                     "url": server.url,
                 }
                 if server.bearer_token_env:
-                    token = os.environ.get(server.bearer_token_env)
+                    token = (mcp_secret_env or {}).get(
+                        server.bearer_token_env
+                    ) or os.environ.get(server.bearer_token_env)
                     if token:
                         cfg["headers"] = {"Authorization": f"Bearer {token}"}
                     else:

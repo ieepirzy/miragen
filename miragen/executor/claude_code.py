@@ -71,13 +71,19 @@ class ClaudeCodeExecutor(ExecutorBackend):
         thread_id: str | None,
         workspace: Path,
         first_turn: bool,
+        mcp_secret_env: dict[str, str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        options = self._options(workspace, thread_id)
+        options = self._options(workspace, thread_id, mcp_secret_env)
         async for message in self._query_factory(prompt, options):
             for payload in _normalize(message):
                 yield payload
 
-    def _options(self, workspace: Path, thread_id: str | None) -> dict[str, Any]:
+    def _options(
+        self,
+        workspace: Path,
+        thread_id: str | None,
+        mcp_secret_env: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         # Leash on: consult the gate before each tool via can_use_tool, so
         # permission_mode must be 'default' (bypassPermissions would skip it).
         permission_mode = "default" if self.leash_enabled else _PERMISSION_MODES[self.spec.approval_policy]
@@ -95,7 +101,9 @@ class ClaudeCodeExecutor(ExecutorBackend):
             for server in self.spec.mcp_servers:
                 cfg: dict[str, Any] = {"type": "http", "url": server.url}
                 if server.bearer_token_env:
-                    token = os.environ.get(server.bearer_token_env)
+                    token = (mcp_secret_env or {}).get(
+                        server.bearer_token_env
+                    ) or os.environ.get(server.bearer_token_env)
                     if token:
                         cfg["headers"] = {"Authorization": f"Bearer {token}"}
                     else:
