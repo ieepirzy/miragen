@@ -27,6 +27,33 @@ x-agent-base: &agent-base
 # ── Services ──────────────────────────────────────────────────────────────────
 services:
 
+  # Swarm lifecycle daemon — the ONE container with the Docker socket. Manages
+  # the dynamic part of the swarm (agents created over its HTTP API by
+  # miragen-mcp or mirarun) in /opt/miragen. The hand-written agents below
+  # exist independently of it; the daemon's registry only covers agents in its
+  # workspace. Optional if you only ever run a static, hand-written swarm.
+  miragend:
+    image: ghcr.io/ieepirzy/miragend:latest
+    container_name: miragend
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /opt/miragen:/opt/miragen
+    environment:
+      MIRAGEN_WORKSPACE: /opt/miragen
+      MIRAGEN_BASE_IMAGE: ghcr.io/ieepirzy/miragen:latest
+      MIRAGEND_TOKEN: replace-with-a-random-token
+      MIRAGEN_INTERNAL_TOKEN: replace-with-the-shared-agent-token
+    networks:
+      # The daemon MUST sit on miragen-net: the agents it creates live there
+      # (container-name DNS), its retriggers POST to http://<agent>:8000 over
+      # it, and control planes (miragen-mcp, mirarun) reach the daemon on it.
+      # The hand-written agents below stay on this file's default network —
+      # they are outside the daemon's registry either way.
+      - miragen-net
+    security_opt:
+      - no-new-privileges:true
+
   # Autonomous agent — wakes on cron, no public port needed
   morning-briefing:
     <<: *agent-base
@@ -130,3 +157,9 @@ volumes:
   kimi-workspaces:
   grok-home:
   grok-workspaces:
+
+networks:
+  # Created by compose if absent, and by miragend at runtime (ensure_network)
+  # so spawned agents can always be attached to it.
+  miragen-net:
+    name: miragen-net
