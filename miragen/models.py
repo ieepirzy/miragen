@@ -457,22 +457,25 @@ class ArtifactSinkSpec(_ProfileModel):
     auto-invoked on executor success — miragen keeps the harvested diff as
     the local source of truth until an orchestrator explicitly publishes.
 
-    Backend-agnostic: ``kind`` selects the implementation (first: Loimi over
-    MCP). miragen does not hard-code product flows beyond the registered
-    backends; new kinds plug in without changing the HTTP contract.
+    Backend-agnostic: ``kind`` selects the implementation (first: Loimi's
+    plain REST v0 API — this is a backend process publishing on an
+    orchestrator's behalf, not an LLM agent making a tool call, so MCP does
+    not apply here). miragen does not hard-code product flows beyond the
+    registered backends; new kinds plug in without changing the HTTP
+    contract.
     """
 
     kind: Literal["loimi"] = Field(
         default="loimi",
         description=(
             "Publication backend implementation. 'loimi' speaks "
-            "store_open_run / store_put_artifact / store_close_run over "
-            "streamable-HTTP MCP. Additional kinds may be added without "
-            "changing the /publications contract."
+            "POST /v0/runs, POST /v0/artifacts, PATCH /v0/runs/{id} against "
+            "Loimi's plain REST v0 API. Additional kinds may be added "
+            "without changing the /publications contract."
         ),
     )
     url: str = Field(
-        description="Streamable-HTTP MCP endpoint URL of the publication backend.",
+        description="Base URL of the publication backend's REST API (e.g. Loimi's LOIMI_API_URL).",
         min_length=1,
     )
     bearer_token_env: Optional[str] = Field(
