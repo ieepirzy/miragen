@@ -465,9 +465,10 @@ class ArtifactSinkSpec(_ProfileModel):
     kind: Literal["loimi"] = Field(
         default="loimi",
         description=(
-            "Publication backend implementation. 'loimi' speaks open_run / "
-            "store_document / close_run over streamable-HTTP MCP. Additional "
-            "kinds may be added without changing the /publications contract."
+            "Publication backend implementation. 'loimi' speaks "
+            "store_open_run / store_put_artifact / store_close_run over "
+            "streamable-HTTP MCP. Additional kinds may be added without "
+            "changing the /publications contract."
         ),
     )
     url: str = Field(
@@ -480,7 +481,7 @@ class ArtifactSinkSpec(_ProfileModel):
     )
     document_kind: str = Field(
         default="executor_diff",
-        description="`kind` stamped on stored documents (backend-specific; Loimi store_document).",
+        description="`kind` stamped on stored artifacts (backend-specific; Loimi store_put_artifact).",
     )
 
 

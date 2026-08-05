@@ -348,11 +348,12 @@ def _extract_id(result: Any, *keys: str) -> str | None:
 
 
 class LoimiPublicationBackend:
-    """Loimi MCP backend: open_run → store_document → close_run.
+    """Loimi MCP backend: store_open_run → store_put_artifact → store_close_run.
 
-    Tool names/args are the Loimi-facing contract; miragen only depends on the
-    PublicationBackend protocol. Other backends implement the same protocol
-    without Loimi tool names.
+    Tool names/args are the Loimi-facing contract (loimi/src/loimi/mcp_server.py
+    — exactly 8 tools, none named open_run/store_document/close_run); miragen
+    only depends on the PublicationBackend protocol. Other backends implement
+    the same protocol without Loimi tool names.
     """
 
     kind = "loimi"
@@ -375,15 +376,25 @@ class LoimiPublicationBackend:
         run: RunRecord,
         provenance: dict[str, Any],
     ) -> PublicationResult:
-        metadata = {
+        properties = {
             "miragen_run_id": run.run_id,
+            # The miragen profile/agent name — Loimi's Run.agent_id and this
+            # artifact's producer identity. routine_slug (below) rides
+            # alongside it, never in place of it: the profile says who ran
+            # this, the slug says which mirarun routine asked for it, and an
+            # agent can be invoked by more than one routine.
             "agent": run.agent_name,
             "thread_id": run.thread_id,
             "executor": run.executor,
             "model": run.model,
             "snapshot_sha256": run.snapshot_sha256,
             "publication_provenance": provenance,
+            "role": "executor_diff",
         }
+        routine_slug = provenance.get("routine_slug")
+        if routine_slug:
+            properties["routine_slug"] = routine_slug
+
         async with McpStreamableClient(
             self.spec.url,
             bearer_token=self._bearer_token,
@@ -391,37 +402,38 @@ class LoimiPublicationBackend:
             client_name="miragen-publication",
         ) as mcp:
             open_result = await mcp.call_tool(
-                "open_run",
+                "store_open_run",
                 {
-                    "kind": "reviewed_executor_run",
-                    "metadata": metadata,
+                    "agent_id": run.agent_name,
+                    "task": run.prompt,
+                    # Loimi auto-mints an agent's home namespace (same id as
+                    # the agent) the first time that agent_id opens a run
+                    # (loimi/src/loimi/service.py:open_run) and never
+                    # auto-creates any other namespace — passing anything
+                    # else here risks UnknownNamespace on a namespace nobody
+                    # registered yet.
+                    "namespace": run.agent_name,
                 },
             )
-            external_run_id = _extract_id(
-                open_result, "run_id", "loimi_run_id", "id"
-            )
+            external_run_id = _extract_id(open_result, "id", "run_id")
             if not external_run_id:
                 raise PublicationError(
-                    f"open_run did not return a run id: {open_result!r}",
+                    f"store_open_run did not return a run id: {open_result!r}",
                     retryable=False,
                     status_code=502,
                 )
 
             store_result = await mcp.call_tool(
-                "store_document",
+                "store_put_artifact",
                 {
+                    "run_id": external_run_id,
                     "kind": self.spec.document_kind,
                     "content": diff,
-                    "run_id": external_run_id,
-                    "metadata": {
-                        **metadata,
-                        "loimi_run_id": external_run_id,
-                        "role": "executor_diff",
-                    },
+                    "properties": {**properties, "loimi_run_id": external_run_id},
                 },
             )
             artifact_id = _extract_id(
-                store_result, "document_id", "artifact_id", "id", "doc_id"
+                store_result, "id", "document_id", "artifact_id", "doc_id"
             )
             if not artifact_id:
                 # Fall back to a stable synthetic id only when the backend
@@ -431,12 +443,8 @@ class LoimiPublicationBackend:
                 artifact_id = text or f"doc:{external_run_id}:diff"
 
             await mcp.call_tool(
-                "close_run",
-                {
-                    "run_id": external_run_id,
-                    "status": "completed",
-                    "metadata": {"miragen_run_id": run.run_id},
-                },
+                "store_close_run",
+                {"run_id": external_run_id, "status": "succeeded"},
             )
 
         return PublicationResult(

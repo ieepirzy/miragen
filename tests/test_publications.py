@@ -94,7 +94,12 @@ async def _succeed_run(client: AsyncClient) -> str:
 
 
 def _mcp_transport(calls: list, *, mode: str = "ok"):
-    """mode: ok | open_fail_5xx | store_error | missing_run_id"""
+    """mode: ok | open_fail_5xx | store_error | missing_run_id
+
+    Mirrors Loimi's real MCP surface (loimi/src/loimi/mcp_server.py): the
+    only write tools are store_open_run / store_put_artifact /
+    store_close_run — there is no open_run, store_document, or close_run.
+    """
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
@@ -114,9 +119,9 @@ def _mcp_transport(calls: list, *, mode: str = "ok"):
             return httpx.Response(202)
         if method == "tools/call":
             name = body["params"]["name"]
-            if mode == "open_fail_5xx" and name == "open_run":
+            if mode == "open_fail_5xx" and name == "store_open_run":
                 return httpx.Response(503, text="upstream unavailable")
-            if mode == "missing_run_id" and name == "open_run":
+            if mode == "missing_run_id" and name == "store_open_run":
                 return httpx.Response(
                     200,
                     json={
@@ -124,7 +129,7 @@ def _mcp_transport(calls: list, *, mode: str = "ok"):
                         "result": {"content": [{"type": "text", "text": "no id here"}]},
                     },
                 )
-            if name == "open_run":
+            if name == "store_open_run":
                 return httpx.Response(
                     200,
                     json={
@@ -132,12 +137,12 @@ def _mcp_transport(calls: list, *, mode: str = "ok"):
                         "result": {
                             "content": [{
                                 "type": "text",
-                                "text": json.dumps({"run_id": "loimi-run-99"}),
+                                "text": json.dumps({"id": "loimi-run-99"}),
                             }],
                         },
                     },
                 )
-            if name == "store_document":
+            if name == "store_put_artifact":
                 if mode == "store_error":
                     return httpx.Response(
                         200,
@@ -153,12 +158,12 @@ def _mcp_transport(calls: list, *, mode: str = "ok"):
                         "result": {
                             "content": [{
                                 "type": "text",
-                                "text": json.dumps({"document_id": "loimi-doc-7"}),
+                                "text": json.dumps({"id": "loimi-doc-7"}),
                             }],
                         },
                     },
                 )
-            if name == "close_run":
+            if name == "store_close_run":
                 return httpx.Response(
                     200,
                     json={"jsonrpc": "2.0", "id": body.get("id"), "result": {"ok": True}},
@@ -169,7 +174,7 @@ def _mcp_transport(calls: list, *, mode: str = "ok"):
     return httpx.MockTransport(handler)
 
 
-def _pub_body(key: str = "mirarun:publication:aaaa") -> dict:
+def _pub_body(key: str = "mirarun:publication:aaaa", **extra_provenance) -> dict:
     return {
         "idempotency_key": key,
         "provenance": {
@@ -177,6 +182,7 @@ def _pub_body(key: str = "mirarun:publication:aaaa") -> dict:
             "environment_id": "env-1",
             "environment_revision": 3,
             "requested_by": "user-9",
+            **extra_provenance,
         },
     }
 
@@ -278,16 +284,72 @@ async def test_successful_whole_run_publication(pub_env):
         for c in calls
         if c["method"] == "tools/call"
     ]
-    assert tool_names == ["open_run", "store_document", "close_run"]
+    assert tool_names == ["store_open_run", "store_put_artifact", "store_close_run"]
     # Auth + session on backend calls
-    store_call = next(c for c in calls if c["method"] == "tools/call" and c["body"]["params"]["name"] == "store_document")
+    store_call = next(c for c in calls if c["method"] == "tools/call" and c["body"]["params"]["name"] == "store_put_artifact")
     assert store_call["headers"]["authorization"] == "Bearer tok-pub"
     assert store_call["headers"]["mcp-session-id"] == "sess-pub"
+
+    open_call = next(c for c in calls if c["method"] == "tools/call" and c["body"]["params"]["name"] == "store_open_run")
+    open_args = open_call["body"]["params"]["arguments"]
+    assert open_args["agent_id"] == "pub-worker"
+    # The agent's own home namespace always exists (Loimi auto-mints it
+    # alongside the agent) — anything else risks UnknownNamespace.
+    assert open_args["namespace"] == "pub-worker"
+
+    artifact_args = store_call["body"]["params"]["arguments"]
+    assert artifact_args["properties"]["agent"] == "pub-worker"
 
     # Run status unchanged; advisory flag set
     record = app_module._run_store.get(run_id)
     assert record.status == "succeeded"
     assert record.artifact_stored is True
+
+
+async def test_routine_slug_travels_alongside_agent_name_in_artifact_properties(pub_env):
+    # This is the coupling the admin dashboard needs: InsightCite's hardcoded
+    # agent-id strings only resolve to real output if the published artifact
+    # carries the routine's slug — and it must sit alongside `agent`
+    # (the miragen profile name), not replace it: an agent can be invoked by
+    # more than one routine, and not every run is routine-driven.
+    calls = []
+    app_module._publication_backend_override = LoimiPublicationBackend(
+        ArtifactSinkSpec.model_validate({"url": "https://loimi.mesh/mcp/"}),
+        transport=_mcp_transport(calls),
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        run_id = await _succeed_run(c)
+        resp = await c.post(
+            f"/runs/{run_id}/publications",
+            json=_pub_body("k-routine", routine_slug="pricing-guardian"),
+        )
+        assert resp.status_code == 200, resp.text
+
+    store_call = next(
+        x for x in calls
+        if x["method"] == "tools/call" and x["body"]["params"]["name"] == "store_put_artifact"
+    )
+    properties = store_call["body"]["params"]["arguments"]["properties"]
+    assert properties["routine_slug"] == "pricing-guardian"
+    assert properties["agent"] == "pub-worker"
+
+
+async def test_no_routine_slug_when_provenance_omits_it(pub_env):
+    calls = []
+    app_module._publication_backend_override = LoimiPublicationBackend(
+        ArtifactSinkSpec.model_validate({"url": "https://loimi.mesh/mcp/"}),
+        transport=_mcp_transport(calls),
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        run_id = await _succeed_run(c)
+        resp = await c.post(f"/runs/{run_id}/publications", json=_pub_body("k-noroutine"))
+        assert resp.status_code == 200, resp.text
+
+    store_call = next(
+        x for x in calls
+        if x["method"] == "tools/call" and x["body"]["params"]["name"] == "store_put_artifact"
+    )
+    assert "routine_slug" not in store_call["body"]["params"]["arguments"]["properties"]
 
 
 async def test_idempotent_repeat_publication(pub_env):
