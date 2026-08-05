@@ -126,7 +126,20 @@ class CodexExecutor(ExecutorBackend):
         thread_id: str | None,
         workspace: Path,
         first_turn: bool,
+        mcp_secret_env: dict[str, str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
+        # NOT WIRED YET: unlike the other adapters, Codex's App Server reads
+        # `bearer_token_env_var` from its own runtime process environment
+        # (config.toml, written once in prepare()), not from a value this
+        # adapter resolves in Python per turn. Threading a per-run value in
+        # here safely needs either SDK-level support for an explicit env/
+        # header override, or a verified-safe way to scope a temporary
+        # os.environ mutation to one turn without racing concurrent turns on
+        # this shared executor instance — neither is confirmed, so this
+        # parameter is accepted for interface parity but currently unused.
+        # A per-run MiraRun MCP credential therefore does not yet reach a
+        # Codex-backed run; it falls back to any statically configured token.
+        del mcp_secret_env
         session = self._session_factory(
             prompt,
             thread_id=thread_id,

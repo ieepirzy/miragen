@@ -31,7 +31,9 @@ class SpawnExecutor(ExecutorBackend):
         thread_id: str | None,
         workspace: Path,
         first_turn: bool,
+        mcp_secret_env: dict[str, str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
+        del mcp_secret_env  # spawn has no MCP server injection surface
         assert self.spec.command, "spawn executor requires command (enforced by ExecutorSpec)"
         argv = [
             arg.replace("{workspace}", str(workspace)).replace("{prompt}", prompt)

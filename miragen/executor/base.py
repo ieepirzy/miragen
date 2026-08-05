@@ -293,8 +293,18 @@ class ExecutorBackend(ABC):
         thread_id: str | None,
         workspace: Path,
         first_turn: bool,
+        mcp_secret_env: dict[str, str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Run one turn and yield normalized event payloads (see module doc)."""
+        """Run one turn and yield normalized event payloads (see module doc).
+
+        `mcp_secret_env` is this turn's ephemeral MCP bearer-token values
+        (environment_variable name → value, e.g. a run-scoped MiraRun
+        credential), passed explicitly rather than read from process
+        environment: `self.spec` and this executor instance are shared
+        across concurrent runs, so a value that must differ per run cannot
+        live in `os.environ` or on `self`. Adapters check this map before
+        falling back to the static `os.environ` lookup for servers that use
+        a shared, deployment-level token instead."""
 
     # ── Job execution (template) ───────────────────────────────────────────
 
@@ -308,6 +318,7 @@ class ExecutorBackend(ABC):
         first_turn: bool = True,
         prior_usage: RunUsage | None = None,
         repositories: list[RepositoryCheckout] | None = None,
+        mcp_secret_env: dict[str, str] | None = None,
     ) -> ExecutorResult:
         """Execute one turn of a job bound to an agent-run.
 
@@ -317,7 +328,11 @@ class ExecutorBackend(ABC):
         needed so a per-run budget check on resume sees the true total, not
         just this turn's usage. `repositories` is the run's checkout plan
         (with ephemeral bindings on the first turn, binding-less on resume);
-        None keeps the classic single-baseline empty workspace.
+        None keeps the classic single-baseline empty workspace. `mcp_secret_env`
+        is this turn's ephemeral MCP bearer-token values, supplied by the
+        caller at launch time and never persisted (see `_stream_turn`); None
+        on resume today — a resumed turn falls back to any statically
+        configured server tokens.
         """
         ws = Path(workspace) if workspace else Path(self.spec.workspace_root) / run_id
 
@@ -363,6 +378,7 @@ class ExecutorBackend(ABC):
                     thread_id=thread_id,
                     workspace=ws,
                     first_turn=first_turn,
+                    mcp_secret_env=mcp_secret_env,
                 ):
                     sink.write(payload)
 
