@@ -74,6 +74,14 @@ kimi-code = [
 grok-build = [
     "grok-build-client>=0.1.0",
 ]
+# miragend — the swarm lifecycle daemon (miragen/daemon/). The only process
+# that holds the Docker socket; miragen-mcp and mirarun are HTTP clients of
+# it. fastapi/uvicorn/apscheduler/httpx are already core dependencies; the
+# extra adds the Docker SDK and sqlalchemy (persistent retrigger job store).
+daemon = [
+    "docker>=7.0",
+    "sqlalchemy>=2.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/ieepirzy/miragen"
@@ -83,6 +91,7 @@ Documentation = "https://github.com/ieepirzy/miragen/blob/main/README.md"
 
 [project.scripts]
 miragen = "miragen.cli:cli"
+miragend = "miragen.daemon.api:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
