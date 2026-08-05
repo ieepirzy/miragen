@@ -272,9 +272,27 @@ def test_stop_restart_delete(core, docker_client, tmp_path):
     assert "alpha" not in compose.get("services", {})
 
 
-def test_restart_missing_container(core):
+def test_restart_missing_container(core, tmp_path):
+    # Workspace exists but the container never started.
+    (tmp_path / "agents" / "ghost").mkdir(parents=True)
     with pytest.raises(ContainerNotFound):
         core.restart_agent("ghost")
+
+
+def test_docker_operations_gated_on_workspace_ownership(core, docker_client):
+    # A container whose name fits the agent grammar but has NO workspace in
+    # the daemon (e.g. the host's own postgres) must be untouchable — Docker
+    # resolves by container name, not by who created the container.
+    interloper = docker_client.add("postgres")
+    for op in (core.restart_agent, core.stop_agent, core.delete_agent):
+        with pytest.raises(AgentNotFound):
+            op("postgres")
+    with pytest.raises(AgentNotFound):
+        core.agent_logs("postgres")
+    with pytest.raises(AgentNotFound):
+        core.start_agent("postgres")
+    assert interloper.status == "running"
+    assert "postgres" in docker_client.container_map
 
 
 def test_delete_missing_container_still_cleans_workspace(core, tmp_path):
@@ -325,6 +343,26 @@ def test_register_list_source_edit_delete_tool(core, docker_client, tmp_path):
         (tmp_path / "agents" / "alpha" / "agent.yaml").read_text()
     )
     assert profile["tools"] == []
+
+
+ALIASED_TOOL_SRC = '''@register("fetch_forecast")
+async def get_forecast(ctx, city: str) -> str:
+    """Return the 7-day forecast for a city."""
+    return "sunny"
+'''
+
+
+def test_aliased_tool_managed_by_registered_name(core):
+    # @register("alias") tools are advertised under the alias, so GET/PATCH/
+    # DELETE must resolve the alias too — not just the function identifier.
+    core.create_agent("alpha", _yaml("alpha"))
+    core.register_tool("alpha", "fetch_forecast", ALIASED_TOOL_SRC)
+
+    assert "async def get_forecast" in core.tool_source("alpha", "fetch_forecast")
+    core.edit_tool("alpha", "fetch_forecast", '"sunny"', '"rainy"')
+    assert '"rainy"' in core.tool_source("alpha", "fetch_forecast")
+    core.delete_tool("alpha", "fetch_forecast")
+    assert core.list_tools("alpha") == []
 
 
 def test_register_tool_bad_source(core):

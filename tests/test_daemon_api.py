@@ -202,6 +202,17 @@ def test_schedule_set_list_cancel(client):
     job_id = resp.json()["job_id"]
     assert job_id.startswith("retrigger-alpha-")
 
+    # Same agent + same fire second must be a distinct job, not a silent
+    # replacement of the first prompt.
+    twin = client.post(
+        "/schedules",
+        json={"agent": "alpha", "prompt": "wake up again", "delay_seconds": 60},
+    )
+    assert twin.status_code == 201
+    assert twin.json()["job_id"] != job_id
+    assert client.get("/schedules").json()["count"] == 2
+    client.delete(f"/schedules/{twin.json()['job_id']}")
+
     listing = client.get("/schedules", params={"agent": "alpha"}).json()
     assert listing["count"] == 1
     assert listing["retriggers"][0]["prompt_preview"] == "wake up"

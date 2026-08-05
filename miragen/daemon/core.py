@@ -246,17 +246,42 @@ def parse_registered_tools(source: str) -> list[dict]:
     return tools
 
 
-def find_function_span(source: str, func_name: str) -> tuple[int, int] | None:
-    """Return (start_line_0indexed, end_line_exclusive) for the named top-level async def."""
+def _registered_name(node: ast.AsyncFunctionDef) -> str | None:
+    """The name a @register-decorated async def is registered under, or None."""
+    for dec in node.decorator_list:
+        if isinstance(dec, ast.Name) and dec.id == "register":
+            return node.name
+        if (
+            isinstance(dec, ast.Call)
+            and isinstance(dec.func, ast.Name)
+            and dec.func.id == "register"
+            and dec.args
+            and isinstance(dec.args[0], ast.Constant)
+        ):
+            return dec.args[0].value
+    return None
+
+
+def find_function_span(source: str, tool_name: str) -> tuple[int, int] | None:
+    """Return (start_line_0indexed, end_line_exclusive) for the top-level async
+    def whose registered tool name — the alias in @register("alias"), else the
+    function identifier — equals tool_name. Falls back to a plain function-name
+    match so undecorated helpers remain addressable."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return None
+    fallback: tuple[int, int] | None = None
     for node in tree.body:
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == func_name:
-            start = node.decorator_list[0].lineno - 1 if node.decorator_list else node.lineno - 1
-            return start, node.end_lineno
-    return None
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        start = node.decorator_list[0].lineno - 1 if node.decorator_list else node.lineno - 1
+        span = (start, node.end_lineno)
+        if _registered_name(node) == tool_name:
+            return span
+        if node.name == tool_name and fallback is None:
+            fallback = span
+    return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -579,12 +604,18 @@ class LifecycleCore:
         )
         return {"changed_keys": changed}
 
+    # Every Docker operation below gates on _require_agent first: the daemon
+    # may only manage containers whose workspace it owns. Without the gate, a
+    # client could drive restart/stop/logs/delete against ANY container on the
+    # host whose name fits the agent-name grammar (e.g. 'postgres') — Docker
+    # resolves by container name, not by who created the container.
+
     def start_agent(self, name: str) -> None:
         self._require_agent(name)
         self._compose_up(name)
 
     def restart_agent(self, name: str) -> None:
-        self.check_name(name)
+        self._require_agent(name)
         try:
             self._docker.containers.get(name).restart()
         except self._not_found:
@@ -593,7 +624,7 @@ class LifecycleCore:
             raise ContainerOperationFailed(str(exc)) from exc
 
     def stop_agent(self, name: str) -> None:
-        self.check_name(name)
+        self._require_agent(name)
         try:
             self._docker.containers.get(name).stop()
         except self._not_found:
@@ -602,8 +633,7 @@ class LifecycleCore:
             raise ContainerOperationFailed(str(exc)) from exc
 
     def delete_agent(self, name: str) -> None:
-        self.check_name(name)
-        d = self._agent_dir(name)
+        d = self._require_agent(name)
         try:
             container = self._docker.containers.get(name)
             container.stop()
@@ -617,7 +647,7 @@ class LifecycleCore:
             shutil.rmtree(d)
 
     def agent_logs(self, name: str, tail: int = 50) -> str:
-        self.check_name(name)
+        self._require_agent(name)
         try:
             logs = self._docker.containers.get(name).logs(
                 tail=min(max(tail, 1), 1000), stream=False

@@ -44,6 +44,13 @@ services:
       MIRAGEN_BASE_IMAGE: ghcr.io/ieepirzy/miragen:latest
       MIRAGEND_TOKEN: replace-with-a-random-token
       MIRAGEN_INTERNAL_TOKEN: replace-with-the-shared-agent-token
+    networks:
+      # The daemon MUST sit on miragen-net: the agents it creates live there
+      # (container-name DNS), its retriggers POST to http://<agent>:8000 over
+      # it, and control planes (miragen-mcp, mirarun) reach the daemon on it.
+      # The hand-written agents below stay on this file's default network —
+      # they are outside the daemon's registry either way.
+      - miragen-net
     security_opt:
       - no-new-privileges:true
 
@@ -150,3 +157,9 @@ volumes:
   kimi-workspaces:
   grok-home:
   grok-workspaces:
+
+networks:
+  # Created by compose if absent, and by miragend at runtime (ensure_network)
+  # so spawned agents can always be attached to it.
+  miragen-net:
+    name: miragen-net

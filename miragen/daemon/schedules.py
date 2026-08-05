@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -28,10 +29,13 @@ logger = logging.getLogger(__name__)
 # still runs; older misses are dropped (APScheduler default behaviour).
 RETRIGGER_MISFIRE_GRACE = 3600
 
-# Scheduled retrigger job ids are "retrigger-<agent>-<unix_ts>". Agent names
-# may contain hyphens, so parse the agent as everything between the fixed
-# prefix and the trailing "-<digits>" timestamp.
-_RETRIGGER_ID_RE = re.compile(r"^retrigger-(?P<agent>.+)-\d+$")
+# Scheduled retrigger job ids are "retrigger-<agent>-<unix_ts>-<token>", where
+# the token is a random suffix making concurrent same-second schedules for one
+# agent distinct jobs instead of silently replacing each other. Agent names may
+# contain hyphens, so parse the agent as everything between the fixed prefix
+# and the trailing timestamp(+token). The token is optional in the pattern so
+# ids persisted by pre-daemon miragen-mcp job stores still parse.
+_RETRIGGER_ID_RE = re.compile(r"^retrigger-(?P<agent>.+)-\d+(?:-[0-9a-f]{8})?$")
 
 # Test seam: when set (httpx.MockTransport in tests), the fire request routes
 # through it instead of the docker network.
@@ -128,13 +132,16 @@ class ScheduleStore:
 
         from apscheduler.triggers.date import DateTrigger
 
-        job_id = f"retrigger-{agent}-{fire_at.timestamp():.0f}"
+        # Random token so two schedules for the same agent landing on the same
+        # second are two jobs — the timestamp alone as the whole key made the
+        # second 201 silently replace the first job's prompt.
+        job_id = f"retrigger-{agent}-{fire_at.timestamp():.0f}-{uuid.uuid4().hex[:8]}"
         self._scheduler.add_job(
             _fire_trigger,
             trigger=DateTrigger(run_date=fire_at),
             args=[agent, prompt],
             id=job_id,
-            replace_existing=True,
+            replace_existing=False,
             misfire_grace_time=RETRIGGER_MISFIRE_GRACE,
         )
         return {"job_id": job_id, "agent": agent, "fire_at": fire_at.isoformat()}
