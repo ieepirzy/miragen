@@ -1,6 +1,8 @@
 """Reviewed whole-run publication (capability reviewed-publication/v1).
 
-Uses mocked MCP/httpx transport — no real Loimi. Covers auth, capability
+Uses a mocked httpx transport against Loimi's plain REST v0 API — no real
+Loimi, and no MCP (this is a backend process publishing on an orchestrator's
+behalf, not an LLM agent making a tool call). Covers auth, capability
 advertisement, success, idempotency, deterministic rejects, and retryable
 backend failure without mutating run status.
 """
@@ -46,7 +48,7 @@ def _profile(**sink_kw) -> AgentProfile:
             "executor": "codex",
             "instructions": "hi.",
             "artifact_sink": {
-                "url": "https://loimi.mesh/mcp/",
+                "url": "https://loimi.mesh",
                 "bearer_token_env": "LOIMI_TOKEN",
                 **sink_kw,
             },
@@ -93,83 +95,40 @@ async def _succeed_run(client: AsyncClient) -> str:
     return run_id
 
 
-def _mcp_transport(calls: list, *, mode: str = "ok"):
-    """mode: ok | open_fail_5xx | store_error | missing_run_id"""
+def _loimi_rest_transport(calls: list, *, mode: str = "ok"):
+    """mode: ok | open_fail_5xx | store_error | missing_run_id
+
+    Mirrors Loimi's real REST v0 write surface (loimi/src/loimi/http_api.py):
+    POST /v0/runs, POST /v0/artifacts, PATCH /v0/runs/{id}. Plain JSON in,
+    plain JSON out — no MCP envelope, no session handshake.
+    """
 
     def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
+        body = json.loads(request.content) if request.content else {}
         calls.append({
-            "method": body.get("method"),
+            "method": request.method,
+            "path": request.url.path,
             "body": body,
             "headers": {k.lower(): v for k, v in request.headers.items()},
         })
-        method = body.get("method")
-        if method == "initialize":
-            return httpx.Response(
-                200,
-                json={"jsonrpc": "2.0", "id": body.get("id"), "result": {"serverInfo": {"name": "loimi"}}},
-                headers={"mcp-session-id": "sess-pub"},
-            )
-        if method == "notifications/initialized":
-            return httpx.Response(202)
-        if method == "tools/call":
-            name = body["params"]["name"]
-            if mode == "open_fail_5xx" and name == "open_run":
+        if request.method == "POST" and request.url.path == "/v0/runs":
+            if mode == "open_fail_5xx":
                 return httpx.Response(503, text="upstream unavailable")
-            if mode == "missing_run_id" and name == "open_run":
-                return httpx.Response(
-                    200,
-                    json={
-                        "jsonrpc": "2.0", "id": body.get("id"),
-                        "result": {"content": [{"type": "text", "text": "no id here"}]},
-                    },
-                )
-            if name == "open_run":
-                return httpx.Response(
-                    200,
-                    json={
-                        "jsonrpc": "2.0", "id": body.get("id"),
-                        "result": {
-                            "content": [{
-                                "type": "text",
-                                "text": json.dumps({"run_id": "loimi-run-99"}),
-                            }],
-                        },
-                    },
-                )
-            if name == "store_document":
-                if mode == "store_error":
-                    return httpx.Response(
-                        200,
-                        json={
-                            "jsonrpc": "2.0", "id": body.get("id"),
-                            "result": {"isError": True, "content": [{"type": "text", "text": "nope"}]},
-                        },
-                    )
-                return httpx.Response(
-                    200,
-                    json={
-                        "jsonrpc": "2.0", "id": body.get("id"),
-                        "result": {
-                            "content": [{
-                                "type": "text",
-                                "text": json.dumps({"document_id": "loimi-doc-7"}),
-                            }],
-                        },
-                    },
-                )
-            if name == "close_run":
-                return httpx.Response(
-                    200,
-                    json={"jsonrpc": "2.0", "id": body.get("id"), "result": {"ok": True}},
-                )
-            raise AssertionError(f"unexpected tool {name}")
-        raise AssertionError(f"unexpected method {method}")
+            if mode == "missing_run_id":
+                return httpx.Response(201, json={})
+            return httpx.Response(201, json={"id": "loimi-run-99"})
+        if request.method == "POST" and request.url.path == "/v0/artifacts":
+            if mode == "store_error":
+                return httpx.Response(422, json={"detail": "nope"})
+            return httpx.Response(201, json={"id": "loimi-doc-7"})
+        if request.method == "PATCH" and request.url.path.startswith("/v0/runs/"):
+            return httpx.Response(200, json={"status": "succeeded"})
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
 
     return httpx.MockTransport(handler)
 
 
-def _pub_body(key: str = "mirarun:publication:aaaa") -> dict:
+def _pub_body(key: str = "mirarun:publication:aaaa", **extra_provenance) -> dict:
     return {
         "idempotency_key": key,
         "provenance": {
@@ -177,6 +136,7 @@ def _pub_body(key: str = "mirarun:publication:aaaa") -> dict:
             "environment_id": "env-1",
             "environment_revision": 3,
             "requested_by": "user-9",
+            **extra_provenance,
         },
     }
 
@@ -248,9 +208,9 @@ async def test_publication_requires_token_when_configured(pub_env, monkeypatch):
 async def test_successful_whole_run_publication(pub_env):
     calls = []
     app_module._publication_backend_override = LoimiPublicationBackend(
-        ArtifactSinkSpec.model_validate({"url": "https://loimi.mesh/mcp/"}),
+        ArtifactSinkSpec.model_validate({"url": "https://loimi.mesh"}),
         bearer_token="tok-pub",
-        transport=_mcp_transport(calls),
+        transport=_loimi_rest_transport(calls),
     )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         run_id = await _succeed_run(c)
@@ -273,16 +233,23 @@ async def test_successful_whole_run_publication(pub_env):
     assert body["publication_id"]
     assert isinstance(body["publication_id"], str)
 
-    tool_names = [
-        c["body"]["params"]["name"]
-        for c in calls
-        if c["method"] == "tools/call"
+    requests = [(c["method"], c["path"]) for c in calls]
+    assert requests == [
+        ("POST", "/v0/runs"),
+        ("POST", "/v0/artifacts"),
+        ("PATCH", "/v0/runs/loimi-run-99"),
     ]
-    assert tool_names == ["open_run", "store_document", "close_run"]
-    # Auth + session on backend calls
-    store_call = next(c for c in calls if c["method"] == "tools/call" and c["body"]["params"]["name"] == "store_document")
+    # Auth on every backend call
+    store_call = next(c for c in calls if (c["method"], c["path"]) == ("POST", "/v0/artifacts"))
     assert store_call["headers"]["authorization"] == "Bearer tok-pub"
-    assert store_call["headers"]["mcp-session-id"] == "sess-pub"
+
+    open_call = next(c for c in calls if (c["method"], c["path"]) == ("POST", "/v0/runs"))
+    assert open_call["body"]["agent_id"] == "pub-worker"
+    # The agent's own home namespace always exists (Loimi auto-mints it
+    # alongside the agent) — anything else risks UnknownNamespace.
+    assert open_call["body"]["namespace"] == "pub-worker"
+
+    assert store_call["body"]["properties"]["agent"] == "pub-worker"
 
     # Run status unchanged; advisory flag set
     record = app_module._run_store.get(run_id)
@@ -290,17 +257,57 @@ async def test_successful_whole_run_publication(pub_env):
     assert record.artifact_stored is True
 
 
+async def test_routine_slug_travels_alongside_agent_name_in_artifact_properties(pub_env):
+    # This is the coupling the admin dashboard needs: InsightCite's hardcoded
+    # agent-id strings only resolve to real output if the published artifact
+    # carries the routine's slug — and it must sit alongside `agent`
+    # (the miragen profile name), not replace it: an agent can be invoked by
+    # more than one routine, and not every run is routine-driven.
+    calls = []
+    app_module._publication_backend_override = LoimiPublicationBackend(
+        ArtifactSinkSpec.model_validate({"url": "https://loimi.mesh"}),
+        transport=_loimi_rest_transport(calls),
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        run_id = await _succeed_run(c)
+        resp = await c.post(
+            f"/runs/{run_id}/publications",
+            json=_pub_body("k-routine", routine_slug="pricing-guardian"),
+        )
+        assert resp.status_code == 200, resp.text
+
+    store_call = next(c for c in calls if (c["method"], c["path"]) == ("POST", "/v0/artifacts"))
+    properties = store_call["body"]["properties"]
+    assert properties["routine_slug"] == "pricing-guardian"
+    assert properties["agent"] == "pub-worker"
+
+
+async def test_no_routine_slug_when_provenance_omits_it(pub_env):
+    calls = []
+    app_module._publication_backend_override = LoimiPublicationBackend(
+        ArtifactSinkSpec.model_validate({"url": "https://loimi.mesh"}),
+        transport=_loimi_rest_transport(calls),
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        run_id = await _succeed_run(c)
+        resp = await c.post(f"/runs/{run_id}/publications", json=_pub_body("k-noroutine"))
+        assert resp.status_code == 200, resp.text
+
+    store_call = next(c for c in calls if (c["method"], c["path"]) == ("POST", "/v0/artifacts"))
+    assert "routine_slug" not in store_call["body"]["properties"]
+
+
 async def test_idempotent_repeat_publication(pub_env):
     calls = []
     app_module._publication_backend_override = LoimiPublicationBackend(
-        ArtifactSinkSpec.model_validate({"url": "https://loimi.mesh/mcp/"}),
-        transport=_mcp_transport(calls),
+        ArtifactSinkSpec.model_validate({"url": "https://loimi.mesh"}),
+        transport=_loimi_rest_transport(calls),
     )
     key = "mirarun:publication:same-key"
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         run_id = await _succeed_run(c)
         first = (await c.post(f"/runs/{run_id}/publications", json=_pub_body(key))).json()
-        n_tools = sum(1 for x in calls if x["method"] == "tools/call")
+        n_requests = len(calls)
         second = await c.post(f"/runs/{run_id}/publications", json=_pub_body(key))
         assert second.status_code == 200
         body = second.json()
@@ -310,7 +317,7 @@ async def test_idempotent_repeat_publication(pub_env):
     assert body["external_run_id"] == first["external_run_id"]
     assert body["external_artifact_ids"] == first["external_artifact_ids"]
     # No additional backend writes
-    assert sum(1 for x in calls if x["method"] == "tools/call") == n_tools
+    assert len(calls) == n_requests
 
 
 # ── Deterministic rejects ────────────────────────────────────────────────────
@@ -376,8 +383,8 @@ async def test_reject_missing_backend_config(tmp_path, monkeypatch):
 async def test_retryable_loimi_failure_does_not_change_run_status(pub_env):
     calls = []
     app_module._publication_backend_override = LoimiPublicationBackend(
-        ArtifactSinkSpec.model_validate({"url": "https://loimi.mesh/mcp/"}),
-        transport=_mcp_transport(calls, mode="open_fail_5xx"),
+        ArtifactSinkSpec.model_validate({"url": "https://loimi.mesh"}),
+        transport=_loimi_rest_transport(calls, mode="open_fail_5xx"),
     )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         run_id = await _succeed_run(c)

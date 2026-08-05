@@ -3,8 +3,7 @@ claude-code and spawn adapters, and publication/sink helpers.
 
 Design record: docs/design/executor-tier-refinement.md. The Claude SDK is
 stubbed via ClaudeCodeExecutor's query_factory seam and plain stand-in message
-classes; SpawnExecutor runs real subprocesses. LoimiSink is a low-level
-store_document helper only (not on the executor success path).
+classes; SpawnExecutor runs real subprocesses.
 """
 
 import asyncio
@@ -13,7 +12,6 @@ import os
 import sys
 from pathlib import Path
 
-import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
@@ -24,9 +22,8 @@ app_module = sys.modules["miragen.app"]
 from miragen.app import app
 from miragen.executor import CodexExecutor, ExecutorBackend, build_executor
 from miragen.executor.claude_code import ClaudeCodeExecutor
-from miragen.executor.sink import LoimiSink
 from miragen.executor.spawn import SpawnExecutor
-from miragen.models import AgentProfile, ArtifactSinkSpec
+from miragen.models import AgentProfile
 from miragen.runs import RunStore
 
 from tests.test_executor import StubThread, default_events
@@ -908,75 +905,6 @@ async def test_spawn_cancellation_kills_the_whole_process_tree(tmp_path):
 
 
 # ── Artifact sink ─────────────────────────────────────────────────────────────
-
-
-def _mcp_transport(calls, *, store_response=None, sse=False):
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        calls.append({"headers": dict(request.headers), "body": body})
-        method = body.get("method")
-        if method == "initialize":
-            return httpx.Response(
-                200,
-                json={"jsonrpc": "2.0", "id": 1, "result": {"serverInfo": {"name": "loimi"}}},
-                headers={"mcp-session-id": "sess-42"},
-            )
-        if method == "notifications/initialized":
-            return httpx.Response(202)
-        if method == "tools/call":
-            payload = store_response or {
-                "jsonrpc": "2.0", "id": 2,
-                "result": {"content": [{"type": "text", "text": "stored doc_1"}]},
-            }
-            if sse:
-                return httpx.Response(
-                    200,
-                    text=f"event: message\ndata: {json.dumps(payload)}\n\n",
-                    headers={"content-type": "text/event-stream"},
-                )
-            return httpx.Response(200, json=payload)
-        raise AssertionError(f"unexpected method {method}")
-
-    return httpx.MockTransport(handler)
-
-
-def _sink_spec(**kw) -> ArtifactSinkSpec:
-    return ArtifactSinkSpec.model_validate({"url": "https://loimi.mesh/mcp/", **kw})
-
-
-async def test_loimi_sink_calls_store_document():
-    calls = []
-    sink = LoimiSink(_sink_spec(), bearer_token="tok-9", transport=_mcp_transport(calls))
-    await sink.store(diff="diff --git a/x b/x", metadata={"run_id": "r1", "agent": "a"})
-
-    methods = [c["body"].get("method") for c in calls]
-    assert methods == ["initialize", "notifications/initialized", "tools/call"]
-    # session id from initialize carried on subsequent calls; bearer on all
-    assert calls[2]["headers"]["mcp-session-id"] == "sess-42"
-    assert calls[2]["headers"]["authorization"] == "Bearer tok-9"
-
-    args = calls[2]["body"]["params"]
-    assert args["name"] == "store_document"
-    assert args["arguments"]["kind"] == "executor_diff"
-    assert args["arguments"]["content"] == "diff --git a/x b/x"
-    assert args["arguments"]["metadata"]["run_id"] == "r1"
-
-
-async def test_loimi_sink_parses_sse_responses():
-    calls = []
-    sink = LoimiSink(_sink_spec(), transport=_mcp_transport(calls, sse=True))
-    await sink.store(diff="d", metadata={})  # no exception = parsed the SSE frame
-
-
-async def test_loimi_sink_raises_on_tool_error():
-    calls = []
-    error_response = {
-        "jsonrpc": "2.0", "id": 2,
-        "result": {"isError": True, "content": [{"type": "text", "text": "schema mismatch"}]},
-    }
-    sink = LoimiSink(_sink_spec(), transport=_mcp_transport(calls, store_response=error_response))
-    with pytest.raises(RuntimeError, match="store_document returned an error|tool 'store_document'"):
-        await sink.store(diff="d", metadata={})
 
 
 async def test_success_does_not_auto_publish_even_with_sink_configured(tmp_path, monkeypatch):

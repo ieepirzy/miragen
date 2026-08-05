@@ -3,13 +3,18 @@
 Orchestrators (e.g. MiraRun) never write artifacts or provenance to a document
 store themselves. After human review they call POST /runs/{id}/publications;
 miragen reads its authoritative run/diff and hands the package to a configured
-**publication backend** (first implementation: Loimi over MCP).
+**publication backend** (first implementation: Loimi's plain REST v0 API —
+this is a backend process publishing on an orchestrator's behalf, not an LLM
+agent making a tool call, so it does not go over MCP).
 
 This is deliberately *not* auto-fired on executor success. The legacy
 auto-push path is retired; `executor.artifact_sink` only configures the
-backend used by the reviewed-publication endpoint.
-`miragen.executor.sink` is a low-level store_document helper only — do not
-re-wire it into the executor finish path.
+backend used by the reviewed-publication endpoint. There is no other write
+path — `miragen.executor.sink`'s one-shot `LoimiSink` was removed: unused in
+production, and could never have worked against real Loimi regardless of
+transport (it never opened a run, so it never had a `run_id` to attach an
+artifact to). Tracked for a proper redesign, if one is ever needed, in
+miragen#55.
 
 Idempotency lives in miragen (per idempotency_key → PublicationRecord). Retry
 after Loimi/network failure re-enters the backend; duplicate keys return the
@@ -23,7 +28,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import uuid
 import contextlib
 from datetime import datetime, timezone
@@ -164,8 +168,30 @@ class PublicationBackend(Protocol):
         ...
 
 
+def _parse_body(response: httpx.Response) -> dict | None:
+    if "text/event-stream" in response.headers.get("content-type", ""):
+        body = None
+        for line in response.text.splitlines():
+            if line.startswith("data:"):
+                try:
+                    body = json.loads(line[len("data:"):].strip())
+                except ValueError:
+                    continue
+        return body
+    if not response.content:
+        return None
+    # May raise JSONDecodeError / ValueError — callers map to PublicationUnavailableError.
+    return response.json()
+
+
 class McpStreamableClient:
-    """Minimal streamable-HTTP MCP client (initialize + tools/call)."""
+    """Minimal streamable-HTTP MCP client (initialize + tools/call).
+
+    Reserved for genuinely agent-facing tool calls now that
+    LoimiPublicationBackend talks plain REST — kept only because
+    executor/sink.py's LoimiSink (an unused, pre-existing helper — see the
+    note left on that module) still imports it.
+    """
 
     def __init__(
         self,
@@ -294,65 +320,42 @@ class McpStreamableClient:
         return response
 
 
-def _parse_body(response: httpx.Response) -> dict | None:
-    if "text/event-stream" in response.headers.get("content-type", ""):
-        body = None
-        for line in response.text.splitlines():
-            if line.startswith("data:"):
-                try:
-                    body = json.loads(line[len("data:"):].strip())
-                except ValueError:
-                    continue
-        return body
+async def _loimi_request(
+    client: httpx.AsyncClient, method: str, path: str, *, json_body: dict | None = None
+) -> dict:
+    """One call against Loimi's plain REST v0 surface, mapped to PublicationError.
+
+    Not MCP: miragen is a backend process publishing on an orchestrator's
+    behalf here, not an LLM agent making a tool call, so it talks to Loimi
+    the same way admin/loimi_client.py does — plain HTTP, no JSON-RPC
+    envelope, no protocol handshake.
+    """
+    try:
+        response = await client.request(method, path, json=json_body)
+    except httpx.HTTPError as e:
+        raise PublicationUnavailableError(f"Loimi transport error on {method} {path}: {e}") from e
+    if response.status_code >= 500:
+        raise PublicationUnavailableError(f"Loimi HTTP {response.status_code} on {method} {path}")
+    if response.status_code >= 400:
+        raise PublicationError(
+            f"Loimi HTTP {response.status_code} on {method} {path}: {response.text}",
+            retryable=False,
+            status_code=502,
+        )
     if not response.content:
-        return None
-    # May raise JSONDecodeError / ValueError — callers map to PublicationUnavailableError.
-    return response.json()
-
-
-def _extract_id(result: Any, *keys: str) -> str | None:
-    """Pull an opaque id from a tools/call result (structured or text JSON)."""
-    if result is None:
-        return None
-    if isinstance(result, str) and result.strip():
-        return result.strip()
-    if isinstance(result, dict):
-        for k in keys:
-            v = result.get(k)
-            if isinstance(v, str) and v:
-                return v
-        # MCP content blocks
-        content = result.get("content")
-        if isinstance(content, list):
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                text = block.get("text")
-                if not isinstance(text, str) or not text.strip():
-                    continue
-                try:
-                    parsed = json.loads(text)
-                except ValueError:
-                    # bare id string
-                    if re.fullmatch(r"[\w.:@/-]+", text.strip()):
-                        return text.strip()
-                    continue
-                if isinstance(parsed, dict):
-                    for k in keys:
-                        v = parsed.get(k)
-                        if isinstance(v, str) and v:
-                            return v
-                elif isinstance(parsed, str) and parsed:
-                    return parsed
-    return None
+        return {}
+    try:
+        return response.json()
+    except ValueError as e:
+        raise PublicationUnavailableError(f"malformed Loimi response to {method} {path}: {e}") from e
 
 
 class LoimiPublicationBackend:
-    """Loimi MCP backend: open_run → store_document → close_run.
+    """Loimi REST v0 backend: POST /v0/runs → POST /v0/artifacts → PATCH /v0/runs/{id}.
 
-    Tool names/args are the Loimi-facing contract; miragen only depends on the
-    PublicationBackend protocol. Other backends implement the same protocol
-    without Loimi tool names.
+    Plain REST, not MCP — Loimi's write surface is documented at
+    loimi/src/loimi/http_api.py / api_contract.md §2, the same one
+    admin/loimi_client.py already uses directly.
     """
 
     kind = "loimi"
@@ -375,68 +378,75 @@ class LoimiPublicationBackend:
         run: RunRecord,
         provenance: dict[str, Any],
     ) -> PublicationResult:
-        metadata = {
+        properties = {
             "miragen_run_id": run.run_id,
+            # The miragen profile/agent name — Loimi's Run.agent_id and this
+            # artifact's producer identity. routine_slug (below) rides
+            # alongside it, never in place of it: the profile says who ran
+            # this, the slug says which mirarun routine asked for it, and an
+            # agent can be invoked by more than one routine.
             "agent": run.agent_name,
             "thread_id": run.thread_id,
             "executor": run.executor,
             "model": run.model,
             "snapshot_sha256": run.snapshot_sha256,
             "publication_provenance": provenance,
+            "role": "executor_diff",
         }
-        async with McpStreamableClient(
-            self.spec.url,
-            bearer_token=self._bearer_token,
-            transport=self._transport,
-            client_name="miragen-publication",
-        ) as mcp:
-            open_result = await mcp.call_tool(
-                "open_run",
-                {
-                    "kind": "reviewed_executor_run",
-                    "metadata": metadata,
+        routine_slug = provenance.get("routine_slug")
+        if routine_slug:
+            properties["routine_slug"] = routine_slug
+
+        headers = {"Authorization": f"Bearer {self._bearer_token}"} if self._bearer_token else {}
+        base_url = self.spec.url.rstrip("/")
+        async with httpx.AsyncClient(
+            base_url=base_url, transport=self._transport, headers=headers, timeout=60.0
+        ) as client:
+            run_body = await _loimi_request(
+                client,
+                "POST",
+                "/v0/runs",
+                json_body={
+                    "agent_id": run.agent_name,
+                    "task": run.prompt,
+                    # Loimi auto-mints an agent's home namespace (same id as
+                    # the agent) the first time that agent_id opens a run
+                    # (loimi/src/loimi/service.py:open_run) and never
+                    # auto-creates any other namespace — passing anything
+                    # else here risks UnknownNamespace on a namespace nobody
+                    # registered yet.
+                    "namespace": run.agent_name,
                 },
             )
-            external_run_id = _extract_id(
-                open_result, "run_id", "loimi_run_id", "id"
-            )
+            external_run_id = run_body.get("id")
             if not external_run_id:
                 raise PublicationError(
-                    f"open_run did not return a run id: {open_result!r}",
+                    f"POST /v0/runs did not return a run id: {run_body!r}",
                     retryable=False,
                     status_code=502,
                 )
 
-            store_result = await mcp.call_tool(
-                "store_document",
-                {
+            artifact_body = await _loimi_request(
+                client,
+                "POST",
+                "/v0/artifacts",
+                json_body={
+                    "run_id": external_run_id,
                     "kind": self.spec.document_kind,
                     "content": diff,
-                    "run_id": external_run_id,
-                    "metadata": {
-                        **metadata,
-                        "loimi_run_id": external_run_id,
-                        "role": "executor_diff",
-                    },
+                    "properties": {**properties, "loimi_run_id": external_run_id},
                 },
             )
-            artifact_id = _extract_id(
-                store_result, "document_id", "artifact_id", "id", "doc_id"
-            )
+            artifact_id = artifact_body.get("id")
             if not artifact_id:
-                # Fall back to a stable synthetic id only when the backend
-                # acknowledges success without an id (some MCP tools return
-                # plain text "stored"). Prefer an explicit opaque token.
-                text = _extract_id(store_result, "text")
-                artifact_id = text or f"doc:{external_run_id}:diff"
+                raise PublicationError(
+                    f"POST /v0/artifacts did not return an artifact id: {artifact_body!r}",
+                    retryable=False,
+                    status_code=502,
+                )
 
-            await mcp.call_tool(
-                "close_run",
-                {
-                    "run_id": external_run_id,
-                    "status": "completed",
-                    "metadata": {"miragen_run_id": run.run_id},
-                },
+            await _loimi_request(
+                client, "PATCH", f"/v0/runs/{external_run_id}", json_body={"status": "succeeded"}
             )
 
         return PublicationResult(
