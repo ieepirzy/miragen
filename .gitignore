@@ -58,3 +58,6 @@ secrets/
 
 # local-only planning notes
 FUTURE_FEATURES.md
+
+# private deployment config
+.env

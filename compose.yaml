@@ -1,0 +1,62 @@
+name: miragen
+
+# ============================================================
+# COMPOSE — miragend, the swarm lifecycle daemon
+#
+# This is the deployable unit needed to make mirarun (or miragen-mcp) usable:
+# the one process that holds the Docker socket and owns the swarm workspace
+# (agents/, compose.yml, exports/) under MIRAGEN_WORKSPACE. mirarun and
+# miragen-mcp never touch Docker themselves -- they are HTTP clients of this
+# daemon, and it is what creates/starts/stops the agent containers they ask
+# for. Hand-written, statically-declared agents are a separate concern (see
+# compose.example.yml) -- this file does not declare any.
+#
+# Usage:
+#   cp .env.example .env   # then fill in MIRAGEND_TOKEN / MIRAGEN_INTERNAL_TOKEN
+#   docker compose up -d
+#
+# On the same host, point mirarun at it via mirarun's own .env:
+#   MIRARUN_MIRAGEN_URL=http://host.docker.internal:${MIRAGEND_PORT:-8000}
+#   MIRARUN_MIRAGEN_TOKEN=<same value as MIRAGEND_TOKEN below>
+# ============================================================
+
+services:
+  miragend:
+    image: ${MIRAGEND_IMAGE:-ghcr.io/ieepirzy/miragend:latest}
+    container_name: miragend
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Must be an identical path inside and outside the container: miragend
+      # drives `docker compose` for spawned agents against this workspace,
+      # but that subprocess talks to the HOST's Docker daemon over the
+      # mounted socket above, which resolves the agent compose file's
+      # relative bind mounts (./agents/<name>:/agent) against ITS OWN
+      # filesystem -- so the workspace path has to be a real, matching path
+      # on the host. A named volume does not satisfy this.
+      - ${MIRAGEN_WORKSPACE:-/opt/miragen}:${MIRAGEN_WORKSPACE:-/opt/miragen}
+    environment:
+      MIRAGEN_WORKSPACE: ${MIRAGEN_WORKSPACE:-/opt/miragen}
+      MIRAGEN_BASE_IMAGE: ${MIRAGEN_BASE_IMAGE:-ghcr.io/ieepirzy/miragen:latest}
+      MIRAGEND_TOKEN: ${MIRAGEND_TOKEN:-}
+      MIRAGEN_INTERNAL_TOKEN: ${MIRAGEN_INTERNAL_TOKEN:-}
+    ports:
+      # Loopback-bound by default: mirarun reaches this over the host's own
+      # network stack (host.docker.internal), not a shared Docker network,
+      # matching mirarun's MIRARUN_MIRAGEN_URL default. Not 0.0.0.0 -- an
+      # unguarded (empty MIRAGEND_TOKEN) daemon holding the Docker socket
+      # should never be reachable beyond the host it runs on.
+      - 127.0.0.1:${MIRAGEND_PORT:-8000}:8000
+    networks:
+      # Agents miragend creates are attached here (container-name DNS); the
+      # daemon also needs to be on it for control planes that DO share this
+      # Docker network (e.g. miragen-mcp colocated on the same host).
+      - miragen-net
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  # Created by compose if absent, and by miragend itself at startup
+  # (ensure_network) so agents it spawns can always attach to it.
+  miragen-net:
+    name: miragen-net
