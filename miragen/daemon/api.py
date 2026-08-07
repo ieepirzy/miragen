@@ -14,6 +14,7 @@ strings here — that's the MCP adapter's job.
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 from importlib.metadata import PackageNotFoundError, version
@@ -124,7 +125,7 @@ def create_app(
         if not token:
             return
         supplied = request.headers.get("authorization", "")
-        if supplied != f"Bearer {token}":
+        if not hmac.compare_digest(supplied, f"Bearer {token}"):
             raise DaemonUnauthorized("missing or invalid bearer token")
 
     guarded = [Depends(require_token)]

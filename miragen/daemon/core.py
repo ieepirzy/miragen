@@ -49,6 +49,15 @@ EXPORT_EXCLUDE_FILES = frozenset({"history.json"})
 MAX_EXPORT_FILE_BYTES = 10 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 50 * 1024 * 1024
 
+# Default cap on concurrently-managed agents/containers, and default
+# per-container resource limits applied to every managed agent's compose
+# service. All three are overridable per-deployment via environment
+# variables so hosts with more (or less) headroom can tune them without a
+# code change — see create_agent() and _compose_add_service() below.
+DEFAULT_MAX_AGENTS = 10
+DEFAULT_AGENT_CPU_LIMIT = "1.0"
+DEFAULT_AGENT_MEM_LIMIT = "512m"
+
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -142,6 +151,11 @@ class ArchiveInvalid(DaemonError):
 class ArchiveTooLarge(DaemonError):
     status = 422
     code = "archive_too_large"
+
+
+class AgentLimitExceeded(DaemonError):
+    status = 429
+    code = "agent_limit_exceeded"
 
 
 class ContainerOperationFailed(DaemonError):
@@ -455,6 +469,12 @@ class LifecycleCore:
             if (k.endswith("_API_KEY_FILE") or k.endswith("_API_KEY")) and v:
                 env[k] = v
 
+        # Every managed agent gets a default resource ceiling so a single
+        # runaway container can't starve the host — overridable per-deployment
+        # via MIRAGEND_AGENT_CPU_LIMIT / MIRAGEND_AGENT_MEM_LIMIT (see #57).
+        cpu_limit = self._environ.get("MIRAGEND_AGENT_CPU_LIMIT", DEFAULT_AGENT_CPU_LIMIT)
+        mem_limit = self._environ.get("MIRAGEND_AGENT_MEM_LIMIT", DEFAULT_AGENT_MEM_LIMIT)
+
         data = self._compose_load()
         data["networks"] = {"miragen-net": {"external": True}}
         data.setdefault("secrets", {}).update({s: {"external": True} for s in secret_names})
@@ -466,6 +486,8 @@ class LifecycleCore:
             "environment": env,
             "volumes": [f"./agents/{name}:/agent"],
             "networks": ["miragen-net"],
+            "cpus": cpu_limit,
+            "mem_limit": mem_limit,
         }
         self._write_yaml(self.compose_file, data)
 
@@ -521,11 +543,29 @@ class LifecycleCore:
 
     # -- lifecycle ----------------------------------------------------------
 
+    def _agent_count(self) -> int:
+        """Number of agent workspaces currently managed by this daemon —
+        the same population create_agent() checks for name collisions, used
+        here as the concurrency count for the MIRAGEND_MAX_AGENTS cap."""
+        if not self.agents_dir.exists():
+            return 0
+        return sum(1 for entry in self.agents_dir.iterdir() if entry.is_dir())
+
     def create_agent(self, name: str, yaml_source: str) -> None:
         self.check_name(name)
         d = self._agent_dir(name)
         if d.exists():
             raise AgentExists(f"agent '{name}' already exists")
+
+        max_agents = int(self._environ.get("MIRAGEND_MAX_AGENTS", DEFAULT_MAX_AGENTS))
+        current = self._agent_count()
+        if current >= max_agents:
+            raise AgentLimitExceeded(
+                f"agent limit reached ({current}/{max_agents}) — delete an existing "
+                "agent or raise MIRAGEND_MAX_AGENTS before creating another",
+                limit=max_agents,
+                current=current,
+            )
 
         profile_name = None
         try:
@@ -863,6 +903,17 @@ class LifecycleCore:
         d = self._agent_dir(name)
         if d.exists():
             raise AgentExists(f"agent '{name}' already exists")
+
+        max_agents = int(self._environ.get("MIRAGEND_MAX_AGENTS", DEFAULT_MAX_AGENTS))
+        current = self._agent_count()
+        if current >= max_agents:
+            raise AgentLimitExceeded(
+                f"agent limit reached ({current}/{max_agents}) — delete an existing "
+                "agent or raise MIRAGEND_MAX_AGENTS before importing another",
+                limit=max_agents,
+                current=current,
+            )
+
         full = self._safe_export_path(archive_path)
         if not full.exists():
             raise ArchiveNotFound(f"archive not found: {archive_path}")
