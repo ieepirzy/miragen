@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -352,6 +353,12 @@ class LifecycleCore:
         self._max_agents = max_agents
         self._agent_cpus = agent_cpus
         self._agent_mem_limit = agent_mem_limit
+        # Guards the cap-check-then-reserve critical section shared by
+        # create_agent and import_agent (request handlers run on separate
+        # worker threads, so "count agents, then add one" must be atomic —
+        # otherwise two concurrent requests can both read the same
+        # pre-creation count and both pass the cap check).
+        self._agent_creation_lock = threading.Lock()
 
     # -- naming / paths -----------------------------------------------------
 
@@ -552,16 +559,28 @@ class LifecycleCore:
             return 0
         return sum(1 for entry in self.agents_dir.iterdir() if entry.is_dir())
 
-    def create_agent(self, name: str, yaml_source: str) -> None:
-        self.check_name(name)
-        d = self._agent_dir(name)
-        if d.exists():
-            raise AgentExists(f"agent '{name}' already exists")
+    def _check_agent_cap(self) -> None:
+        """Raise TooManyAgents if the daemon is already at MIRAGEND_MAX_AGENTS.
+
+        Shared by create_agent and import_agent — both are ways a client can
+        add a new agent directory, so both must respect the cap. Callers
+        MUST hold self._agent_creation_lock across this check AND the
+        directory creation/move that follows it: _agent_count() counts
+        directories under agents_dir, so the check and the new directory's
+        appearance have to be atomic, or two concurrent requests can both
+        read the same pre-creation count and both pass (TOCTOU).
+        """
         if self._agent_count() >= self._max_agents:
             raise TooManyAgents(
                 f"at the cap of {self._max_agents} concurrent agents "
                 "(MIRAGEND_MAX_AGENTS) — delete an agent before creating another"
             )
+
+    def create_agent(self, name: str, yaml_source: str) -> None:
+        self.check_name(name)
+        d = self._agent_dir(name)
+        if d.exists():
+            raise AgentExists(f"agent '{name}' already exists")
 
         profile_name = None
         try:
@@ -575,8 +594,21 @@ class LifecycleCore:
                 f"created as '{name}' — set 'name: {name}' in the YAML"
             )
 
+        # Cap check + directory reservation happen atomically under the
+        # lock so a concurrent create_agent/import_agent can't slip past
+        # the cap before this agent's directory is visible to _agent_count().
+        with self._agent_creation_lock:
+            if d.exists():
+                raise AgentExists(f"agent '{name}' already exists")
+            self._check_agent_cap()
+            try:
+                d.mkdir(parents=True)
+            except DaemonError:
+                raise
+            except Exception as exc:
+                raise DaemonError(str(exc)) from exc
+
         try:
-            d.mkdir(parents=True)
             (d / "agent.yaml").write_text(yaml_source)
             (d / "tools.py").write_text(
                 f"from miragen import register\n\n# Tools for {name}\n"
@@ -945,9 +977,18 @@ class LifecycleCore:
 
             validate_profile_text(rewritten)
 
-            d.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src_root), str(d))
-            created_dir = True
+            # Same cap-check-then-reserve critical section as create_agent:
+            # hold the lock across the cap check and the move that makes
+            # this agent's directory appear, so concurrent imports (or a
+            # concurrent create_agent) can't all pass the check before any
+            # of them is actually registered.
+            with self._agent_creation_lock:
+                if d.exists():
+                    raise AgentExists(f"agent '{name}' already exists")
+                self._check_agent_cap()
+                d.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src_root), str(d))
+                created_dir = True
 
             self._compose_add_service(name)
             added_service = True

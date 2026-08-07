@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from httpx import AsyncClient, ASGITransport
 
 from miragen.daemon.api import DAEMON_CAPABILITIES, create_app
 from miragen.daemon.core import LifecycleCore
@@ -89,6 +90,92 @@ def test_health_is_unguarded_and_advertises_capabilities(client):
 def test_missing_or_wrong_token_is_401(client):
     for headers in ({"Authorization": ""}, {"Authorization": "Bearer wrong"}):
         resp = client.get("/agents", headers=headers)
+        assert resp.status_code == 401
+        assert resp.json()["code"] == "unauthorized"
+
+
+def test_non_ascii_authorization_header_is_401_not_500(client):
+    """hmac.compare_digest raises TypeError on non-ASCII str operands — a
+    non-ASCII byte in an incoming header must resolve to a clean 401, not
+    crash the request handler with a 500. httpx's own header validation
+    only accepts str values, so send the raw non-ASCII bytes directly."""
+    resp = client.get(
+        "/agents", headers={"Authorization": "Bearer wröng".encode("utf-8")}
+    )
+    assert resp.status_code == 401
+    assert resp.json()["code"] == "unauthorized"
+
+
+def test_non_ascii_daemon_token_config_does_not_crash(tmp_path):
+    """A non-ASCII MIRAGEND_TOKEN must not crash compare_digest either — a
+    request against it (matching or not) must cleanly resolve to 401/200,
+    never a 500 from an uncaught TypeError."""
+    docker_client = FakeDocker()
+    runner = RecordingRunner()
+    core = LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        environ={},
+        runner=runner,
+        not_found=FakeNotFound,
+    )
+    app = create_app(core, token="tökén-sécret")
+    non_ascii_client = TestClient(app)
+
+    wrong = non_ascii_client.get("/agents", headers={"Authorization": "Bearer wrong"})
+    assert wrong.status_code == 401
+    assert wrong.json()["code"] == "unauthorized"
+
+    # httpx's own header validation only accepts str values (ASCII-checked),
+    # so send a non-ASCII bearer value as raw bytes directly — the point is
+    # that comparing it against the non-ASCII configured token must not
+    # raise, regardless of whether it happens to match.
+    also_non_ascii = non_ascii_client.get(
+        "/agents",
+        headers={"Authorization": "Bearer wröng-töö".encode("utf-8")},
+    )
+    assert also_non_ascii.status_code == 401
+    assert also_non_ascii.json()["code"] == "unauthorized"
+
+    # And the plain ASCII normal case with a non-ASCII configured token must
+    # keep working exactly as before the fix: a wrong ASCII bearer value
+    # cleanly 401s, it doesn't crash just because the *configured* token
+    # happens to be non-ASCII.
+    plain = non_ascii_client.get("/agents", headers={"Authorization": "Bearer nope"})
+    assert plain.status_code == 401
+    assert plain.json()["code"] == "unauthorized"
+
+
+async def test_non_ascii_daemon_token_authenticates_when_matching(tmp_path):
+    """The fix must not just avoid crashing — a request bearing the exact
+    non-ASCII configured token must still authenticate. Uses httpx's
+    ASGITransport directly (as tests/test_app.py does for its async tests)
+    since starlette's synchronous TestClient re-encodes raw header bytes as
+    UTF-8 on the way out, which would mangle a non-ASCII header before it
+    ever reaches the app."""
+    docker_client = FakeDocker()
+    runner = RecordingRunner()
+    core = LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        environ={},
+        runner=runner,
+        not_found=FakeNotFound,
+    )
+    token = "tökén-sécret"
+    app = create_app(core, token=token)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        # HTTP header values are latin-1 on the wire (and Starlette decodes
+        # request.headers that way), so encode the matching value as latin-1.
+        matching = (f"Bearer {token}").encode("latin-1")
+        resp = await c.get("/agents", headers=[(b"authorization", matching)])
+        assert resp.status_code == 200
+
+        mismatched = (f"Bearer {token}x").encode("latin-1")
+        resp = await c.get("/agents", headers=[(b"authorization", mismatched)])
         assert resp.status_code == 401
         assert resp.json()["code"] == "unauthorized"
 

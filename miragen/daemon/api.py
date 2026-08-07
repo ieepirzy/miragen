@@ -125,7 +125,17 @@ def create_app(
         if not token:
             return
         supplied = request.headers.get("authorization", "")
-        if not hmac.compare_digest(supplied, f"Bearer {token}"):
+        # hmac.compare_digest raises TypeError on str operands containing
+        # non-ASCII characters. `supplied` comes straight off an incoming
+        # header (arbitrary bytes an attacker controls) and `token` comes
+        # from daemon config (MIRAGEND_TOKEN could be set to anything) — so
+        # either side can carry non-ASCII. Encoding both to bytes first
+        # keeps compare_digest's constant-time guarantee for the normal
+        # ASCII case while making the mismatch case a clean False (401)
+        # instead of an uncaught 500.
+        supplied_bytes = supplied.encode("utf-8", errors="surrogateescape")
+        expected_bytes = f"Bearer {token}".encode("utf-8", errors="surrogateescape")
+        if not hmac.compare_digest(supplied_bytes, expected_bytes):
             raise DaemonUnauthorized("missing or invalid bearer token")
 
     guarded = [Depends(require_token)]

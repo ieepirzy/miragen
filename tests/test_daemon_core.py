@@ -2,6 +2,7 @@
 no socket, no subprocesses."""
 
 import tarfile
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -236,6 +237,51 @@ def test_create_agent_enforces_max_agents_cap(tmp_path, docker_client, runner):
     # Deleting one frees a slot for the next create.
     core.delete_agent("alpha")
     core.create_agent("beta", _yaml("beta"))
+
+
+def test_concurrent_create_agent_respects_cap(tmp_path, docker_client, runner):
+    """Two racing POST /agents (separate worker threads in the real daemon)
+    must not both slip past a cap of 1 — regression test for the TOCTOU
+    check-then-act race between _agent_count() and the directory create."""
+    core = LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        runner=runner,
+        not_found=FakeNotFound,
+        max_agents=1,
+    )
+
+    n = 6
+    barrier = threading.Barrier(n)
+    results: list[Exception | None] = [None] * n
+    results_lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        name = f"agent{i}"
+        barrier.wait()  # line every thread up so they hit create_agent together
+        err: Exception | None = None
+        try:
+            core.create_agent(name, _yaml(name))
+        except TooManyAgents as exc:
+            err = exc
+        with results_lock:
+            results[i] = err
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    succeeded = [r for r in results if r is None]
+    rejected = [r for r in results if isinstance(r, TooManyAgents)]
+    assert len(succeeded) == 1, f"expected exactly 1 winner, got {len(succeeded)}"
+    assert len(rejected) == n - 1
+
+    # The on-disk agent count must match the cap exactly — no over-admission.
+    on_disk = [e for e in (tmp_path / "agents").iterdir() if e.is_dir()]
+    assert len(on_disk) == 1
 
 
 def test_create_agent_duplicate_rejected(core):
@@ -490,3 +536,29 @@ def test_import_missing_archive(core):
 def test_import_archive_path_escape_rejected(core):
     with pytest.raises(InvalidPath):
         core.import_agent("beta", "/etc/passwd")
+
+
+def test_import_agent_enforces_max_agents_cap(tmp_path, docker_client, runner):
+    """POST /agents/import calls import_agent() directly, bypassing
+    create_agent — it must independently respect MIRAGEND_MAX_AGENTS, or a
+    client can export one agent and re-import it under new names to exceed
+    the cap. Mirrors test_create_agent_enforces_max_agents_cap."""
+    core = LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        runner=runner,
+        not_found=FakeNotFound,
+        max_agents=1,
+    )
+    core.create_agent("alpha", _yaml("alpha"))
+    export = core.export_agent("alpha")
+
+    with pytest.raises(TooManyAgents):
+        core.import_agent("beta", export["archive_path"])
+    assert not (tmp_path / "agents" / "beta").exists()
+
+    # Deleting one frees a slot for the next import.
+    core.delete_agent("alpha")
+    core.import_agent("beta", export["archive_path"])
+    assert (tmp_path / "agents" / "beta").exists()
