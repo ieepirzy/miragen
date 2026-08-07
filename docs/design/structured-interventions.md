@@ -6,6 +6,10 @@
 sentinel file — executor-agnostic, no SDK dependency, deterministic schema
 validation. A miragen-hosted MCP `ask_human` tool can layer on later by
 writing the same file; nothing in the contract changes.
+**Update (2026-08-07):** the MCP `ask_human` variant now exists
+(`miragen/intervention_mcp.py`, mounted at `/mcp/ask-human`) — and it did
+layer on exactly as decided: it writes the same sentinel, and the contract
+below is unchanged. See docs/executor-tier.md § ask_human over MCP.
 
 ## 1. The question mechanism
 
@@ -119,5 +123,6 @@ policy decision point (Stage 3), keyed by exactly these `approval_ref` /
 
 Intervention queues/inboxes, notification delivery, actor authorization,
 answer UX, expiry/escalation policies (MiraRun); target adapters and
-credential brokering (Stage 3); the MCP `ask_human` tool variant (layers on
-without contract changes).
+credential brokering (Stage 3). (The MCP `ask_human` tool variant was in
+this list until 2026-08-07 — it layered on without contract changes, as
+predicted.)

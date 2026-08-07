@@ -7,7 +7,7 @@ import logging
 import os
 import shutil
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -25,6 +25,7 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
 
+from miragen import events as run_events
 from miragen.broker import PendingApproval, get_broker
 from miragen.edf import (
     EDFValidationError,
@@ -74,6 +75,8 @@ from miragen.schedules import (
     ScheduleSpec,
     ScheduleStore,
 )
+from miragen.intervention_mcp import build_ask_human_mcp
+from miragen.telemetry import MiragenTelemetry, telemetry_from_env
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +92,7 @@ _schedule_store: ScheduleStore | None = None
 _publication_store: PublicationStore | None = None
 # Test seam: inject a PublicationBackend (or factory) without hitting the network.
 _publication_backend_override: object | None = None
+_telemetry: MiragenTelemetry | None = None
 
 HISTORY_FILE = Path("/agent/history.json")
 HISTORY_SIDECAR = Path("/agent/history.runs.jsonl")
@@ -193,6 +197,13 @@ async def run_agent(
     declared secret's environment_variable name — never persisted.
     """
     if _executor is not None:
+        if use_history:
+            # Loud rejection, not a silent no-op: the executor thread is the
+            # history, and a caller who set the flag believed otherwise.
+            raise ValueError(
+                "executor-tier runs do not support use_history — the executor "
+                "thread is the conversation state; resume the run instead"
+            )
         return await _run_executor_turn(
             prompt, record, repositories=repositories, mcp_secret_env=mcp_secret_env
         )
@@ -207,11 +218,29 @@ async def run_agent(
         except Exception:
             logger.warning("Failed to load history, starting fresh")
 
+    run_ctx = (
+        _telemetry.run_span(
+            "agent run",
+            run_id=record.run_id if record is not None else uuid.uuid4().hex,
+            trigger=record.trigger if record is not None else None,
+            tier="model",
+        )
+        if _telemetry is not None
+        else nullcontext()
+    )
     try:
-        result = await _agent.run(prompt, usage_limits=_limits, message_history=history)
+        with run_ctx as run_span:
+            result = await _agent.run(prompt, usage_limits=_limits, message_history=history)
+            if run_span is not None:
+                pai_usage = result.usage
+                if pai_usage.input_tokens:
+                    run_span.set_attribute("gen_ai.usage.input_tokens", pai_usage.input_tokens)
+                if pai_usage.output_tokens:
+                    run_span.set_attribute("gen_ai.usage.output_tokens", pai_usage.output_tokens)
     except Exception as e:
         if record is not None and _run_store is not None:
             _run_store.finish(record, status="failed", error=str(e))
+            _write_model_run_events(record.run_id, error=str(e))
         raise
 
     if use_history:
@@ -227,9 +256,35 @@ async def run_agent(
 
     if record is not None and _run_store is not None:
         usage, tool_calls = extract_run_details(result)
-        _run_store.finish(record, status="succeeded", output=output, usage=usage, tool_calls=tool_calls)
+        _run_store.finish(
+            record,
+            status="succeeded",
+            output=output,
+            usage=usage,
+            tool_calls=tool_calls,
+            # Aggregates derived from the same trace, so both tiers report
+            # them — a consumer of tool_call_count no longer needs to know
+            # which backend ran the agent.
+            tool_call_count=len(tool_calls),
+            tool_call_failures=sum(1 for c in tool_calls if not c.ok),
+        )
+        _write_model_run_events(record.run_id, tool_calls=tool_calls, usage=usage, output=output)
 
     return output
+
+
+def _write_model_run_events(run_id: str, **kw) -> None:
+    """Model-tier half of the unified event log: one post-hoc turn write into
+    the same stream the executor tier appends live. Best effort — the run
+    record stays authoritative; a failed event write never fails the run."""
+    if _run_store is None:
+        return
+    try:
+        run_events.write_model_turn_events(
+            run_events.events_path(_run_store.root, run_id), **kw
+        )
+    except Exception:
+        logger.warning("Failed to write model-tier run events", exc_info=True)
 
 
 async def _run_executor_turn(
@@ -261,6 +316,11 @@ async def _run_executor_turn(
             )
             for r in record.repositories
         ]
+
+    # Cursor + wall clock captured before the turn so its slice of the event
+    # stream (and its true span interval) can be exported afterwards.
+    turn_started = datetime.now(timezone.utc)
+    events_before = _executor.last_seq(run_id) if _telemetry is not None else 0
 
     turn = _executor.run_job(
         prompt,
@@ -326,6 +386,29 @@ async def _run_executor_turn(
         )
         if prepared_revisions:
             _record_snapshot_commits(record.run_id, prepared_revisions)
+
+    if _telemetry is not None:
+        # Post-hoc, from the turn's slice of the durable event stream — the
+        # self-harnessed loop can't be instrumented from here, but its events
+        # can be translated span-for-span with their own timestamps.
+        page = _executor.read_events_page(run_id, after=events_before, limit=10_000)
+        if page.has_more:
+            logger.warning(
+                f"[{_profile.name if _profile else '?'}] run {run_id}: turn produced "
+                ">10k events; telemetry export truncated to the first 10k"
+            )
+        _telemetry.emit_executor_turn(
+            page.events,
+            run_id=run_id,
+            trigger=record.trigger if record is not None else None,
+            executor=_executor.spec.executor,
+            status=result.status,
+            exit_reason=result.exit_reason,
+            usage=result.usage,
+            started_at=turn_started,
+            finished_at=datetime.now(timezone.utc),
+            resume_count=record.resume_count if record is not None else 0,
+        )
 
     # Reviewed publication only: do NOT auto-push to the publication backend
     # on success. Orchestrators call POST /runs/{id}/publications after human
@@ -600,7 +683,8 @@ def _load_file_secrets() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _profile, _agent, _limits, _run_store, _executor, _schedule_store, _publication_store
+    global _profile, _agent, _limits, _run_store, _executor, _schedule_store, \
+        _publication_store, _telemetry
 
     _load_file_secrets()
 
@@ -608,6 +692,10 @@ async def lifespan(app: FastAPI):
     logger.info(f"Loading agent profile: {profile_path}")
 
     _profile = load_profile(profile_path)
+
+    _telemetry = telemetry_from_env(_profile)
+    if _telemetry is not None:
+        logger.info("OTLP telemetry enabled")
 
     _run_store = RunStore(retention=run_retention_from_env())
     _publication_store = PublicationStore(_run_store.root / "publications")
@@ -620,7 +708,7 @@ async def lifespan(app: FastAPI):
         _executor.prepare()
         logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode (executor tier: {_profile.executor.executor})")
     else:
-        _agent, _limits = build_agent(_profile)
+        _agent, _limits = build_agent(_profile, telemetry=_telemetry)
         logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode")
 
     # Register self-activating triggers (cron, interval, startup)
@@ -666,18 +754,96 @@ async def lifespan(app: FastAPI):
     if managed:
         logger.info(f"Registered {managed} managed schedule binding(s)")
 
-    _scheduler.start()
-    logger.info("Scheduler started")
-
-    yield
+    # The mounted ask_human MCP sub-app doesn't get its own lifespan from
+    # FastAPI; its session manager must be running for the endpoint to serve —
+    # and it's once-per-instance, so each lifespan builds a fresh server.
+    # Entered BEFORE the scheduler starts: its startup awaits must not open a
+    # window in which an immediate startup trigger fires ahead of `yield`.
+    ask_human_mcp = build_ask_human_mcp(lambda: (_run_store, _executor))
+    _ask_human_guard.inner = ask_human_mcp.streamable_http_app()
+    try:
+        async with ask_human_mcp.session_manager.run():
+            _scheduler.start()
+            logger.info("Scheduler started")
+            yield
+    finally:
+        _ask_human_guard.inner = _mcp_not_ready
 
     _scheduler.shutdown(wait=False)
     logger.info("Scheduler stopped")
+
+    if _telemetry is not None:
+        _telemetry.shutdown()
+        _telemetry = None
+        logger.info("Telemetry flushed")
 
 
 # ── App ────────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(lifespan=lifespan)
+
+
+# ── ask_human MCP mount ──────────────────────────────────────────────────────
+#
+# The MCP-tool variant of structured interventions (design doc §5): writes the
+# same workspace sentinel the file mechanism uses. Executor profiles opt in by
+# pointing an executor.mcp_servers entry at /mcp/ask-human on this app.
+
+
+class _TokenGuardASGI:
+    """Route-level `_internal_auth` doesn't reach a mounted sub-app, so the
+    same MIRAGEN_INTERNAL_TOKEN contract is enforced here: unset means no
+    enforcement (single-container zero-config), set means the header (or a
+    bearer token, which is how ExecutorMCPServer.bearer_token_env arrives)
+    must match."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        expected = os.environ.get("MIRAGEN_INTERNAL_TOKEN")
+        if scope["type"] == "http" and expected:
+            headers = {
+                k.decode("latin-1").lower(): v.decode("latin-1")
+                for k, v in scope.get("headers") or []
+            }
+            supplied = headers.get("x-miragen-token") or ""
+            auth = headers.get("authorization", "")
+            if not supplied and auth.startswith("Bearer "):
+                supplied = auth[len("Bearer "):].strip()
+            if not hmac.compare_digest(supplied, expected):
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [(b"content-type", b"application/json")],
+                })
+                await send({
+                    "type": "http.response.body",
+                    "body": b'{"error": "unauthorized"}',
+                })
+                return
+        await self.inner(scope, receive, send)
+
+
+async def _mcp_not_ready(scope, receive, send):
+    if scope["type"] != "http":  # pragma: no cover - lifespan probes
+        return
+    await send({
+        "type": "http.response.start",
+        "status": 503,
+        "headers": [(b"content-type", b"application/json")],
+    })
+    await send({
+        "type": "http.response.body",
+        "body": b'{"error": "ask_human MCP not started (app lifespan not running)"}',
+    })
+
+
+# The guard's inner app is swapped in by the lifespan: the MCP session manager
+# is once-per-instance, so each lifespan run (restarts, tests) builds a fresh
+# FastMCP rather than re-running a module-level one.
+_ask_human_guard = _TokenGuardASGI(_mcp_not_ready)
+app.mount("/mcp/ask-human", _ask_human_guard)
 
 
 # ── HTTP trigger schemas ────────────────────────────────────────────────────────────────
@@ -740,8 +906,10 @@ CONTRACT_CAPABILITIES = [
     "executor-launch/v1",                # POST /executor-runs (idempotency + provenance)
     "run-snapshot/v1",                   # GET /runs/{id}/snapshot
     "events-cursor/v1",                  # GET /runs/{id}/events?after=
+    "run-events-unified/v1",             # /runs/{id}/events serves BOTH tiers
     "managed-schedules/v1",              # GET/PUT/DELETE /schedules (CAS reconciliation)
     "interventions/v1",                  # structured question suspension + answered resume
+    "ask-human-mcp/v1",                  # /mcp/ask-human MCP tool (writes the sentinel)
     "reviewed-publication/v1",           # POST /runs/{id}/publications (endpoint; backend config required)
 ]
 
@@ -789,7 +957,24 @@ async def health():
         "version": _installed_version(),
         "capabilities": CONTRACT_CAPABILITIES,
         "publication": _publication_health(),
+        # Honest readiness, same pattern as publication: configured ≠ healthy,
+        # but a False here explains an empty backend before anyone debugs it.
+        "telemetry": {"otlp_configured": _telemetry is not None},
     }
+
+
+def _reject_executor_use_history(request: "RunRequest") -> None:
+    """use_history on an executor-backed agent was silently ignored once —
+    a caller who sets it believes a history mechanism exists. 400, loudly."""
+    if _executor is not None and request.use_history:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "use_history does not apply to executor-backed agents — the "
+                "executor thread is the conversation state; resume the run "
+                "(POST /runs/{run_id}/resume) to continue it"
+            ),
+        )
 
 
 def _raise_if_daily_budget_exceeded() -> None:
@@ -810,6 +995,7 @@ async def run(request: RunRequest):
     """
     if _agent is None and _executor is None:
         raise HTTPException(status_code=503, detail="Agent not ready")
+    _reject_executor_use_history(request)
     _raise_if_daily_budget_exceeded()
 
     prompt = _apply_trigger_prompt(request.prompt)
@@ -838,6 +1024,7 @@ async def run_async(request: RunRequest):
         raise HTTPException(status_code=503, detail="Agent not ready")
     if _run_store is None or _profile is None:
         raise HTTPException(status_code=503, detail="Run store not ready")
+    _reject_executor_use_history(request)
     _raise_if_daily_budget_exceeded()
 
     prompt = _apply_trigger_prompt(request.prompt)
@@ -1158,9 +1345,12 @@ async def publish_run(run_id: str, request: PublicationRequest):
 
 @app.get("/runs/{run_id}/events", dependencies=[_internal_auth])
 async def get_run_events(run_id: str, limit: int = 200, after: Optional[int] = None):
-    """The executor event stream (turn events, item/tool events, lifecycle
-    timing, errors) — what this tier owes the layers above, alongside the
-    exit reason.
+    """The run's durable event stream — BOTH tiers (capability
+    run-events-unified/v1). Executor runs stream turn/item/lifecycle events
+    live; model-tier runs write their turn's events (tool calls, usage,
+    outcome) after the fact from the same run details that fill the record.
+    One envelope, one sequence, one cursor contract — a projector never
+    branches on tier.
 
     Two read modes over the same durable sequenced stream:
     - without `after`: tail read (newest `limit` events), original contract;
@@ -1169,10 +1359,28 @@ async def get_run_events(run_id: str, limit: int = 200, after: Optional[int] = N
       deduplication key; replaying any cursor is idempotent, so a projector
       can rebuild its projection from after=0 at any time.
     """
-    record = _get_executor_record(run_id)
+    if _run_store is None:
+        raise HTTPException(status_code=503, detail="Run store not ready")
+    try:
+        record = _run_store.get(run_id)
+    except AmbiguousRunIdError as e:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": f"ambiguous run_id prefix '{run_id}'", "candidates": e.candidates},
+        )
+    if record is None:
+        raise HTTPException(status_code=404, detail={"error": f"unknown run_id '{run_id}'"})
+
+    # The executor knows its own runs_root (they can differ in tests/embeds);
+    # model-tier streams live beside the run store.
+    path = (
+        _executor._events_path(record.run_id)
+        if _executor is not None
+        else run_events.events_path(_run_store.root, record.run_id)
+    )
     limit = min(limit, 1000)
     if after is not None:
-        page = _executor.read_events_page(record.run_id, after=after, limit=limit)
+        page = run_events.read_events_page(path, after=after, limit=limit)
         return {
             "run_id": record.run_id,
             "count": len(page.events),
@@ -1180,7 +1388,7 @@ async def get_run_events(run_id: str, limit: int = 200, after: Optional[int] = N
             "next_after": page.next_after,
             "has_more": page.has_more,
         }
-    events = _executor.read_events(record.run_id, limit=limit)
+    events = run_events.read_events(path, limit=limit)
     return {"run_id": record.run_id, "count": len(events), "events": events}
 
 
@@ -1660,13 +1868,25 @@ async def run_stream(request: RunRequest):
         except Exception as e:
             if record is not None and _run_store is not None:
                 _run_store.finish(record, status="failed", error=str(e), output="".join(chunks) or None)
+                _write_model_run_events(record.run_id, error=str(e))
             raise
         if record is not None and _run_store is not None:
             try:
                 usage, tool_calls = extract_run_details(stream)
             except Exception:
                 usage, tool_calls = None, []
-            _run_store.finish(record, status="succeeded", output="".join(chunks), usage=usage, tool_calls=tool_calls)
+            _run_store.finish(
+                record,
+                status="succeeded",
+                output="".join(chunks),
+                usage=usage,
+                tool_calls=tool_calls,
+                tool_call_count=len(tool_calls),
+                tool_call_failures=sum(1 for c in tool_calls if not c.ok),
+            )
+            _write_model_run_events(
+                record.run_id, tool_calls=tool_calls, usage=usage, output="".join(chunks)
+            )
         yield "data: [DONE]\n\n"
 
     headers = {"X-Miragen-Run-Id": record.run_id} if record is not None else None

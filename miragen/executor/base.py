@@ -45,97 +45,31 @@ import subprocess
 import time
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncIterator
 
 import threading
 
 from pydantic import ValidationError
 
+from miragen import events as _events
+from miragen.events import EVENT_SCHEMA, EventPage, EventWriter
 from miragen.executor.leash import GateDecision, GateOperation, LeashPolicy
 from miragen.models import AgentProfile, ExecutorSpec, InterventionRequest, RunUsage, sum_usage
 
 logger = logging.getLogger("miragen.executor")
 
 _DIFF_NAME = "diff.patch"
-_EVENTS_SUFFIX = ".events.jsonl"
 _BASELINE_TAG = "miragen-baseline"
 
-# Event envelope version (issue #33 Phase C). Every persisted event carries
-# `seq` (per-run monotonic, 1-based), `schema`, `ts`, and `type` alongside its
-# payload fields. The envelope is flat — new keys on the same JSONL object —
-# so existing tail readers keep working unchanged.
-EVENT_SCHEMA = "miragen/executor-event/v1"
-
-
-def _iter_event_lines(path: Path) -> Iterator[tuple[int, dict[str, Any] | None]]:
-    """Yield (line_no, parsed | None) for every non-blank line. Unparsable
-    lines yield None but still occupy a line number, so sequence assignment
-    stays stable no matter who reads the file."""
-    with path.open() as f:
-        line_no = 0
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            line_no += 1
-            try:
-                yield line_no, json.loads(line)
-            except ValueError:
-                yield line_no, None
-
-
-def _effective_seq(line_no: int, event: dict[str, Any]) -> int:
-    """Explicit seq when the writer stamped one; the 1-based line number for
-    legacy pre-envelope lines (writers have always been append-only and
-    single-writer per run, so line order IS event order)."""
-    seq = event.get("seq")
-    return seq if isinstance(seq, int) else line_no
-
-
-class _EventWriter:
-    """Append-only events.jsonl sink owning the per-run monotonic sequence.
-
-    On open, scans the existing file (resume case) and continues numbering
-    after the last effective sequence — a resumed turn's events extend the
-    same ordered stream rather than restarting at 1. Each write is flushed so
-    cursor/tail readers and crash forensics see events promptly.
-    """
-
-    def __init__(self, path: Path):
-        self.path = path
-        self._last_seq = 0
-        if path.exists():
-            for line_no, event in _iter_event_lines(path):
-                self._last_seq = _effective_seq(line_no, event) if event is not None else line_no
-        self._fh = path.open("a")
-
-    def write(self, payload: dict[str, Any]) -> None:
-        self._last_seq += 1
-        payload.setdefault("ts", datetime.now(timezone.utc).isoformat())
-        payload["seq"] = self._last_seq
-        payload["schema"] = EVENT_SCHEMA
-        self._fh.write(json.dumps(payload, default=str) + "\n")
-        self._fh.flush()
-
-    def __enter__(self) -> "_EventWriter":
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self._fh.close()
-
-
-@dataclass
-class EventPage:
-    """One page of a cursor read: events with seq > `after`, in order.
-    Replay contract: (run_id, seq) is the deduplication key; re-reading any
-    cursor returns the same events."""
-
-    events: list[dict[str, Any]] = field(default_factory=list)
-    next_after: int = 0  # pass as `after` to get the next page
-    has_more: bool = False
+# The event-stream machinery (envelope, writer, cursor reads) lives in
+# miragen/events.py since the log stopped being executor-only; these aliases
+# keep this module's historical import surface working.
+_EventWriter = EventWriter
+_iter_event_lines = _events.iter_event_lines
+_effective_seq = _events.effective_seq
 
 
 @dataclass
@@ -503,51 +437,30 @@ class ExecutorBackend(ABC):
     # ── Events ─────────────────────────────────────────────────────────────
 
     def _events_path(self, run_id: str) -> Path:
-        return self.runs_root / f"{run_id}{_EVENTS_SUFFIX}"
-
-    def _parsed_events(self, run_id: str) -> list[dict[str, Any]]:
-        """All parseable events with an effective `seq` stamped — explicit for
-        envelope-era lines, line-number-derived for legacy pre-envelope files,
-        so replay/dedup by (run_id, seq) works across both."""
-        path = self._events_path(run_id)
-        if not path.exists():
-            return []
-        events = []
-        for line_no, event in _iter_event_lines(path):
-            if event is None:
-                continue
-            event.setdefault("seq", _effective_seq(line_no, event))
-            events.append(event)
-        return events
+        return _events.events_path(self.runs_root, run_id)
 
     def read_events(self, run_id: str, limit: int = 200) -> list[dict[str, Any]]:
         """Tail read (newest `limit` events, in order) — the original polling
         contract, preserved."""
-        return self._parsed_events(run_id)[-limit:]
+        return _events.read_events(self._events_path(run_id), limit)
 
     def read_events_page(self, run_id: str, *, after: int = 0, limit: int = 200) -> EventPage:
-        """Cursor read: up to `limit` events with seq > `after`, oldest first.
-        Feed `next_after` back as `after` to continue; a cursor past the end
-        returns an empty page with has_more=False. Reads are pure — replaying
-        the same cursor yields the same page, and a projector can rebuild its
-        projection from after=0 at any time."""
-        newer = [e for e in self._parsed_events(run_id) if e["seq"] > after]
-        page = newer[:limit]
-        return EventPage(
-            events=page,
-            next_after=page[-1]["seq"] if page else after,
-            has_more=len(newer) > limit,
-        )
+        """Cursor read — see miragen.events.read_events_page for the replay
+        contract."""
+        return _events.read_events_page(self._events_path(run_id), after=after, limit=limit)
+
+    def last_seq(self, run_id: str) -> int:
+        """Last persisted sequence for a run (0 when no stream exists yet) —
+        recorded by the app tier before a turn so the turn's own events can be
+        sliced out afterwards (telemetry export)."""
+        return _events.last_seq(self._events_path(run_id))
 
     def append_event(self, run_id: str, payload: dict[str, Any]) -> None:
         """Append one event to a run's durable stream from OUTSIDE a turn —
         used by the app tier for intervention answered/superseded events.
         Safe because a suspended/failed run has no writer holding the file;
         the sequence continues from the last effective seq."""
-        path = self._events_path(run_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with _EventWriter(path) as sink:
-            sink.write(payload)
+        _events.append_event(self._events_path(run_id), payload)
 
     def latest_thread_id(self, run_id: str) -> str | None:
         """Recover the resume handle from the persisted event stream — used by

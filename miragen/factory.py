@@ -3,13 +3,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, overload
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, InstrumentationSettings
+from pydantic_ai.capabilities import Instrumentation
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import UsageLimits
 
 from miragen.approval import build_approval_hooks
 from miragen.load import resolve_capabilities
 from miragen.models import AgentProfile
+from miragen.telemetry import MiragenTelemetry
 
 
 # ── Tool registry ────────────────────────────────────────────────────────────
@@ -108,19 +110,44 @@ def get_approval_handler() -> Callable | None:
 
 # ── Factory ──────────────────────────────────────────────────────────────────
 
-def build_agent(profile: AgentProfile) -> tuple[Agent, UsageLimits | None]:
+def build_agent(
+    profile: AgentProfile,
+    telemetry: MiragenTelemetry | None = None,
+) -> tuple[Agent, UsageLimits | None]:
     """
     Construct a live PydanticAI Agent from a validated AgentProfile.
 
     Resolves capabilities, injects whitelisted tools, applies usage limits.
     MCP tools are handled automatically via the MCP capability — they do
     not need to appear in the profile's tools list.
+
+    With `telemetry`, the agent is built with pydantic-ai's own OTel
+    instrumentation wired to miragen's tracer provider — every model
+    request and tool call becomes a span (GenAI semconv), nested under the
+    run span the app tier opens and stamped with the run's `mira.*`
+    attributes by the provider's run-context processor.
     """
     capabilities = resolve_capabilities(profile.spec.capabilities or [])
 
     approval_hooks = build_approval_hooks(profile)
     if approval_hooks is not None:
         capabilities.append(approval_hooks)
+
+    if telemetry is not None:
+        # pydantic-ai's own OTel instrumentation (GenAI semconv spans for the
+        # run, each model request, and each tool execution), exporting through
+        # miragen's provider — so the run-context processor stamps `mira.*`
+        # run identity onto every one of these spans too.
+        capabilities.append(
+            Instrumentation(
+                InstrumentationSettings(
+                    tracer_provider=telemetry.provider,
+                    # pydantic-ai defaults to exporting prompts, responses and
+                    # tool arguments; span data carries mechanical facts only.
+                    include_content=False,
+                )
+            )
+        )
 
     limits_kwargs: dict[str, int] = {}
     if profile.spec.max_steps:
