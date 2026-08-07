@@ -461,9 +461,8 @@ def _daily_budget_status() -> tuple[int, int] | None:
     midnight_utc = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     limit = _profile.limits.tokens_per_day
     used = tokens_used_since(_run_store, midnight_utc)
-    used += reserved_tokens_in_flight(
-        _run_store, midnight_utc, _profile.limits.tokens_per_run, remaining_budget=limit - used
-    )
+    still_remaining = limit - used
+    used += reserved_tokens_in_flight(_run_store, midnight_utc, _profile.limits.tokens_per_run, still_remaining)
     return used, limit
 
 
