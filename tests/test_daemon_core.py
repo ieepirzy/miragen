@@ -21,6 +21,7 @@ from miragen.daemon.core import (
     RestartFailed,
     ToolNotFound,
     ToolSourceInvalid,
+    TooManyAgents,
     ValidationFailed,
     WorkspaceFileNotFound,
     validate_profile_text,
@@ -192,6 +193,49 @@ def test_create_agent_writes_workspace_compose_and_starts(core, runner, tmp_path
     assert service["environment"]["MIRAGEN_INTERNAL_TOKEN"] == "shared-secret"
     assert service["environment"]["ANTHROPIC_API_KEY_FILE"] == "/run/secrets/anthropic_key"
     assert compose["secrets"] == {"anthropic_key": {"external": True}}
+    # Default per-container resource caps are always written.
+    assert service["cpus"] == 2.0
+    assert service["mem_limit"] == "2g"
+
+
+def test_agent_resource_limits_configurable(tmp_path, docker_client, runner):
+    core = LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        runner=runner,
+        not_found=FakeNotFound,
+        agent_cpus=0.5,
+        agent_mem_limit="512m",
+    )
+    core.create_agent("alpha", _yaml("alpha"))
+
+    import yaml as pyyaml
+
+    compose = pyyaml.safe_load((tmp_path / "compose.yml").read_text())
+    service = compose["services"]["alpha"]
+    assert service["cpus"] == 0.5
+    assert service["mem_limit"] == "512m"
+
+
+def test_create_agent_enforces_max_agents_cap(tmp_path, docker_client, runner):
+    core = LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        runner=runner,
+        not_found=FakeNotFound,
+        max_agents=1,
+    )
+    core.create_agent("alpha", _yaml("alpha"))
+
+    with pytest.raises(TooManyAgents):
+        core.create_agent("beta", _yaml("beta"))
+    assert not (tmp_path / "agents" / "beta").exists()
+
+    # Deleting one frees a slot for the next create.
+    core.delete_agent("alpha")
+    core.create_agent("beta", _yaml("beta"))
 
 
 def test_create_agent_duplicate_rejected(core):

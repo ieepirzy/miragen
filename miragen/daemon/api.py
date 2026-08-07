@@ -319,6 +319,9 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
         docker.from_env(),
         base_image=os.getenv("MIRAGEN_BASE_IMAGE", "ghcr.io/ieepirzy/miragen:latest"),
         internal_token=os.getenv("MIRAGEN_INTERNAL_TOKEN", ""),
+        max_agents=int(os.getenv("MIRAGEND_MAX_AGENTS", "20")),
+        agent_cpus=float(os.getenv("MIRAGEND_AGENT_CPUS", "2")),
+        agent_mem_limit=os.getenv("MIRAGEND_AGENT_MEM_LIMIT", "2g"),
     )
     core.ensure_network()
 

@@ -281,6 +281,8 @@ The published image is `ghcr.io/ieepirzy/miragend:latest`
 | `MIRAGEN_INTERNAL_TOKEN` | Forwarded to created agents to arm their `/run*` guard; also what daemon clients use as `X-Miragen-Token` toward agents |
 | `MIRAGEND_TOKEN` | Bearer token guarding the daemon's own API. Empty = unguarded, relying on Docker network isolation (logged loudly) |
 | `MIRAGEND_HOST` / `MIRAGEND_PORT` | Bind address (default `0.0.0.0:8000`) |
+| `MIRAGEND_MAX_AGENTS` | Cap on concurrently created agents (default `20`); `POST /agents` returns 429 once reached |
+| `MIRAGEND_AGENT_CPUS` / `MIRAGEND_AGENT_MEM_LIMIT` | Per-container resource limits applied to every created agent (default `2` CPUs / `2g` memory) |
 
 Surface (all JSON; `Authorization: Bearer $MIRAGEND_TOKEN`; `GET /health` is
 never guarded and advertises `capabilities` for version-skew detection):

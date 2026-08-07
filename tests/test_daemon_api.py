@@ -154,6 +154,34 @@ def test_error_mapping(client):
     assert mismatch.json()["code"] == "name_mismatch"
 
 
+def test_create_agent_over_cap_is_429(tmp_path):
+    docker_client = FakeDocker()
+    runner = RecordingRunner()
+    runner.on_up = lambda name: docker_client.add(name)
+    core = LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        environ={},
+        runner=runner,
+        not_found=FakeNotFound,
+        max_agents=1,
+    )
+    app = create_app(core, token="daemon-token")
+    capped = TestClient(app)
+    capped.headers["Authorization"] = "Bearer daemon-token"
+
+    assert capped.post(
+        "/agents", json={"name": "alpha", "yaml_source": _yaml("alpha")}
+    ).status_code == 201
+
+    over = capped.post(
+        "/agents", json={"name": "beta", "yaml_source": _yaml("beta")}
+    )
+    assert over.status_code == 429
+    assert over.json()["code"] == "agent_cap_exceeded"
+
+
 def test_validate_endpoint(client):
     good = client.post("/validate", json={"yaml_source": _yaml()})
     assert good.status_code == 200

@@ -49,6 +49,15 @@ EXPORT_EXCLUDE_FILES = frozenset({"history.json"})
 MAX_EXPORT_FILE_BYTES = 10 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 50 * 1024 * 1024
 
+# Defaults for the concurrent-agent cap and per-container resource limits
+# (overridable via MIRAGEND_MAX_AGENTS / MIRAGEND_AGENT_CPUS /
+# MIRAGEND_AGENT_MEM_LIMIT at the miragend entry point). Without these, any
+# caller holding a valid MIRAGEND_TOKEN could spawn containers in an
+# unbounded loop until the host runs out of memory, CPU, or disk.
+DEFAULT_MAX_AGENTS = 20
+DEFAULT_AGENT_CPUS = 2.0
+DEFAULT_AGENT_MEM_LIMIT = "2g"
+
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -110,6 +119,11 @@ class ContainerNotFound(DaemonError):
 class AgentExists(DaemonError):
     status = 409
     code = "agent_exists"
+
+
+class TooManyAgents(DaemonError):
+    status = 429
+    code = "agent_cap_exceeded"
 
 
 class EditConflict(DaemonError):
@@ -321,6 +335,9 @@ class LifecycleCore:
         environ: Mapping[str, str] | None = None,
         runner: Callable = subprocess.run,
         not_found: type[Exception] | None = None,
+        max_agents: int = DEFAULT_MAX_AGENTS,
+        agent_cpus: float = DEFAULT_AGENT_CPUS,
+        agent_mem_limit: str = DEFAULT_AGENT_MEM_LIMIT,
     ) -> None:
         self.workspace = Path(workspace)
         self.agents_dir = self.workspace / "agents"
@@ -332,6 +349,9 @@ class LifecycleCore:
         self._environ = os.environ if environ is None else environ
         self._run = runner
         self._not_found = not_found or _default_not_found()
+        self._max_agents = max_agents
+        self._agent_cpus = agent_cpus
+        self._agent_mem_limit = agent_mem_limit
 
     # -- naming / paths -----------------------------------------------------
 
@@ -466,6 +486,12 @@ class LifecycleCore:
             "environment": env,
             "volumes": [f"./agents/{name}:/agent"],
             "networks": ["miragen-net"],
+            # Caps every created agent to a fixed CPU/memory budget so a
+            # single container (or a client spinning up many) can't exhaust
+            # the host — configurable via MIRAGEND_AGENT_CPUS /
+            # MIRAGEND_AGENT_MEM_LIMIT.
+            "cpus": self._agent_cpus,
+            "mem_limit": self._agent_mem_limit,
         }
         self._write_yaml(self.compose_file, data)
 
@@ -521,11 +547,21 @@ class LifecycleCore:
 
     # -- lifecycle ----------------------------------------------------------
 
+    def _agent_count(self) -> int:
+        if not self.agents_dir.exists():
+            return 0
+        return sum(1 for entry in self.agents_dir.iterdir() if entry.is_dir())
+
     def create_agent(self, name: str, yaml_source: str) -> None:
         self.check_name(name)
         d = self._agent_dir(name)
         if d.exists():
             raise AgentExists(f"agent '{name}' already exists")
+        if self._agent_count() >= self._max_agents:
+            raise TooManyAgents(
+                f"at the cap of {self._max_agents} concurrent agents "
+                "(MIRAGEND_MAX_AGENTS) — delete an agent before creating another"
+            )
 
         profile_name = None
         try:
