@@ -1,0 +1,13 @@
+# Confirmed false positives, verified by hand against gitleaks 8.24.3 (the
+# version CI runs) -- see the comment above each fingerprint for why it's
+# not a secret. See miragen#63.
+
+# miragen/app.py:465, commit 30dd1bd3e115142d1740b4330b8501278004da2d --
+# generic-api-key matched the keyword-arg call `remaining_budget=limit - used`
+# in _daily_budget_status(); there is no secret on that line, it's a plain
+# Python function argument. A later commit (be3298b) rewrote the call to
+# avoid the pattern going forward, but gitleaks-action's push-delta scan
+# (before^..after) re-includes this already-fixed commit's own patch
+# whenever a push's "before" SHA lands on or after it, so the historical
+# finding needs an explicit ignore entry to stop resurfacing.
+30dd1bd3e115142d1740b4330b8501278004da2d:miragen/app.py:generic-api-key:465
