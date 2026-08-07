@@ -5,7 +5,14 @@ from unittest.mock import MagicMock
 import pytest
 
 from miragen.models import RunRecord, RunUsage, ToolCallRecord
-from miragen.runs import AmbiguousRunIdError, RunStore, extract_run_details, simplify_history_messages, tokens_used_since
+from miragen.runs import (
+    AmbiguousRunIdError,
+    RunStore,
+    extract_run_details,
+    reserved_tokens_in_flight,
+    simplify_history_messages,
+    tokens_used_since,
+)
 
 
 class TestRunStoreStartFinish:
@@ -431,3 +438,72 @@ class TestTokensUsedSince:
         store._write(record)
 
         assert tokens_used_since(store, base) == 20
+
+
+class TestReservedTokensInFlight:
+    """miragen#58: tokens_used_since only sees usage recorded by finish(), so
+    a still-running record must be reserved separately or a burst of
+    concurrent run requests can each read the same not-yet-exceeded total."""
+
+    def _running_record(self, run_id, started_at):
+        return RunRecord(
+            run_id=run_id, agent_name="a", trigger="http_async", status="running",
+            prompt="p", started_at=started_at,
+        )
+
+    def _finished_record(self, run_id, started_at, input_tokens, output_tokens):
+        return RunRecord(
+            run_id=run_id, agent_name="a", trigger="cron", status="succeeded",
+            prompt="p", started_at=started_at,
+            usage=RunUsage(requests=1, input_tokens=input_tokens, output_tokens=output_tokens),
+        )
+
+    def test_no_running_records_is_zero(self, tmp_path):
+        store = RunStore(root=tmp_path)
+        since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert reserved_tokens_in_flight(store, since, per_run_reserve=1_000, remaining_budget=5_000) == 0
+
+    def test_finished_records_are_not_reserved(self, tmp_path):
+        store = RunStore(root=tmp_path)
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        store._write(self._finished_record("1" * 32, base, 100, 50))
+
+        assert reserved_tokens_in_flight(store, base, per_run_reserve=1_000, remaining_budget=5_000) == 0
+
+    def test_running_records_before_since_are_excluded(self, tmp_path):
+        store = RunStore(root=tmp_path)
+        midnight = datetime(2026, 1, 2, tzinfo=timezone.utc)
+        store._write(self._running_record("1" * 32, midnight - timedelta(hours=1)))
+
+        assert reserved_tokens_in_flight(store, midnight, per_run_reserve=1_000, remaining_budget=5_000) == 0
+
+    def test_reserves_per_run_reserve_per_running_record(self, tmp_path):
+        store = RunStore(root=tmp_path)
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        store._write(self._running_record("1" * 32, base))
+        store._write(self._running_record("2" * 32, base + timedelta(minutes=1)))
+        # A finished record must not add to the reservation on top of the two running ones.
+        store._write(self._finished_record("3" * 32, base, 10, 10))
+
+        reserved = reserved_tokens_in_flight(store, base, per_run_reserve=1_000, remaining_budget=50_000)
+        assert reserved == 2_000
+
+    def test_no_per_run_reserve_configured_reserves_whole_remaining_budget(self, tmp_path):
+        """No tokens_per_run to size the reservation on -- a single in-flight
+        run's real cost is unknown and could be anything up to the whole
+        budget, so reserve all of it rather than under-reserve."""
+        store = RunStore(root=tmp_path)
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        store._write(self._running_record("1" * 32, base))
+        store._write(self._running_record("2" * 32, base + timedelta(minutes=1)))
+
+        reserved = reserved_tokens_in_flight(store, base, per_run_reserve=None, remaining_budget=5_000)
+        assert reserved == 5_000
+
+    def test_negative_remaining_budget_reserves_zero_not_negative(self, tmp_path):
+        store = RunStore(root=tmp_path)
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        store._write(self._running_record("1" * 32, base))
+
+        reserved = reserved_tokens_in_flight(store, base, per_run_reserve=None, remaining_budget=-500)
+        assert reserved == 0
