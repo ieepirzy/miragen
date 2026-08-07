@@ -139,7 +139,14 @@ def build_agent(
         # miragen's provider — so the run-context processor stamps `mira.*`
         # run identity onto every one of these spans too.
         capabilities.append(
-            Instrumentation(InstrumentationSettings(tracer_provider=telemetry.provider))
+            Instrumentation(
+                InstrumentationSettings(
+                    tracer_provider=telemetry.provider,
+                    # pydantic-ai defaults to exporting prompts, responses and
+                    # tool arguments; span data carries mechanical facts only.
+                    include_content=False,
+                )
+            )
         )
 
     limits_kwargs: dict[str, int] = {}

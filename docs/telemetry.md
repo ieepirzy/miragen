@@ -66,8 +66,12 @@ non-zero exit), diff harvest, and interventions. The
 `miragen.intervention.*` attributes including `approval_ref`.
 
 Span attributes carry **mechanical facts only** — no message payloads, no
-diffs, no file contents. Large content stays in the run record, the event
-stream, and the artifact sink; a span references it, it doesn't embed it.
+diffs, no file contents. On the model tier that means pydantic-ai's
+instrumentation runs with `include_content=False` (its default captures
+prompts, responses and tool arguments); on the executor tier, agent
+messages and intervention question text are excluded from the span
+translation. Large content stays in the run record, the event stream, and
+the artifact sink; a span references it, it doesn't embed it.
 And deliberately no LLM-in-the-loop analytics (no judge scores, no
 model-authored classifications) — spans state what happened, not what a
 model thinks about it.

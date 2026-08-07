@@ -415,9 +415,10 @@ class MiragenTelemetry:
                 "intervention requested",
                 start_ns=ts_ns,
                 attrs={
+                    # The question text is payload (it can quote findings,
+                    # paths, credentials); only mechanical facts export.
                     "miragen.intervention.id": event.get("intervention_id"),
                     "miragen.intervention.kind": event.get("kind"),
-                    "miragen.intervention.question": event.get("question"),
                     "miragen.intervention.source": event.get("source"),
                 },
             )

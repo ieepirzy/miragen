@@ -163,3 +163,26 @@ async def test_model_tier_failed_run_still_writes_events(model_client, tmp_path)
     run_id = app_module._run_store.list(limit=1)[0].run_id
     body = (await model_client.get(f"/runs/{run_id}/events")).json()
     assert any(e["type"] == "turn.failed" for e in body["events"])
+
+
+async def test_model_tier_failed_stream_still_writes_events(model_client):
+    class _FailingStreamAgent:
+        def run_stream(self, prompt, usage_limits=None, message_history=None):
+            class _Ctx:
+                async def __aenter__(self):
+                    raise RuntimeError("stream exploded")
+
+                async def __aexit__(self, *exc):
+                    return False
+
+            return _Ctx()
+
+    app_module._agent = _FailingStreamAgent()
+    # The exception escapes mid-stream, so it surfaces while the body is read
+    # rather than as a status code.
+    with pytest.raises(Exception):
+        await model_client.post("/run/stream", json={"prompt": "go"})
+    record = app_module._run_store.list(limit=1)[0]
+    assert record.status == "failed"
+    body = (await model_client.get(f"/runs/{record.run_id}/events")).json()
+    assert any(e["type"] == "turn.failed" for e in body["events"])

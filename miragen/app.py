@@ -1868,6 +1868,7 @@ async def run_stream(request: RunRequest):
         except Exception as e:
             if record is not None and _run_store is not None:
                 _run_store.finish(record, status="failed", error=str(e), output="".join(chunks) or None)
+                _write_model_run_events(record.run_id, error=str(e))
             raise
         if record is not None and _run_store is not None:
             try:

@@ -228,6 +228,36 @@ def test_agent_message_content_stays_out_of_spans():
     assert not any("secret sauce" in str(v) for s in spans for v in s.attributes.values())
 
 
+def test_intervention_question_stays_out_of_spans():
+    telemetry, exporter = make_telemetry()
+    start = datetime(2026, 8, 7, 12, 0, tzinfo=timezone.utc)
+    question = "prod DB found at 10.0.0.5 with creds in .env — drop it?"
+    events = _stamped(
+        [{
+            "type": "intervention.requested",
+            "intervention_id": "iv-1",
+            "kind": "approval",
+            "question": question,
+            "source": "ask_human",
+        }],
+        start,
+    )
+    telemetry.emit_executor_turn(
+        events, run_id="r", trigger=None, executor="codex", status="suspended",
+        started_at=start, finished_at=start,
+    )
+    telemetry.provider.force_flush()
+    spans = spans_by_name(exporter)
+    (span,) = spans["intervention requested"]
+    # Mechanical facts stay; the human-facing question is payload.
+    assert span.attributes["miragen.intervention.id"] == "iv-1"
+    assert span.attributes["miragen.intervention.kind"] == "approval"
+    assert span.attributes["miragen.intervention.source"] == "ask_human"
+    assert not any(
+        question in str(v) for s in exporter.get_finished_spans() for v in s.attributes.values()
+    )
+
+
 # ── Env wiring ───────────────────────────────────────────────────────────────
 
 
@@ -264,6 +294,35 @@ def test_build_agent_wires_instrumentation_capability():
 
     agent_off, _ = build_agent(profile)
     assert not any(isinstance(c, Instrumentation) for c in flatten(agent_off.root_capability))
+
+
+async def test_model_instrumentation_captures_no_content():
+    """pydantic-ai's instrumentation defaults to exporting prompts, responses
+    and tool arguments; the factory must switch that off — span data carries
+    mechanical facts only, same as the executor-side translation."""
+    from miragen.factory import build_agent
+
+    telemetry, exporter = make_telemetry()
+    profile = model_profile()
+    profile.spec.model = "test"  # pydantic-ai TestModel — no network
+    agent, _limits = build_agent(profile, telemetry=telemetry)
+
+    sentinel = "SECRET-PROMPT-b6f2"
+    await agent.run(sentinel)
+    telemetry.provider.force_flush()
+
+    spans = exporter.get_finished_spans()
+    assert spans  # instrumentation did export request spans
+    leaked = [
+        (s.name, where)
+        for s in spans
+        for where, values in (
+            ("attr", list(s.attributes.values())),
+            ("event", [v for e in s.events for v in e.attributes.values()]),
+        )
+        if any(sentinel in str(v) for v in values)
+    ]
+    assert not leaked, f"prompt content exported to telemetry: {leaked}"
 
 
 # ── App integration, both tiers ──────────────────────────────────────────────
