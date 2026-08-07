@@ -689,6 +689,14 @@ class ExecutorSpec(_ProfileModel):
                     "grok-build host leash requires grok_transport: acp "
                     "(headless has no pre-tool approval seam)"
                 )
+            if self.mcp_servers and self.grok_transport == "headless":
+                # Same dead-config rule as leash+headless: the headless
+                # transport has no injection seam, so declared servers would
+                # silently never reach the agent.
+                raise ValueError(
+                    "grok-build `mcp_servers` injection requires grok_transport: acp "
+                    "(headless reads MCP config only from GROK_HOME / project .grok/)"
+                )
         else:
             if self.grok_home is not None:
                 raise ValueError(f"`grok_home` only applies to the grok-build executor, not '{self.executor}'")

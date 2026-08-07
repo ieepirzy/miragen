@@ -179,9 +179,49 @@ activity), the workspace is keyed to the agent-run.
 | `POST /runs/{id}/resume` `{prompt}` | Re-open the thread of a suspended/failed run. |
 | `POST /runs/{id}/abandon?discard_workspace=` | Human-terminal; optionally discard the workspace. |
 | `GET /runs/{id}/diff` | The harvested diff (404 until terminal success). |
-| `GET /runs/{id}/events` | Executor event stream: turn events, item/tool events, errors. |
+| `GET /runs/{id}/events` | Run event stream: turn events, item/tool events, errors. |
 
 `POST /run/stream` returns 400 for executor profiles — poll `/events`.
+`POST /run` / `/run/async` with `use_history: true` return 400 — the
+executor thread is the conversation state; resume the run instead.
+
+`GET /runs/{id}/events` is no longer executor-only (capability
+`run-events-unified/v1`): model-tier runs write their turn's events —
+tool calls, usage, outcome — into the same per-run stream after the fact,
+with the same envelope/sequence/cursor contract. Executor streams stay
+richer (live lifecycle/timing events); the read side is tier-uniform.
+
+### ask_human over MCP
+
+The MCP-tool variant of structured interventions
+([design/structured-interventions.md](design/structured-interventions.md) §5)
+is served by miragen itself at `/mcp/ask-human` (streamable HTTP,
+stateless). The tool writes exactly the `.miragen/intervention.json`
+sentinel — detection, validation, id-stamping, archiving, event emission
+and suspension are the existing base-tier machinery, unchanged. Opt in per
+profile:
+
+```yaml
+executor:
+  mcp_servers:
+    - name: miragen
+      url: http://localhost:8000/mcp/ask-human
+      bearer_token_env: MIRAGEN_INTERNAL_TOKEN   # when the app is token-guarded
+```
+
+Run binding: with exactly one `running` run (the normal one-agent-per-
+container case) the question binds to it; with several the agent must pass
+`run_id`; with none the tool errors and points back at the sentinel file.
+The mounted endpoint honors `MIRAGEN_INTERNAL_TOKEN` (as `X-Miragen-Token`
+or a bearer token) exactly like the run endpoints.
+
+### OTLP telemetry
+
+With `MIRAGEN_OTLP_ENDPOINT` set, each executor turn's slice of the event
+stream is translated post-hoc into OTel spans (root turn span + workspace
+setup / repo prep / tool / harvest / intervention children, using the
+events' own timestamps) and exported over OTLP/HTTP. See
+[telemetry.md](telemetry.md).
 
 ## SDK integration
 
@@ -212,9 +252,11 @@ subscription-first via a shared `kimi_home` (`KIMI_CODE_HOME`) or metered
 baked into the image) and the `grok` binary. Transports:
 
 - `grok_transport: headless` (default) — `grok -p` + streaming-json; mint
-  UUID (`-s`) / resume (`-r`). No host leash; MCP not injected.
+  UUID (`-s`) / resume (`-r`). No host leash; no MCP injection — declaring
+  `leash` or `mcp_servers` under headless is rejected at profile validation
+  (dead config would otherwise read as a guardrail).
 - `grok_transport: acp` — `grok agent stdio` via the client; required for
-  host leash, preferred for MCP injection on `session/new`.
+  host leash and for `mcp_servers` injection on `session/new`.
 
 Auth is subscription-first via shared `grok_home` (`GROK_HOME`,
 `miragen grok-login --device-auth`) or metered `XAI_API_KEY`.
