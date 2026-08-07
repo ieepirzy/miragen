@@ -458,6 +458,16 @@ class TestReservedTokensInFlight:
             usage=RunUsage(requests=1, input_tokens=input_tokens, output_tokens=output_tokens),
         )
 
+    def _resumed_record(self, run_id, started_at, input_tokens, output_tokens):
+        """RunStore.reopen() flips status back to 'running' but keeps the
+        usage accumulated across earlier turns -- unlike a fresh running
+        record, this one is not usage=None."""
+        return RunRecord(
+            run_id=run_id, agent_name="a", trigger="http_async", status="running",
+            prompt="p", started_at=started_at,
+            usage=RunUsage(requests=1, input_tokens=input_tokens, output_tokens=output_tokens),
+        )
+
     def test_no_running_records_is_zero(self, tmp_path):
         store = RunStore(root=tmp_path)
         since = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -507,3 +517,49 @@ class TestReservedTokensInFlight:
 
         reserved = reserved_tokens_in_flight(store, base, per_run_reserve=None, remaining_budget=-500)
         assert reserved == 0
+
+    def test_resumed_run_reserves_only_its_remaining_allowance(self, tmp_path):
+        """A resumed run already has 500 of a 600 tokens_per_run cap counted
+        by tokens_used_since (its usage survives reopen()). Reserving the
+        full 600 again here would double-count it and falsely exceed the
+        budget for unrelated runs -- only the 100 tokens it could still use
+        should be reserved."""
+        store = RunStore(root=tmp_path)
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        store._write(self._resumed_record("1" * 32, base, input_tokens=300, output_tokens=200))
+
+        reserved = reserved_tokens_in_flight(store, base, per_run_reserve=600, remaining_budget=50_000)
+        assert reserved == 100
+
+    def test_resumed_run_that_already_used_its_full_allowance_reserves_zero(self, tmp_path):
+        store = RunStore(root=tmp_path)
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        store._write(self._resumed_record("1" * 32, base, input_tokens=400, output_tokens=250))
+
+        reserved = reserved_tokens_in_flight(store, base, per_run_reserve=600, remaining_budget=50_000)
+        assert reserved == 0
+
+    def test_fresh_and_resumed_running_records_combine_correctly(self, tmp_path):
+        store = RunStore(root=tmp_path)
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        store._write(self._running_record("1" * 32, base))  # fresh: usage=None, reserves the full cap
+        store._write(self._resumed_record("2" * 32, base, input_tokens=500, output_tokens=0))  # reserves 100
+
+        reserved = reserved_tokens_in_flight(store, base, per_run_reserve=600, remaining_budget=50_000)
+        assert reserved == 600 + 100
+
+    def test_matches_daily_budget_status_end_to_end_for_a_resumed_run(self, tmp_path):
+        """Full miragen#58 + Codex-review scenario together: a profile with
+        tokens_per_day=1000 and tokens_per_run=600 has one resumed run that
+        already used 500. used (tokens_used_since) must fold in the 100
+        remaining reservation, not another full 600, for a total of 600 --
+        not 1100."""
+        store = RunStore(root=tmp_path)
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        store._write(self._resumed_record("1" * 32, base, input_tokens=300, output_tokens=200))
+
+        limit = 1_000
+        used = tokens_used_since(store, base)
+        used += reserved_tokens_in_flight(store, base, per_run_reserve=600, remaining_budget=limit - used)
+
+        assert used == 600
