@@ -125,13 +125,16 @@ def test_empty_token_disables_the_guard(tmp_path):
     assert unguarded.get("/agents").status_code == 200
 
 
-# ── non-ASCII tokens (hmac.compare_digest raises on non-ASCII str) ─────────
+# ── non-ASCII tokens ─────────────────────────────────────────────────────
 #
 # hmac.compare_digest(a, b) raises TypeError when either str operand
-# contains a non-ASCII character. A plain TestClient re-encodes header
-# values as ASCII/latin-1 before they ever reach the app, so it can't
-# reproduce a raw non-ASCII Authorization header — httpx's AsyncClient over
-# ASGITransport is used instead so real non-ASCII bytes make it through.
+# contains a non-ASCII character, and comparing the wrong byte
+# representation of a non-ASCII token silently mangles it so it can never
+# match. A plain TestClient re-encodes header values as ASCII/latin-1
+# before they ever reach the app, so it can't reproduce a raw non-ASCII
+# Authorization header — httpx's AsyncClient over ASGITransport is used
+# instead so real (UTF-8-encoded) non-ASCII wire bytes make it through
+# unaltered.
 
 
 async def test_non_ascii_authorization_header_is_401_not_500(tmp_path):
@@ -159,21 +162,41 @@ async def test_non_ascii_configured_token_does_not_crash(tmp_path):
     assert resp.json()["code"] == "unauthorized"
 
 
-async def test_matching_non_ascii_token_authenticates(tmp_path):
+async def test_matching_utf8_token_authenticates(tmp_path):
+    # A real UTF-8-aware client sends non-ASCII header bytes UTF-8-encoded
+    # on the wire (not latin-1-encoded) — "café" is 5 codepoints but 6 UTF-8
+    # bytes (é is 2 bytes), so this exercises an actual multi-byte
+    # character, not one that happens to already fit in a single latin-1
+    # byte. require_token must compare against the raw wire bytes so this
+    # authenticates correctly instead of being mangled by a latin-1
+    # decode/utf-8 re-encode round trip.
     core = _make_core(tmp_path)
-    token = "tökén-with-ünicode"
+    token = "café-token"
     app = create_app(core, token=token)
     transport = ASGITransport(app=app)
-    # Starlette decodes raw header bytes as latin-1 (ISO-8859-1, per the HTTP
-    # spec), so send the header pre-encoded the same way — that's what makes
-    # request.headers.get(...) come back byte-identical to `token` here (all
-    # of its characters happen to be in the latin-1 range).
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         resp = await c.get(
             "/agents",
-            headers=[(b"authorization", f"Bearer {token}".encode("latin-1"))],
+            headers=[(b"authorization", f"Bearer {token}".encode("utf-8"))],
         )
     assert resp.status_code == 200
+
+
+async def test_mismatched_utf8_token_is_401_not_500(tmp_path):
+    # Same wire encoding as above, but the supplied token doesn't match the
+    # configured one — must cleanly reject, not crash.
+    core = _make_core(tmp_path)
+    app = create_app(core, token="café-token")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get(
+            "/agents",
+            headers=[
+                (b"authorization", "Bearer café-wrong".encode("utf-8"))
+            ],
+        )
+    assert resp.status_code == 401
+    assert resp.json()["code"] == "unauthorized"
 
 
 # ── lifecycle over HTTP ──────────────────────────────────────────────────────
