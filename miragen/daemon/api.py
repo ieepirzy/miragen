@@ -124,8 +124,25 @@ def create_app(
     async def require_token(request: Request) -> None:
         if not token:
             return
-        supplied = request.headers.get("authorization", "")
-        if not hmac.compare_digest(supplied, f"Bearer {token}"):
+        # request.headers.get() returns a str that Starlette produced by
+        # decoding the raw wire bytes as latin-1 (never raises, since
+        # latin-1 maps every byte 0-255 to a codepoint). That decode is not
+        # invertible via .encode("utf-8"): a client that sent a non-ASCII
+        # token UTF-8-encoded on the wire ends up, after latin-1 decode,
+        # with a str whose UTF-8 re-encoding does not reproduce the
+        # original bytes — so no UTF-8 non-ASCII token could ever match,
+        # even the correct one. Use request.headers.raw instead, which
+        # exposes the untouched wire bytes directly (ASGI servers always
+        # deliver header names lowercased), and compare those bytes as-is
+        # against the configured token UTF-8-encoded (what a UTF-8-aware
+        # client actually puts on the wire).
+        supplied_bytes = b""
+        for raw_name, raw_value in request.headers.raw:
+            if raw_name == b"authorization":
+                supplied_bytes = raw_value
+                break
+        expected_bytes = f"Bearer {token}".encode("utf-8")
+        if not hmac.compare_digest(supplied_bytes, expected_bytes):
             raise DaemonUnauthorized("missing or invalid bearer token")
 
     guarded = [Depends(require_token)]

@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -346,6 +347,15 @@ class LifecycleCore:
         self._environ = os.environ if environ is None else environ
         self._run = runner
         self._not_found = not_found or _default_not_found()
+        # create_agent/import_agent both do a check-then-act against
+        # _agent_count() before committing a new agent (mkdir / shutil.move).
+        # The daemon's request handlers can run concurrently in separate
+        # worker threads, so without serializing that check+commit pair two
+        # racing requests can both observe the same under-cap count and both
+        # proceed — even with MIRAGEND_MAX_AGENTS=1. This lock closes that
+        # window; hold it only across the count check through the step that
+        # actually commits the new agent, not the slower I/O around it.
+        self._agent_creation_lock = threading.Lock()
 
     # -- naming / paths -----------------------------------------------------
 
@@ -557,16 +567,9 @@ class LifecycleCore:
         if d.exists():
             raise AgentExists(f"agent '{name}' already exists")
 
-        max_agents = int(self._environ.get("MIRAGEND_MAX_AGENTS", DEFAULT_MAX_AGENTS))
-        current = self._agent_count()
-        if current >= max_agents:
-            raise AgentLimitExceeded(
-                f"agent limit reached ({current}/{max_agents}) — delete an existing "
-                "agent or raise MIRAGEND_MAX_AGENTS before creating another",
-                limit=max_agents,
-                current=current,
-            )
-
+        # Validate before touching the cap/lock: it's pure computation (no
+        # effect on _agent_count()), so it belongs outside the critical
+        # section — the lock below should cover only the check-then-act pair.
         profile_name = None
         try:
             summary = validate_profile_text(yaml_source)
@@ -579,8 +582,25 @@ class LifecycleCore:
                 f"created as '{name}' — set 'name: {name}' in the YAML"
             )
 
+        max_agents = int(self._environ.get("MIRAGEND_MAX_AGENTS", DEFAULT_MAX_AGENTS))
+        # Check-then-act: reading the count and creating the directory that
+        # count is derived from must be atomic, or two concurrent callers can
+        # both pass the check before either directory exists (see #61 review).
+        with self._agent_creation_lock:
+            current = self._agent_count()
+            if current >= max_agents:
+                raise AgentLimitExceeded(
+                    f"agent limit reached ({current}/{max_agents}) — delete an existing "
+                    "agent or raise MIRAGEND_MAX_AGENTS before creating another",
+                    limit=max_agents,
+                    current=current,
+                )
+            try:
+                d.mkdir(parents=True)
+            except Exception as exc:
+                raise DaemonError(str(exc)) from exc
+
         try:
-            d.mkdir(parents=True)
             (d / "agent.yaml").write_text(yaml_source)
             (d / "tools.py").write_text(
                 f"from miragen import register\n\n# Tools for {name}\n"
@@ -905,11 +925,24 @@ class LifecycleCore:
             raise AgentExists(f"agent '{name}' already exists")
 
         max_agents = int(self._environ.get("MIRAGEND_MAX_AGENTS", DEFAULT_MAX_AGENTS))
+
+        # Optimistic, lock-free cap check, as early as possible — before the
+        # uploaded archive is even opened. Extraction below is real work
+        # (opening a gzip tar, walking and writing out every member up to
+        # MAX_ARCHIVE_BYTES) that's entirely wasted when the daemon is
+        # already at/over MIRAGEND_MAX_AGENTS, since the authoritative check
+        # further down is guaranteed to reject it anyway. This check reads
+        # _agent_count() with no lock, so it's inherently racy (a concurrent
+        # import/create can land between this read and the real check) —
+        # it exists purely to short-circuit the common case, not to replace
+        # the race-safe check-then-act guard inside _agent_creation_lock
+        # right before the commit (shutil.move) below.
         current = self._agent_count()
         if current >= max_agents:
             raise AgentLimitExceeded(
-                f"agent limit reached ({current}/{max_agents}) — delete an existing "
-                "agent or raise MIRAGEND_MAX_AGENTS before importing another",
+                f"agent limit reached ({current}/{max_agents}) — delete an "
+                "existing agent or raise MIRAGEND_MAX_AGENTS before "
+                "importing another",
                 limit=max_agents,
                 current=current,
             )
@@ -961,8 +994,23 @@ class LifecycleCore:
             validate_profile_text(rewritten)
 
             d.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src_root), str(d))
-            created_dir = True
+            # Everything above operates on `staging`, not agents_dir, so it
+            # doesn't affect _agent_count() and doesn't need the lock. The
+            # move is the commit step — pair it tightly with the cap check
+            # so two concurrent imports can't both pass the check before
+            # either agent directory actually exists (see #61 review).
+            with self._agent_creation_lock:
+                current = self._agent_count()
+                if current >= max_agents:
+                    raise AgentLimitExceeded(
+                        f"agent limit reached ({current}/{max_agents}) — delete an "
+                        "existing agent or raise MIRAGEND_MAX_AGENTS before "
+                        "importing another",
+                        limit=max_agents,
+                        current=current,
+                    )
+                shutil.move(str(src_root), str(d))
+                created_dir = True
 
             self._compose_add_service(name)
             added_service = True
