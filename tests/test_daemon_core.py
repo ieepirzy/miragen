@@ -2,6 +2,7 @@
 no socket, no subprocesses."""
 
 import tarfile
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ import pytest
 
 from miragen.daemon.core import (
     AgentExists,
+    AgentLimitExceeded,
     AgentNotFound,
     ArchiveNotFound,
     ContainerNotFound,
@@ -222,6 +224,50 @@ def test_create_agent_start_failure_rolls_back(core, runner, tmp_path):
 
     compose = pyyaml.safe_load((tmp_path / "compose.yml").read_text())
     assert "alpha" not in compose.get("services", {})
+
+
+def test_create_agent_concurrent_race_respects_cap(tmp_path):
+    # Regression for the TOCTOU race: MIRAGEND_MAX_AGENTS=1 with several
+    # threads racing create_agent for *different* names must still let
+    # exactly one through — the pre-lock version let every thread pass the
+    # cap check before any of them had created a directory.
+    docker_client = FakeDocker()
+    runner = RecordingRunner()
+    runner.on_up = lambda name: docker_client.add(name)
+    core = LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        environ={"MIRAGEND_MAX_AGENTS": "1"},
+        runner=runner,
+        not_found=FakeNotFound,
+    )
+
+    n = 6
+    results: list[str] = [""] * n
+    barrier = threading.Barrier(n)
+
+    def worker(i: int) -> None:
+        barrier.wait()
+        try:
+            core.create_agent(f"racer{i}", _yaml(f"racer{i}"))
+            results[i] = "ok"
+        except AgentLimitExceeded:
+            results[i] = "limited"
+        except Exception as exc:  # pragma: no cover - would fail the test below
+            results[i] = f"error: {exc!r}"
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results.count("ok") == 1, results
+    assert results.count("limited") == n - 1, results
+
+    created = [p for p in (tmp_path / "agents").iterdir() if p.is_dir()]
+    assert len(created) == 1
 
 
 def test_list_agents_reports_status_and_endpoint(core, docker_client):
@@ -446,3 +492,58 @@ def test_import_missing_archive(core):
 def test_import_archive_path_escape_rejected(core):
     with pytest.raises(InvalidPath):
         core.import_agent("beta", "/etc/passwd")
+
+
+def test_import_agent_concurrent_race_respects_cap(tmp_path):
+    # Same TOCTOU race as create_agent, but through import_agent's
+    # shutil.move commit step.
+    docker_client = FakeDocker()
+    runner = RecordingRunner()
+    runner.on_up = lambda name: docker_client.add(name)
+
+    setup_core = LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        environ={"MIRAGEND_MAX_AGENTS": "100"},
+        runner=runner,
+        not_found=FakeNotFound,
+    )
+    setup_core.create_agent("source", _yaml("source"))
+    archive_path = setup_core.export_agent("source")["archive_path"]
+    setup_core.delete_agent("source")
+
+    race_core = LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        environ={"MIRAGEND_MAX_AGENTS": "1"},
+        runner=runner,
+        not_found=FakeNotFound,
+    )
+
+    n = 6
+    results: list[str] = [""] * n
+    barrier = threading.Barrier(n)
+
+    def worker(i: int) -> None:
+        barrier.wait()
+        try:
+            race_core.import_agent(f"imported{i}", archive_path)
+            results[i] = "ok"
+        except AgentLimitExceeded:
+            results[i] = "limited"
+        except Exception as exc:  # pragma: no cover - would fail the test below
+            results[i] = f"error: {exc!r}"
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results.count("ok") == 1, results
+    assert results.count("limited") == n - 1, results
+
+    created = [p for p in (tmp_path / "agents").iterdir() if p.is_dir()]
+    assert len(created) == 1
