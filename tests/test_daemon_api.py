@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 
 from miragen.daemon.api import DAEMON_CAPABILITIES, create_app
 from miragen.daemon.core import LifecycleCore
@@ -17,6 +18,22 @@ from tests.test_daemon_core import (
     FakeNotFound,
     RecordingRunner,
 )
+
+
+def _make_core(tmp_path, **kw):
+    docker_client = FakeDocker()
+    runner = RecordingRunner()
+    runner.on_up = lambda name: docker_client.add(name)
+    core = LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        environ={},
+        runner=runner,
+        not_found=FakeNotFound,
+        **kw,
+    )
+    return core
 
 
 class FakeJob:
@@ -106,6 +123,57 @@ def test_empty_token_disables_the_guard(tmp_path):
     )
     unguarded = TestClient(create_app(core, token=""))
     assert unguarded.get("/agents").status_code == 200
+
+
+# ── non-ASCII tokens (hmac.compare_digest raises on non-ASCII str) ─────────
+#
+# hmac.compare_digest(a, b) raises TypeError when either str operand
+# contains a non-ASCII character. A plain TestClient re-encodes header
+# values as ASCII/latin-1 before they ever reach the app, so it can't
+# reproduce a raw non-ASCII Authorization header — httpx's AsyncClient over
+# ASGITransport is used instead so real non-ASCII bytes make it through.
+
+
+async def test_non_ascii_authorization_header_is_401_not_500(tmp_path):
+    core = _make_core(tmp_path)
+    app = create_app(core, token="daemon-token")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get(
+            "/agents",
+            headers=[(b"authorization", "Bearer café-token".encode("utf-8"))],
+        )
+    assert resp.status_code == 401
+    assert resp.json()["code"] == "unauthorized"
+
+
+async def test_non_ascii_configured_token_does_not_crash(tmp_path):
+    core = _make_core(tmp_path)
+    app = create_app(core, token="tökén-with-ünicode")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get(
+            "/agents", headers=[(b"authorization", b"Bearer wrong")]
+        )
+    assert resp.status_code == 401
+    assert resp.json()["code"] == "unauthorized"
+
+
+async def test_matching_non_ascii_token_authenticates(tmp_path):
+    core = _make_core(tmp_path)
+    token = "tökén-with-ünicode"
+    app = create_app(core, token=token)
+    transport = ASGITransport(app=app)
+    # Starlette decodes raw header bytes as latin-1 (ISO-8859-1, per the HTTP
+    # spec), so send the header pre-encoded the same way — that's what makes
+    # request.headers.get(...) come back byte-identical to `token` here (all
+    # of its characters happen to be in the latin-1 range).
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get(
+            "/agents",
+            headers=[(b"authorization", f"Bearer {token}".encode("latin-1"))],
+        )
+    assert resp.status_code == 200
 
 
 # ── lifecycle over HTTP ──────────────────────────────────────────────────────

@@ -125,7 +125,19 @@ def create_app(
         if not token:
             return
         supplied = request.headers.get("authorization", "")
-        if not hmac.compare_digest(supplied, f"Bearer {token}"):
+        # hmac.compare_digest raises TypeError on str operands containing
+        # non-ASCII characters. `supplied` is attacker-controlled (the raw
+        # Authorization header) and `token` may itself be configured with
+        # non-ASCII bytes, so either side can carry non-ASCII — encode both
+        # to bytes first so a non-ASCII header/token resolves to a clean 401
+        # instead of crashing the request with an uncaught 500. Starlette
+        # decodes header bytes as latin-1 (never raises) and os.environ
+        # decodes with surrogateescape, so utf-8/surrogateescape encoding
+        # here never raises either, while staying byte-identical to the
+        # normal ASCII case.
+        supplied_bytes = supplied.encode("utf-8", errors="surrogateescape")
+        expected_bytes = f"Bearer {token}".encode("utf-8", errors="surrogateescape")
+        if not hmac.compare_digest(supplied_bytes, expected_bytes):
             raise DaemonUnauthorized("missing or invalid bearer token")
 
     guarded = [Depends(require_token)]
