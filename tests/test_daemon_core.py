@@ -12,6 +12,7 @@ from miragen.daemon.core import (
     AgentExists,
     AgentLimitExceeded,
     AgentNotFound,
+    ArchiveInvalid,
     ArchiveNotFound,
     ContainerNotFound,
     ContainerOperationFailed,
@@ -547,3 +548,54 @@ def test_import_agent_concurrent_race_respects_cap(tmp_path):
 
     created = [p for p in (tmp_path / "agents").iterdir() if p.is_dir()]
     assert len(created) == 1
+
+
+def test_import_agent_rejects_before_extraction_when_at_cap(tmp_path):
+    # The cap check must run — and reject — before the uploaded archive is
+    # ever opened/extracted. Point at a real file that is deliberately not
+    # a valid gzip tarball: if import_agent got as far as tarfile.open, it
+    # would fail loudly with ArchiveInvalid instead of the expected
+    # AgentLimitExceeded, and it would have created a staging directory
+    # under exports/ first. Asserting AgentLimitExceeded (not
+    # ArchiveInvalid) and that no staging dir was left behind proves
+    # extraction never happened.
+    docker_client = FakeDocker()
+    runner = RecordingRunner()
+    runner.on_up = lambda name: docker_client.add(name)
+    core = LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        environ={"MIRAGEND_MAX_AGENTS": "1"},
+        runner=runner,
+        not_found=FakeNotFound,
+    )
+    core.create_agent("alpha", _yaml("alpha"))  # already at the cap (max=1)
+
+    exports_dir = tmp_path / "exports"
+    exports_dir.mkdir(parents=True, exist_ok=True)
+    bogus = exports_dir / "not-a-tarball.tar.gz"
+    bogus.write_bytes(b"this is not gzip data and would blow up tarfile.open")
+
+    before = set(exports_dir.iterdir())
+
+    with pytest.raises(AgentLimitExceeded):
+        core.import_agent("beta", "exports/not-a-tarball.tar.gz")
+
+    after = set(exports_dir.iterdir())
+    # Nothing new (no staging dir) appeared under exports/ — extraction
+    # (tempfile.mkdtemp + tarfile.open + extractall) never ran.
+    assert after == before
+
+    with pytest.raises(ArchiveInvalid):
+        # Sanity check: opening the same bogus archive for real (cap not
+        # in the way) does surface ArchiveInvalid, confirming the file
+        # would indeed "fail loudly" had extraction been attempted above.
+        LifecycleCore(
+            tmp_path,
+            docker_client,
+            base_image="ghcr.io/example/miragen:test",
+            environ={"MIRAGEND_MAX_AGENTS": "100"},
+            runner=runner,
+            not_found=FakeNotFound,
+        ).import_agent("gamma", "exports/not-a-tarball.tar.gz")

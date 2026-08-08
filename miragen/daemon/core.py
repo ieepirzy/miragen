@@ -924,11 +924,32 @@ class LifecycleCore:
         if d.exists():
             raise AgentExists(f"agent '{name}' already exists")
 
+        max_agents = int(self._environ.get("MIRAGEND_MAX_AGENTS", DEFAULT_MAX_AGENTS))
+
+        # Optimistic, lock-free cap check, as early as possible — before the
+        # uploaded archive is even opened. Extraction below is real work
+        # (opening a gzip tar, walking and writing out every member up to
+        # MAX_ARCHIVE_BYTES) that's entirely wasted when the daemon is
+        # already at/over MIRAGEND_MAX_AGENTS, since the authoritative check
+        # further down is guaranteed to reject it anyway. This check reads
+        # _agent_count() with no lock, so it's inherently racy (a concurrent
+        # import/create can land between this read and the real check) —
+        # it exists purely to short-circuit the common case, not to replace
+        # the race-safe check-then-act guard inside _agent_creation_lock
+        # right before the commit (shutil.move) below.
+        current = self._agent_count()
+        if current >= max_agents:
+            raise AgentLimitExceeded(
+                f"agent limit reached ({current}/{max_agents}) — delete an "
+                "existing agent or raise MIRAGEND_MAX_AGENTS before "
+                "importing another",
+                limit=max_agents,
+                current=current,
+            )
+
         full = self._safe_export_path(archive_path)
         if not full.exists():
             raise ArchiveNotFound(f"archive not found: {archive_path}")
-
-        max_agents = int(self._environ.get("MIRAGEND_MAX_AGENTS", DEFAULT_MAX_AGENTS))
 
         staging = None
         created_dir = False
