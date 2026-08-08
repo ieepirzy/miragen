@@ -304,14 +304,54 @@ def tokens_used_since(store: RunStore, since: datetime) -> int:
     """
     Sum input+output tokens across `store`'s run records with started_at >= since.
 
-    Records with no usage (e.g. a run that failed before the model responded)
-    contribute 0 — unknown usage counts as 0, not as unbounded.
+    Records with no usage (e.g. a run that failed before the model responded,
+    or a fresh `running` record that hasn't finished a turn yet) contribute 0
+    — unknown usage counts as 0, not as unbounded. A *resumed* run
+    (`RunStore.reopen()`) is `running` again but keeps the `usage` it
+    accumulated before suspension, so it is NOT unknown here — this already
+    counts it. Callers enforcing a daily budget need `reserved_tokens_in_flight`
+    alongside this to also account for runs that haven't finished a turn yet.
     """
     total = 0
     for record in store._iter_records():
         if record.started_at < since or record.usage is None:
             continue
         total += (record.usage.input_tokens or 0) + (record.usage.output_tokens or 0)
+    return total
+
+
+def reserved_tokens_in_flight(
+    store: RunStore, since: datetime, per_run_reserve: int | None, remaining_budget: int
+) -> int:
+    """
+    Estimated additional token cost of runs started >= since that are still
+    `running` — on top of whatever `tokens_used_since` already counted for them.
+
+    `tokens_used_since` only sees usage recorded so far, so a burst of
+    concurrent run requests issued before any of them record usage would each
+    read the same not-yet-exceeded total and all pass a daily-budget check —
+    see miragen#58. Each in-flight run reserves up to `per_run_reserve` tokens
+    (a profile's `limits.tokens_per_run`, its own worst-case-per-run bound)
+    when one is configured, MINUS whatever usage it has already recorded — a
+    resumed run (`RunStore.reopen()`) keeps its prior accumulated usage across
+    the status flip back to `running`, and `tokens_used_since` already counts
+    that; reserving the full `per_run_reserve` again on top of it would double
+    -count and falsely exceed the budget for unrelated runs. Without
+    `per_run_reserve` there is no bound to size a reservation on at all, so a
+    single in-flight run reserves the entire `remaining_budget` instead — the
+    conservative choice, since its real cost is unknown and could be anything
+    up to the whole budget.
+    """
+    total = 0
+    for record in store._iter_records():
+        if record.started_at < since or record.status != "running":
+            continue
+        if per_run_reserve is None:
+            return max(remaining_budget, 0)
+        already_used = 0
+        if record.usage is not None:
+            already_used = (record.usage.input_tokens or 0) + (record.usage.output_tokens or 0)
+        total += max(per_run_reserve - already_used, 0)
     return total
 
 

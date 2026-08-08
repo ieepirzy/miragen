@@ -65,6 +65,7 @@ from miragen.runs import (
     AmbiguousRunIdError,
     RunStore,
     extract_run_details,
+    reserved_tokens_in_flight,
     run_retention_from_env,
     simplify_history_messages,
     tokens_used_since,
@@ -447,14 +448,22 @@ def _record_snapshot_commits(run_id: str, revisions: list[RepositoryRevision]) -
 
 
 def _daily_budget_status() -> tuple[int, int] | None:
-    """(used, limit) today (UTC) if profile.limits.tokens_per_day is configured, else None."""
+    """(used, limit) today (UTC) if profile.limits.tokens_per_day is configured, else None.
+
+    `used` folds in a reservation for runs still `running`, not just usage
+    already recorded by `finish()` — otherwise concurrent run requests issued
+    before any of them complete each see the same total and all pass. See
+    reserved_tokens_in_flight and miragen#58."""
     if _profile is None or _profile.limits is None or _profile.limits.tokens_per_day is None:
         return None
     if _run_store is None:
         return None
     midnight_utc = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    limit = _profile.limits.tokens_per_day
     used = tokens_used_since(_run_store, midnight_utc)
-    return used, _profile.limits.tokens_per_day
+    still_remaining = limit - used
+    used += reserved_tokens_in_flight(_run_store, midnight_utc, _profile.limits.tokens_per_run, still_remaining)
+    return used, limit
 
 
 async def _notify_budget_exceeded(used: int, limit: int) -> None:

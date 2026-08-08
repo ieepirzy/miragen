@@ -968,6 +968,38 @@ class TestBudgetGuardrails:
 
         assert resp.status_code == 429
 
+    async def test_run_async_second_call_rejected_while_first_still_running(self, tmp_path):
+        """miragen#58 regression: tokens_used_since only sees usage recorded
+        by finish(), so before this fix a second /run/async call issued while
+        the first is still in flight would read the same not-yet-exceeded
+        total (0 completed usage) and pass the budget check too, unbounded."""
+        from miragen.runs import RunStore
+
+        profile = _make_profile(limits={"tokens_per_day": 100})  # no tokens_per_run to reserve against
+        app_module._profile = profile
+        app_module._run_store = RunStore(root=tmp_path)
+
+        release = asyncio.Event()
+
+        async def slow_run(*args, **kwargs):
+            await release.wait()
+            return _mock_run_result()
+
+        app_module._agent = MagicMock(run=AsyncMock(side_effect=slow_run))
+
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                first = await c.post("/run/async", json={"prompt": "hi"})
+                assert first.status_code == 202
+
+                second = await c.post("/run/async", json={"prompt": "hi"})
+        finally:
+            release.set()
+            await asyncio.sleep(0)  # let the background task finish and stop referencing app_module state
+
+        assert second.status_code == 429
+        assert "100/100" in second.json()["detail"]
+
     async def test_yesterdays_usage_does_not_count(self, profile_with_daily_limit, tmp_path):
         yesterday = self._midnight_utc() - timedelta(hours=1)
         store = self._seed_usage(tmp_path, started_at=yesterday, input_tokens=10_000, output_tokens=10_000)
