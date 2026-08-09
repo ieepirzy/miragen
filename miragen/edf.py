@@ -515,9 +515,105 @@ _SANDBOX_MODES = {
 
 # spawn is deliberately absent: it needs an argv template, which EDF v1alpha1
 # cannot express.
-_RESOLVABLE_KINDS = {"codex", "claude-code"}
+#
+# "model" is the model tier — miragen owns the loop via pydantic-ai rather
+# than shelling out to a self-harnessed CLI. Added without an apiVersion bump
+# because it is purely additive: every existing codex/claude-code document
+# resolves byte-identically, and a resolver that predates this kind rejects a
+# model-tier document on its own (fail-closed). Clients feature-detect the
+# capability string, not the schema version.
+_MODEL_KIND = "model"
+_RESOLVABLE_KINDS = {"codex", "claude-code", _MODEL_KIND}
 
 _MCP_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _resolve_model_tier_spec(
+    spec: Any,
+    context: ResolutionContext,
+    mcp_servers: list[dict[str, Any]],
+    warnings: list[str],
+) -> dict[str, Any]:
+    """Map an EDF onto a model-tier AgentSpec.
+
+    Capabilities are DERIVED from spec.tools rather than declared directly.
+    EDF stays backend-neutral — it describes what the environment may do, and
+    each tier maps that onto its own machinery. Letting a document name
+    miragen's capability classes would leak one backend's internals into a
+    document the control plane validates without knowing any backend.
+    """
+    if not spec.executor.model:
+        raise _error(
+            "spec.executor.model",
+            "model-tier EDFs must name a model (any pydantic-ai model string, "
+            "e.g. 'anthropic:claude-sonnet-4-6') — unlike a self-harnessed "
+            "executor, there is no CLI default to fall back to",
+        )
+
+    if spec.workspace.repositories:
+        # The model tier has no workspace checkout: miragen owns the loop and
+        # never prepares a repo tree for it. Accepting these would hand the
+        # launcher a checkout plan nothing acts on, and the run would look
+        # successful while the agent saw no code at all.
+        raise _error(
+            "spec.workspace.repositories",
+            "the model tier has no workspace checkout, so declared repositories "
+            "would never be materialised. Use an executor-tier kind for runs "
+            "that need a repository tree",
+        )
+
+    capabilities: list[Any] = []
+    if spec.tools.web_search:
+        capabilities.append("WebSearch")
+    # reasoningEffort is a first-class EDF field for both tiers; the model
+    # tier expresses it as a configured capability rather than a run flag.
+    capabilities.append({"Thinking": {"effort": spec.executor.reasoning_effort}})
+    for server in mcp_servers:
+        if "bearer_token_env" in server:
+            # The model tier's MCP capability takes url and name only — it has
+            # nowhere to put a bearer token. Resolving this anyway would drop
+            # the credential silently and send an unauthenticated agent at a
+            # server that requires one, so refuse instead. This is the one
+            # place the two tiers are genuinely not at parity.
+            raise _error(
+                "spec.tools.mcpServers",
+                f"mcpServer '{server['name']}' declares auth, which the model "
+                "tier cannot carry — its MCP capability accepts no bearer "
+                "token. Use an executor-tier kind for authenticated MCP "
+                "servers, or drop the auth block",
+            )
+        capabilities.append({"MCP": {"url": server["url"], "name": server["name"]}})
+
+    # Fields the model tier has no equivalent for. Warned rather than ignored:
+    # a caller who set them believes they took effect. Not raised, because
+    # each has a safe reading here — miragen owns the loop, so there is no
+    # self-harnessed sandbox to widen and no executor approval flow to skip.
+    executor_set = spec.executor.model_fields_set
+    if "sandbox" in executor_set:
+        warnings.append(
+            "spec.executor.sandbox does not apply to the model tier: miragen owns "
+            "the loop, so there is no executor sandbox to configure. The agent is "
+            "confined by its container, not by this field."
+        )
+    if "approvals" in executor_set:
+        warnings.append(
+            "spec.executor.approvals does not apply to the model tier: gating is "
+            "the profile's approval_required/approval_mode, not an executor "
+            "approval policy."
+        )
+    if "timeout" in executor_set:
+        warnings.append(
+            "spec.executor.timeout does not apply to the model tier: there is no "
+            "per-turn executor timeout to set."
+        )
+
+    model_spec: dict[str, Any] = {
+        "model": spec.executor.model,
+        "instructions": context.instructions or DEFAULT_INSTRUCTIONS,
+    }
+    if capabilities:
+        model_spec["capabilities"] = capabilities
+    return model_spec
 
 
 def resolve_edf(
@@ -570,26 +666,28 @@ def resolve_edf(
             **({"bearer_token_env": bearer_token_env} if bearer_token_env else {}),
         })
 
-    executor_spec: dict[str, Any] = {
-        "executor": kind,
-        "instructions": context.instructions or DEFAULT_INSTRUCTIONS,
-        "model": spec.executor.model,
-        "sandbox_mode": _SANDBOX_MODES[spec.executor.sandbox.mode],
-        "approval_policy": "never" if spec.executor.approvals.unattended else "on-request",
-        "network_access": spec.network.outbound == "allowlist",
-        "web_search": spec.tools.web_search,
-        "reasoning_effort": spec.executor.reasoning_effort,
-        "turn_timeout_s": parse_duration(spec.executor.timeout),
-    }
-    if mcp_servers:
-        executor_spec["mcp_servers"] = mcp_servers
-
     profile_doc: dict[str, Any] = {
         "name": edf.metadata.name,
         "mode": "interactive",
         "triggers": [{"type": "http"}],
-        "executor": executor_spec,
     }
+    if kind == _MODEL_KIND:
+        profile_doc["spec"] = _resolve_model_tier_spec(spec, context, mcp_servers, warnings)
+    else:
+        executor_spec: dict[str, Any] = {
+            "executor": kind,
+            "instructions": context.instructions or DEFAULT_INSTRUCTIONS,
+            "model": spec.executor.model,
+            "sandbox_mode": _SANDBOX_MODES[spec.executor.sandbox.mode],
+            "approval_policy": "never" if spec.executor.approvals.unattended else "on-request",
+            "network_access": spec.network.outbound == "allowlist",
+            "web_search": spec.tools.web_search,
+            "reasoning_effort": spec.executor.reasoning_effort,
+            "turn_timeout_s": parse_duration(spec.executor.timeout),
+        }
+        if mcp_servers:
+            executor_spec["mcp_servers"] = mcp_servers
+        profile_doc["executor"] = executor_spec
     if spec.executor.budget is not None:
         profile_doc["limits"] = {"tokens_per_run": spec.executor.budget.tokens_per_run}
 

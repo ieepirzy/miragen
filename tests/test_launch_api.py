@@ -13,7 +13,7 @@ import miragen.app  # noqa: F401 — ensure module is registered in sys.modules
 
 app_module = sys.modules["miragen.app"]
 from miragen.app import app
-from miragen.models import RunProvenance
+from miragen.models import AgentProfile, RunProvenance
 from miragen.runs import RunStore
 
 from tests.test_edf import default_dev_edf, minimal_edf
@@ -249,16 +249,20 @@ async def test_launch_refuses_expected_sha_without_edf(executor_client):
     assert resp.status_code == 422
 
 
-async def test_launch_requires_executor_tier(tmp_path):
+async def test_launch_requires_some_backend(tmp_path):
+    """/executor-runs serves BOTH tiers (capability model-tier-launch/v1), so
+    the 400 is about having no backend at all rather than about not being
+    executor-tier. A profile with neither cannot run anything."""
     from unittest.mock import MagicMock
 
     app_module._profile = MagicMock()
     app_module._executor = None
-    app_module._agent = MagicMock()
+    app_module._agent = None
     app_module._run_store = RunStore(root=tmp_path / "runs")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         resp = await c.post("/executor-runs", json={"prompt": "x", "idempotency_key": "k"})
     assert resp.status_code == 400
+    assert "model-tier" in resp.json()["detail"]
 
 
 # ── /health: version + capability discovery ──────────────────────────────────
@@ -274,3 +278,78 @@ async def test_health_advertises_version_and_contract_capabilities(executor_clie
     assert body["publication"]["endpoint_supported"] is True
     # executor_client fixture has no artifact_sink by default
     assert body["publication"]["backend_configured"] is False
+
+# ── model tier: both tiers launch through /executor-runs ─────────────────────
+
+
+def _model_tier_profile(model: str = "anthropic:claude-sonnet-4-6"):
+    return AgentProfile.model_validate({
+        "name": "scribe",
+        "mode": "interactive",
+        "triggers": [{"type": "http"}],
+        "spec": {"model": model, "instructions": "You are a careful writer."},
+    })
+
+
+def _model_tier_edf(model: str = "anthropic:claude-sonnet-4-6") -> dict:
+    return {
+        "apiVersion": "mirarun.io/v1alpha1",
+        "kind": "Environment",
+        "metadata": {"name": "scribe"},
+        "spec": {
+            "executor": {"kind": "model", "model": model},
+            "workspace": {"repositories": []},
+        },
+    }
+
+
+@pytest.fixture
+async def model_client(tmp_path):
+    from unittest.mock import MagicMock
+
+    app_module._profile = _model_tier_profile()
+    app_module._executor = None
+    app_module._agent = MagicMock()
+    app_module._run_store = RunStore(root=tmp_path / "runs", retention=50)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        yield c
+
+
+async def test_health_advertises_model_tier_launch(executor_client):
+    body = (await executor_client.get("/health")).json()
+    assert "model-tier-launch/v1" in body["capabilities"]
+
+
+async def test_model_tier_edf_is_compatible_with_a_matching_model_agent(model_client):
+    resp = await model_client.post("/profiles/resolve", json={"edf": _model_tier_edf()})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["agent_compatibility"]["compatible"] is True
+
+
+async def test_model_tier_edf_reports_a_model_mismatch(model_client):
+    resp = await model_client.post(
+        "/profiles/resolve", json={"edf": _model_tier_edf(model="openai:gpt-5")}
+    )
+
+    compatibility = resp.json()["agent_compatibility"]
+    assert compatibility["compatible"] is False
+    assert any("openai:gpt-5" in issue for issue in compatibility["issues"])
+
+
+async def test_model_tier_edf_against_an_executor_agent_is_incompatible(executor_client):
+    """A launch executes with the CONFIGURED agent, so a tier mismatch belongs
+    to a different deployment — the same rule the executor tier already had."""
+    resp = await executor_client.post("/profiles/resolve", json={"edf": _model_tier_edf()})
+
+    compatibility = resp.json()["agent_compatibility"]
+    assert compatibility["compatible"] is False
+    assert any("executor-tier" in issue for issue in compatibility["issues"])
+
+
+async def test_executor_edf_against_a_model_agent_is_incompatible(model_client):
+    resp = await model_client.post("/profiles/resolve", json={"edf": minimal_edf()})
+
+    compatibility = resp.json()["agent_compatibility"]
+    assert compatibility["compatible"] is False
+    assert any("model-tier" in issue for issue in compatibility["issues"])
