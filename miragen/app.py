@@ -211,6 +211,23 @@ async def run_agent(
 
     assert _agent is not None, "Agent not initialized"
 
+    # Same rule as use_history above, in the other direction. resolve_edf
+    # refuses both of these for model-tier documents, so reaching here means
+    # a caller bypassed the resolver — fail loudly rather than run an agent
+    # that silently never sees the repositories or the credential.
+    if repositories:
+        raise ValueError(
+            "model-tier runs do not support repositories — miragen owns the "
+            "loop and prepares no workspace checkout; use an executor-tier "
+            "profile for runs that need a repository tree"
+        )
+    if mcp_secret_env:
+        raise ValueError(
+            "model-tier runs cannot carry per-run MCP bearer tokens — the "
+            "model tier's MCP capability accepts no token; use an "
+            "executor-tier profile for authenticated MCP servers"
+        )
+
     history = None
     if use_history:
         try:
@@ -920,6 +937,7 @@ CONTRACT_CAPABILITIES = [
     "interventions/v1",                  # structured question suspension + answered resume
     "ask-human-mcp/v1",                  # /mcp/ask-human MCP tool (writes the sentinel)
     "reviewed-publication/v1",           # POST /runs/{id}/publications (endpoint; backend config required)
+    "model-tier-launch/v1",              # /executor-runs accepts model-tier EDFs (spec.executor.kind: model)
 ]
 
 
@@ -1451,8 +1469,33 @@ def _edf_compatibility(resolved: ResolvedEDF) -> dict | None:
     if _profile is None:
         return None
     issues: list[str] = []
-    if _profile.executor is None:
-        issues.append("configured agent is model-tier; EDF launches require an executor-tier agent")
+    # resolved_profile is AgentProfile.model_dump(), which carries BOTH tier
+    # keys with the unused one set to None — so presence of the key proves
+    # nothing and the value is what distinguishes the tiers.
+    wants_model_tier = resolved.resolved_profile.get("spec") is not None
+    if wants_model_tier or _profile.executor is None:
+        # Model tier on at least one side. Both must be model tier, and the
+        # model must match for the same reason it must on the executor tier:
+        # a launch executes with the CONFIGURED agent, so an EDF resolving to
+        # a different one belongs to a different deployment.
+        if not wants_model_tier:
+            issues.append(
+                "configured agent is model-tier but the EDF resolves to executor "
+                f"'{resolved.resolved_profile['executor']['executor']}'"
+            )
+        elif _profile.spec is None:
+            issues.append(
+                "EDF resolves to the model tier but this agent is executor-tier "
+                f"('{_profile.executor.executor}')"
+            )
+        else:
+            want_model = resolved.resolved_profile["spec"]["model"]
+            if want_model != _profile.spec.model:
+                issues.append(
+                    f"EDF resolves to model '{want_model}' but this agent is "
+                    f"configured for '{_profile.spec.model}'"
+                )
+        return {"compatible": not issues, "issues": issues}
     else:
         want = resolved.resolved_profile["executor"]
         have = _profile.executor
@@ -1496,10 +1539,15 @@ async def launch_executor_run(request: ExecutorLaunchRequest, response: Response
     true) instead of launching twice, and the caller decides how to proceed
     with full knowledge of its status.
     """
-    if _executor is None:
+    # Both tiers launch here (capability model-tier-launch/v1). The endpoint
+    # name is executor-era and kept for compatibility; what it actually means
+    # is "durable, idempotent, provenance-carrying launch", which is not
+    # tier-specific. A profile with neither backend cannot run at all.
+    if _executor is None and _agent is None:
         raise HTTPException(
             status_code=400,
-            detail="this agent is not executor-backed; /executor-runs requires an executor-tier profile",
+            detail="this agent has no backend configured; /executor-runs requires "
+            "an executor-tier or model-tier profile",
         )
     if _run_store is None or _profile is None:
         raise HTTPException(status_code=503, detail="Run store not ready")
