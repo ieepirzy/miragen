@@ -113,6 +113,8 @@ def get_approval_handler() -> Callable | None:
 def build_agent(
     profile: AgentProfile,
     telemetry: MiragenTelemetry | None = None,
+    *,
+    secret_env: dict[str, str] | None = None,
 ) -> tuple[Agent, UsageLimits | None]:
     """
     Construct a live PydanticAI Agent from a validated AgentProfile.
@@ -127,7 +129,12 @@ def build_agent(
     run span the app tier opens and stamped with the run's `mira.*`
     attributes by the provider's run-context processor.
     """
-    capabilities = resolve_capabilities(profile.spec.capabilities or [])
+    # `secret_env` carries this launch's ephemeral credential values (e.g. a
+    # run-scoped MCP bearer token). Capabilities are constructed here, so an
+    # agent that needs one is built per run rather than reused from startup.
+    capabilities = resolve_capabilities(
+        profile.spec.capabilities or [], secret_env=secret_env
+    )
 
     approval_hooks = build_approval_hooks(profile)
     if approval_hooks is not None:

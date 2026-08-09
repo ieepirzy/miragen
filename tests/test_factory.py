@@ -214,7 +214,7 @@ class TestBuildAgent:
         with patch("miragen.factory.Agent") as MockAgent, \
              patch("miragen.factory.resolve_capabilities", return_value=[fake_cap]) as mock_resolve:
             build_agent(profile)
-            mock_resolve.assert_called_once_with(["WebSearch"])
+            mock_resolve.assert_called_once_with(["WebSearch"], secret_env=None)
             kw = MockAgent.call_args.kwargs
             assert kw["capabilities"] == [fake_cap]
 
