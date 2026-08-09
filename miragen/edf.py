@@ -551,15 +551,16 @@ def _resolve_model_tier_spec(
         )
 
     if spec.workspace.repositories:
-        # The model tier has no workspace checkout: miragen owns the loop and
-        # never prepares a repo tree for it. Accepting these would hand the
-        # launcher a checkout plan nothing acts on, and the run would look
-        # successful while the agent saw no code at all.
+        # Workspace checkout is executor-tier machinery the model tier does
+        # not have yet — not something about the tier that forbids it.
+        # Refused rather than accepted-and-ignored because a checkout plan
+        # nothing acts on yields a run that looks successful while the agent
+        # never saw the code.
         raise _error(
             "spec.workspace.repositories",
-            "the model tier has no workspace checkout, so declared repositories "
-            "would never be materialised. Use an executor-tier kind for runs "
-            "that need a repository tree",
+            "the model tier does not prepare a workspace checkout yet, so "
+            "declared repositories would never be materialised. Use an "
+            "executor-tier kind for runs that need a repository tree",
         )
 
     capabilities: list[Any] = []
@@ -569,20 +570,22 @@ def _resolve_model_tier_spec(
     # tier expresses it as a configured capability rather than a run flag.
     capabilities.append({"Thinking": {"effort": spec.executor.reasoning_effort}})
     for server in mcp_servers:
-        if "bearer_token_env" in server:
-            # The model tier's MCP capability takes url and name only — it has
-            # nowhere to put a bearer token. Resolving this anyway would drop
-            # the credential silently and send an unauthenticated agent at a
-            # server that requires one, so refuse instead. This is the one
-            # place the two tiers are genuinely not at parity.
-            raise _error(
-                "spec.tools.mcpServers",
-                f"mcpServer '{server['name']}' declares auth, which the model "
-                "tier cannot carry — its MCP capability accepts no bearer "
-                "token. Use an executor-tier kind for authenticated MCP "
-                "servers, or drop the auth block",
-            )
-        capabilities.append({"MCP": {"url": server["url"], "name": server["name"]}})
+        # bearer_token_env is carried as the indirection it already is on the
+        # executor tier: the capability resolves the name against this run's
+        # ephemeral secrets first and the deployment environment second, so
+        # the token itself never enters the profile, the canonical document,
+        # or the snapshot hash.
+        capabilities.append({
+            "MCP": {
+                "url": server["url"],
+                "name": server["name"],
+                **(
+                    {"bearer_token_env": server["bearer_token_env"]}
+                    if "bearer_token_env" in server
+                    else {}
+                ),
+            }
+        })
 
     # Fields the model tier has no equivalent for. Warned rather than ignored:
     # a caller who set them believes they took effect. Not raised, because

@@ -353,3 +353,70 @@ async def test_executor_edf_against_a_model_agent_is_incompatible(model_client):
     compatibility = resp.json()["agent_compatibility"]
     assert compatibility["compatible"] is False
     assert any("model-tier" in issue for issue in compatibility["issues"])
+
+
+async def test_tier_detection_reads_the_value_not_the_key(executor_client):
+    """Regression: AgentProfile.model_dump() emits BOTH tier keys, with the
+    unused one set to None. A tier check written as `"spec" in profile` is
+    therefore always true and reports every executor-tier EDF as model-tier.
+    Asserting the dump shape directly, so the trap is named rather than
+    rediscovered through a downstream 409."""
+    body = (await executor_client.post(
+        "/profiles/resolve", json={"edf": minimal_edf()}
+    )).json()
+
+    profile = body["resolved_profile"]
+    assert "spec" in profile and profile["spec"] is None
+    assert profile["executor"] is not None
+    assert body["agent_compatibility"]["compatible"] is True
+
+
+async def test_model_tier_run_builds_a_per_run_agent_for_ephemeral_credentials(
+    model_client, monkeypatch
+):
+    """The integration point that makes the credential plumbing real:
+    capabilities are constructed in build_agent, so a launch carrying
+    ephemeral token values must get its own agent rather than the one built at
+    startup with the deployment environment baked in."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    built: dict = {}
+
+    def fake_build_agent(profile, telemetry=None, *, secret_env=None):
+        built["secret_env"] = secret_env
+        agent = MagicMock()
+        result = MagicMock()
+        result.output = "done"
+        result.usage = MagicMock(input_tokens=1, output_tokens=1)
+        result.all_messages.return_value = []
+        result.new_messages.return_value = []
+        agent.run = AsyncMock(return_value=result)
+        return agent, None
+
+    monkeypatch.setattr(app_module, "build_agent", fake_build_agent)
+
+    await app_module.run_agent("hello", mcp_secret_env={"MIRARUN_TOKEN": "per-run"})
+
+    assert built["secret_env"] == {"MIRARUN_TOKEN": "per-run"}
+
+
+async def test_model_tier_run_reuses_the_startup_agent_without_credentials(
+    model_client, monkeypatch
+):
+    """The common case must not pay for a rebuild on every run."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    calls: list = []
+    monkeypatch.setattr(
+        app_module, "build_agent", lambda *a, **k: calls.append(k) or (MagicMock(), None)
+    )
+    result = MagicMock()
+    result.output = "done"
+    result.usage = MagicMock(input_tokens=1, output_tokens=1)
+    result.all_messages.return_value = []
+    result.new_messages.return_value = []
+    app_module._agent.run = AsyncMock(return_value=result)
+
+    await app_module.run_agent("hello")
+
+    assert calls == [], "startup agent should be reused when no run secrets are supplied"

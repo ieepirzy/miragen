@@ -211,21 +211,26 @@ async def run_agent(
 
     assert _agent is not None, "Agent not initialized"
 
-    # Same rule as use_history above, in the other direction. resolve_edf
-    # refuses both of these for model-tier documents, so reaching here means
-    # a caller bypassed the resolver — fail loudly rather than run an agent
-    # that silently never sees the repositories or the credential.
+    # Same rule as use_history above, in the other direction. Workspace
+    # checkout is executor-tier machinery that the model tier does not have
+    # yet, so accepting a plan nothing acts on would produce a run that looks
+    # successful while the agent never saw the code.
     if repositories:
         raise ValueError(
-            "model-tier runs do not support repositories — miragen owns the "
-            "loop and prepares no workspace checkout; use an executor-tier "
-            "profile for runs that need a repository tree"
+            "model-tier runs do not support repositories yet — miragen owns "
+            "the loop and prepares no workspace checkout; use an "
+            "executor-tier profile for runs that need a repository tree"
         )
+
+    # Per-run MCP credentials, on the other hand, ARE carried: capabilities
+    # are constructed in build_agent, so a launch supplying ephemeral token
+    # values gets its own agent rather than the one built at startup with the
+    # deployment-level environment baked in. The startup agent is reused
+    # whenever a run supplies none, which is the common case.
+    agent, limits = (_agent, _limits)
     if mcp_secret_env:
-        raise ValueError(
-            "model-tier runs cannot carry per-run MCP bearer tokens — the "
-            "model tier's MCP capability accepts no token; use an "
-            "executor-tier profile for authenticated MCP servers"
+        agent, limits = build_agent(
+            _profile, telemetry=_telemetry, secret_env=mcp_secret_env
         )
 
     history = None
@@ -248,7 +253,7 @@ async def run_agent(
     )
     try:
         with run_ctx as run_span:
-            result = await _agent.run(prompt, usage_limits=_limits, message_history=history)
+            result = await agent.run(prompt, usage_limits=limits, message_history=history)
             if run_span is not None:
                 pai_usage = result.usage
                 if pai_usage.input_tokens:

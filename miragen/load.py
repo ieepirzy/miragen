@@ -41,6 +41,7 @@ _CAPABILITY_REGISTRY: dict[str, Any] = {
                            url=cfg["url"],
                            id=cfg.get("name"),
                            native=True,
+                           authorization_token=cfg.get("authorization_token"),
                        ),
     "Peer":            lambda cfg: build_peer_capability(cfg),
 }
@@ -61,13 +62,25 @@ def register_capability(name: str) -> Callable[[Callable[[dict], Any]], Callable
     return decorator
 
 
-def resolve_capabilities(raw: list[str | dict]) -> list[AbstractCapability[Any]]:
+def resolve_capabilities(
+    raw: list[str | dict],
+    *,
+    secret_env: dict[str, str] | None = None,
+) -> list[AbstractCapability[Any]]:
     """
     Turn the raw YAML capability list into instantiated PydanticAI capability objects.
 
     Accepts both forms:
         - "WebSearch"                      → WebSearch()
         - {"Thinking": {"effort": "high"}} → Thinking(effort="high")
+
+    A capability config may name a credential indirectly with
+    `bearer_token_env` rather than carrying the secret in the profile. It is
+    resolved here into `authorization_token`, checking `secret_env` (this
+    run's ephemeral values) before the deployment-level environment — the
+    same precedence the executor adapters use for their own
+    `bearer_token_env` lookup, so a run-scoped credential wins over the
+    static one and a profile with neither still loads.
     """
     resolved = []
 
@@ -91,6 +104,13 @@ def resolve_capabilities(raw: list[str | dict]) -> list[AbstractCapability[Any]]
                 f"For custom capabilities, use @register_capability('{name}') in your "
                 f"tools.py — it must be imported before the agent profile is loaded."
             )
+
+        if "bearer_token_env" in cfg:
+            cfg = {k: v for k, v in cfg.items() if k != "bearer_token_env"}
+            env_name = entry[name]["bearer_token_env"]
+            token = (secret_env or {}).get(env_name) or os.environ.get(env_name)
+            if token:
+                cfg["authorization_token"] = token
 
         resolved.append(_CAPABILITY_REGISTRY[name](cfg))
 
