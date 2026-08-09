@@ -1,0 +1,40 @@
+# Both images in this repo do `COPY . /build/`, so anything not excluded here
+# does not just get uploaded to the daemon as build context — it is baked into
+# the published image and stays there. .git alone was ~820 KB of image weight
+# that no runtime code path reads.
+
+.git
+.github
+.gitignore
+
+# Tests and docs are CI/developer inputs, never runtime inputs.
+tests
+docs
+*.md
+!README.md
+
+# Compose/deploy files describe how to run the image; they don't belong inside it.
+compose.yaml
+compose.yml
+compose.example.yml
+compose.secrets.yml
+.env
+.env.*
+!.env.example
+
+# Python build/test/cache artifacts.
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+venv
+*.egg-info
+build
+dist
+
+# Editor/OS cruft.
+.vscode
+.idea
+.DS_Store
