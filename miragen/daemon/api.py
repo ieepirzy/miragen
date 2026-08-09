@@ -30,6 +30,7 @@ from miragen.daemon.core import (
     LifecycleCore,
     validate_profile_text,
 )
+from miragen.daemon.contract import CONTRACT_CAPABILITIES, register_contract_routes
 from miragen.daemon.schedules import ScheduleStore
 
 logger = logging.getLogger(__name__)
@@ -118,6 +119,8 @@ def create_app(
     schedules: ScheduleStore | None = None,
     *,
     token: str = "",
+    internal_token: str = "",
+    contract_transport=None,
 ) -> FastAPI:
     app = FastAPI(title="miragend", version=_miragen_version())
 
@@ -157,11 +160,17 @@ def create_app(
 
     @app.get("/health")
     def health() -> dict:
+        capabilities = list(DAEMON_CAPABILITIES)
+        if internal_token:
+            # The run-control contract is served only when the shared agent
+            # token exists to authenticate it (and to forward downstream), so
+            # it is advertised only then — a capability string is a promise.
+            capabilities += list(CONTRACT_CAPABILITIES)
         return {
             "status": "ok",
             "service": "miragend",
             "version": _miragen_version(),
-            "capabilities": list(DAEMON_CAPABILITIES),
+            "capabilities": capabilities,
         }
 
     # -- registry -----------------------------------------------------------
@@ -297,6 +306,15 @@ def create_app(
             schedules.cancel(job_id)
             return {"job_id": job_id, "cancelled": True}
 
+    # -- run-control contract (X-Miragen-Token, not the bearer) -------------
+    # Registered even without an internal token so the routes answer 503
+    # "unconfigured" rather than 404 — a client can tell "daemon too old"
+    # from "daemon missing its token". Capabilities advertise only when
+    # configured (see health()).
+    register_contract_routes(
+        app, core, internal_token=internal_token, transport=contract_transport
+    )
+
     return app
 
 
@@ -340,7 +358,12 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
     core.ensure_network()
 
     schedules = ScheduleStore(build_scheduler(workspace / "retriggers.sqlite"))
-    app = create_app(core, schedules, token=token)
+    app = create_app(
+        core,
+        schedules,
+        token=token,
+        internal_token=os.getenv("MIRAGEN_INTERNAL_TOKEN", ""),
+    )
 
     @app.router.on_event("startup")
     async def _start_scheduler() -> None:
