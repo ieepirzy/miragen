@@ -13,6 +13,13 @@ docs
 *.md
 !README.md
 
+# Deployed agent definitions (agents/<name>/{agent.yaml,tools.py}) are inputs
+# to miragend's workspace, not to this image: the daemon writes them into
+# MIRAGEN_WORKSPACE/agents/ on the host and bind-mounts them into the agent
+# container at /agent. Baking them into the base image would ship one tenant's
+# profiles inside the generic engine every other tenant runs.
+agents
+
 # Compose/deploy files describe how to run the image; they don't belong inside it.
 compose.yaml
 compose.yml
