@@ -211,6 +211,18 @@ def validate_profile_text(source: str) -> dict:
         "mode": profile.mode,
         "triggers": [t.type for t in profile.triggers],
         "tools": list(profile.tools or []),
+        # Named @register_handler targets this profile depends on. post_to is
+        # excluded on purpose: it is a plain webhook URL, not a registry
+        # lookup, so it cannot be unsatisfied by a missing tools.py.
+        "handlers": [
+            name
+            for name in (
+                (profile.on_complete.log_to, profile.on_complete.notify)
+                if profile.on_complete
+                else ()
+            )
+            if name
+        ],
     }
     if profile.is_executor:
         summary["executor"] = profile.executor.executor
@@ -259,6 +271,83 @@ def parse_registered_tools(source: str) -> list[dict]:
             )
             break
     return tools
+
+
+def parse_registered_handlers(source: str) -> list[str]:
+    """Return every name registered with @register_handler("name") in source.
+
+    Counterpart to parse_registered_tools, for the on_complete side. Accepts
+    both `def` and `async def`: the dispatcher awaits handlers, but a sync one
+    is a mistake worth catching at load rather than hiding here by refusing to
+    see it.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    names: list[str] = []
+    for node in tree.body:
+        if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            if (
+                isinstance(dec, ast.Call)
+                and isinstance(dec.func, ast.Name)
+                and dec.func.id == "register_handler"
+                and dec.args
+                and isinstance(dec.args[0], ast.Constant)
+            ):
+                names.append(dec.args[0].value)
+                break
+    return names
+
+
+def _assert_profile_satisfied_by_tools(summary: dict, tools_source: str | None) -> None:
+    """Refuse to create an agent the supplied tools source cannot support.
+
+    Creation writes agent.yaml, writes tools.py, and starts the container in
+    one breath. Before this check, a profile naming tools or on_complete
+    handlers could be created against the empty placeholder tools.py, and the
+    daemon would answer 201 for an agent that then failed on every single boot:
+    `_inject_tools` raises on unknown tool names, and the lifespan now raises on
+    unregistered handler names. The caller saw success; the agent was dead.
+
+    So the profile and its tools are checked together, before anything starts.
+    Either the pair is coherent and the agent runs, or creation is refused with
+    the specific names that are missing — no half-provisioned agent in between.
+
+    Deliberately a check against the source actually being written, not against
+    the live registry: this runs in the daemon, which never imports an agent's
+    tools.py.
+    """
+    source = tools_source or ""
+    available_tools = {t["name"] for t in parse_registered_tools(source)}
+    available_handlers = set(parse_registered_handlers(source))
+
+    missing_tools = [t for t in summary.get("tools", []) if t not in available_tools]
+    missing_handlers = [
+        h for h in summary.get("handlers", []) if h not in available_handlers
+    ]
+    if not missing_tools and not missing_handlers:
+        return
+
+    parts = []
+    if missing_tools:
+        parts.append(f"tools {missing_tools}")
+    if missing_handlers:
+        parts.append(f"on_complete handlers {missing_handlers}")
+    supplied = (
+        f"the supplied tools source registers tools {sorted(available_tools)} "
+        f"and handlers {sorted(available_handlers)}"
+        if tools_source is not None
+        else "no tools source was supplied, so tools.py would be an empty placeholder"
+    )
+    raise InvalidInput(
+        f"profile requires {' and '.join(parts)}, but {supplied}. "
+        "Pass `tools_source` with the matching @register / @register_handler "
+        "definitions, or remove the references from the profile — creating this "
+        "agent would produce one that fails on every boot."
+    )
 
 
 def _registered_name(node: ast.AsyncFunctionDef) -> str | None:
@@ -561,7 +650,9 @@ class LifecycleCore:
             return 0
         return sum(1 for entry in self.agents_dir.iterdir() if entry.is_dir())
 
-    def create_agent(self, name: str, yaml_source: str) -> None:
+    def create_agent(
+        self, name: str, yaml_source: str, tools_source: str | None = None
+    ) -> None:
         self.check_name(name)
         d = self._agent_dir(name)
         if d.exists():
@@ -581,6 +672,8 @@ class LifecycleCore:
                 f"profile 'name' field is '{profile_name}' but the agent is being "
                 f"created as '{name}' — set 'name: {name}' in the YAML"
             )
+
+        _assert_profile_satisfied_by_tools(summary, tools_source)
 
         max_agents = int(self._environ.get("MIRAGEND_MAX_AGENTS", DEFAULT_MAX_AGENTS))
         # Check-then-act: reading the count and creating the directory that
@@ -603,7 +696,9 @@ class LifecycleCore:
         try:
             (d / "agent.yaml").write_text(yaml_source)
             (d / "tools.py").write_text(
-                f"from miragen import register\n\n# Tools for {name}\n"
+                tools_source
+                if tools_source is not None
+                else f"from miragen import register\n\n# Tools for {name}\n"
             )
             self._compose_add_service(name)
             try:

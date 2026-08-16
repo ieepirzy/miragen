@@ -599,3 +599,115 @@ def test_import_agent_rejects_before_extraction_when_at_cap(tmp_path):
             runner=runner,
             not_found=FakeNotFound,
         ).import_agent("gamma", "exports/not-a-tarball.tar.gz")
+
+
+# ── atomic creation: profile and tools checked together ──────────────────────
+
+from miragen.daemon.core import InvalidInput, parse_registered_handlers  # noqa: E402
+
+TOOLS_YAML = """\
+name: {name}
+mode: interactive
+triggers:
+  - type: http
+tools:
+  - fetch_page
+spec:
+  model: "test:whatever"
+  instructions: "be helpful"
+"""
+
+HANDLER_YAML = """\
+name: {name}
+mode: autonomous
+triggers:
+  - type: cron
+    schedule: "0 6 * * 1"
+on_complete:
+  notify: telegram
+spec:
+  model: "test:whatever"
+  instructions: "be helpful"
+"""
+
+GOOD_TOOLS = '''\
+from miragen import register
+
+
+@register
+async def fetch_page(ctx, url: str) -> str:
+    """Fetch a page."""
+    return url
+'''
+
+GOOD_HANDLER = '''\
+from miragen import register_handler
+
+
+@register_handler("telegram")
+async def notify(agent, output):
+    return None
+'''
+
+
+class TestParseRegisteredHandlers:
+    def test_finds_named_handler(self):
+        assert parse_registered_handlers(GOOD_HANDLER) == ["telegram"]
+
+    def test_finds_sync_handler_too(self):
+        src = 'from miragen import register_handler\n\n@register_handler("miradb")\ndef h(a, o):\n    pass\n'
+        assert parse_registered_handlers(src) == ["miradb"]
+
+    def test_ignores_undecorated_and_unparseable(self):
+        assert parse_registered_handlers("def nope(): pass") == []
+        assert parse_registered_handlers("def (((") == []
+
+
+class TestCreateAgentRequiresSatisfiableTools:
+    """A profile and its tools are checked together, before anything starts.
+
+    Without this the daemon answered 201 for an agent that then failed on every
+    boot — _inject_tools raises on unknown tool names, and the lifespan raises
+    on unregistered on_complete handlers, while create_agent wrote an empty
+    placeholder tools.py and started the container regardless.
+    """
+
+    def test_profile_with_tools_and_no_source_is_refused(self, core, tmp_path):
+        with pytest.raises(InvalidInput, match="fetch_page"):
+            core.create_agent("alpha", TOOLS_YAML.format(name="alpha"))
+        assert not (tmp_path / "agents" / "alpha").exists()
+
+    def test_profile_with_handler_and_no_source_is_refused(self, core, tmp_path):
+        with pytest.raises(InvalidInput, match="telegram"):
+            core.create_agent("alpha", HANDLER_YAML.format(name="alpha"))
+        assert not (tmp_path / "agents" / "alpha").exists()
+
+    def test_matching_tools_source_creates_and_is_written(self, core, tmp_path):
+        core.create_agent("alpha", TOOLS_YAML.format(name="alpha"), GOOD_TOOLS)
+        written = (tmp_path / "agents" / "alpha" / "tools.py").read_text()
+        assert "async def fetch_page" in written
+
+    def test_matching_handler_source_creates(self, core, tmp_path):
+        core.create_agent("alpha", HANDLER_YAML.format(name="alpha"), GOOD_HANDLER)
+        assert (tmp_path / "agents" / "alpha" / "tools.py").read_text() == GOOD_HANDLER
+
+    def test_partial_source_names_what_is_missing(self, core):
+        with pytest.raises(InvalidInput) as exc:
+            core.create_agent("alpha", TOOLS_YAML.format(name="alpha"), GOOD_HANDLER)
+        message = str(exc.value)
+        assert "fetch_page" in message and "telegram" in message
+
+    def test_plain_profile_still_gets_the_placeholder(self, core, tmp_path):
+        core.create_agent("alpha", _yaml("alpha"))
+        written = (tmp_path / "agents" / "alpha" / "tools.py").read_text()
+        assert written == "from miragen import register\n\n# Tools for alpha\n"
+
+    def test_post_to_alone_needs_no_handler(self, core):
+        yaml_source = HANDLER_YAML.format(name="alpha").replace(
+            "  notify: telegram", "  post_to: https://example.invalid/hook"
+        )
+        core.create_agent("alpha", yaml_source)
+
+    def test_summary_reports_referenced_handlers(self):
+        summary = validate_profile_text(HANDLER_YAML.format(name="alpha"))
+        assert summary["handlers"] == ["telegram"]

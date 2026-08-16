@@ -69,6 +69,12 @@ class DaemonUnauthorized(DaemonError):
 class CreateAgentBody(BaseModel):
     name: str = Field(pattern=AGENT_NAME_PATTERN)
     yaml_source: str = Field(min_length=1)
+    # Optional tools.py contents, written instead of the empty placeholder.
+    # Creation is refused when the profile names tools or on_complete handlers
+    # this source does not define, so a control plane can provision a complete
+    # agent — profile plus tools — in one call, and cannot accidentally create
+    # one that fails on every boot.
+    tools_source: str | None = None
 
 
 class YamlBody(BaseModel):
@@ -188,7 +194,7 @@ def create_app(
 
     @app.post("/agents", status_code=201, dependencies=guarded)
     def create_agent(body: CreateAgentBody) -> dict:
-        core.create_agent(body.name, body.yaml_source)
+        core.create_agent(body.name, body.yaml_source, body.tools_source)
         return {"name": body.name, "status": core.container_status(body.name)}
 
     @app.put("/agents/{name}/config", dependencies=guarded)
