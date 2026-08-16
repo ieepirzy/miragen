@@ -1232,3 +1232,51 @@ class TestHistoryCap:
         assert resp.status_code == 200
         passed_history = mock_agent_with_usage.run.call_args.kwargs["message_history"]
         assert passed_history == stored[-2:]
+
+
+class TestOnCompleteHandlerValidation:
+    """Refuse to boot when on_complete names a handler nobody registered
+    (issue #71).
+
+    The bug is invisible by construction: dispatch is
+    `if oc.notify and oc.notify in handlers`, so an unregistered name is
+    skipped without a log line while the run still succeeds. Nothing an
+    operator can see distinguishes it from delivery that worked.
+    """
+
+    def _assert(self, profile):
+        return app_module._assert_on_complete_handlers_registered(profile)
+
+    def test_no_on_complete_block_is_fine(self):
+        self._assert(_make_profile())
+
+    def test_registered_handler_passes(self):
+        with patch.object(app_module, "registered_handlers",
+                          return_value={"telegram": lambda *a: None}):
+            self._assert(_make_profile(on_complete=OnComplete(notify="telegram")))
+
+    def test_unregistered_notify_refuses_to_start(self):
+        with patch.object(app_module, "registered_handlers", return_value={}):
+            with pytest.raises(ValueError, match="unregistered handler"):
+                self._assert(_make_profile(on_complete=OnComplete(notify="telegram")))
+
+    def test_unregistered_log_to_refuses_to_start(self):
+        with patch.object(app_module, "registered_handlers", return_value={}):
+            with pytest.raises(ValueError, match="log_to"):
+                self._assert(_make_profile(on_complete=OnComplete(log_to="miradb")))
+
+    def test_error_names_both_the_missing_and_the_available(self):
+        with patch.object(app_module, "registered_handlers",
+                          return_value={"slack": lambda *a: None}):
+            with pytest.raises(ValueError) as exc:
+                self._assert(_make_profile(
+                    on_complete=OnComplete(notify="telegram", log_to="miradb")))
+        message = str(exc.value)
+        assert "telegram" in message and "miradb" in message and "slack" in message
+
+    def test_post_to_alone_needs_no_handler(self):
+        # post_to is a plain webhook, not a registry lookup — it cannot go
+        # silently missing the way a named handler can.
+        with patch.object(app_module, "registered_handlers", return_value={}):
+            self._assert(_make_profile(
+                on_complete=OnComplete(post_to="https://example.invalid/hook")))
