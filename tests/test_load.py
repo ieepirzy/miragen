@@ -171,3 +171,59 @@ class TestLoadProfile:
             pytest.skip("example.yaml not found")
         p = load_profile(example)
         assert p.name == "morning-briefing"
+
+
+class TestMCPCapabilityScoping:
+    """Per-agent scoping of a shared MCP server (issue #70).
+
+    These assert on the constructed capability rather than just the count:
+    the bug they cover was a silently-dropped kwarg, which a length check
+    cannot see — resolve_capabilities returned one perfectly valid capability
+    the whole time, just without the scoping the profile asked for.
+    """
+
+    def test_allowed_tools_reaches_the_capability(self):
+        caps = resolve_capabilities([
+            {"MCP": {"url": "http://localhost:8080", "name": "marketing",
+                     "allowed_tools": ["seo_fetch_page", "seo_fetch_robots"]}}
+        ])
+        assert caps[0].allowed_tools == ["seo_fetch_page", "seo_fetch_robots"]
+
+    def test_defer_loading_reaches_the_capability(self):
+        caps = resolve_capabilities([
+            {"MCP": {"url": "http://localhost:8080", "defer_loading": True}}
+        ])
+        assert caps[0].defer_loading is True
+
+    def test_defaults_are_unscoped_and_eager(self):
+        caps = resolve_capabilities([{"MCP": {"url": "http://localhost:8080"}}])
+        assert caps[0].allowed_tools is None
+        assert caps[0].defer_loading is False
+
+    def test_bearer_token_env_still_resolves_alongside(self):
+        import os
+        with patch.dict(os.environ, {"MARKETING_TOKEN": "s3cret"}):
+            caps = resolve_capabilities([
+                {"MCP": {"url": "http://localhost:8080",
+                         "bearer_token_env": "MARKETING_TOKEN",
+                         "allowed_tools": ["seo_fetch_page"]}}
+            ])
+        assert caps[0].allowed_tools == ["seo_fetch_page"]
+
+    def test_unknown_key_raises_rather_than_being_dropped(self):
+        with pytest.raises(ValueError, match="Unknown MCP capability config key"):
+            resolve_capabilities([
+                {"MCP": {"url": "http://localhost:8080", "allow_tools": ["typo"]}}
+            ])
+
+    def test_allowed_tools_must_be_a_list_of_strings(self):
+        with pytest.raises(ValueError, match="list of tool-name strings"):
+            resolve_capabilities([
+                {"MCP": {"url": "http://localhost:8080", "allowed_tools": "seo_fetch_page"}}
+            ])
+
+    def test_defer_loading_must_be_boolean(self):
+        with pytest.raises(ValueError, match="must be true or false"):
+            resolve_capabilities([
+                {"MCP": {"url": "http://localhost:8080", "defer_loading": "yes"}}
+            ])

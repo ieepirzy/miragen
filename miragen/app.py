@@ -659,6 +659,50 @@ def _next_fire_at(name: str) -> str | None:
     return next_run.isoformat() if next_run else None
 
 
+def _assert_on_complete_handlers_registered(profile) -> None:
+    """Refuse to start when on_complete names a handler nobody registered.
+
+    Dispatch below is `if oc.notify and oc.notify in handlers` — a name that
+    was never registered is skipped in silence. miragen ships no handlers of
+    its own, so `notify: telegram` in a profile whose tools.py never calls
+    `@register_handler("telegram")` produces no notification, no warning and no
+    error, while the run itself succeeds. "Delivered" and "silently dropped"
+    then look identical from every angle an operator can see, and an autonomous
+    agent's entire output path can be dead for weeks.
+
+    A named handler that does not exist is a configuration error, so it fails
+    here the way `_inject_tools` already fails on unknown tool names.
+
+    This lives in the lifespan rather than in `load_profile` on purpose: the
+    daemon's `validate_profile_text` validates YAML without ever importing an
+    agent's tools.py, so a check there would reject every profile carrying an
+    on_complete block. By the time this runs, `_import_tools` has executed
+    (cli.run imports tools before starting uvicorn) and the registry is
+    populated.
+    """
+    if not profile.on_complete:
+        return
+
+    handlers = registered_handlers()
+    missing = [
+        (field, name)
+        for field, name in (
+            ("log_to", profile.on_complete.log_to),
+            ("notify", profile.on_complete.notify),
+        )
+        if name and name not in handlers
+    ]
+    if missing:
+        described = ", ".join(f"{field}: '{name}'" for field, name in missing)
+        raise ValueError(
+            f"Agent '{profile.name}' on_complete references unregistered "
+            f"handler(s) — {described}. Registered: {sorted(handlers) or 'none'}. "
+            "Register it in the agent's tools.py with @register_handler, or "
+            "remove it from the profile; leaving it configured would silently "
+            "deliver nothing."
+        )
+
+
 async def _handle_on_complete(output: str) -> None:
     """Dispatch on_complete side effects after an autonomous run."""
     if not _profile or not _profile.on_complete:
@@ -741,6 +785,8 @@ async def lifespan(app: FastAPI):
     else:
         _agent, _limits = build_agent(_profile, telemetry=_telemetry)
         logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode")
+
+    _assert_on_complete_handlers_registered(_profile)
 
     # Register self-activating triggers (cron, interval, startup)
     interval_i = 0

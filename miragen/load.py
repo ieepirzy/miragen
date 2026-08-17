@@ -37,14 +37,67 @@ _CAPABILITY_REGISTRY: dict[str, Any] = {
     "ImageGeneration": lambda cfg: ImageGeneration(
                            fallback_model=cfg.get("fallback_model")
                        ),
-    "MCP":             lambda cfg: MCP(
-                           url=cfg["url"],
-                           id=cfg.get("name"),
-                           native=True,
-                           authorization_token=cfg.get("authorization_token"),
-                       ),
+    "MCP":             lambda cfg: _build_mcp(cfg),
     "Peer":            lambda cfg: build_peer_capability(cfg),
 }
+
+
+# Config keys the MCP capability accepts from a profile.
+#
+# Declared explicitly because the registry entries above pick keys by name: a
+# key nobody names is dropped without a word. That is precisely how
+# `allowed_tools` and `defer_loading` stayed unreachable from a profile even
+# though PydanticAI has accepted both all along — no error, no warning, just a
+# capability quietly built without them (issue #70). Naming the accepted set
+# means the next key to go missing fails loudly instead.
+_MCP_CONFIG_KEYS = frozenset(
+    {"url", "name", "allowed_tools", "defer_loading", "authorization_token"}
+)
+
+
+def _build_mcp(cfg: dict) -> Any:
+    """Build the MCP capability, passing through per-agent tool scoping.
+
+    `allowed_tools` restricts which of the server's tools this agent may call,
+    and is what makes one shared, domain-scoped MCP server usable by several
+    agents with different grants. It is enforced client-side, in the agent
+    process: it shapes what the model is offered, and is NOT an authorization
+    boundary. Anything that must hold against a determined caller belongs in
+    the MCP server's own auth.
+
+    `defer_loading` hides the server's tools from the model until it discovers
+    them through tool search, so an agent attached to several servers does not
+    pay every schema's context cost on every request.
+    """
+    unknown = sorted(set(cfg) - _MCP_CONFIG_KEYS)
+    if unknown:
+        raise ValueError(
+            f"Unknown MCP capability config key(s): {unknown}. "
+            f"Accepted: {sorted(_MCP_CONFIG_KEYS)} — plus 'bearer_token_env', "
+            "which resolve_capabilities turns into 'authorization_token' before "
+            "reaching here."
+        )
+
+    allowed = cfg.get("allowed_tools")
+    if allowed is not None and (
+        not isinstance(allowed, list) or not all(isinstance(t, str) for t in allowed)
+    ):
+        raise ValueError(
+            f"MCP 'allowed_tools' must be a list of tool-name strings, got: {allowed!r}"
+        )
+
+    defer = cfg.get("defer_loading", False)
+    if not isinstance(defer, bool):
+        raise ValueError(f"MCP 'defer_loading' must be true or false, got: {defer!r}")
+
+    return MCP(
+        url=cfg["url"],
+        id=cfg.get("name"),
+        native=True,
+        authorization_token=cfg.get("authorization_token"),
+        allowed_tools=allowed,
+        defer_loading=defer,
+    )
 
 
 def register_capability(name: str) -> Callable[[Callable[[dict], Any]], Callable[[dict], Any]]:
