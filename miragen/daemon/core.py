@@ -72,6 +72,23 @@ DEFAULT_AGENT_MEM_LIMIT = "512m"
 # rejects at startup (that dies in ~1-2s), short enough not to hold the
 # API. 0 means a single immediate status check (used by tests).
 DEFAULT_BOOT_PROBE_SECONDS = 10
+# How long the container must hold 'running' before first boot counts as
+# good, and how often that is checked. The settle window is the latency a
+# healthy create pays; the probe budget above is only spent on a container
+# that keeps failing to settle.
+BOOT_SETTLE_SECONDS = 2.0
+BOOT_POLL_SECONDS = 0.5
+
+# Subscription credentials a vendor runtime is known to read from a single
+# env variable, keyed by the executor kind that consumes them. These are
+# auto-forwarded — no MIRAGEND_AGENT_ENV_PASSTHROUGH entry — but only into
+# agents whose profile declares that executor kind, so an agent that never
+# runs claude-code never sees the subscription token. claude-code is the
+# only kind here on purpose: the other products authenticate via home
+# volumes (docs/design/subscription-homes.md), not a portable env token.
+EXECUTOR_CREDENTIAL_ENV: dict[str, tuple[str, ...]] = {
+    "claude-code": ("CLAUDE_CODE_OAUTH_TOKEN",),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -718,15 +735,25 @@ class LifecycleCore:
             logger.warning("could not remove container '%s' during rollback", name)
 
     def _watch_first_boot(self, name: str) -> None:
-        """Watch a freshly (re)started container until the probe window
-        closes or it dies. A runtime that rejects the profile exits within
-        a second or two and the restart policy flips the container to
-        'restarting' — that is a boot failure to surface with its logs,
-        not a success to discover later in `docker logs` (#75)."""
+        """Watch a freshly (re)started container until it has held `running`
+        long enough to call the boot good, or until it dies. A runtime that
+        rejects the profile exits within a second or two and the restart
+        policy flips the container to 'restarting' — that is a boot failure
+        to surface with its logs, not a success to discover later in
+        `docker logs` (#75).
+
+        The settle window is what keeps this cheap: a healthy create returns
+        as soon as the container has been up for BOOT_SETTLE_SECONDS rather
+        than holding the API open for the whole probe budget, which is only
+        spent on a container that never settles.
+        """
         probe_seconds = float(
             self._environ.get("MIRAGEND_BOOT_PROBE_SECONDS", DEFAULT_BOOT_PROBE_SECONDS)
         )
+        settle_seconds = min(BOOT_SETTLE_SECONDS, probe_seconds)
         waited = 0.0
+        running_for = 0.0
+        last_step = 0.0
         while True:
             status = self.container_status(name)
             if status in ("exited", "dead", "restarting"):
@@ -739,11 +766,14 @@ class LifecycleCore:
                     f"{status}). Last log lines:\n{excerpt}",
                     container_status=status,
                 )
+            running_for = running_for + last_step if status == "running" else 0.0
+            if status == "running" and running_for >= settle_seconds:
+                return
             if waited >= probe_seconds:
                 return
-            step = min(1.0, probe_seconds - waited)
-            self._sleep(step)
-            waited += step
+            last_step = min(BOOT_POLL_SECONDS, probe_seconds - waited)
+            self._sleep(last_step)
+            waited += last_step
 
     def _read_yaml(self, path: Path) -> dict:
         with open(path) as f:
@@ -769,6 +799,27 @@ class LifecycleCore:
             "services": {},
             "networks": {"miragen-net": {"external": True}},
         }
+
+    def _agent_executor_kind(self, name: str) -> str:
+        """Executor kind from the agent's on-disk profile — every caller of
+        _compose_add_service (create, import, config update) has written
+        agent.yaml before the service is composed.
+
+        Resolved through validate_profile_text, i.e. the loader, NOT a raw
+        YAML read: `executor: ${EXECUTOR_KIND:-claude-code}` is a valid
+        profile, and interpolate_env expands it before Pydantic ever sees
+        it. Reading the unprocessed file returns the literal placeholder and
+        the credential lookup silently misses. Interpolation resolves against
+        this daemon's own os.environ — the same environment the forwarded
+        value is read from, so the two cannot disagree.
+
+        Model-tier profiles and unreadable YAML yield "", which maps to no
+        auto-forwarded credential."""
+        try:
+            text = (self._agent_dir(name) / "agent.yaml").read_text()
+            return str(validate_profile_text(text).get("executor") or "")
+        except Exception:
+            return ""
 
     def _compose_add_service(self, name: str, image_ref: str | None = None) -> None:
         self.ensure_network()
@@ -797,6 +848,15 @@ class LifecycleCore:
             key = raw_name.strip()
             if key and self._environ.get(key):
                 env[key] = self._environ[key]
+        # Executor-kind-scoped auto-forward: the profile already names the
+        # vendor runtime it needs, so the well-known credential for that
+        # runtime is delivered without any passthrough entry — the operator
+        # surface is "set the variable", nothing else. Scoped by kind, not
+        # broadcast: only agents whose profile declares the consuming
+        # executor receive it.
+        for cred in EXECUTOR_CREDENTIAL_ENV.get(self._agent_executor_kind(name), ()):
+            if self._environ.get(cred):
+                env.setdefault(cred, self._environ[cred])
 
         # Every managed agent gets a default resource ceiling so a single
         # runaway container can't starve the host — overridable per-deployment
@@ -981,15 +1041,24 @@ class LifecycleCore:
                 f"being updated is '{name}' — set 'name: {name}' in the YAML"
             )
 
-        # Same boundary as create, against the RIGHT image: an in-place
-        # update restarts the existing container, which re-executes the
-        # image pinned in its compose service — not whatever the base tag
-        # points at today. Checking the base tag would both reject updates
-        # the running image supports and admit updates that crash it
-        # (Codex review, PR #76). Falls back to the base image for agents
+        old_kind_for_contract = self._agent_executor_kind(name)
+        will_recreate = str(summary.get("executor") or "") != old_kind_for_contract
+
+        # Same boundary as create, against the RIGHT image — which depends
+        # on what this update will actually do. A kind change recreates the
+        # container from the base image (validate and pin that, exactly like
+        # create); anything else restarts in place and re-executes the image
+        # pinned in the service, so THAT is what must satisfy the contract.
+        # Checking the base tag on the restart path would both reject
+        # updates the running image supports and admit updates that crash
+        # it (Codex review, PR #76). Falls back to the base image for agents
         # created before service pinning existed.
-        running_ref = self._service_image(name) or self._base_image
-        self._validated_image(running_ref, summary["profile_contract"])
+        if will_recreate:
+            spawn_ref = self._validated_spawn_ref(summary["profile_contract"])
+        else:
+            spawn_ref = None
+            running_ref = self._service_image(name) or self._base_image
+            self._validated_image(running_ref, summary["profile_contract"])
 
         original = yaml_path.read_text()
         try:
@@ -1005,14 +1074,24 @@ class LifecycleCore:
         if not isinstance(new_data, dict):
             new_data = {}
 
+        # A change of executor kind changes which credentials the service is
+        # entitled to, and container environment is fixed at create time --
+        # restart() preserves it. Recompose and let compose recreate the
+        # container instead, or an agent switched TO claude-code runs without
+        # its subscription token while one switched AWAY keeps holding it.
+        old_kind = self._agent_executor_kind(name)
+        new_kind = str(summary.get("executor") or "")
+
         yaml_path.write_text(yaml_source)
         try:
-            self.restart_agent(name)
+            self._apply_config(
+                name, recreate=new_kind != old_kind, image_ref=spawn_ref
+            )
             self._watch_first_boot(name)
         except DaemonError as exc:
             yaml_path.write_text(original)
             try:
-                self.restart_agent(name)
+                self._apply_config(name, recreate=new_kind != old_kind)
             except DaemonError:
                 pass
             raise RestartFailed(
@@ -1034,6 +1113,24 @@ class LifecycleCore:
     def start_agent(self, name: str) -> None:
         self._require_agent(name)
         self._compose_up(name)
+
+    def _apply_config(
+        self, name: str, *, recreate: bool, image_ref: str | None = None
+    ) -> None:
+        """Put a rewritten agent.yaml into effect. A plain restart re-reads
+        the mounted profile, which is all most edits need; `recreate` also
+        regenerates the compose service so `compose up` replaces the
+        container, picking up an environment the running one cannot change.
+
+        `image_ref` is the runtime the caller validated for the new profile
+        — required on the recreate path, because regenerating the service
+        without it would rewrite the mutable tag and discard the digest pin
+        the contract check established (#75 + Codex review on #76)."""
+        if recreate:
+            self._compose_add_service(name, image_ref)
+            self._compose_up(name)
+        else:
+            self.restart_agent(name)
 
     def restart_agent(self, name: str) -> None:
         self._require_agent(name)

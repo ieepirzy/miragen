@@ -269,6 +269,116 @@ def test_env_passthrough_forwards_named_variables_only(tmp_path):
     assert "UNLISTED_SECRET" not in env
 
 
+EXECUTOR_CLAUDE_YAML = """\
+name: {name}
+mode: interactive
+triggers:
+  - type: http
+executor:
+  executor: claude-code
+  instructions: "operate on the workspace"
+"""
+
+
+def _executor_kind_core(tmp_path, environ):
+    docker_client = FakeDocker()
+    runner = RecordingRunner()
+    runner.on_up = lambda name: docker_client.add(name)
+    return LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        environ=environ,
+        runner=runner,
+        not_found=FakeNotFound,
+        sleep=lambda _s: None,
+    )
+
+
+def _service_env(tmp_path, name):
+    import yaml as pyyaml
+
+    return pyyaml.safe_load((tmp_path / "compose.yml").read_text())["services"][name][
+        "environment"
+    ]
+
+
+def test_subscription_token_auto_forwarded_to_claude_code_executor(tmp_path):
+    """A set CLAUDE_CODE_OAUTH_TOKEN reaches an `executor: claude-code`
+    agent with NO passthrough entry — the profile names the consuming
+    runtime, so the operator surface is just setting the variable."""
+    core = _executor_kind_core(
+        tmp_path, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-auto"}
+    )
+    core.create_agent("worker", EXECUTOR_CLAUDE_YAML.format(name="worker"))
+    assert _service_env(tmp_path, "worker")["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-auto"
+
+
+def test_subscription_token_not_forwarded_to_other_kinds(tmp_path):
+    """The auto-forward is scoped by executor kind: a model-tier agent must
+    not receive the subscription token even when the daemon holds it —
+    only a passthrough entry may widen delivery beyond the consuming kind."""
+    core = _executor_kind_core(
+        tmp_path, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-auto"}
+    )
+    core.create_agent("alpha", _yaml("alpha"))
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in _service_env(tmp_path, "alpha")
+
+
+def test_subscription_token_resolved_through_profile_interpolation(tmp_path, monkeypatch):
+    """The kind is read through the loader, not the raw file: a profile
+    naming its executor via ${VAR:-default} interpolates before validation,
+    so the credential lookup must see the resolved kind, not the literal.
+
+    interpolate_env resolves against the process environment (os.environ),
+    which in a real daemon is the same environment the forwarded value comes
+    from — hence monkeypatch here rather than the injected environ dict."""
+    monkeypatch.setenv("EXECUTOR_KIND", "claude-code")
+    core = _executor_kind_core(
+        tmp_path, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-auto"}
+    )
+    interpolated = EXECUTOR_CLAUDE_YAML.format(name="worker").replace(
+        "executor: claude-code", "executor: ${EXECUTOR_KIND:-codex}"
+    )
+    core.create_agent("worker", interpolated)
+    assert _service_env(tmp_path, "worker")["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-auto"
+
+
+def test_update_config_to_claude_code_recreates_with_token(tmp_path):
+    """Switching an existing agent TO claude-code must deliver the token.
+    Container environment is fixed at create time, so a plain restart()
+    would leave the agent authenticating against nothing."""
+    core = _executor_kind_core(
+        tmp_path, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-auto"}
+    )
+    core.create_agent("alpha", _yaml("alpha"))
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in _service_env(tmp_path, "alpha")
+
+    core.update_agent_config("alpha", EXECUTOR_CLAUDE_YAML.format(name="alpha"))
+    assert _service_env(tmp_path, "alpha")["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-auto"
+
+
+def test_update_config_away_from_claude_code_drops_token(tmp_path):
+    """Switching AWAY from claude-code must withdraw the token rather than
+    leave it in a container whose profile no longer declares that runtime."""
+    core = _executor_kind_core(
+        tmp_path, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-auto"}
+    )
+    core.create_agent("worker", EXECUTOR_CLAUDE_YAML.format(name="worker"))
+    assert _service_env(tmp_path, "worker")["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-auto"
+
+    core.update_agent_config("worker", _yaml("worker"))
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in _service_env(tmp_path, "worker")
+
+
+def test_subscription_token_absent_forwards_nothing(tmp_path):
+    """An unset or empty token forwards nothing to a claude-code agent —
+    never an empty string."""
+    core = _executor_kind_core(tmp_path, {"CLAUDE_CODE_OAUTH_TOKEN": ""})
+    core.create_agent("worker", EXECUTOR_CLAUDE_YAML.format(name="worker"))
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in _service_env(tmp_path, "worker")
+
+
 def test_create_agent_duplicate_rejected(core):
     core.create_agent("alpha", _yaml("alpha"))
     with pytest.raises(AgentExists):
@@ -1064,12 +1174,12 @@ def test_compose_pins_the_validated_image_not_a_second_lookup(
     assert data["services"]["alpha"]["image"] == validated_digest
 
 
-def test_update_validates_the_image_the_agent_actually_runs(
-    core, docker_client, tmp_path
-):
-    # The agent runs the digest pinned in its service. A base tag that has
-    # since moved forward to a capable image must not license an executor
-    # profile onto a container that will restart on the OLD image.
+def test_update_validates_the_image_the_agent_actually_runs(core, docker_client):
+    # A same-kind update restarts the container in place, re-executing the
+    # digest pinned in its service. A profile that raises its requirement
+    # (by declaring forward) must be judged against THAT image — even when
+    # the base tag has since moved to something capable, which an in-place
+    # restart will never touch.
     core.create_agent("alpha", _yaml("alpha"))  # service pins DEFAULT_DIGEST
     docker_client.image_map[DEFAULT_DIGEST] = FakeImage(
         labels={"io.miragen.profile-contracts": "1"}
@@ -1081,23 +1191,41 @@ def test_update_validates_the_image_the_agent_actually_runs(
     from miragen.daemon.core import ImageContractUnsupported
 
     container = docker_client.container_map["alpha"]
+    forward = "apiVersion: miragen/v2\n" + _yaml("alpha")
     with pytest.raises(ImageContractUnsupported) as exc:
-        core.update_agent_config("alpha", EXECUTOR_YAML.format(name="alpha"))
-    # The refusal names the pinned image, not the base tag.
-    assert DEFAULT_DIGEST in str(exc.value)
-    assert container.restarted == 0
-
+        core.update_agent_config("alpha", forward)
+    assert DEFAULT_DIGEST in str(exc.value)  # names the pinned image
+    assert container.restarted == 0  # the running agent was never disturbed
 
 def test_update_accepted_when_the_pinned_image_supports_it(core, docker_client):
-    # The mirror case: the base tag now points somewhere incapable, but the
-    # image this agent actually runs supports the profile — refusing that
+    # The mirror case: the base tag now points at something incapable, but
+    # the image this agent actually runs supports the profile. Refusing that
     # update would be a lie about what would happen.
-    core.create_agent("alpha", _yaml("alpha"))
+    core.create_agent("alpha", EXECUTOR_YAML.format(name="alpha"))
     docker_client.image_map[DEFAULT_DIGEST] = FakeImage(
         labels={"io.miragen.profile-contracts": "1 2"}
     )
     docker_client.image_map[DEFAULT_IMAGE] = FakeImage(
         labels={"io.miragen.profile-contracts": "1"}
     )
-    core.update_agent_config("alpha", EXECUTOR_YAML.format(name="alpha"))
+    docker_client.images.pull = lambda ref: None
+
+    revised = EXECUTOR_YAML.format(name="alpha").replace(
+        "review things", "review things carefully"
+    )
+    core.update_agent_config("alpha", revised)
     assert docker_client.container_map["alpha"].restarted == 1
+
+
+def test_kind_change_recreates_on_a_validated_pin(core, docker_client, tmp_path):
+    # An executor-kind change regenerates the compose service (the recreate
+    # path). Regenerating without the validated reference would rewrite the
+    # mutable tag and quietly discard the digest pin the contract check
+    # established — so the recreate carries it forward.
+    import yaml as _yaml_mod
+
+    core.create_agent("alpha", _yaml("alpha"))  # model tier
+    core.update_agent_config("alpha", EXECUTOR_YAML.format(name="alpha"))
+
+    data = _yaml_mod.safe_load((tmp_path / "compose.yml").read_text())
+    assert data["services"]["alpha"]["image"] == DEFAULT_DIGEST
