@@ -568,16 +568,29 @@ class LifecycleCore:
 
     # -- profile↔runtime contract (#75) -------------------------------------
 
-    def _spawn_image(self):
-        """The image object for self._base_image, pulling it if absent —
-        the contract must be judged against what will actually run, and an
-        image that is not on the host yet would otherwise be judged blind."""
+    def _pull_image(self) -> None:
+        try:
+            self._docker.images.pull(self._base_image)
+        except Exception as exc:
+            raise ImageContractUnsupported(
+                f"cannot pull runtime image '{self._base_image}': {exc} — "
+                "the profile contract cannot be verified against an image "
+                "the daemon cannot see"
+            ) from exc
+
+    def _spawn_image(self, *, refresh: bool = False):
+        """The image object for self._base_image. Pulled when absent — the
+        contract must be judged against what will actually run, and an image
+        not on the host yet would otherwise be judged blind — or when
+        `refresh` asks for the registry's current answer."""
+        if refresh:
+            self._pull_image()
         try:
             return self._docker.images.get(self._base_image)
         except self._not_found:
             pass
+        self._pull_image()
         try:
-            self._docker.images.pull(self._base_image)
             return self._docker.images.get(self._base_image)
         except Exception as exc:
             raise ImageContractUnsupported(
@@ -586,11 +599,11 @@ class LifecycleCore:
                 "the daemon cannot see"
             ) from exc
 
-    def _image_contracts(self) -> set[int]:
+    def _image_contracts(self, *, refresh: bool = False) -> set[int]:
         """Contract levels the spawn image declares (its OCI label). An
         unlabeled image predates contract labeling: a pre-executor-tier
         runtime, contract 1 only."""
-        labels = self._spawn_image().labels or {}
+        labels = self._spawn_image(refresh=refresh).labels or {}
         try:
             return parse_contracts_label(labels.get(PROFILE_CONTRACTS_LABEL))
         except ValueError as exc:
@@ -599,15 +612,37 @@ class LifecycleCore:
                 f"{PROFILE_CONTRACTS_LABEL} label: {exc}"
             ) from exc
 
+    def _is_mutable_ref(self) -> bool:
+        """A tag can be re-pointed upstream; a digest cannot. Only a mutable
+        reference is worth re-pulling when the local copy disappoints."""
+        return "@" not in self._base_image
+
     def _assert_image_contract(self, required: int) -> None:
         supported = self._image_contracts()
+        if required not in supported and self._is_mutable_ref():
+            # A locally cached tag that disappoints is far more often stale
+            # than genuinely incapable — `latest` moves upstream, Compose
+            # trusts the cache, and the host silently keeps last month's
+            # runtime. That exact staleness caused the failure #75 exists to
+            # prevent, so refresh once from the registry before refusing:
+            # the daemon repairs what it can and only reports what it can't.
+            logger.info(
+                "runtime image '%s' does not satisfy profile contract %d — "
+                "re-pulling in case the local copy is stale",
+                self._base_image,
+                required,
+            )
+            supported = self._image_contracts(refresh=True)
         if required not in supported:
             raise ImageContractUnsupported(
                 f"runtime image '{self._base_image}' declares profile "
                 f"contract(s) {sorted(supported)} but this profile requires "
-                f"contract {required}. Pull a runtime that supports it "
-                f"(e.g. `docker pull {self._base_image}`) and retry — "
-                "spawning anyway would crash-loop at boot (#75).",
+                f"contract {required} — and this is the registry's current "
+                "answer, not a stale local copy (the daemon re-pulled a "
+                "mutable reference before refusing). Point "
+                "MIRAGEN_BASE_IMAGE at a runtime that supports the "
+                "contract, or lower the profile's requirement; spawning "
+                "anyway would crash-loop at boot (#75).",
                 required=required,
                 supported=sorted(supported),
                 image=self._base_image,

@@ -920,3 +920,68 @@ def test_validate_summary_reports_the_required_contract():
         validate_profile_text(EXECUTOR_YAML.format(name="alpha"))["profile_contract"]
         == 2
     )
+
+
+def test_stale_cached_tag_is_refreshed_before_refusing(core, docker_client):
+    # The real-world shape of #75's failure: the registry has a capable
+    # runtime, the host's cached `latest` is last month's. Refusing an
+    # operator who is already pointed at a good tag helps nobody — the
+    # daemon re-pulls the mutable reference and proceeds.
+    docker_client.image_map[DEFAULT_IMAGE] = FakeImage(
+        labels={"io.miragen.profile-contracts": "1"}
+    )
+
+    def pull(ref):
+        docker_client.pulled.append(ref)
+        docker_client.image_map[ref] = FakeImage(
+            labels={"io.miragen.profile-contracts": "1 2"},
+            repo_digests=[DEFAULT_DIGEST],
+        )
+
+    docker_client.images.pull = pull
+
+    core.create_agent("alpha", EXECUTOR_YAML.format(name="alpha"))
+    assert docker_client.pulled == [DEFAULT_IMAGE]
+    assert "alpha" in docker_client.container_map
+
+
+def test_refusal_survives_the_refresh_when_the_registry_agrees(
+    core, docker_client, tmp_path
+):
+    # Refreshed and still incapable: that is a real answer about the
+    # registry, and the error says so rather than sending the operator to
+    # re-pull something the daemon already pulled.
+    docker_client.image_map[DEFAULT_IMAGE] = FakeImage(
+        labels={"io.miragen.profile-contracts": "1"}
+    )
+    docker_client.images.pull = lambda ref: docker_client.pulled.append(ref)
+    from miragen.daemon.core import ImageContractUnsupported
+
+    with pytest.raises(ImageContractUnsupported) as exc:
+        core.create_agent("alpha", EXECUTOR_YAML.format(name="alpha"))
+    assert docker_client.pulled == [DEFAULT_IMAGE]  # tried exactly once
+    assert "registry's current answer" in str(exc.value)
+    assert not (tmp_path / "agents" / "alpha").exists()
+
+
+def test_digest_pinned_base_image_is_never_re_pulled(tmp_path, docker_client, runner):
+    # A digest cannot be re-pointed upstream, so a refresh could only
+    # return the same bytes — re-pulling would be pure latency.
+    digest_ref = DEFAULT_DIGEST
+    docker_client.image_map[digest_ref] = FakeImage(
+        labels={"io.miragen.profile-contracts": "1"}
+    )
+    docker_client.images.pull = lambda ref: docker_client.pulled.append(ref)
+    pinned = LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image=digest_ref,
+        runner=runner,
+        not_found=FakeNotFound,
+        sleep=lambda _s: None,
+    )
+    from miragen.daemon.core import ImageContractUnsupported
+
+    with pytest.raises(ImageContractUnsupported):
+        pinned.create_agent("alpha", EXECUTOR_YAML.format(name="alpha"))
+    assert docker_client.pulled == []
