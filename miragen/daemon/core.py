@@ -567,59 +567,70 @@ class LifecycleCore:
             )
 
     # -- profile↔runtime contract (#75) -------------------------------------
+    #
+    # One rule governs this whole section: the contract is judged against the
+    # exact image that will execute the profile, and that same image object
+    # is what gets pinned or restarted. Re-looking-up a tag between the check
+    # and the spawn would reintroduce the swap the digest pin exists to
+    # prevent (Codex review, PR #76).
 
-    def _pull_image(self) -> None:
+    def _pull_ref(self, ref: str) -> None:
         try:
-            self._docker.images.pull(self._base_image)
+            self._docker.images.pull(ref)
         except Exception as exc:
             raise ImageContractUnsupported(
-                f"cannot pull runtime image '{self._base_image}': {exc} — "
-                "the profile contract cannot be verified against an image "
-                "the daemon cannot see"
+                f"cannot pull runtime image '{ref}': {exc} — the profile "
+                "contract cannot be verified against an image the daemon "
+                "cannot see"
             ) from exc
 
-    def _spawn_image(self, *, refresh: bool = False):
-        """The image object for self._base_image. Pulled when absent — the
-        contract must be judged against what will actually run, and an image
-        not on the host yet would otherwise be judged blind — or when
-        `refresh` asks for the registry's current answer."""
+    def _image_for_ref(self, ref: str, *, refresh: bool = False):
+        """The image object for `ref`. Pulled when absent — the contract must
+        be judged against what will actually run, and an image not on the
+        host yet would otherwise be judged blind — or when `refresh` asks for
+        the registry's current answer."""
         if refresh:
-            self._pull_image()
+            self._pull_ref(ref)
         try:
-            return self._docker.images.get(self._base_image)
+            return self._docker.images.get(ref)
         except self._not_found:
             pass
-        self._pull_image()
+        self._pull_ref(ref)
         try:
-            return self._docker.images.get(self._base_image)
+            return self._docker.images.get(ref)
         except Exception as exc:
             raise ImageContractUnsupported(
-                f"cannot inspect runtime image '{self._base_image}': {exc} — "
-                "the profile contract cannot be verified against an image "
-                "the daemon cannot see"
+                f"cannot inspect runtime image '{ref}': {exc} — the profile "
+                "contract cannot be verified against an image the daemon "
+                "cannot see"
             ) from exc
 
-    def _image_contracts(self, *, refresh: bool = False) -> set[int]:
-        """Contract levels the spawn image declares (its OCI label). An
-        unlabeled image predates contract labeling: a pre-executor-tier
-        runtime, contract 1 only."""
-        labels = self._spawn_image(refresh=refresh).labels or {}
+    @staticmethod
+    def _is_mutable_ref(ref: str) -> bool:
+        """A tag can be re-pointed upstream; a digest cannot. Only a mutable
+        reference is worth re-pulling when the local copy disappoints."""
+        return "@" not in ref
+
+    def _contracts_of(self, image, ref: str) -> set[int]:
+        """Contract levels an image declares (its OCI label). An unlabeled
+        image predates contract labeling: a pre-executor-tier runtime,
+        contract 1 only."""
+        labels = image.labels or {}
         try:
             return parse_contracts_label(labels.get(PROFILE_CONTRACTS_LABEL))
         except ValueError as exc:
             raise ImageContractUnsupported(
-                f"runtime image '{self._base_image}' carries a malformed "
+                f"runtime image '{ref}' carries a malformed "
                 f"{PROFILE_CONTRACTS_LABEL} label: {exc}"
             ) from exc
 
-    def _is_mutable_ref(self) -> bool:
-        """A tag can be re-pointed upstream; a digest cannot. Only a mutable
-        reference is worth re-pulling when the local copy disappoints."""
-        return "@" not in self._base_image
-
-    def _assert_image_contract(self, required: int) -> None:
-        supported = self._image_contracts()
-        if required not in supported and self._is_mutable_ref():
+    def _validated_image(self, ref: str, required: int):
+        """Return the image object at `ref` after proving it can execute a
+        profile requiring `required` — the caller pins or restarts THIS
+        object, never a fresh lookup of the same tag."""
+        image = self._image_for_ref(ref)
+        supported = self._contracts_of(image, ref)
+        if required not in supported and self._is_mutable_ref(ref):
             # A locally cached tag that disappoints is far more often stale
             # than genuinely incapable — `latest` moves upstream, Compose
             # trusts the cache, and the host silently keeps last month's
@@ -629,42 +640,59 @@ class LifecycleCore:
             logger.info(
                 "runtime image '%s' does not satisfy profile contract %d — "
                 "re-pulling in case the local copy is stale",
-                self._base_image,
+                ref,
                 required,
             )
-            supported = self._image_contracts(refresh=True)
+            image = self._image_for_ref(ref, refresh=True)
+            supported = self._contracts_of(image, ref)
         if required not in supported:
+            mutable = self._is_mutable_ref(ref)
             raise ImageContractUnsupported(
-                f"runtime image '{self._base_image}' declares profile "
-                f"contract(s) {sorted(supported)} but this profile requires "
-                f"contract {required} — and this is the registry's current "
-                "answer, not a stale local copy (the daemon re-pulled a "
-                "mutable reference before refusing). Point "
-                "MIRAGEN_BASE_IMAGE at a runtime that supports the "
+                f"runtime image '{ref}' declares profile contract(s) "
+                f"{sorted(supported)} but this profile requires contract "
+                f"{required}"
+                + (
+                    " — and this is the registry's current answer, not a "
+                    "stale local copy (the daemon re-pulled before refusing)"
+                    if mutable
+                    else " (a digest-pinned image; its contract cannot change)"
+                )
+                + ". Point MIRAGEN_BASE_IMAGE at a runtime that supports the "
                 "contract, or lower the profile's requirement; spawning "
                 "anyway would crash-loop at boot (#75).",
                 required=required,
                 supported=sorted(supported),
-                image=self._base_image,
+                image=ref,
             )
+        return image
 
-    def _resolve_spawn_ref(self) -> str:
-        """The image reference written into the compose service: the digest
-        the contract check just ran against, so what was validated is what
-        runs — a later re-tag of `latest` cannot change the runtime under a
-        validated profile. Falls back to the tag for images without a repo
+    def _digest_ref_for(self, image, ref: str) -> str:
+        """The immutable reference for an image object: what was validated is
+        what runs. Falls back to `ref` for images without a matching repo
         digest (e.g. built locally, never pushed)."""
-        if "@" in self._base_image:
-            return self._base_image
-        try:
-            image = self._docker.images.get(self._base_image)
-        except Exception:
-            return self._base_image
-        repo = self._repo_of(self._base_image)
+        if not self._is_mutable_ref(ref):
+            return ref
+        repo = self._repo_of(ref)
         for digest_ref in (image.attrs or {}).get("RepoDigests") or []:
             if digest_ref.startswith(repo + "@"):
                 return digest_ref
-        return self._base_image
+        return ref
+
+    def _validated_spawn_ref(self, required: int) -> str:
+        """Create/import path: prove the configured base image can run the
+        profile, then return the reference to write into the compose
+        service — derived from the very image object that passed."""
+        image = self._validated_image(self._base_image, required)
+        return self._digest_ref_for(image, self._base_image)
+
+    def _service_image(self, name: str) -> str | None:
+        """The image reference pinned in an existing agent's compose service
+        — the image that agent actually runs, which is what an in-place
+        restart will re-execute."""
+        if not self.compose_file.exists():
+            return None
+        service = (self._compose_load().get("services") or {}).get(name) or {}
+        return service.get("image")
 
     @staticmethod
     def _repo_of(ref: str) -> str:
@@ -675,6 +703,19 @@ class LifecycleCore:
         if sep and "/" not in tail:
             return head
         return ref
+
+    def _teardown_container(self, name: str) -> None:
+        try:
+            container = self._docker.containers.get(name)
+            container.stop()
+            container.remove()
+        except self._not_found:
+            pass
+        except Exception:
+            # Rollback best-effort: the compose service removal and the
+            # workspace removal still proceed; an orphaned stopped
+            # container is recoverable, a half-registered agent is worse.
+            logger.warning("could not remove container '%s' during rollback", name)
 
     def _watch_first_boot(self, name: str) -> None:
         """Watch a freshly (re)started container until the probe window
@@ -704,21 +745,6 @@ class LifecycleCore:
             self._sleep(step)
             waited += step
 
-    def _teardown_container(self, name: str) -> None:
-        try:
-            container = self._docker.containers.get(name)
-            container.stop()
-            container.remove()
-        except self._not_found:
-            pass
-        except Exception:
-            # Rollback best-effort: the compose service removal and the
-            # workspace removal still proceed; an orphaned stopped
-            # container is recoverable, a half-registered agent is worse.
-            logger.warning("could not remove container '%s' during rollback", name)
-
-    # -- compose.yml --------------------------------------------------------
-
     def _read_yaml(self, path: Path) -> dict:
         with open(path) as f:
             return yaml.safe_load(f) or {}
@@ -744,7 +770,7 @@ class LifecycleCore:
             "networks": {"miragen-net": {"external": True}},
         }
 
-    def _compose_add_service(self, name: str) -> None:
+    def _compose_add_service(self, name: str, image_ref: str | None = None) -> None:
         self.ensure_network()
         secret_names = self._secret_names()
         env = {"AGENT_PROFILE": "agent.yaml"}
@@ -782,10 +808,11 @@ class LifecycleCore:
         data["networks"] = {"miragen-net": {"external": True}}
         data.setdefault("secrets", {}).update({s: {"external": True} for s in secret_names})
         data.setdefault("services", {})[name] = {
-            # The digest the contract check ran against — what was validated
-            # is what runs; a re-tagged `latest` cannot swap the runtime
-            # under a validated profile (#75).
-            "image": self._resolve_spawn_ref(),
+            # The digest of the very image the contract check validated —
+            # what was validated is what runs; a re-tagged `latest` cannot
+            # swap the runtime under a validated profile, and this is not a
+            # second lookup of the tag (#75, Codex review on #76).
+            "image": image_ref or self._base_image,
             "container_name": name,
             "restart": "unless-stopped",
             "secrets": secret_names,
@@ -892,7 +919,9 @@ class LifecycleCore:
         # The contract is judged against the image that will actually run
         # the profile — never against this daemon's own bundled miragen,
         # which is the two-interpreters gap of the motivating failure (#75).
-        self._assert_image_contract(summary["profile_contract"])
+        # The returned reference IS the validated image, carried to the
+        # compose service rather than re-resolved.
+        spawn_ref = self._validated_spawn_ref(summary["profile_contract"])
 
         max_agents = int(self._environ.get("MIRAGEND_MAX_AGENTS", DEFAULT_MAX_AGENTS))
         # Check-then-act: reading the count and creating the directory that
@@ -919,7 +948,7 @@ class LifecycleCore:
                 if tools_source is not None
                 else f"from miragen import register\n\n# Tools for {name}\n"
             )
-            self._compose_add_service(name)
+            self._compose_add_service(name, spawn_ref)
             try:
                 self._compose_up(name)
                 self._watch_first_boot(name)
@@ -952,9 +981,15 @@ class LifecycleCore:
                 f"being updated is '{name}' — set 'name: {name}' in the YAML"
             )
 
-        # Same boundary as create: the new profile must be executable by
-        # the runtime image before the running agent is disturbed (#75).
-        self._assert_image_contract(summary["profile_contract"])
+        # Same boundary as create, against the RIGHT image: an in-place
+        # update restarts the existing container, which re-executes the
+        # image pinned in its compose service — not whatever the base tag
+        # points at today. Checking the base tag would both reject updates
+        # the running image supports and admit updates that crash it
+        # (Codex review, PR #76). Falls back to the base image for agents
+        # created before service pinning existed.
+        running_ref = self._service_image(name) or self._base_image
+        self._validated_image(running_ref, summary["profile_contract"])
 
         original = yaml_path.read_text()
         try:
@@ -1280,6 +1315,7 @@ class LifecycleCore:
         staging = None
         created_dir = False
         added_service = False
+        started = False
         try:
             self.exports_dir.mkdir(parents=True, exist_ok=True)
             staging = Path(
@@ -1317,7 +1353,12 @@ class LifecycleCore:
                 rewritten = f"name: {name}\n" + original_text
             yaml_src.write_text(rewritten)
 
-            validate_profile_text(rewritten)
+            summary = validate_profile_text(rewritten)
+
+            # An import is a create by another door: the archive's profile
+            # meets the same contract gate, or it lands as the crash loop
+            # #75 exists to prevent (Codex review, PR #76).
+            spawn_ref = self._validated_spawn_ref(summary["profile_contract"])
 
             d.parent.mkdir(parents=True, exist_ok=True)
             # Everything above operates on `staging`, not agents_dir, so it
@@ -1338,18 +1379,24 @@ class LifecycleCore:
                 shutil.move(str(src_root), str(d))
                 created_dir = True
 
-            self._compose_add_service(name)
+            self._compose_add_service(name, spawn_ref)
             added_service = True
 
             if start:
                 self._compose_up(name)
+                started = True
+                self._watch_first_boot(name)
         except DaemonError:
+            if started:
+                self._teardown_container(name)
             if added_service:
                 self._compose_remove_service(name)
             if created_dir:
                 shutil.rmtree(d, ignore_errors=True)
             raise
         except Exception as exc:
+            if started:
+                self._teardown_container(name)
             if added_service:
                 self._compose_remove_service(name)
             if created_dir:

@@ -985,3 +985,119 @@ def test_digest_pinned_base_image_is_never_re_pulled(tmp_path, docker_client, ru
     with pytest.raises(ImageContractUnsupported):
         pinned.create_agent("alpha", EXECUTOR_YAML.format(name="alpha"))
     assert docker_client.pulled == []
+
+
+# ── Codex review on PR #76: the three paths the first cut missed ─────────────
+
+
+def _export_of(core, name, yaml_text):
+    """An archive of `name`, built through the daemon's own export path."""
+    core.create_agent(name, yaml_text)
+    archive = core.export_agent(name)["archive_path"]
+    core.delete_agent(name)
+    return archive
+
+
+def test_import_is_gated_by_the_contract_too(core, docker_client, tmp_path):
+    # An import is a create by another door. Before this, import validated
+    # the profile, discarded the contract result, and started the container
+    # anyway — landing exactly the crash loop the gate exists to prevent.
+    archive = _export_of(core, "exectier", EXECUTOR_YAML.format(name="exectier"))
+    docker_client.image_map[DEFAULT_IMAGE] = FakeImage(
+        labels={"io.miragen.profile-contracts": "1"}
+    )
+    docker_client.images.pull = lambda ref: None  # refresh finds no better image
+    from miragen.daemon.core import ImageContractUnsupported
+
+    with pytest.raises(ImageContractUnsupported):
+        core.import_agent("imported", archive)
+    assert not (tmp_path / "agents" / "imported").exists()
+    assert "imported" not in docker_client.container_map
+
+
+def test_import_boot_failure_rolls_back(core, docker_client, runner, tmp_path):
+    archive = _export_of(core, "alpha", _yaml("alpha"))
+
+    def on_up(name):
+        container = docker_client.add(name)
+        container.status = "exited"
+
+    runner.on_up = on_up
+    from miragen.daemon.core import AgentBootFailed
+
+    with pytest.raises(AgentBootFailed):
+        core.import_agent("imported", archive)
+    assert not (tmp_path / "agents" / "imported").exists()
+    assert "imported" not in docker_client.container_map
+
+
+def test_compose_pins_the_validated_image_not_a_second_lookup(
+    core, docker_client, tmp_path
+):
+    # The tag is re-pointed between the contract check and compose
+    # generation (a concurrent pull, upstream retag). The service must
+    # carry the digest that was VALIDATED, not whatever the tag means by
+    # the time the service is written — otherwise digest pinning restores
+    # the very swap it advertises preventing.
+    validated_digest = DEFAULT_DIGEST
+    swapped_digest = "ghcr.io/example/miragen@sha256:" + "cd" * 32
+
+    real_get = docker_client.images.get
+    state = {"calls": 0}
+
+    def get(ref):
+        state["calls"] += 1
+        if state["calls"] > 1 and ref == DEFAULT_IMAGE:
+            # Second and later lookups see a different image under the tag.
+            return FakeImage(
+                labels={"io.miragen.profile-contracts": "1 2"},
+                repo_digests=[swapped_digest],
+            )
+        return real_get(ref)
+
+    docker_client.images.get = get
+    core.create_agent("alpha", _yaml("alpha"))
+
+    import yaml as _yaml_mod
+
+    data = _yaml_mod.safe_load((tmp_path / "compose.yml").read_text())
+    assert data["services"]["alpha"]["image"] == validated_digest
+
+
+def test_update_validates_the_image_the_agent_actually_runs(
+    core, docker_client, tmp_path
+):
+    # The agent runs the digest pinned in its service. A base tag that has
+    # since moved forward to a capable image must not license an executor
+    # profile onto a container that will restart on the OLD image.
+    core.create_agent("alpha", _yaml("alpha"))  # service pins DEFAULT_DIGEST
+    docker_client.image_map[DEFAULT_DIGEST] = FakeImage(
+        labels={"io.miragen.profile-contracts": "1"}
+    )
+    docker_client.image_map[DEFAULT_IMAGE] = FakeImage(
+        labels={"io.miragen.profile-contracts": "1 2"},
+        repo_digests=[DEFAULT_DIGEST],
+    )
+    from miragen.daemon.core import ImageContractUnsupported
+
+    container = docker_client.container_map["alpha"]
+    with pytest.raises(ImageContractUnsupported) as exc:
+        core.update_agent_config("alpha", EXECUTOR_YAML.format(name="alpha"))
+    # The refusal names the pinned image, not the base tag.
+    assert DEFAULT_DIGEST in str(exc.value)
+    assert container.restarted == 0
+
+
+def test_update_accepted_when_the_pinned_image_supports_it(core, docker_client):
+    # The mirror case: the base tag now points somewhere incapable, but the
+    # image this agent actually runs supports the profile — refusing that
+    # update would be a lie about what would happen.
+    core.create_agent("alpha", _yaml("alpha"))
+    docker_client.image_map[DEFAULT_DIGEST] = FakeImage(
+        labels={"io.miragen.profile-contracts": "1 2"}
+    )
+    docker_client.image_map[DEFAULT_IMAGE] = FakeImage(
+        labels={"io.miragen.profile-contracts": "1"}
+    )
+    core.update_agent_config("alpha", EXECUTOR_YAML.format(name="alpha"))
+    assert docker_client.container_map["alpha"].restarted == 1
