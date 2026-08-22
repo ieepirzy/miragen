@@ -1,5 +1,11 @@
 FROM python:3.12-slim
 
+# Profile contract levels this runtime executes (#75). miragend reads this
+# label off the image it will spawn and refuses profiles the runtime cannot
+# run. Kept in lockstep with miragen/profile_contract.py by
+# tests/test_profile_contract.py::test_dockerfile_label_matches_source.
+LABEL io.miragen.profile-contracts="1 2"
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 

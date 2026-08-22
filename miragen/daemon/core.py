@@ -20,6 +20,8 @@ import os
 import re
 import shutil
 import subprocess
+import logging
+import time
 import tarfile
 import tempfile
 import threading
@@ -31,6 +33,12 @@ import yaml
 from pydantic import ValidationError
 
 from miragen.load import load_profile
+from miragen.profile_contract import (
+    PROFILE_CONTRACTS_LABEL,
+    parse_contracts_label,
+)
+
+logger = logging.getLogger("miragen.daemon")
 
 # Agent names double as directory names, compose service names, and Docker
 # container names — restrict them accordingly (also blocks path traversal).
@@ -58,6 +66,12 @@ MAX_ARCHIVE_BYTES = 50 * 1024 * 1024
 DEFAULT_MAX_AGENTS = 10
 DEFAULT_AGENT_CPU_LIMIT = "1.0"
 DEFAULT_AGENT_MEM_LIMIT = "512m"
+
+# How long create/update watches a freshly (re)started container before
+# declaring first boot good — long enough to catch a profile the runtime
+# rejects at startup (that dies in ~1-2s), short enough not to hold the
+# API. 0 means a single immediate status check (used by tests).
+DEFAULT_BOOT_PROBE_SECONDS = 10
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +178,24 @@ class ContainerOperationFailed(DaemonError):
     code = "container_operation_failed"
 
 
+class ImageContractUnsupported(DaemonError):
+    """The runtime image this daemon would spawn does not declare support
+    for the profile's required contract (#75) — refused at create, in the
+    caller's face, instead of a crash loop discovered in container logs."""
+
+    status = 409
+    code = "image_contract_unsupported"
+
+
+class AgentBootFailed(DaemonError):
+    """The container started but the runtime died during first boot. The
+    create is rolled back and the boot log excerpt rides in the error, so
+    the caller learns synchronously what the runtime rejected."""
+
+    status = 502
+    code = "agent_boot_failed"
+
+
 class RestartFailed(DaemonError):
     status = 502
     code = "restart_failed"
@@ -229,6 +261,11 @@ def validate_profile_text(source: str) -> dict:
     else:
         summary["model"] = profile.spec.model
         summary["capabilities"] = list(profile.spec.capabilities or [])
+    # The contract level a runtime must support to execute this profile —
+    # what miragend checks the spawn image against (#75).
+    summary["profile_contract"] = profile.required_contract()
+    if profile.api_version:
+        summary["api_version"] = profile.api_version
     return summary
 
 
@@ -425,6 +462,7 @@ class LifecycleCore:
         environ: Mapping[str, str] | None = None,
         runner: Callable = subprocess.run,
         not_found: type[Exception] | None = None,
+        sleep: Callable = time.sleep,
     ) -> None:
         self.workspace = Path(workspace)
         self.agents_dir = self.workspace / "agents"
@@ -435,6 +473,7 @@ class LifecycleCore:
         self._internal_token = internal_token
         self._environ = os.environ if environ is None else environ
         self._run = runner
+        self._sleep = sleep
         self._not_found = not_found or _default_not_found()
         # create_agent/import_agent both do a check-then-act against
         # _agent_count() before committing a new agent (mkdir / shutil.move).
@@ -527,6 +566,122 @@ class LifecycleCore:
                 f"container failed to start: {result.stderr.strip()}"
             )
 
+    # -- profile↔runtime contract (#75) -------------------------------------
+
+    def _spawn_image(self):
+        """The image object for self._base_image, pulling it if absent —
+        the contract must be judged against what will actually run, and an
+        image that is not on the host yet would otherwise be judged blind."""
+        try:
+            return self._docker.images.get(self._base_image)
+        except self._not_found:
+            pass
+        try:
+            self._docker.images.pull(self._base_image)
+            return self._docker.images.get(self._base_image)
+        except Exception as exc:
+            raise ImageContractUnsupported(
+                f"cannot inspect runtime image '{self._base_image}': {exc} — "
+                "the profile contract cannot be verified against an image "
+                "the daemon cannot see"
+            ) from exc
+
+    def _image_contracts(self) -> set[int]:
+        """Contract levels the spawn image declares (its OCI label). An
+        unlabeled image predates contract labeling: a pre-executor-tier
+        runtime, contract 1 only."""
+        labels = self._spawn_image().labels or {}
+        try:
+            return parse_contracts_label(labels.get(PROFILE_CONTRACTS_LABEL))
+        except ValueError as exc:
+            raise ImageContractUnsupported(
+                f"runtime image '{self._base_image}' carries a malformed "
+                f"{PROFILE_CONTRACTS_LABEL} label: {exc}"
+            ) from exc
+
+    def _assert_image_contract(self, required: int) -> None:
+        supported = self._image_contracts()
+        if required not in supported:
+            raise ImageContractUnsupported(
+                f"runtime image '{self._base_image}' declares profile "
+                f"contract(s) {sorted(supported)} but this profile requires "
+                f"contract {required}. Pull a runtime that supports it "
+                f"(e.g. `docker pull {self._base_image}`) and retry — "
+                "spawning anyway would crash-loop at boot (#75).",
+                required=required,
+                supported=sorted(supported),
+                image=self._base_image,
+            )
+
+    def _resolve_spawn_ref(self) -> str:
+        """The image reference written into the compose service: the digest
+        the contract check just ran against, so what was validated is what
+        runs — a later re-tag of `latest` cannot change the runtime under a
+        validated profile. Falls back to the tag for images without a repo
+        digest (e.g. built locally, never pushed)."""
+        if "@" in self._base_image:
+            return self._base_image
+        try:
+            image = self._docker.images.get(self._base_image)
+        except Exception:
+            return self._base_image
+        repo = self._repo_of(self._base_image)
+        for digest_ref in (image.attrs or {}).get("RepoDigests") or []:
+            if digest_ref.startswith(repo + "@"):
+                return digest_ref
+        return self._base_image
+
+    @staticmethod
+    def _repo_of(ref: str) -> str:
+        """Image reference minus its tag ('ghcr.io/x/y:latest' -> the repo).
+        A colon inside the last path segment is a tag; a colon before a
+        slash is a registry port and is left alone."""
+        head, sep, tail = ref.rpartition(":")
+        if sep and "/" not in tail:
+            return head
+        return ref
+
+    def _watch_first_boot(self, name: str) -> None:
+        """Watch a freshly (re)started container until the probe window
+        closes or it dies. A runtime that rejects the profile exits within
+        a second or two and the restart policy flips the container to
+        'restarting' — that is a boot failure to surface with its logs,
+        not a success to discover later in `docker logs` (#75)."""
+        probe_seconds = float(
+            self._environ.get("MIRAGEND_BOOT_PROBE_SECONDS", DEFAULT_BOOT_PROBE_SECONDS)
+        )
+        waited = 0.0
+        while True:
+            status = self.container_status(name)
+            if status in ("exited", "dead", "restarting"):
+                try:
+                    excerpt = self.agent_logs(name, tail=40)
+                except Exception:
+                    excerpt = "(logs unavailable)"
+                raise AgentBootFailed(
+                    f"agent '{name}' failed first boot (container status: "
+                    f"{status}). Last log lines:\n{excerpt}",
+                    container_status=status,
+                )
+            if waited >= probe_seconds:
+                return
+            step = min(1.0, probe_seconds - waited)
+            self._sleep(step)
+            waited += step
+
+    def _teardown_container(self, name: str) -> None:
+        try:
+            container = self._docker.containers.get(name)
+            container.stop()
+            container.remove()
+        except self._not_found:
+            pass
+        except Exception:
+            # Rollback best-effort: the compose service removal and the
+            # workspace removal still proceed; an orphaned stopped
+            # container is recoverable, a half-registered agent is worse.
+            logger.warning("could not remove container '%s' during rollback", name)
+
     # -- compose.yml --------------------------------------------------------
 
     def _read_yaml(self, path: Path) -> dict:
@@ -592,7 +747,10 @@ class LifecycleCore:
         data["networks"] = {"miragen-net": {"external": True}}
         data.setdefault("secrets", {}).update({s: {"external": True} for s in secret_names})
         data.setdefault("services", {})[name] = {
-            "image": self._base_image,
+            # The digest the contract check ran against — what was validated
+            # is what runs; a re-tagged `latest` cannot swap the runtime
+            # under a validated profile (#75).
+            "image": self._resolve_spawn_ref(),
             "container_name": name,
             "restart": "unless-stopped",
             "secrets": secret_names,
@@ -601,6 +759,13 @@ class LifecycleCore:
             "networks": ["miragen-net"],
             "cpus": cpu_limit,
             "mem_limit": mem_limit,
+            # Managed-by markers for host tooling: miragend's containers
+            # belong to no compose stack a scoped operator can see, so at
+            # minimum they identify themselves (#75 companion).
+            "labels": {
+                "io.miragen.agent": "true",
+                "io.miragen.managed-by": "miragend",
+            },
         }
         self._write_yaml(self.compose_file, data)
 
@@ -689,6 +854,11 @@ class LifecycleCore:
 
         _assert_profile_satisfied_by_tools(summary, tools_source)
 
+        # The contract is judged against the image that will actually run
+        # the profile — never against this daemon's own bundled miragen,
+        # which is the two-interpreters gap of the motivating failure (#75).
+        self._assert_image_contract(summary["profile_contract"])
+
         max_agents = int(self._environ.get("MIRAGEND_MAX_AGENTS", DEFAULT_MAX_AGENTS))
         # Check-then-act: reading the count and creating the directory that
         # count is derived from must be atomic, or two concurrent callers can
@@ -717,6 +887,13 @@ class LifecycleCore:
             self._compose_add_service(name)
             try:
                 self._compose_up(name)
+                self._watch_first_boot(name)
+            except AgentBootFailed:
+                # The container came up and died: tear it down so the
+                # rollback leaves nothing crash-looping behind the error.
+                self._teardown_container(name)
+                self._compose_remove_service(name)
+                raise
             except ContainerOperationFailed:
                 self._compose_remove_service(name)
                 raise
@@ -740,6 +917,10 @@ class LifecycleCore:
                 f"being updated is '{name}' — set 'name: {name}' in the YAML"
             )
 
+        # Same boundary as create: the new profile must be executable by
+        # the runtime image before the running agent is disturbed (#75).
+        self._assert_image_contract(summary["profile_contract"])
+
         original = yaml_path.read_text()
         try:
             old_data = yaml.safe_load(original)
@@ -757,6 +938,7 @@ class LifecycleCore:
         yaml_path.write_text(yaml_source)
         try:
             self.restart_agent(name)
+            self._watch_first_boot(name)
         except DaemonError as exc:
             yaml_path.write_text(original)
             try:

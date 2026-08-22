@@ -4,6 +4,8 @@ from datetime import datetime
 from typing import Annotated, Literal, Optional, Union
 
 from apscheduler.triggers.cron import CronTrigger as _APCronTrigger
+
+from miragen.profile_contract import format_api_version, parse_api_version
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 
@@ -711,6 +713,21 @@ class ExecutorSpec(_ProfileModel):
 # ── Top-level agent profile ──────────────────────────────────────────────────
 
 class AgentProfile(_ProfileModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    api_version: Optional[str] = Field(
+        default=None,
+        alias="apiVersion",
+        description=(
+            "Profile contract this profile is written against, e.g. "
+            "'miragen/v2'. Optional: the effective requirement is the "
+            "greater of this declaration and what the profile's features "
+            "imply (an executor block implies v2), so a profile can pin "
+            "forward but never understate what it uses. miragend refuses "
+            "to spawn a profile onto a runtime image that does not "
+            "declare support for the required contract (#75)."
+        ),
+    )
     name: str = Field(
         description=(
             "Unique agent ID, also used as the Docker container name. Lowercase "
@@ -771,6 +788,45 @@ class AgentProfile(_ProfileModel):
     @property
     def is_executor(self) -> bool:
         return self.executor is not None
+
+    # -- profile contract (#75) --------------------------------------------
+
+    def inferred_contract(self) -> int:
+        """The contract level this profile's FEATURES require, regardless
+        of what it declares. The executor tier is the v2 surface; everything
+        the model tier ever supported is v1."""
+        return 2 if self.executor is not None else 1
+
+    def required_contract(self) -> int:
+        """The effective requirement miragend checks the runtime against:
+        max of declaration and inference — declaring forward is allowed,
+        understating is rejected by the validator below."""
+        declared = (
+            parse_api_version(self.api_version) if self.api_version else 1
+        )
+        return max(declared, self.inferred_contract())
+
+    @field_validator("api_version")
+    @classmethod
+    def validate_api_version(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            parse_api_version(v)  # raises ValueError with the pattern
+        return v
+
+    @model_validator(mode="after")
+    def validate_contract_not_understated(self) -> "AgentProfile":
+        if self.api_version is None:
+            return self
+        declared = parse_api_version(self.api_version)
+        inferred = self.inferred_contract()
+        if declared < inferred:
+            raise ValueError(
+                f"profile declares apiVersion {self.api_version} but uses "
+                f"features requiring {format_api_version(inferred)} "
+                "(the executor tier is a v2 surface) — a profile must not "
+                "understate its runtime requirement"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_exactly_one_backend(self) -> AgentProfile:
