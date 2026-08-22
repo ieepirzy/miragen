@@ -567,6 +567,20 @@ class LifecycleCore:
         for k, v in self._environ.items():
             if (k.endswith("_API_KEY_FILE") or k.endswith("_API_KEY")) and v:
                 env[k] = v
+        # Operator-named passthrough for credentials the suffix filter above
+        # cannot see — subscription OAuth env tokens foremost (e.g. the
+        # long-lived token Claude Code mints via `claude setup-token`, which
+        # is the subscription-primary path of docs/design/
+        # subscription-homes.md delivered as a single variable instead of a
+        # shared home volume). Names, never values: a variable is forwarded
+        # only when the operator listed it here AND it is set non-empty in
+        # the daemon's own environment, so the daemon still cannot be talked
+        # into minting credentials it does not hold.
+        passthrough = self._environ.get("MIRAGEND_AGENT_ENV_PASSTHROUGH", "")
+        for raw_name in passthrough.split(","):
+            key = raw_name.strip()
+            if key and self._environ.get(key):
+                env[key] = self._environ[key]
 
         # Every managed agent gets a default resource ceiling so a single
         # runaway container can't starve the host — overridable per-deployment

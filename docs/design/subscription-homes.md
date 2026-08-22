@@ -26,7 +26,26 @@ documents — it does not invent a parallel store.
 | `codex` | `codex_home` | `CODEX_HOME` | `~/.codex` | `/agent/codex-home` | `auth.json` (ChatGPT OAuth) | `CODEX_API_KEY` / `OPENAI_API_KEY` |
 | `kimi-code` | `kimi_home` | `KIMI_CODE_HOME` | `~/.kimi-code` | `/agent/kimi-home` | OAuth via Kimi Code login (config/store under home) | `KIMI_API_KEY` / `MOONSHOT_API_KEY` (and product equivalents) |
 | `grok-build` | `grok_home` | `GROK_HOME` | `~/.grok` | `/agent/grok-home` | `auth.json` (SuperGrok / X Premium+ OAuth) | `XAI_API_KEY` |
-| `claude-code` | *(none)* | — | `~/.claude` | mount or env | Claude Code OAuth at `~/.claude` | `ANTHROPIC_API_KEY` |
+| `claude-code` | *(none)* | `CLAUDE_CODE_OAUTH_TOKEN` | `~/.claude` | env token (or mount) | long-lived subscription token from `claude setup-token`, or OAuth store at `~/.claude` | `ANTHROPIC_API_KEY` |
+
+### Claude Code env-token note (decided 2026-08-22)
+
+Claude Code is the one product whose subscription credential is deliverable
+as a **single env var**: `claude setup-token` mints a long-lived (~1 year)
+OAuth token bound to the operator's subscription, and both the CLI and the
+`claude-agent-sdk` honor it as `CLAUDE_CODE_OAUTH_TOKEN`. That collapses the
+whole shared-home lifecycle for this backend — no login helper, no volume,
+no refresh races; mint once, set the variable, rotate before expiry. The
+`~/.claude` mount remains as the alternative for operators who prefer the
+home-volume model, and `ANTHROPIC_API_KEY` stays the metered fallback.
+`prepare()` accepts any of the three.
+
+Delivery through miragend uses `MIRAGEND_AGENT_ENV_PASSTHROUGH` — a
+comma-separated list of env var **names** the daemon forwards from its own
+environment into every agent container it writes. The mechanism is generic
+(names, never values; only set-non-empty variables forwarded) so the daemon
+stays control-plane-agnostic and vendor-agnostic; this token is merely the
+motivating case.
 
 ### Codex SDK note (re-verified 2026-07-25)
 
