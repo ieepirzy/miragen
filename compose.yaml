@@ -35,17 +35,30 @@ services:
       # filesystem -- so the workspace path has to be a real, matching path
       # on the host. A named volume does not satisfy this.
       - ${MIRAGEN_WORKSPACE:-/opt/miragen}:${MIRAGEN_WORKSPACE:-/opt/miragen}
+    env_file:
+      # The daemon can only forward credentials that reach ITS OWN
+      # environment (the *_API_KEY suffix filter, the passthrough list, and
+      # the executor-kind auto-forward all read os.environ). Loading the
+      # operator env file wholesale here means "set the variable" is the
+      # whole operator surface -- no per-credential declaration line on this
+      # service. `.env` covers plain docker compose; `stack.env` is the same
+      # mechanism under Portainer-managed stacks. Both optional.
+      - path: .env
+        required: false
+      - path: stack.env
+        required: false
     environment:
       MIRAGEN_WORKSPACE: ${MIRAGEN_WORKSPACE:-/opt/miragen}
       MIRAGEN_BASE_IMAGE: ${MIRAGEN_BASE_IMAGE:-ghcr.io/ieepirzy/miragen:latest}
       # Env var NAMES the daemon forwards from its own environment into
-      # every agent container it writes -- the subscription-token flow of
-      # docs/design/subscription-homes.md. Compose only injects values a
-      # service references, so each credential named in the passthrough
-      # list must ALSO be declared on this service; CLAUDE_CODE_OAUTH_TOKEN
-      # is the motivating one and pre-declared here (empty default -- the
-      # daemon forwards only set-non-empty variables). Add a matching line
-      # for any further credential you list.
+      # every agent container it writes -- for operator-specific credentials
+      # (tool-server bearers and the like) the suffix filter and the
+      # executor-kind auto-forward cannot know about. Values arrive via the
+      # env_file above; the declarations below exist only so a deployment
+      # that injects env some other way (shell exports, CI) still works.
+      # CLAUDE_CODE_OAUTH_TOKEN needs NO passthrough entry: the daemon
+      # auto-forwards it to agents whose profile declares
+      # `executor: claude-code` (docs/design/subscription-homes.md).
       MIRAGEND_AGENT_ENV_PASSTHROUGH: ${MIRAGEND_AGENT_ENV_PASSTHROUGH:-}
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       MIRAGEND_TOKEN: ${MIRAGEND_TOKEN:-}

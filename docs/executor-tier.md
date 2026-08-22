@@ -283,8 +283,9 @@ thread handle, resume in practice means abandon-and-rerun.
    path — see docs/design/subscription-homes.md), or a metered
    `ANTHROPIC_API_KEY` (the `*_FILE` secrets loader works here too), or
    mount Claude Code OAuth credentials at `~/.claude`. miragen warns at
-   startup when none of the three is visible. miragend forwards the token
-   to agent containers via `MIRAGEND_AGENT_ENV_PASSTHROUGH`.
+   startup when none of the three is visible. miragend auto-forwards a set
+   `CLAUDE_CODE_OAUTH_TOKEN` to agents whose profile declares
+   `executor: claude-code` — no passthrough entry needed.
 5. **Kimi Code: mount `kimi_home` or set an API key** — same shared-store
    model as Codex. Run `miragen kimi-login --kimi-home <volume>` once
    (subscription) or set `KIMI_API_KEY`/`MOONSHOT_API_KEY`. **Not** baked into
