@@ -5,9 +5,13 @@ plays the thread_id role on the run record: resume re-opens the session bound
 to the run. Jobs are atomic — nothing persists between distinct runs; the
 per-run session is the resume state, exactly as a Codex thread is.
 
-Auth: `ANTHROPIC_API_KEY` in the container environment, or Claude Code OAuth
-credentials volume-mounted at ~/.claude (the Codex `auth.json` story, one door
-over). `prepare()` warns at startup when neither is visible.
+Auth, in the order subscription-homes.md ranks them: `CLAUDE_CODE_OAUTH_TOKEN`
+in the container environment (the long-lived subscription token from
+`claude setup-token` — Claude Code is the one backend whose subscription
+credential travels as a single env var, so no shared home volume is needed),
+or Claude Code OAuth credentials volume-mounted at ~/.claude (the Codex
+`auth.json` story, one door over), or a metered `ANTHROPIC_API_KEY`.
+`prepare()` warns at startup when none of the three is visible.
 """
 
 from __future__ import annotations
@@ -55,10 +59,16 @@ class ClaudeCodeExecutor(ExecutorBackend):
     # ── Startup ────────────────────────────────────────────────────────────
 
     def prepare(self) -> None:
-        if not os.environ.get("ANTHROPIC_API_KEY") and not (Path.home() / ".claude").exists():
+        if (
+            not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+            and not os.environ.get("ANTHROPIC_API_KEY")
+            and not (Path.home() / ".claude").exists()
+        ):
             logger.warning(
-                f"[{self.profile.name}] no ANTHROPIC_API_KEY and no ~/.claude credentials — "
-                "executor spawns will fail auth. Set the key or mount Claude Code credentials."
+                f"[{self.profile.name}] no CLAUDE_CODE_OAUTH_TOKEN, no ANTHROPIC_API_KEY and "
+                "no ~/.claude credentials — executor spawns will fail auth. Mint a "
+                "subscription token with `claude setup-token`, set a metered key, or mount "
+                "Claude Code credentials."
             )
 
     # ── Turn streaming ─────────────────────────────────────────────────────

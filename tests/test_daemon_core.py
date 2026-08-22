@@ -197,6 +197,41 @@ def test_create_agent_writes_workspace_compose_and_starts(core, runner, tmp_path
     assert compose["secrets"] == {"anthropic_key": {"external": True}}
 
 
+def test_env_passthrough_forwards_named_variables_only(tmp_path):
+    """MIRAGEND_AGENT_ENV_PASSTHROUGH forwards exactly the operator-named,
+    set-non-empty variables — subscription OAuth env tokens foremost, which
+    the *_API_KEY suffix filter cannot see. Unlisted variables must not leak
+    into agent containers, and listing a variable the daemon does not hold
+    must forward nothing rather than an empty string."""
+    docker_client = FakeDocker()
+    runner = RecordingRunner()
+    runner.on_up = lambda name: docker_client.add(name)
+    core = LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        environ={
+            "MIRAGEND_AGENT_ENV_PASSTHROUGH": "CLAUDE_CODE_OAUTH_TOKEN, UNSET_ONE,,EMPTY_ONE",
+            "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-example",
+            "EMPTY_ONE": "",
+            "UNLISTED_SECRET": "must-not-leak",
+        },
+        runner=runner,
+        not_found=FakeNotFound,
+    )
+    core.create_agent("alpha", _yaml("alpha"))
+
+    import yaml as pyyaml
+
+    env = pyyaml.safe_load((tmp_path / "compose.yml").read_text())["services"]["alpha"][
+        "environment"
+    ]
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-example"
+    assert "UNSET_ONE" not in env
+    assert "EMPTY_ONE" not in env
+    assert "UNLISTED_SECRET" not in env
+
+
 def test_create_agent_duplicate_rejected(core):
     core.create_agent("alpha", _yaml("alpha"))
     with pytest.raises(AgentExists):

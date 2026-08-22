@@ -938,3 +938,26 @@ async def test_no_sink_configured_leaves_field_none(tmp_path):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post("/run", json={"prompt": "fix it"})
     assert app_module._run_store.get(resp.json()["run_id"]).artifact_stored is None
+
+def test_claude_code_prepare_accepts_subscription_env_token(tmp_path, monkeypatch, caplog):
+    """CLAUDE_CODE_OAUTH_TOKEN alone satisfies the startup auth check — it is
+    the subscription-primary path (docs/design/subscription-homes.md), so its
+    presence must not trigger the missing-credentials warning; its absence
+    alongside no key and no ~/.claude must."""
+    import logging
+
+    profile = _profile({"executor": "claude-code"})
+    executor = ClaudeCodeExecutor(profile, runs_root=tmp_path / "runs")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "no-such-home")
+
+    with caplog.at_level(logging.WARNING, logger="miragen.executor"):
+        executor.prepare()
+    assert any("CLAUDE_CODE_OAUTH_TOKEN" in r.message for r in caplog.records)
+
+    caplog.clear()
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-example")
+    with caplog.at_level(logging.WARNING, logger="miragen.executor"):
+        executor.prepare()
+    assert not caplog.records

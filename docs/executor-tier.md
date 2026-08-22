@@ -278,9 +278,13 @@ thread handle, resume in practice means abandon-and-rerun.
    construction if the CLI is absent. Install the codex CLI in the container
    image (or run `openai_codex_sdk.install.install_codex()` at build time).
 4. **Claude Code auth is env or mount, never image-baked** — set
-   `ANTHROPIC_API_KEY` in the container environment (the `*_FILE` secrets
-   loader works here too) or mount Claude Code OAuth credentials at
-   `~/.claude`. miragen warns at startup when neither is visible.
+   `CLAUDE_CODE_OAUTH_TOKEN` in the container environment (the long-lived
+   subscription token from `claude setup-token`; the subscription-primary
+   path — see docs/design/subscription-homes.md), or a metered
+   `ANTHROPIC_API_KEY` (the `*_FILE` secrets loader works here too), or
+   mount Claude Code OAuth credentials at `~/.claude`. miragen warns at
+   startup when none of the three is visible. miragend forwards the token
+   to agent containers via `MIRAGEND_AGENT_ENV_PASSTHROUGH`.
 5. **Kimi Code: mount `kimi_home` or set an API key** — same shared-store
    model as Codex. Run `miragen kimi-login --kimi-home <volume>` once
    (subscription) or set `KIMI_API_KEY`/`MOONSHOT_API_KEY`. **Not** baked into
