@@ -232,6 +232,69 @@ def test_env_passthrough_forwards_named_variables_only(tmp_path):
     assert "UNLISTED_SECRET" not in env
 
 
+EXECUTOR_CLAUDE_YAML = """\
+name: {name}
+mode: interactive
+triggers:
+  - type: http
+executor:
+  executor: claude-code
+  instructions: "operate on the workspace"
+"""
+
+
+def _executor_kind_core(tmp_path, environ):
+    docker_client = FakeDocker()
+    runner = RecordingRunner()
+    runner.on_up = lambda name: docker_client.add(name)
+    return LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        environ=environ,
+        runner=runner,
+        not_found=FakeNotFound,
+    )
+
+
+def _service_env(tmp_path, name):
+    import yaml as pyyaml
+
+    return pyyaml.safe_load((tmp_path / "compose.yml").read_text())["services"][name][
+        "environment"
+    ]
+
+
+def test_subscription_token_auto_forwarded_to_claude_code_executor(tmp_path):
+    """A set CLAUDE_CODE_OAUTH_TOKEN reaches an `executor: claude-code`
+    agent with NO passthrough entry — the profile names the consuming
+    runtime, so the operator surface is just setting the variable."""
+    core = _executor_kind_core(
+        tmp_path, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-auto"}
+    )
+    core.create_agent("worker", EXECUTOR_CLAUDE_YAML.format(name="worker"))
+    assert _service_env(tmp_path, "worker")["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-auto"
+
+
+def test_subscription_token_not_forwarded_to_other_kinds(tmp_path):
+    """The auto-forward is scoped by executor kind: a model-tier agent must
+    not receive the subscription token even when the daemon holds it —
+    only a passthrough entry may widen delivery beyond the consuming kind."""
+    core = _executor_kind_core(
+        tmp_path, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-auto"}
+    )
+    core.create_agent("alpha", _yaml("alpha"))
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in _service_env(tmp_path, "alpha")
+
+
+def test_subscription_token_absent_forwards_nothing(tmp_path):
+    """An unset or empty token forwards nothing to a claude-code agent —
+    never an empty string."""
+    core = _executor_kind_core(tmp_path, {"CLAUDE_CODE_OAUTH_TOKEN": ""})
+    core.create_agent("worker", EXECUTOR_CLAUDE_YAML.format(name="worker"))
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in _service_env(tmp_path, "worker")
+
+
 def test_create_agent_duplicate_rejected(core):
     core.create_agent("alpha", _yaml("alpha"))
     with pytest.raises(AgentExists):

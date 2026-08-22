@@ -59,6 +59,17 @@ DEFAULT_MAX_AGENTS = 10
 DEFAULT_AGENT_CPU_LIMIT = "1.0"
 DEFAULT_AGENT_MEM_LIMIT = "512m"
 
+# Subscription credentials a vendor runtime is known to read from a single
+# env variable, keyed by the executor kind that consumes them. These are
+# auto-forwarded — no MIRAGEND_AGENT_ENV_PASSTHROUGH entry — but only into
+# agents whose profile declares that executor kind, so an agent that never
+# runs claude-code never sees the subscription token. claude-code is the
+# only kind here on purpose: the other products authenticate via home
+# volumes (docs/design/subscription-homes.md), not a portable env token.
+EXECUTOR_CREDENTIAL_ENV: dict[str, tuple[str, ...]] = {
+    "claude-code": ("CLAUDE_CODE_OAUTH_TOKEN",),
+}
+
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -554,6 +565,17 @@ class LifecycleCore:
             "networks": {"miragen-net": {"external": True}},
         }
 
+    def _agent_executor_kind(self, name: str) -> str:
+        """Best-effort executor kind from the agent's on-disk profile — both
+        callers of _compose_add_service (create, import) have written
+        agent.yaml before the service is composed. Model-tier profiles and
+        unreadable YAML yield "", which maps to no auto-forwarded credential."""
+        try:
+            data = self._read_yaml(self._agent_dir(name) / "agent.yaml")
+            return str((data.get("executor") or {}).get("executor") or "")
+        except Exception:
+            return ""
+
     def _compose_add_service(self, name: str) -> None:
         self.ensure_network()
         secret_names = self._secret_names()
@@ -581,6 +603,15 @@ class LifecycleCore:
             key = raw_name.strip()
             if key and self._environ.get(key):
                 env[key] = self._environ[key]
+        # Executor-kind-scoped auto-forward: the profile already names the
+        # vendor runtime it needs, so the well-known credential for that
+        # runtime is delivered without any passthrough entry — the operator
+        # surface is "set the variable", nothing else. Scoped by kind, not
+        # broadcast: only agents whose profile declares the consuming
+        # executor receive it.
+        for cred in EXECUTOR_CREDENTIAL_ENV.get(self._agent_executor_kind(name), ()):
+            if self._environ.get(cred):
+                env.setdefault(cred, self._environ[cred])
 
         # Every managed agent gets a default resource ceiling so a single
         # runaway container can't starve the host — overridable per-deployment

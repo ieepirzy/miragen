@@ -40,12 +40,18 @@ no refresh races; mint once, set the variable, rotate before expiry. The
 home-volume model, and `ANTHROPIC_API_KEY` stays the metered fallback.
 `prepare()` accepts any of the three.
 
-Delivery through miragend uses `MIRAGEND_AGENT_ENV_PASSTHROUGH` — a
-comma-separated list of env var **names** the daemon forwards from its own
-environment into every agent container it writes. The mechanism is generic
-(names, never values; only set-non-empty variables forwarded) so the daemon
-stays control-plane-agnostic and vendor-agnostic; this token is merely the
-motivating case.
+Delivery through miragend is automatic and scoped by executor kind: the
+daemon knows each agent's profile, so a set `CLAUDE_CODE_OAUTH_TOKEN` is
+forwarded to exactly the agents that declare `executor: claude-code` —
+no configuration, and no delivery to agents running anything else
+(`EXECUTOR_CREDENTIAL_ENV` in `daemon/core.py`; claude-code is its only
+entry because the other products authenticate via home volumes, not a
+portable env token). `MIRAGEND_AGENT_ENV_PASSTHROUGH` — a comma-separated
+list of env var **names** the daemon forwards from its own environment
+into every agent container it writes — remains for operator-specific
+credentials the daemon cannot know about (tool-server bearers and the
+like). Both mechanisms forward names, never values, and only set-non-empty
+variables, so the daemon stays control-plane-agnostic and vendor-agnostic.
 
 ### Codex SDK note (re-verified 2026-07-25)
 
