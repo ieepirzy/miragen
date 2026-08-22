@@ -566,13 +566,23 @@ class LifecycleCore:
         }
 
     def _agent_executor_kind(self, name: str) -> str:
-        """Best-effort executor kind from the agent's on-disk profile — both
-        callers of _compose_add_service (create, import) have written
-        agent.yaml before the service is composed. Model-tier profiles and
-        unreadable YAML yield "", which maps to no auto-forwarded credential."""
+        """Executor kind from the agent's on-disk profile — every caller of
+        _compose_add_service (create, import, config update) has written
+        agent.yaml before the service is composed.
+
+        Resolved through validate_profile_text, i.e. the loader, NOT a raw
+        YAML read: `executor: ${EXECUTOR_KIND:-claude-code}` is a valid
+        profile, and interpolate_env expands it before Pydantic ever sees
+        it. Reading the unprocessed file returns the literal placeholder and
+        the credential lookup silently misses. Interpolation resolves against
+        this daemon's own os.environ — the same environment the forwarded
+        value is read from, so the two cannot disagree.
+
+        Model-tier profiles and unreadable YAML yield "", which maps to no
+        auto-forwarded credential."""
         try:
-            data = self._read_yaml(self._agent_dir(name) / "agent.yaml")
-            return str((data.get("executor") or {}).get("executor") or "")
+            text = (self._agent_dir(name) / "agent.yaml").read_text()
+            return str(validate_profile_text(text).get("executor") or "")
         except Exception:
             return ""
 
@@ -785,13 +795,21 @@ class LifecycleCore:
         if not isinstance(new_data, dict):
             new_data = {}
 
+        # A change of executor kind changes which credentials the service is
+        # entitled to, and container environment is fixed at create time --
+        # restart() preserves it. Recompose and let compose recreate the
+        # container instead, or an agent switched TO claude-code runs without
+        # its subscription token while one switched AWAY keeps holding it.
+        old_kind = self._agent_executor_kind(name)
+        new_kind = str(summary.get("executor") or "")
+
         yaml_path.write_text(yaml_source)
         try:
-            self.restart_agent(name)
+            self._apply_config(name, recreate=new_kind != old_kind)
         except DaemonError as exc:
             yaml_path.write_text(original)
             try:
-                self.restart_agent(name)
+                self._apply_config(name, recreate=new_kind != old_kind)
             except DaemonError:
                 pass
             raise RestartFailed(
@@ -813,6 +831,17 @@ class LifecycleCore:
     def start_agent(self, name: str) -> None:
         self._require_agent(name)
         self._compose_up(name)
+
+    def _apply_config(self, name: str, *, recreate: bool) -> None:
+        """Put a rewritten agent.yaml into effect. A plain restart re-reads
+        the mounted profile, which is all most edits need; `recreate` also
+        regenerates the compose service so `compose up` replaces the
+        container, picking up an environment the running one cannot change."""
+        if recreate:
+            self._compose_add_service(name)
+            self._compose_up(name)
+        else:
+            self.restart_agent(name)
 
     def restart_agent(self, name: str) -> None:
         self._require_agent(name)

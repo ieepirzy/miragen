@@ -287,6 +287,52 @@ def test_subscription_token_not_forwarded_to_other_kinds(tmp_path):
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in _service_env(tmp_path, "alpha")
 
 
+def test_subscription_token_resolved_through_profile_interpolation(tmp_path, monkeypatch):
+    """The kind is read through the loader, not the raw file: a profile
+    naming its executor via ${VAR:-default} interpolates before validation,
+    so the credential lookup must see the resolved kind, not the literal.
+
+    interpolate_env resolves against the process environment (os.environ),
+    which in a real daemon is the same environment the forwarded value comes
+    from — hence monkeypatch here rather than the injected environ dict."""
+    monkeypatch.setenv("EXECUTOR_KIND", "claude-code")
+    core = _executor_kind_core(
+        tmp_path, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-auto"}
+    )
+    interpolated = EXECUTOR_CLAUDE_YAML.format(name="worker").replace(
+        "executor: claude-code", "executor: ${EXECUTOR_KIND:-codex}"
+    )
+    core.create_agent("worker", interpolated)
+    assert _service_env(tmp_path, "worker")["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-auto"
+
+
+def test_update_config_to_claude_code_recreates_with_token(tmp_path):
+    """Switching an existing agent TO claude-code must deliver the token.
+    Container environment is fixed at create time, so a plain restart()
+    would leave the agent authenticating against nothing."""
+    core = _executor_kind_core(
+        tmp_path, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-auto"}
+    )
+    core.create_agent("alpha", _yaml("alpha"))
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in _service_env(tmp_path, "alpha")
+
+    core.update_agent_config("alpha", EXECUTOR_CLAUDE_YAML.format(name="alpha"))
+    assert _service_env(tmp_path, "alpha")["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-auto"
+
+
+def test_update_config_away_from_claude_code_drops_token(tmp_path):
+    """Switching AWAY from claude-code must withdraw the token rather than
+    leave it in a container whose profile no longer declares that runtime."""
+    core = _executor_kind_core(
+        tmp_path, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-auto"}
+    )
+    core.create_agent("worker", EXECUTOR_CLAUDE_YAML.format(name="worker"))
+    assert _service_env(tmp_path, "worker")["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-auto"
+
+    core.update_agent_config("worker", _yaml("worker"))
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in _service_env(tmp_path, "worker")
+
+
 def test_subscription_token_absent_forwards_nothing(tmp_path):
     """An unset or empty token forwards nothing to a claude-code agent —
     never an empty string."""
