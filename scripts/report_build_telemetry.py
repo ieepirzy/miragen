@@ -30,16 +30,28 @@ All inputs come from the environment (never argv), so the calling workflow
 step just sets env: and runs `python3 scripts/report_build_telemetry.py`.
 
 Required:
-    OTEL_EXPORTER_OTLP_ENDPOINT   Base OTLP/HTTP endpoint (e.g.
-                                  https://admin.example.com); this appends
+    OTEL_EXPORTER_OTLP_ENDPOINT   Base OTLP/HTTP endpoint; this appends
                                   /v1/metrics and /v1/logs itself, same as
-                                  a real OTel SDK exporter would. Unset ->
-                                  no-op, by design: this is the switch
-                                  each repo's own secret is left empty
-                                  until it should start reporting — and
-                                  the same switch that lets this endpoint
-                                  be swapped for a real OTel Collector
-                                  later with zero producer-side changes.
+                                  a real OTel SDK exporter would. Pointed
+                                  at movingfirm-admin specifically, the
+                                  value must include the /api prefix (e.g.
+                                  https://admin.example.com/api) — that
+                                  repo's routing convention requires every
+                                  backend route to live under /api (a
+                                  route outside it can be shadowed by its
+                                  Vue SPA's client-side catch-all), so its
+                                  receiver is mounted at /api/v1/metrics
+                                  and /api/v1/logs rather than the
+                                  OTLP-conventional root-level paths. A
+                                  real OTel Collector has no such
+                                  constraint and would just take the bare
+                                  host. Unset -> no-op, by design: this is
+                                  the switch each repo's own secret is
+                                  left empty until it should start
+                                  reporting — and the same switch that
+                                  lets this endpoint be swapped for a real
+                                  OTel Collector later with zero
+                                  producer-side changes.
     IMAGE_REF                     Image ref as passed to `docker
                                   build`/`buildx build --tag` (e.g.
                                   ghcr.io/ieepirzy/x:sha-abc).
