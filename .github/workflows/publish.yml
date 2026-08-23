@@ -37,13 +37,40 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
 
+      - name: Record build start
+        id: build_start
+        run: echo "ts=$(date +%s.%N)" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      # Best-effort fleet build-telemetry push (image footprint, layer count,
+      # build duration) to movingfirm-admin's /api/ci/build-telemetry — see
+      # scripts/report_build_telemetry.py's docstring (movingfirm-admin#120).
+      # No-ops cleanly while BUILD_TELEMETRY_URL is unset; never fails this
+      # job either way.
+      - name: Report build telemetry
+        if: always() && steps.build.outcome == 'success'
+        continue-on-error: true
+        env:
+          BUILD_TELEMETRY_URL: ${{ secrets.BUILD_TELEMETRY_URL }}
+          BUILD_TELEMETRY_TOKEN: ${{ secrets.BUILD_TELEMETRY_TOKEN }}
+          IMAGE_REF: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          BUILD_STARTED_AT: ${{ steps.build_start.outputs.ts }}
+          REPO: ${{ github.repository }}
+          GIT_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          JOB_NAME: publish
+        run: python3 scripts/report_build_telemetry.py
 
   # miragend — the swarm lifecycle daemon (Dockerfile.miragend). Published as
   # its own image so miragen-mcp's compose stack can pull it prebuilt.
@@ -75,7 +102,12 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
 
+      - name: Record build start
+        id: build_start
+        run: echo "ts=$(date +%s.%N)" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -83,3 +115,25 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      # Best-effort fleet build-telemetry push (image footprint, layer count,
+      # build duration) to movingfirm-admin's /api/ci/build-telemetry — see
+      # scripts/report_build_telemetry.py's docstring (movingfirm-admin#120).
+      # No-ops cleanly while BUILD_TELEMETRY_URL is unset; never fails this
+      # job either way.
+      - name: Report build telemetry
+        if: always() && steps.build.outcome == 'success'
+        continue-on-error: true
+        env:
+          BUILD_TELEMETRY_URL: ${{ secrets.BUILD_TELEMETRY_URL }}
+          BUILD_TELEMETRY_TOKEN: ${{ secrets.BUILD_TELEMETRY_TOKEN }}
+          IMAGE_REF: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          BUILD_STARTED_AT: ${{ steps.build_start.outputs.ts }}
+          REPO: ${{ github.repository }}
+          GIT_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          JOB_NAME: publish-miragend
+        run: python3 scripts/report_build_telemetry.py
