@@ -20,6 +20,8 @@ import os
 import re
 import shutil
 import subprocess
+import logging
+import time
 import tarfile
 import tempfile
 import threading
@@ -31,6 +33,12 @@ import yaml
 from pydantic import ValidationError
 
 from miragen.load import load_profile
+from miragen.profile_contract import (
+    PROFILE_CONTRACTS_LABEL,
+    parse_contracts_label,
+)
+
+logger = logging.getLogger("miragen.daemon")
 
 # Agent names double as directory names, compose service names, and Docker
 # container names — restrict them accordingly (also blocks path traversal).
@@ -58,6 +66,18 @@ MAX_ARCHIVE_BYTES = 50 * 1024 * 1024
 DEFAULT_MAX_AGENTS = 10
 DEFAULT_AGENT_CPU_LIMIT = "1.0"
 DEFAULT_AGENT_MEM_LIMIT = "512m"
+
+# How long create/update watches a freshly (re)started container before
+# declaring first boot good — long enough to catch a profile the runtime
+# rejects at startup (that dies in ~1-2s), short enough not to hold the
+# API. 0 means a single immediate status check (used by tests).
+DEFAULT_BOOT_PROBE_SECONDS = 10
+# How long the container must hold 'running' before first boot counts as
+# good, and how often that is checked. The settle window is the latency a
+# healthy create pays; the probe budget above is only spent on a container
+# that keeps failing to settle.
+BOOT_SETTLE_SECONDS = 2.0
+BOOT_POLL_SECONDS = 0.5
 
 # Subscription credentials a vendor runtime is known to read from a single
 # env variable, keyed by the executor kind that consumes them. These are
@@ -175,6 +195,24 @@ class ContainerOperationFailed(DaemonError):
     code = "container_operation_failed"
 
 
+class ImageContractUnsupported(DaemonError):
+    """The runtime image this daemon would spawn does not declare support
+    for the profile's required contract (#75) — refused at create, in the
+    caller's face, instead of a crash loop discovered in container logs."""
+
+    status = 409
+    code = "image_contract_unsupported"
+
+
+class AgentBootFailed(DaemonError):
+    """The container started but the runtime died during first boot. The
+    create is rolled back and the boot log excerpt rides in the error, so
+    the caller learns synchronously what the runtime rejected."""
+
+    status = 502
+    code = "agent_boot_failed"
+
+
 class RestartFailed(DaemonError):
     status = 502
     code = "restart_failed"
@@ -240,6 +278,11 @@ def validate_profile_text(source: str) -> dict:
     else:
         summary["model"] = profile.spec.model
         summary["capabilities"] = list(profile.spec.capabilities or [])
+    # The contract level a runtime must support to execute this profile —
+    # what miragend checks the spawn image against (#75).
+    summary["profile_contract"] = profile.required_contract()
+    if profile.api_version:
+        summary["api_version"] = profile.api_version
     return summary
 
 
@@ -436,6 +479,7 @@ class LifecycleCore:
         environ: Mapping[str, str] | None = None,
         runner: Callable = subprocess.run,
         not_found: type[Exception] | None = None,
+        sleep: Callable = time.sleep,
     ) -> None:
         self.workspace = Path(workspace)
         self.agents_dir = self.workspace / "agents"
@@ -446,6 +490,7 @@ class LifecycleCore:
         self._internal_token = internal_token
         self._environ = os.environ if environ is None else environ
         self._run = runner
+        self._sleep = sleep
         self._not_found = not_found or _default_not_found()
         # create_agent/import_agent both do a check-then-act against
         # _agent_count() before committing a new agent (mkdir / shutil.move).
@@ -538,7 +583,197 @@ class LifecycleCore:
                 f"container failed to start: {result.stderr.strip()}"
             )
 
-    # -- compose.yml --------------------------------------------------------
+    # -- profile↔runtime contract (#75) -------------------------------------
+    #
+    # One rule governs this whole section: the contract is judged against the
+    # exact image that will execute the profile, and that same image object
+    # is what gets pinned or restarted. Re-looking-up a tag between the check
+    # and the spawn would reintroduce the swap the digest pin exists to
+    # prevent (Codex review, PR #76).
+
+    def _pull_ref(self, ref: str) -> None:
+        try:
+            self._docker.images.pull(ref)
+        except Exception as exc:
+            raise ImageContractUnsupported(
+                f"cannot pull runtime image '{ref}': {exc} — the profile "
+                "contract cannot be verified against an image the daemon "
+                "cannot see"
+            ) from exc
+
+    def _image_for_ref(self, ref: str, *, refresh: bool = False):
+        """The image object for `ref`. Pulled when absent — the contract must
+        be judged against what will actually run, and an image not on the
+        host yet would otherwise be judged blind — or when `refresh` asks for
+        the registry's current answer."""
+        if refresh:
+            self._pull_ref(ref)
+        try:
+            return self._docker.images.get(ref)
+        except self._not_found:
+            pass
+        self._pull_ref(ref)
+        try:
+            return self._docker.images.get(ref)
+        except Exception as exc:
+            raise ImageContractUnsupported(
+                f"cannot inspect runtime image '{ref}': {exc} — the profile "
+                "contract cannot be verified against an image the daemon "
+                "cannot see"
+            ) from exc
+
+    @staticmethod
+    def _is_mutable_ref(ref: str) -> bool:
+        """A tag can be re-pointed upstream; a digest cannot. Only a mutable
+        reference is worth re-pulling when the local copy disappoints."""
+        return "@" not in ref
+
+    def _contracts_of(self, image, ref: str) -> set[int]:
+        """Contract levels an image declares (its OCI label). An unlabeled
+        image predates contract labeling: a pre-executor-tier runtime,
+        contract 1 only."""
+        labels = image.labels or {}
+        try:
+            return parse_contracts_label(labels.get(PROFILE_CONTRACTS_LABEL))
+        except ValueError as exc:
+            raise ImageContractUnsupported(
+                f"runtime image '{ref}' carries a malformed "
+                f"{PROFILE_CONTRACTS_LABEL} label: {exc}"
+            ) from exc
+
+    def _validated_image(self, ref: str, required: int):
+        """Return the image object at `ref` after proving it can execute a
+        profile requiring `required` — the caller pins or restarts THIS
+        object, never a fresh lookup of the same tag."""
+        image = self._image_for_ref(ref)
+        supported = self._contracts_of(image, ref)
+        if required not in supported and self._is_mutable_ref(ref):
+            # A locally cached tag that disappoints is far more often stale
+            # than genuinely incapable — `latest` moves upstream, Compose
+            # trusts the cache, and the host silently keeps last month's
+            # runtime. That exact staleness caused the failure #75 exists to
+            # prevent, so refresh once from the registry before refusing:
+            # the daemon repairs what it can and only reports what it can't.
+            logger.info(
+                "runtime image '%s' does not satisfy profile contract %d — "
+                "re-pulling in case the local copy is stale",
+                ref,
+                required,
+            )
+            image = self._image_for_ref(ref, refresh=True)
+            supported = self._contracts_of(image, ref)
+        if required not in supported:
+            mutable = self._is_mutable_ref(ref)
+            raise ImageContractUnsupported(
+                f"runtime image '{ref}' declares profile contract(s) "
+                f"{sorted(supported)} but this profile requires contract "
+                f"{required}"
+                + (
+                    " — and this is the registry's current answer, not a "
+                    "stale local copy (the daemon re-pulled before refusing)"
+                    if mutable
+                    else " (a digest-pinned image; its contract cannot change)"
+                )
+                + ". Point MIRAGEN_BASE_IMAGE at a runtime that supports the "
+                "contract, or lower the profile's requirement; spawning "
+                "anyway would crash-loop at boot (#75).",
+                required=required,
+                supported=sorted(supported),
+                image=ref,
+            )
+        return image
+
+    def _digest_ref_for(self, image, ref: str) -> str:
+        """The immutable reference for an image object: what was validated is
+        what runs. Falls back to `ref` for images without a matching repo
+        digest (e.g. built locally, never pushed)."""
+        if not self._is_mutable_ref(ref):
+            return ref
+        repo = self._repo_of(ref)
+        for digest_ref in (image.attrs or {}).get("RepoDigests") or []:
+            if digest_ref.startswith(repo + "@"):
+                return digest_ref
+        return ref
+
+    def _validated_spawn_ref(self, required: int) -> str:
+        """Create/import path: prove the configured base image can run the
+        profile, then return the reference to write into the compose
+        service — derived from the very image object that passed."""
+        image = self._validated_image(self._base_image, required)
+        return self._digest_ref_for(image, self._base_image)
+
+    def _service_image(self, name: str) -> str | None:
+        """The image reference pinned in an existing agent's compose service
+        — the image that agent actually runs, which is what an in-place
+        restart will re-execute."""
+        if not self.compose_file.exists():
+            return None
+        service = (self._compose_load().get("services") or {}).get(name) or {}
+        return service.get("image")
+
+    @staticmethod
+    def _repo_of(ref: str) -> str:
+        """Image reference minus its tag ('ghcr.io/x/y:latest' -> the repo).
+        A colon inside the last path segment is a tag; a colon before a
+        slash is a registry port and is left alone."""
+        head, sep, tail = ref.rpartition(":")
+        if sep and "/" not in tail:
+            return head
+        return ref
+
+    def _teardown_container(self, name: str) -> None:
+        try:
+            container = self._docker.containers.get(name)
+            container.stop()
+            container.remove()
+        except self._not_found:
+            pass
+        except Exception:
+            # Rollback best-effort: the compose service removal and the
+            # workspace removal still proceed; an orphaned stopped
+            # container is recoverable, a half-registered agent is worse.
+            logger.warning("could not remove container '%s' during rollback", name)
+
+    def _watch_first_boot(self, name: str) -> None:
+        """Watch a freshly (re)started container until it has held `running`
+        long enough to call the boot good, or until it dies. A runtime that
+        rejects the profile exits within a second or two and the restart
+        policy flips the container to 'restarting' — that is a boot failure
+        to surface with its logs, not a success to discover later in
+        `docker logs` (#75).
+
+        The settle window is what keeps this cheap: a healthy create returns
+        as soon as the container has been up for BOOT_SETTLE_SECONDS rather
+        than holding the API open for the whole probe budget, which is only
+        spent on a container that never settles.
+        """
+        probe_seconds = float(
+            self._environ.get("MIRAGEND_BOOT_PROBE_SECONDS", DEFAULT_BOOT_PROBE_SECONDS)
+        )
+        settle_seconds = min(BOOT_SETTLE_SECONDS, probe_seconds)
+        waited = 0.0
+        running_for = 0.0
+        last_step = 0.0
+        while True:
+            status = self.container_status(name)
+            if status in ("exited", "dead", "restarting"):
+                try:
+                    excerpt = self.agent_logs(name, tail=40)
+                except Exception:
+                    excerpt = "(logs unavailable)"
+                raise AgentBootFailed(
+                    f"agent '{name}' failed first boot (container status: "
+                    f"{status}). Last log lines:\n{excerpt}",
+                    container_status=status,
+                )
+            running_for = running_for + last_step if status == "running" else 0.0
+            if status == "running" and running_for >= settle_seconds:
+                return
+            if waited >= probe_seconds:
+                return
+            last_step = min(BOOT_POLL_SECONDS, probe_seconds - waited)
+            self._sleep(last_step)
+            waited += last_step
 
     def _read_yaml(self, path: Path) -> dict:
         with open(path) as f:
@@ -586,7 +821,7 @@ class LifecycleCore:
         except Exception:
             return ""
 
-    def _compose_add_service(self, name: str) -> None:
+    def _compose_add_service(self, name: str, image_ref: str | None = None) -> None:
         self.ensure_network()
         secret_names = self._secret_names()
         env = {"AGENT_PROFILE": "agent.yaml"}
@@ -633,7 +868,11 @@ class LifecycleCore:
         data["networks"] = {"miragen-net": {"external": True}}
         data.setdefault("secrets", {}).update({s: {"external": True} for s in secret_names})
         data.setdefault("services", {})[name] = {
-            "image": self._base_image,
+            # The digest of the very image the contract check validated —
+            # what was validated is what runs; a re-tagged `latest` cannot
+            # swap the runtime under a validated profile, and this is not a
+            # second lookup of the tag (#75, Codex review on #76).
+            "image": image_ref or self._base_image,
             "container_name": name,
             "restart": "unless-stopped",
             "secrets": secret_names,
@@ -642,6 +881,13 @@ class LifecycleCore:
             "networks": ["miragen-net"],
             "cpus": cpu_limit,
             "mem_limit": mem_limit,
+            # Managed-by markers for host tooling: miragend's containers
+            # belong to no compose stack a scoped operator can see, so at
+            # minimum they identify themselves (#75 companion).
+            "labels": {
+                "io.miragen.agent": "true",
+                "io.miragen.managed-by": "miragend",
+            },
         }
         self._write_yaml(self.compose_file, data)
 
@@ -730,6 +976,13 @@ class LifecycleCore:
 
         _assert_profile_satisfied_by_tools(summary, tools_source)
 
+        # The contract is judged against the image that will actually run
+        # the profile — never against this daemon's own bundled miragen,
+        # which is the two-interpreters gap of the motivating failure (#75).
+        # The returned reference IS the validated image, carried to the
+        # compose service rather than re-resolved.
+        spawn_ref = self._validated_spawn_ref(summary["profile_contract"])
+
         max_agents = int(self._environ.get("MIRAGEND_MAX_AGENTS", DEFAULT_MAX_AGENTS))
         # Check-then-act: reading the count and creating the directory that
         # count is derived from must be atomic, or two concurrent callers can
@@ -755,9 +1008,16 @@ class LifecycleCore:
                 if tools_source is not None
                 else f"from miragen import register\n\n# Tools for {name}\n"
             )
-            self._compose_add_service(name)
+            self._compose_add_service(name, spawn_ref)
             try:
                 self._compose_up(name)
+                self._watch_first_boot(name)
+            except AgentBootFailed:
+                # The container came up and died: tear it down so the
+                # rollback leaves nothing crash-looping behind the error.
+                self._teardown_container(name)
+                self._compose_remove_service(name)
+                raise
             except ContainerOperationFailed:
                 self._compose_remove_service(name)
                 raise
@@ -780,6 +1040,25 @@ class LifecycleCore:
                 f"profile 'name' field is '{summary.get('name')}' but the agent "
                 f"being updated is '{name}' — set 'name: {name}' in the YAML"
             )
+
+        old_kind_for_contract = self._agent_executor_kind(name)
+        will_recreate = str(summary.get("executor") or "") != old_kind_for_contract
+
+        # Same boundary as create, against the RIGHT image — which depends
+        # on what this update will actually do. A kind change recreates the
+        # container from the base image (validate and pin that, exactly like
+        # create); anything else restarts in place and re-executes the image
+        # pinned in the service, so THAT is what must satisfy the contract.
+        # Checking the base tag on the restart path would both reject
+        # updates the running image supports and admit updates that crash
+        # it (Codex review, PR #76). Falls back to the base image for agents
+        # created before service pinning existed.
+        if will_recreate:
+            spawn_ref = self._validated_spawn_ref(summary["profile_contract"])
+        else:
+            spawn_ref = None
+            running_ref = self._service_image(name) or self._base_image
+            self._validated_image(running_ref, summary["profile_contract"])
 
         original = yaml_path.read_text()
         try:
@@ -805,7 +1084,10 @@ class LifecycleCore:
 
         yaml_path.write_text(yaml_source)
         try:
-            self._apply_config(name, recreate=new_kind != old_kind)
+            self._apply_config(
+                name, recreate=new_kind != old_kind, image_ref=spawn_ref
+            )
+            self._watch_first_boot(name)
         except DaemonError as exc:
             yaml_path.write_text(original)
             try:
@@ -832,13 +1114,20 @@ class LifecycleCore:
         self._require_agent(name)
         self._compose_up(name)
 
-    def _apply_config(self, name: str, *, recreate: bool) -> None:
+    def _apply_config(
+        self, name: str, *, recreate: bool, image_ref: str | None = None
+    ) -> None:
         """Put a rewritten agent.yaml into effect. A plain restart re-reads
         the mounted profile, which is all most edits need; `recreate` also
         regenerates the compose service so `compose up` replaces the
-        container, picking up an environment the running one cannot change."""
+        container, picking up an environment the running one cannot change.
+
+        `image_ref` is the runtime the caller validated for the new profile
+        — required on the recreate path, because regenerating the service
+        without it would rewrite the mutable tag and discard the digest pin
+        the contract check established (#75 + Codex review on #76)."""
         if recreate:
-            self._compose_add_service(name)
+            self._compose_add_service(name, image_ref)
             self._compose_up(name)
         else:
             self.restart_agent(name)
@@ -1123,6 +1412,7 @@ class LifecycleCore:
         staging = None
         created_dir = False
         added_service = False
+        started = False
         try:
             self.exports_dir.mkdir(parents=True, exist_ok=True)
             staging = Path(
@@ -1160,7 +1450,12 @@ class LifecycleCore:
                 rewritten = f"name: {name}\n" + original_text
             yaml_src.write_text(rewritten)
 
-            validate_profile_text(rewritten)
+            summary = validate_profile_text(rewritten)
+
+            # An import is a create by another door: the archive's profile
+            # meets the same contract gate, or it lands as the crash loop
+            # #75 exists to prevent (Codex review, PR #76).
+            spawn_ref = self._validated_spawn_ref(summary["profile_contract"])
 
             d.parent.mkdir(parents=True, exist_ok=True)
             # Everything above operates on `staging`, not agents_dir, so it
@@ -1181,18 +1476,24 @@ class LifecycleCore:
                 shutil.move(str(src_root), str(d))
                 created_dir = True
 
-            self._compose_add_service(name)
+            self._compose_add_service(name, spawn_ref)
             added_service = True
 
             if start:
                 self._compose_up(name)
+                started = True
+                self._watch_first_boot(name)
         except DaemonError:
+            if started:
+                self._teardown_container(name)
             if added_service:
                 self._compose_remove_service(name)
             if created_dir:
                 shutil.rmtree(d, ignore_errors=True)
             raise
         except Exception as exc:
+            if started:
+                self._teardown_container(name)
             if added_service:
                 self._compose_remove_service(name)
             if created_dir:

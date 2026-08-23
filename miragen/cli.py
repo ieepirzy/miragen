@@ -54,6 +54,20 @@ def run(tools: str, host: str, port: int, reload: bool) -> None:
     )
 
 
+@cli.command()
+def contract() -> None:
+    """Print the profile contract levels this runtime supports, as JSON.
+
+    The third declaration surface next to the image label and /health (#75):
+    lets a daemon or an operator query any runtime — container or venv —
+    without booting an agent."""
+    import json as _json
+
+    from miragen.profile_contract import SUPPORTED_PROFILE_CONTRACTS
+
+    click.echo(_json.dumps({"profile_contracts": list(SUPPORTED_PROFILE_CONTRACTS)}))
+
+
 @cli.command(name="codex-login")
 @click.option(
     "--codex-home", default=None, envvar="CODEX_HOME",

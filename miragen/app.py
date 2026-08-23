@@ -37,6 +37,7 @@ from miragen.edf import (
 from miragen.executor import ExecutorBackend, ExecutorResult, RepositoryCheckout, build_executor
 from miragen.factory import build_agent, registered_handlers
 from miragen.load import load_profile
+from miragen.profile_contract import SUPPORTED_PROFILE_CONTRACTS
 from miragen.models import (
     AgentProfile,
     ApprovalResponse,
@@ -1034,6 +1035,9 @@ async def health():
         "pending_approvals": len(get_broker().pending()),
         "version": _installed_version(),
         "capabilities": CONTRACT_CAPABILITIES,
+        # Profile contract levels this runtime executes (#75) — the same
+        # declaration the image label and `miragen contract` carry.
+        "profile_contracts": list(SUPPORTED_PROFILE_CONTRACTS),
         "publication": _publication_health(),
         # Honest readiness, same pattern as publication: configured ≠ healthy,
         # but a False here explains an empty backend before anyone debugs it.

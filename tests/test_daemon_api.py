@@ -31,6 +31,7 @@ def _make_core(tmp_path, **kw):
         environ={},
         runner=runner,
         not_found=FakeNotFound,
+        sleep=lambda _s: None,
         **kw,
     )
     return core
@@ -80,6 +81,7 @@ def client(tmp_path):
         environ={},
         runner=runner,
         not_found=FakeNotFound,
+        sleep=lambda _s: None,
     )
     schedules = ScheduleStore(FakeScheduler())
     app = create_app(core, schedules, token="daemon-token")
@@ -120,6 +122,7 @@ def test_empty_token_disables_the_guard(tmp_path):
         environ={},
         runner=runner,
         not_found=FakeNotFound,
+        sleep=lambda _s: None,
     )
     unguarded = TestClient(create_app(core, token=""))
     assert unguarded.get("/agents").status_code == 200
