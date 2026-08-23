@@ -51,16 +51,16 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
       # Best-effort fleet build-telemetry push (image footprint, layer count,
-      # build duration) to movingfirm-admin's /api/ci/build-telemetry — see
+      # build duration) to movingfirm-admin's OTLP /v1/metrics and /v1/logs — see
       # scripts/report_build_telemetry.py's docstring (movingfirm-admin#120).
-      # No-ops cleanly while BUILD_TELEMETRY_URL is unset; never fails this
+      # No-ops cleanly while OTEL_EXPORTER_OTLP_ENDPOINT is unset; never fails this
       # job either way.
       - name: Report build telemetry
         if: always() && steps.build.outcome == 'success'
         continue-on-error: true
         env:
-          BUILD_TELEMETRY_URL: ${{ secrets.BUILD_TELEMETRY_URL }}
-          BUILD_TELEMETRY_TOKEN: ${{ secrets.BUILD_TELEMETRY_TOKEN }}
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
           IMAGE_REF: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
           BUILD_STARTED_AT: ${{ steps.build_start.outputs.ts }}
@@ -117,16 +117,16 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
       # Best-effort fleet build-telemetry push (image footprint, layer count,
-      # build duration) to movingfirm-admin's /api/ci/build-telemetry — see
+      # build duration) to movingfirm-admin's OTLP /v1/metrics and /v1/logs — see
       # scripts/report_build_telemetry.py's docstring (movingfirm-admin#120).
-      # No-ops cleanly while BUILD_TELEMETRY_URL is unset; never fails this
+      # No-ops cleanly while OTEL_EXPORTER_OTLP_ENDPOINT is unset; never fails this
       # job either way.
       - name: Report build telemetry
         if: always() && steps.build.outcome == 'success'
         continue-on-error: true
         env:
-          BUILD_TELEMETRY_URL: ${{ secrets.BUILD_TELEMETRY_URL }}
-          BUILD_TELEMETRY_TOKEN: ${{ secrets.BUILD_TELEMETRY_TOKEN }}
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
           IMAGE_REF: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
           BUILD_STARTED_AT: ${{ steps.build_start.outputs.ts }}
