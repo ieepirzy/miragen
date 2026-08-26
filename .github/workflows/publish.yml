@@ -7,7 +7,18 @@ on:
 
 jobs:
   test:
+    # test.yml's code-health job calls a reusable workflow of its own, and a
+    # called workflow's jobs cannot request permissions greater than the
+    # calling job's -- exceeding them fails the run before any job starts,
+    # with `startup_failure` and no log. Without this block the job would
+    # inherit only the repository's default token grant, so the nested call
+    # has to be covered here as well as in test.yml.
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
     uses: ./.github/workflows/test.yml
+    secrets: inherit
 
   publish:
     needs: test

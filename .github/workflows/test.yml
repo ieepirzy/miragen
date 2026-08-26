@@ -25,5 +25,81 @@ jobs:
           pip install -e ./packages/grok-build-client
           pip install -e ".[dev]"
 
+      # Coverage is measured on every leg so the command stays identical
+      # across the matrix; only 3.12's reports are published, because the
+      # code-health snapshot needs one deterministic source and coverage
+      # differs between interpreters.
       - name: Test
-        run: pytest packages/grok-build-client/tests tests
+        run: |
+          pytest packages/grok-build-client/tests tests \
+            --junitxml=reports/junit.xml \
+            --cov=miragen --cov=grok_build_client \
+            --cov-report=xml:reports/coverage.xml
+
+      - name: Publish the reports the code-health lane consumes
+        if: always() && matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-py312
+          path: reports/
+          retention-days: 7
+
+  # Code health, maintainability and authorship telemetry. The collector is a
+  # separate package so the measurement definitions live in one place across
+  # every repository rather than being copied into each one; what *this*
+  # repository measures is declared in `[tool.mira_vitals]` in pyproject.toml.
+  #
+  # `needs: [test]` with `if: always()` on purpose: the snapshot should
+  # describe the run that gated the build, including a run whose tests failed
+  # -- a failing suite is a code-health observation, not a reason to record
+  # nothing.
+  code-health:
+    name: Code health
+    needs: [test]
+    if: always()
+    # A called reusable workflow's jobs cannot request permissions greater
+    # than the calling job's, and exceeding them fails the whole run before
+    # any job starts -- `startup_failure`, with no log to read. measure.yml
+    # needs `actions: read` to fetch the baseline artifact from the previous
+    # default-branch run and `pull-requests: read` for provenance labels.
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    # Pinned to an immutable commit, not `@main`. Two reasons, and either
+    # alone would be sufficient.
+    #
+    # Security: `uses:` on a mutable ref executes whatever that branch holds at
+    # run time, in this repository's runner, with this repository's
+    # credentials -- so a change in another repository takes effect here with
+    # no reviewed change here. A SHA makes every collector upgrade a commit in
+    # this repo that someone approves.
+    #
+    # Measurement: the collector computes the function set, the percentiles and
+    # the aggregates. A moving ref means two runs can execute materially
+    # different code with nothing in the snapshot to explain a shift, which is
+    # the silent redefinition this lane exists to prevent. `measure.yml` pins
+    # the collector package for exactly this reason; leaving the workflow
+    # reference itself mutable left the same hole one level up.
+    #
+    # This is the same commit `@main` resolved to when this PR's runs were
+    # measured, so pinning changes no number here.
+    uses: ieepirzy/mira-vitals/.github/workflows/measure.yml@ca82e5f0bfd3da46d9794a0dfb45df5d1fa49c81
+    with:
+      # Both packages, installed so pyright resolves their imports. Without
+      # the project's own dependencies the error count is dominated by
+      # unresolved imports and is not comparable with a run that has them.
+      project-install: "-e ./packages/grok-build-client -e .[dev]"
+      reports-artifact: test-reports-py312
+      tests-python-version: "3.12"
+      # Telemetry only for now: `miragen/` carries 6 ruff findings and the
+      # type-error baseline is unmeasured. Baselines first, thresholds later
+      # -- see pyproject.toml.
+      gate: false
+    # Named rather than `inherit`. `inherit` forwards every secret this
+    # repository holds across a repository boundary; measure.yml declares
+    # exactly these two, both optional, and needs nothing else. Telemetry
+    # credentials are the whole of what the collector should ever see.
+    secrets:
+      OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+      CODE_HEALTH_TOKEN: ${{ secrets.CODE_HEALTH_TOKEN }}

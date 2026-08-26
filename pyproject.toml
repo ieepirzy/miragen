@@ -55,6 +55,10 @@ dependencies = [
 dev = [
     "pytest>=9.0",
     "pytest-asyncio>=1.0",
+    # Coverage is one of the code-health lane's measured quantities. Without
+    # it the snapshot records coverage as unmeasured, which is honest but
+    # leaves a real gap in the series.
+    "pytest-cov>=5.0",
 ]
 # Executor backend tier (self-harnessed executors). `openai-codex` is OpenAI's
 # App Server JSON-RPC SDK (AsyncCodex → threads → turns → notifications), which
@@ -104,3 +108,65 @@ testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["miragen"]
+
+# ---------------------------------------------------------------------------
+# Code health and provenance telemetry (mira-vitals).
+#
+# CI orchestrates, the repository configures, and neither holds the data
+# model: `.github/workflows/test.yml` calls the reusable workflow, and what
+# gets measured in *this* repository is declared here, versioned and
+# reviewable.
+[tool.mira_vitals]
+# Both maintained packages: `miragen` and the `grok_build_client` distributed
+# from `packages/`. Excluding the latter would leave a quarter of the code
+# this repository maintains outside every series; including its `tests/` would
+# mix test complexity into a maintainability figure, which is why the path
+# names the package directory rather than the project directory.
+paths = ["miragen", "packages/grok-build-client/grok_build_client"]
+
+# Lint is measured wider, because an unused import in a test is still a real
+# finding worth trending.
+lint_paths = ["miragen", "packages", "tests"]
+
+# Measured everywhere, gated nowhere yet. At adoption `miragen/` has 6 ruff
+# findings (4 W292, 2 F401) and `tests/` has 85 (63 E402, 19 F401, ...).
+# Gating on day one would fail the build over a missing newline at end of
+# file and force exactly the unrelated cleanup this lane must not cause. The
+# findings are recorded and trended from the first run instead; this flips to
+# true once the baseline reaches zero.
+lint_blocking = false
+
+# The ruff rule selection, declared explicitly rather than left to ruff's
+# defaults. Without it `lint.total` means "whatever this version of ruff
+# selects by default", which is not a stable metric: the same origo commit
+# measured 12 findings under ruff 0.15.8 and 153 under 0.16.4. E1/E2/E3/E5
+# (whitespace, line length) are excluded deliberately -- E501 would dominate
+# the number with a signal about line width rather than code health.
+lint_select = ["E4", "E7", "E9", "F", "W"]
+
+typecheck_paths = ["miragen", "packages/grok-build-client/grok_build_client"]
+type_checker = "pyright"
+# Measured from the first run, gated only once the baseline reaches zero.
+typecheck_blocking = false
+
+hotspot_limit = 20
+
+# Provenance is configuration, not code: the collector ships knowing about no
+# orchestrator and no label scheme. The *schema* lives here because it is a
+# property of this repository's conventions -- versioned, reviewable in a pull
+# request, identical across runs. The *values* arrive as environment variables
+# at run time, because only whatever launched the run knows them. Nothing is
+# ever inferred from commit messages, author names or branch prefixes.
+[tool.mira_vitals.provenance.labels]
+"authoring:human" = "human"
+"authoring:human-assisted" = "human_assisted"
+"authoring:agent-supervised" = "agent_supervised"
+"authoring:agent-autonomous" = "agent_autonomous"
+"authoring:mixed" = "mixed"
+
+# MiraRun is this ecosystem's agent orchestrator. It contributes nothing
+# unless `MIRARUN_RUN_ID` is set: a named agent with no run to point at is an
+# assertion, not a record.
+[[tool.mira_vitals.provenance.agent_sources]]
+name = "mirarun"
+env = { run_id = "MIRARUN_RUN_ID", name = "MIRARUN_AGENT_NAME", provider = "MIRARUN_AGENT_PROVIDER", model = "MIRARUN_MODEL", authoring_mode = "MIRARUN_AUTHORING_MODE", environment_id = "MIRARUN_ENVIRONMENT_ID" }
