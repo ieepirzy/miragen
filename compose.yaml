@@ -48,6 +48,19 @@ services:
       - path: stack.env
         required: false
     environment:
+      # The in-container listen address is NOT an operator knob, and pinning
+      # it here is load-bearing: `environment` overrides `env_file`, and the
+      # wholesale .env load above would otherwise hand the daemon the
+      # operator's own MIRAGEND_PORT -- which in `ports:` below means the
+      # HOST publish port, but which the daemon reads as its BIND port
+      # (daemon/api.py). One name, two meanings: an operator publishing on
+      # 8183 silently moved the daemon off 8000, leaving the container's
+      # EXPOSE/HEALTHCHECK port dead, the healthcheck failing, and every
+      # client dialing miragend:8000 refused (mirarun answered 503
+      # "lifecycle daemon request failed"). Pinned, the two meanings stop
+      # colliding: publish wherever you like, the daemon always serves 8000.
+      MIRAGEND_HOST: 0.0.0.0
+      MIRAGEND_PORT: "8000"
       MIRAGEN_WORKSPACE: ${MIRAGEN_WORKSPACE:-/opt/miragen}
       MIRAGEN_BASE_IMAGE: ${MIRAGEN_BASE_IMAGE:-ghcr.io/ieepirzy/miragen:latest}
       # Env var NAMES the daemon forwards from its own environment into
@@ -69,6 +82,9 @@ services:
       # matching mirarun's MIRARUN_MIRAGEN_URL default. Not 0.0.0.0 -- an
       # unguarded (empty MIRAGEND_TOKEN) daemon holding the Docker socket
       # should never be reachable beyond the host it runs on.
+      # MIRAGEND_PORT here is the HOST side only -- the container always
+      # serves 8000 (pinned in `environment` above, matching EXPOSE and the
+      # HEALTHCHECK).
       - 127.0.0.1:${MIRAGEND_PORT:-8000}:8000
     networks:
       # Agents miragend creates are attached here (container-name DNS); the
