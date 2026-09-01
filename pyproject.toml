@@ -44,6 +44,13 @@ dependencies = [
     # pin (the kimi-code executor backend). pydantic-ai-slim gives us only
     # the extras we actually use.
     "pydantic-ai-slim[web-fetch,duckduckgo,mcp,openai]==1.106.0",
+    # mcp 2.x (PyPI since 2026-07-28) renamed FastMCP to MCPServer and
+    # changed other APIs; miragen/intervention_mcp.py imports the v1
+    # `mcp.server.fastmcp.FastMCP` directly. pydantic-ai-slim's `mcp` extra
+    # does not itself upper-bound this, so an unconstrained resolver can
+    # silently pick an incompatible mcp and break at import time instead of
+    # at install time.
+    "mcp<2",
     # OTLP span export (miragen/telemetry.py). Same floor as mira-sdk's
     # telemetry module — the two must speak the same wire format and
     # attribute vocabulary (mira.* resource attributes, OTLP/HTTP).
