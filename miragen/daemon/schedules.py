@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -41,6 +42,27 @@ _RETRIGGER_ID_RE = re.compile(r"^retrigger-(?P<agent>.+)-\d+(?:-[0-9a-f]{8})?$")
 # through it instead of the docker network.
 _agent_transport = None
 
+# How to reach a managed agent's own HTTP app — substrate-specific (Compose:
+# container-name DNS on miragen-net; a different scheme for other
+# substrates), so this defers to whatever LifecycleCore's spawn driver
+# says. Module-level, not a constructor arg: _fire_trigger is pickled by
+# reference into the persistent job store (see its docstring) and cannot
+# close over a LifecycleCore instance. Set once at daemon startup via
+# set_endpoint_resolver(); the Compose default below is the historical
+# behaviour, kept so unconfigured callers (and existing tests) don't break.
+_endpoint_resolver: Callable[[str], str] | None = None
+
+
+def set_endpoint_resolver(resolver: Callable[[str], str]) -> None:
+    global _endpoint_resolver
+    _endpoint_resolver = resolver
+
+
+def _agent_endpoint(agent: str) -> str:
+    if _endpoint_resolver is not None:
+        return _endpoint_resolver(agent)
+    return f"http://{agent}:8000"
+
 
 class JobNotFound(DaemonError):
     status = 404
@@ -58,7 +80,7 @@ async def _fire_trigger(agent: str, prompt: str) -> None:
     try:
         async with httpx.AsyncClient(transport=_agent_transport) as client:
             resp = await client.post(
-                f"http://{agent}:8000/run",
+                f"{_agent_endpoint(agent)}/run",
                 json={"prompt": prompt},
                 headers=headers,
                 timeout=10,
