@@ -75,6 +75,11 @@ class CreateAgentBody(BaseModel):
     # agent — profile plus tools — in one call, and cannot accidentally create
     # one that fails on every boot.
     tools_source: str | None = None
+    # Recorded on the spawned unit, forwarded verbatim to whichever spawn
+    # driver is active, never interpreted by miragen — see core.py's
+    # _validate_labels docstring. The orchestrator calling this endpoint
+    # assigns whatever meaning these carry; miragen just carries them.
+    labels: dict[str, str] = Field(default_factory=dict)
 
 
 class YamlBody(BaseModel):
@@ -194,7 +199,9 @@ def create_app(
 
     @app.post("/agents", status_code=201, dependencies=guarded)
     def create_agent(body: CreateAgentBody) -> dict:
-        core.create_agent(body.name, body.yaml_source, body.tools_source)
+        core.create_agent(
+            body.name, body.yaml_source, body.tools_source, labels=body.labels
+        )
         return {"name": body.name, "status": core.container_status(body.name)}
 
     @app.put("/agents/{name}/config", dependencies=guarded)
@@ -355,11 +362,30 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "agents").mkdir(parents=True, exist_ok=True)
 
+    # Which substrate spawned agents run on — a miragend deployment-level
+    # choice, orthogonal to which control plane (mirarun or otherwise) is
+    # calling this daemon's API: every caller drives the same /agents
+    # endpoints regardless. Image-contract validation still needs a Docker
+    # client either way (see LifecycleCore.__init__), so docker.from_env()
+    # runs unconditionally.
+    substrate = os.getenv("MIRAGEN_SPAWN_SUBSTRATE", "docker-compose")
+    spawn_driver = None
+    if substrate == "kubernetes":
+        from miragen.daemon.spawn.kubernetes import KubernetesSpawnDriver
+
+        spawn_driver = KubernetesSpawnDriver.from_incluster_config()
+    elif substrate != "docker-compose":
+        raise SystemExit(
+            f"MIRAGEN_SPAWN_SUBSTRATE={substrate!r} is not recognized "
+            "(expected 'docker-compose' or 'kubernetes')"
+        )
+
     core = LifecycleCore(
         workspace,
         docker.from_env(),
         base_image=os.getenv("MIRAGEN_BASE_IMAGE", "ghcr.io/ieepirzy/miragen:latest"),
         internal_token=os.getenv("MIRAGEN_INTERNAL_TOKEN", ""),
+        spawn_driver=spawn_driver,
     )
     core.ensure_network()
 
