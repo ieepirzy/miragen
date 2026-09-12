@@ -24,13 +24,13 @@ from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from miragen.daemon.contract import CONTRACT_CAPABILITIES, register_contract_routes
 from miragen.daemon.core import (
     AGENT_NAME_PATTERN,
     DaemonError,
     LifecycleCore,
     validate_profile_text,
 )
-from miragen.daemon.contract import CONTRACT_CAPABILITIES, register_contract_routes
 from miragen.daemon.schedules import ScheduleStore
 
 logger = logging.getLogger(__name__)
@@ -362,6 +362,10 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
         internal_token=os.getenv("MIRAGEN_INTERNAL_TOKEN", ""),
     )
     core.ensure_network()
+
+    import miragen.daemon.schedules as schedules_module
+
+    schedules_module.set_endpoint_resolver(core.endpoint)
 
     schedules = ScheduleStore(build_scheduler(workspace / "retriggers.sqlite"))
     app = create_app(

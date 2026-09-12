@@ -51,16 +51,10 @@ CONTRACT_CAPABILITIES = (
 _PROXY_GET = frozenset({"", "events", "diff", "snapshot"})
 _PROXY_POST = frozenset({"publications", "resume", "abandon"})
 
-_AGENT_PORT = 8000
-
 
 class _ResolveBody(BaseModel):
     edf: dict
     context: Optional[ResolutionContext] = None
-
-
-def _agent_url(name: str, path: str = "") -> str:
-    return f"http://{name}:{_AGENT_PORT}{path}"
 
 
 def _compatibility(resolved: Any, profile: AgentProfile | None, name: str) -> dict:
@@ -160,7 +154,7 @@ def register_contract_routes(
         try:
             upstream = client.request(
                 method,
-                _agent_url(name, path),
+                f"{core.endpoint(name)}{path}",
                 content=request_body or None,
                 params=params or None,
                 headers={
@@ -192,7 +186,7 @@ def register_contract_routes(
             name = agent["name"]
             try:
                 probe = client.get(
-                    _agent_url(name, f"/runs/{run_id}"),
+                    f"{core.endpoint(name)}/runs/{run_id}",
                     headers={"X-Miragen-Token": internal_token},
                     timeout=10.0,
                 )
