@@ -18,6 +18,7 @@ from miragen.daemon.core import (
     ContainerOperationFailed,
     EditConflict,
     InvalidAgentName,
+    InvalidLabels,
     InvalidPath,
     LifecycleCore,
     NameMismatch,
@@ -231,6 +232,53 @@ def test_create_agent_writes_workspace_compose_and_starts(core, runner, tmp_path
     assert service["environment"]["MIRAGEN_INTERNAL_TOKEN"] == "shared-secret"
     assert service["environment"]["ANTHROPIC_API_KEY_FILE"] == "/run/secrets/anthropic_key"
     assert compose["secrets"] == {"anthropic_key": {"external": True}}
+
+
+def test_create_agent_forwards_labels_to_the_spawned_unit(core, tmp_path):
+    core.create_agent("alpha", _yaml("alpha"), labels={"access.mirarun.io/hel1": "granted"})
+
+    import yaml as pyyaml
+
+    compose = pyyaml.safe_load((tmp_path / "compose.yml").read_text())
+    labels = compose["services"]["alpha"]["labels"]
+    assert labels["access.mirarun.io/hel1"] == "granted"
+    # Reserved markers survive alongside caller-supplied ones.
+    assert labels["io.miragen.agent"] == "true"
+
+
+def test_create_agent_rejects_labels_using_the_reserved_prefix(core):
+    with pytest.raises(InvalidLabels):
+        core.create_agent(
+            "alpha", _yaml("alpha"), labels={"io.miragen.agent": "shadowed"}
+        )
+    assert not (core.agents_dir / "alpha").exists()
+
+
+def test_create_agent_rejects_a_label_key_kubernetes_would_reject(core):
+    with pytest.raises(InvalidLabels):
+        core.create_agent("alpha", _yaml("alpha"), labels={"not a valid key": "x"})
+
+
+def test_create_agent_rejects_too_many_labels(core):
+    labels = {f"label-{i}": "x" for i in range(17)}
+    with pytest.raises(InvalidLabels):
+        core.create_agent("alpha", _yaml("alpha"), labels=labels)
+
+
+def test_labels_persist_across_a_kind_change_recreate(core, tmp_path):
+    core.create_agent("alpha", _yaml("alpha"), labels={"team": "platform"})
+    core.update_agent_config(
+        "alpha",
+        _yaml("alpha").replace(
+            'spec:\n  model: "test:whatever"\n  instructions: "be helpful"\n',
+            'executor:\n  executor: claude-code\n  instructions: "be helpful"\n',
+        ),
+    )
+
+    import yaml as pyyaml
+
+    compose = pyyaml.safe_load((tmp_path / "compose.yml").read_text())
+    assert compose["services"]["alpha"]["labels"]["team"] == "platform"
 
 
 def test_env_passthrough_forwards_named_variables_only(tmp_path):

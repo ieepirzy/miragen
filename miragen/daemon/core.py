@@ -16,15 +16,16 @@ maps codes back to its LLM-facing guidance.
 from __future__ import annotations
 
 import ast
+import json
+import logging
 import os
 import re
 import shutil
 import subprocess
-import logging
-import time
 import tarfile
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,13 @@ from pathlib import Path
 import yaml
 from pydantic import ValidationError
 
+from miragen.daemon.spawn.base import (
+    ServiceSpec,
+    SpawnDriverError,
+    SpawnOperationFailed,
+    SpawnUnitNotFound,
+)
+from miragen.daemon.spawn.docker_compose import DockerComposeSpawnDriver
 from miragen.load import load_profile
 from miragen.profile_contract import (
     PROFILE_CONTRACTS_LABEL,
@@ -44,6 +52,24 @@ logger = logging.getLogger("miragen.daemon")
 # container names — restrict them accordingly (also blocks path traversal).
 AGENT_NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,62}$"
 _AGENT_NAME_RE = re.compile(AGENT_NAME_PATTERN)
+
+# Orchestrator-supplied labels (CreateAgentBody.labels): recorded on the
+# spawned unit, forwarded verbatim to whichever spawn driver is active,
+# never interpreted by miragen — the concrete expression of miragen being
+# one execution substrate multiple orchestrators can drive, not something
+# built around any one caller's vocabulary (mirarun's `access.mirarun.io/*`
+# network-access grants are exactly this: a label mirarun assigns meaning
+# to, that miragen just carries).
+#
+# Validated as Kubernetes label keys/values regardless of which driver is
+# active — Docker accepts nearly anything, Kubernetes does not, and callers
+# should get one rule rather than a validator that only fires once they
+# switch substrates.
+_LABEL_NAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$")
+_LABEL_PREFIX = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
+_LABEL_VALUE = re.compile(r"^([A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?)?$")
+MAX_AGENT_LABELS = 16
+RESERVED_LABEL_PREFIX = "io.miragen."
 
 # Names an agent may never take: they collide with the management containers
 # on miragen-net (container-name DNS), letting an agent shadow the daemon.
@@ -121,6 +147,11 @@ class InvalidPath(DaemonError):
 class InvalidInput(DaemonError):
     status = 400
     code = "invalid_input"
+
+
+class InvalidLabels(DaemonError):
+    status = 422
+    code = "invalid_labels"
 
 
 class AgentNotFound(DaemonError):
@@ -460,13 +491,20 @@ def _default_not_found() -> type[Exception]:
 
 
 class LifecycleCore:
-    """All swarm lifecycle operations, behind injected Docker/subprocess seams.
+    """Everything about an agent that isn't specific to where it runs: naming,
+    workspace layout, profile/contract validation, credential-env assembly,
+    boot-watching, rollback ordering. Where and how the agent's process
+    actually runs is a `spawn.base.SpawnDriver` — this constructor always
+    builds a `DockerComposeSpawnDriver`, miragend's substrate today.
 
     `docker_client` needs: .containers.get(name) -> obj with .status/.stop()/
-    .remove()/.restart()/.logs(tail=, stream=False); .networks.get/.create.
-    `runner` is subprocess.run-compatible and receives the `docker compose`
-    invocations. `not_found` is the exception .containers.get raises for a
-    missing container (docker.errors.NotFound in production).
+    .remove()/.restart()/.logs(tail=, stream=False); .networks.get/.create;
+    .images.get/.pull (image-contract validation, still done here — no
+    substrate-neutral image-inspection API exists to move it behind the
+    driver seam). `runner` is subprocess.run-compatible and receives the
+    `docker compose` invocations. `not_found` is the exception
+    .containers.get raises for a missing container (docker.errors.NotFound
+    in production).
     """
 
     def __init__(
@@ -480,18 +518,30 @@ class LifecycleCore:
         runner: Callable = subprocess.run,
         not_found: type[Exception] | None = None,
         sleep: Callable = time.sleep,
+        spawn_driver: object | None = None,
     ) -> None:
         self.workspace = Path(workspace)
         self.agents_dir = self.workspace / "agents"
         self.compose_file = self.workspace / "compose.yml"
         self.exports_dir = self.workspace / "exports"
+        # Image-contract validation (_validated_spawn_ref and friends, below)
+        # stays keyed to a Docker client regardless of which spawn_driver is
+        # active — kubelet exposes no image-inspect API, so there is no
+        # substrate-neutral way to do this check, and every substrate this
+        # daemon supports still needs it done somewhere before spawning.
         self._docker = docker_client
         self._base_image = base_image
         self._internal_token = internal_token
         self._environ = os.environ if environ is None else environ
-        self._run = runner
         self._sleep = sleep
         self._not_found = not_found or _default_not_found()
+        self._spawn_driver = spawn_driver or DockerComposeSpawnDriver(
+            self.workspace,
+            docker_client,
+            runner=runner,
+            not_found=self._not_found,
+            sleep=sleep,
+        )
         # create_agent/import_agent both do a check-then-act against
         # _agent_count() before committing a new agent (mkdir / shutil.move).
         # The daemon's request handlers can run concurrently in separate
@@ -514,6 +564,25 @@ class LifecycleCore:
             raise InvalidAgentName(
                 f"'{name}' is reserved for the miragen management containers"
             )
+
+    def _validate_labels(self, labels: Mapping[str, str]) -> dict[str, str]:
+        if len(labels) > MAX_AGENT_LABELS:
+            raise InvalidLabels(f"at most {MAX_AGENT_LABELS} labels may be set")
+        validated: dict[str, str] = {}
+        for key, value in labels.items():
+            prefix, sep, name = key.rpartition("/")
+            if sep and (len(prefix) > 253 or not _LABEL_PREFIX.fullmatch(prefix)):
+                raise InvalidLabels(f"label '{key}' has an invalid prefix")
+            if key.startswith(RESERVED_LABEL_PREFIX):
+                raise InvalidLabels(
+                    f"label '{key}' uses the reserved {RESERVED_LABEL_PREFIX} prefix"
+                )
+            if not _LABEL_NAME.fullmatch(name):
+                raise InvalidLabels(f"label key '{key}' is not a valid label key")
+            if not _LABEL_VALUE.fullmatch(value):
+                raise InvalidLabels(f"label value for '{key}' is not a valid label value")
+            validated[key] = value
+        return validated
 
     def _agent_dir(self, name: str) -> Path:
         return self.agents_dir / name
@@ -558,30 +627,19 @@ class LifecycleCore:
     # -- container helpers --------------------------------------------------
 
     def container_status(self, name: str) -> str:
-        try:
-            return self._docker.containers.get(name).status
-        except self._not_found:
-            return "not found"
-        except Exception as exc:
-            return f"error: {exc}"
+        return self._spawn_driver.status(name)
 
     def ensure_network(self) -> None:
-        try:
-            self._docker.networks.get("miragen-net")
-        except self._not_found:
-            self._docker.networks.create("miragen-net", driver="bridge", attachable=True)
+        self._spawn_driver.ensure_ready()
+
+    def endpoint(self, name: str) -> str:
+        return self._spawn_driver.endpoint(name)
 
     def _compose_up(self, name: str) -> None:
-        result = self._run(
-            ["docker", "compose", "up", "-d", name],
-            capture_output=True,
-            text=True,
-            cwd=self.workspace,
-        )
-        if result.returncode != 0:
-            raise ContainerOperationFailed(
-                f"container failed to start: {result.stderr.strip()}"
-            )
+        try:
+            self._spawn_driver.up(name)
+        except SpawnOperationFailed as exc:
+            raise ContainerOperationFailed(str(exc)) from exc
 
     # -- profile↔runtime contract (#75) -------------------------------------
     #
@@ -703,13 +761,10 @@ class LifecycleCore:
         return self._digest_ref_for(image, self._base_image)
 
     def _service_image(self, name: str) -> str | None:
-        """The image reference pinned in an existing agent's compose service
+        """The image reference pinned in an existing agent's compute unit
         — the image that agent actually runs, which is what an in-place
         restart will re-execute."""
-        if not self.compose_file.exists():
-            return None
-        service = (self._compose_load().get("services") or {}).get(name) or {}
-        return service.get("image")
+        return self._spawn_driver.current_image(name)
 
     @staticmethod
     def _repo_of(ref: str) -> str:
@@ -723,12 +778,8 @@ class LifecycleCore:
 
     def _teardown_container(self, name: str) -> None:
         try:
-            container = self._docker.containers.get(name)
-            container.stop()
-            container.remove()
-        except self._not_found:
-            pass
-        except Exception:
+            self._spawn_driver.teardown(name)
+        except SpawnDriverError:
             # Rollback best-effort: the compose service removal and the
             # workspace removal still proceed; an orphaned stopped
             # container is recoverable, a half-registered agent is worse.
@@ -791,15 +842,6 @@ class LifecycleCore:
             if k.endswith("_API_KEY_FILE") and v
         ]
 
-    def _compose_load(self) -> dict:
-        if self.compose_file.exists():
-            return self._read_yaml(self.compose_file)
-        return {
-            "secrets": {k: {"external": True} for k in self._secret_names()},
-            "services": {},
-            "networks": {"miragen-net": {"external": True}},
-        }
-
     def _agent_executor_kind(self, name: str) -> str:
         """Executor kind from the agent's on-disk profile — every caller of
         _compose_add_service (create, import, config update) has written
@@ -821,8 +863,26 @@ class LifecycleCore:
         except Exception:
             return ""
 
-    def _compose_add_service(self, name: str, image_ref: str | None = None) -> None:
-        self.ensure_network()
+    def _labels_path(self, name: str) -> Path:
+        return self._agent_dir(name) / "labels.json"
+
+    def _read_agent_labels(self, name: str) -> dict[str, str]:
+        path = self._labels_path(name)
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text())
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write_agent_labels(self, name: str, labels: Mapping[str, str]) -> None:
+        if labels:
+            self._labels_path(name).write_text(json.dumps(dict(labels)))
+        else:
+            self._labels_path(name).unlink(missing_ok=True)
+
+    def _build_service_spec(self, name: str, image_ref: str | None = None) -> ServiceSpec:
         secret_names = self._secret_names()
         env = {"AGENT_PROFILE": "agent.yaml"}
         if self._internal_token:
@@ -870,39 +930,36 @@ class LifecycleCore:
         cpu_limit = self._environ.get("MIRAGEND_AGENT_CPU_LIMIT", DEFAULT_AGENT_CPU_LIMIT)
         mem_limit = self._environ.get("MIRAGEND_AGENT_MEM_LIMIT", DEFAULT_AGENT_MEM_LIMIT)
 
-        data = self._compose_load()
-        data["networks"] = {"miragen-net": {"external": True}}
-        data.setdefault("secrets", {}).update({s: {"external": True} for s in secret_names})
-        data.setdefault("services", {})[name] = {
+        return ServiceSpec(
             # The digest of the very image the contract check validated —
             # what was validated is what runs; a re-tagged `latest` cannot
             # swap the runtime under a validated profile, and this is not a
             # second lookup of the tag (#75, Codex review on #76).
-            "image": image_ref or self._base_image,
-            "container_name": name,
-            "restart": "unless-stopped",
-            "secrets": secret_names,
-            "environment": env,
-            "volumes": [f"./agents/{name}:/agent"],
-            "networks": ["miragen-net"],
-            "cpus": cpu_limit,
-            "mem_limit": mem_limit,
-            # Managed-by markers for host tooling: miragend's containers
-            # belong to no compose stack a scoped operator can see, so at
-            # minimum they identify themselves (#75 companion).
-            "labels": {
+            image=image_ref or self._base_image,
+            environment=env,
+            # Managed-by markers for host tooling: a spawned unit belongs to
+            # no compose stack (or its substrate equivalent) a scoped
+            # operator can see, so at minimum it identifies itself (#75
+            # companion) — merged with whatever the orchestrator that
+            # created this agent asked for (io.miragen.* is reserved, see
+            # _validate_labels, so these two can never be shadowed).
+            labels={
                 "io.miragen.agent": "true",
                 "io.miragen.managed-by": "miragend",
+                **self._read_agent_labels(name),
             },
-        }
-        self._write_yaml(self.compose_file, data)
+            cpu_limit=cpu_limit,
+            mem_limit=mem_limit,
+            workspace_dir=self._agent_dir(name),
+            secret_names=tuple(secret_names),
+        )
+
+    def _compose_add_service(self, name: str, image_ref: str | None = None) -> None:
+        self.ensure_network()
+        self._spawn_driver.define_service(name, self._build_service_spec(name, image_ref))
 
     def _compose_remove_service(self, name: str) -> None:
-        if not self.compose_file.exists():
-            return
-        data = self._compose_load()
-        data.get("services", {}).pop(name, None)
-        self._write_yaml(self.compose_file, data)
+        self._spawn_driver.remove_service(name)
 
     # -- registry -----------------------------------------------------------
 
@@ -928,10 +985,11 @@ class LifecycleCore:
                         "status": self.container_status(name),
                         "mode": mode,
                         "model": model,
-                        # Reachable by any container on miragen-net
-                        # (container-name DNS); identity comes from this
-                        # daemon's own state, never from the agent.
-                        "endpoint": f"http://{name}:8000",
+                        # Identity comes from this daemon's own state, never
+                        # from the agent; addressing is the driver's call —
+                        # container-name DNS on miragen-net for Compose, a
+                        # different scheme for other substrates.
+                        "endpoint": self.endpoint(name),
                     }
                 )
         return result
@@ -944,7 +1002,7 @@ class LifecycleCore:
             "yaml": yaml_path.read_text() if yaml_path.exists() else "",
             "status": self.container_status(name),
             "has_tools": (d / "tools.py").exists(),
-            "endpoint": f"http://{name}:8000",
+            "endpoint": self.endpoint(name),
         }
 
     # -- lifecycle ----------------------------------------------------------
@@ -958,7 +1016,12 @@ class LifecycleCore:
         return sum(1 for entry in self.agents_dir.iterdir() if entry.is_dir())
 
     def create_agent(
-        self, name: str, yaml_source: str, tools_source: str | None = None
+        self,
+        name: str,
+        yaml_source: str,
+        tools_source: str | None = None,
+        *,
+        labels: Mapping[str, str] | None = None,
     ) -> None:
         self.check_name(name)
         d = self._agent_dir(name)
@@ -968,6 +1031,7 @@ class LifecycleCore:
         # Validate before touching the cap/lock: it's pure computation (no
         # effect on _agent_count()), so it belongs outside the critical
         # section — the lock below should cover only the check-then-act pair.
+        validated_labels = self._validate_labels(labels or {})
         profile_name = None
         try:
             summary = validate_profile_text(yaml_source)
@@ -1014,6 +1078,7 @@ class LifecycleCore:
                 if tools_source is not None
                 else f"from miragen import register\n\n# Tools for {name}\n"
             )
+            self._write_agent_labels(name, validated_labels)
             self._compose_add_service(name, spawn_ref)
             try:
                 self._compose_up(name)
@@ -1141,30 +1206,26 @@ class LifecycleCore:
     def restart_agent(self, name: str) -> None:
         self._require_agent(name)
         try:
-            self._docker.containers.get(name).restart()
-        except self._not_found:
+            self._spawn_driver.restart(name)
+        except SpawnUnitNotFound:
             raise ContainerNotFound(f"container '{name}' not found") from None
-        except Exception as exc:
+        except SpawnOperationFailed as exc:
             raise ContainerOperationFailed(str(exc)) from exc
 
     def stop_agent(self, name: str) -> None:
         self._require_agent(name)
         try:
-            self._docker.containers.get(name).stop()
-        except self._not_found:
+            self._spawn_driver.stop(name)
+        except SpawnUnitNotFound:
             raise ContainerNotFound(f"container '{name}' not found") from None
-        except Exception as exc:
+        except SpawnOperationFailed as exc:
             raise ContainerOperationFailed(str(exc)) from exc
 
     def delete_agent(self, name: str) -> None:
         d = self._require_agent(name)
         try:
-            container = self._docker.containers.get(name)
-            container.stop()
-            container.remove()
-        except self._not_found:
-            pass
-        except Exception as exc:
+            self._spawn_driver.teardown(name)
+        except SpawnOperationFailed as exc:
             raise ContainerOperationFailed(str(exc)) from exc
         self._compose_remove_service(name)
         if d.exists():
@@ -1173,14 +1234,11 @@ class LifecycleCore:
     def agent_logs(self, name: str, tail: int = 50) -> str:
         self._require_agent(name)
         try:
-            logs = self._docker.containers.get(name).logs(
-                tail=min(max(tail, 1), 1000), stream=False
-            )
-        except self._not_found:
+            return self._spawn_driver.logs(name, tail=tail)
+        except SpawnUnitNotFound:
             raise ContainerNotFound(f"container '{name}' not found") from None
-        except Exception as exc:
+        except SpawnOperationFailed as exc:
             raise ContainerOperationFailed(str(exc)) from exc
-        return logs.decode("utf-8", errors="replace")
 
     # -- tool management ----------------------------------------------------
 
