@@ -115,6 +115,7 @@ def build_agent(
     telemetry: MiragenTelemetry | None = None,
     *,
     secret_env: dict[str, str] | None = None,
+    extra_tools: list[Callable] | None = None,
 ) -> tuple[Agent, UsageLimits | None]:
     """
     Construct a live PydanticAI Agent from a validated AgentProfile.
@@ -180,6 +181,13 @@ def build_agent(
     )
 
     _inject_tools(agent, profile)
+
+    # Runtime-provided tools that are not part of the profile's whitelist —
+    # e.g. the `speak` tool the app injects when the profile has a `voice:`
+    # block. Plain functions (no RunContext), already closed over their
+    # dependencies by the caller.
+    for tool_fn in extra_tools or ():
+        agent.tool_plain(tool_fn)
 
     return agent, limits
 

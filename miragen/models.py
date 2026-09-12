@@ -39,6 +39,14 @@ class ToolCallRecord(BaseModel):
     ok: bool  # False if the call raised / was denied
 
 
+# Instance names share the agent-name grammar: they key filesystem paths
+# (histories/<instance>.json) exactly like agent names key workspace dirs,
+# so the same traversal-safe restriction applies (instance model ADR:
+# docs/design/instance-model.md).
+INSTANCE_NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,62}$"
+DEFAULT_INSTANCE = "default"
+
+
 class RunUsage(BaseModel):
     requests: int
     input_tokens: Optional[int] = None
@@ -187,6 +195,11 @@ class RunRecord(BaseModel):
     usage: Optional[RunUsage] = None
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
     use_history: bool = False
+    # The named instance this run belongs to (instance model ADR). None =
+    # an ephemeral run with no persistent state scope — the default for
+    # scheduled fires and stateless HTTP runs, and what every pre-instance
+    # record on disk reads back as.
+    instance: Optional[str] = None
     # Executor-tier fields (None for model-tier runs). The thread handle lives
     # on the agent-run record, not any job record — resume re-opens the thread
     # bound to this run. exit_reason qualifies non-succeeded terminal states
@@ -230,6 +243,10 @@ class RunRecord(BaseModel):
     # 'intervention'), cleared when the run is resumed. History lives in the
     # event stream (intervention.requested/answered/superseded).
     pending_intervention: Optional[InterventionRequest] = None
+    # Audio files this run's speak calls produced (docs/design/voice.md),
+    # annotated post-finish from the run's audio/ directory. None = no voice
+    # activity (or a provider that played the audio itself and returned none).
+    audio_artifacts: Optional[list[str]] = None
 
 
 class RunSummary(BaseModel):
@@ -246,6 +263,7 @@ class RunSummary(BaseModel):
     duration_s: Optional[float] = None
     usage: Optional[RunUsage] = None
     use_history: bool = False
+    instance: Optional[str] = None
     snapshot_sha256: Optional[str] = None
     resume_count: int = 0
     # Control-plane correlation (managed schedule provenance, etc.). Omitted
@@ -267,6 +285,7 @@ class RunSummary(BaseModel):
             duration_s=record.duration_s,
             usage=record.usage,
             use_history=record.use_history,
+            instance=record.instance,
             snapshot_sha256=record.snapshot_sha256,
             resume_count=record.resume_count,
             provenance=record.provenance,
@@ -285,6 +304,22 @@ class _ProfileModel(BaseModel):
 
 # ── Triggers ────────────────────────────────────────────────────────────────
 
+# Shared by every self-activating trigger: scheduled fires are stateless and
+# ephemeral by default; naming an instance opts the trigger into persistent
+# state — on the model tier its fires then run with that instance's history
+# (docs/design/instance-model.md).
+_TRIGGER_INSTANCE_FIELD = Field(
+    default=None,
+    pattern=INSTANCE_NAME_PATTERN,
+    description=(
+        "Named instance this trigger's fires belong to. Omitted = each fire "
+        "is an ephemeral anonymous instance (stateless, today's behaviour); "
+        "named = fires serialize on, and (model tier) converse with, that "
+        "instance's persistent state."
+    ),
+)
+
+
 class CronTrigger(_ProfileModel):
     type: Literal["cron"]
     schedule: str = Field(
@@ -295,6 +330,7 @@ class CronTrigger(_ProfileModel):
         default=None,
         description="Prompt injected when the cron fires without an explicit prompt.",
     )
+    instance: Optional[str] = _TRIGGER_INSTANCE_FIELD
 
     @field_validator("schedule")
     @classmethod
@@ -327,6 +363,7 @@ class IntervalTrigger(_ProfileModel):
         default=None,
         description="Prompt injected when the interval fires without an explicit prompt.",
     )
+    instance: Optional[str] = _TRIGGER_INSTANCE_FIELD
 
 
 class StartupTrigger(_ProfileModel):
@@ -340,6 +377,7 @@ class StartupTrigger(_ProfileModel):
         ge=0,
         description="Seconds to wait after container boot before firing.",
     )
+    instance: Optional[str] = _TRIGGER_INSTANCE_FIELD
 
 
 Trigger = Annotated[
@@ -363,6 +401,68 @@ class OnComplete(_ProfileModel):
         default=None,
         description="Webhook URL that receives the run output — escape hatch for any output routing.",
     )
+    speak: bool = Field(
+        default=False,
+        description=(
+            "Voice the run output through the profile's `voice:` provider "
+            "(docs/design/voice.md). Requires a voice block — enforced at load."
+        ),
+    )
+
+
+# ── Voice (docs/design/voice.md) ─────────────────────────────────────────────
+
+class VoiceSpec(_ProfileModel):
+    """Speech provider configuration. miragen owns the speak contract: an
+    `http` provider is any endpoint implementing miragen's POST schema
+    ({"text", "voice", "agent"}) — it owns synthesis AND playback, answering
+    202/204 (played it) or an audio/* body (stored as a run artifact). Cloud
+    providers synthesize to bytes; the artifact is the deliverable (a
+    container has no speaker)."""
+
+    provider: Literal["http", "openai"] = Field(
+        default="http",
+        description="'http' = self-hosted endpoint speaking miragen's schema; 'openai' = OpenAI TTS.",
+    )
+    url: Optional[str] = Field(
+        default=None,
+        description="http provider: the endpoint URL miragen POSTs the speak schema to.",
+        min_length=1,
+    )
+    api_key_env: Optional[str] = Field(
+        default=None,
+        description=(
+            "Env var NAME holding the credential — a bearer token for an http "
+            "endpoint (optional), the API key for a cloud provider (default "
+            "OPENAI_API_KEY for 'openai'). Value injected at spawn via the "
+            "daemon's *_API_KEY forwarding; never in the profile."
+        ),
+    )
+    voice: Optional[str] = Field(
+        default=None,
+        description="Default voice id, provider-defined (e.g. 'alloy').",
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description="Cloud providers only: TTS model override (openai default: gpt-4o-mini-tts).",
+    )
+
+    @model_validator(mode="after")
+    def validate_provider_fields(self) -> "VoiceSpec":
+        # Same loud-rejection philosophy as the executor spec: dead config is
+        # a false sense of a guardrail.
+        if self.provider == "http":
+            if not self.url:
+                raise ValueError("voice provider 'http' requires `url`")
+            if self.model is not None:
+                raise ValueError("voice `model` only applies to cloud providers, not 'http'")
+        else:
+            if self.url is not None:
+                raise ValueError(
+                    f"voice `url` only applies to the http provider, not '{self.provider}' "
+                    "(cloud providers have fixed endpoints)"
+                )
+        return self
 
 
 # ── PydanticAI spec (their layer) ───────────────────────────────────────────
@@ -413,13 +513,27 @@ class Limits(_ProfileModel):
         default="skip",
         description="What a blocked cron/interval/startup run does when tokens_per_day is exceeded.",
     )
+    max_concurrent_runs: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Container-wide cap on concurrently running turns across all "
+            "instances (instance model ADR). Overflow answers 429; scheduled "
+            "fires skip. Default 4; the MIRAGEN_MAX_CONCURRENT env var "
+            "overrides per deployment."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_at_least_one_cap(self) -> Limits:
-        if self.tokens_per_run is None and self.tokens_per_day is None:
+        if (
+            self.tokens_per_run is None
+            and self.tokens_per_day is None
+            and self.max_concurrent_runs is None
+        ):
             raise ValueError(
-                "limits block requires at least one of tokens_per_run or tokens_per_day "
-                "(an empty limits: {} block is dead config)"
+                "limits block requires at least one of tokens_per_run, tokens_per_day "
+                "or max_concurrent_runs (an empty limits: {} block is dead config)"
             )
         return self
 
@@ -762,6 +876,14 @@ class AgentProfile(_ProfileModel):
         default=None,
         description="Whitelisted @register tool names; None/omitted = no local tools injected.",
     )
+    voice: Optional[VoiceSpec] = Field(
+        default=None,
+        description=(
+            "Speech provider (docs/design/voice.md). Presence grants the "
+            "agent a `speak` tool (model tier) and the /mcp/voice mount "
+            "(executor tier), and enables on_complete.speak."
+        ),
+    )
     on_complete: Optional[OnComplete] = None
     inject_timestamp: bool = Field(
         default=True,
@@ -876,6 +998,15 @@ class AgentProfile(_ProfileModel):
                 "use hybrid mode instead"
             )
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_speak_needs_voice(self) -> AgentProfile:
+        if self.on_complete is not None and self.on_complete.speak and self.voice is None:
+            raise ValueError(
+                "on_complete.speak requires a `voice:` block — without a "
+                "provider there is nothing to speak through (dead config)"
+            )
         return self
 
     @model_validator(mode="after")
