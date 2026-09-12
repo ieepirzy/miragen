@@ -130,7 +130,7 @@ class TestRunEndpoint:
         )
         captured = {}
 
-        async def capture(prompt, use_history=False, record=None):
+        async def capture(prompt, use_history=False, record=None, instance=None):
             captured["prompt"] = prompt
             return "ok"
 
@@ -146,7 +146,7 @@ class TestRunEndpoint:
     async def test_no_header_prompt_passes_prompt_unchanged(self, client):
         captured = {}
 
-        async def capture(prompt, use_history=False, record=None):
+        async def capture(prompt, use_history=False, record=None, instance=None):
             captured["prompt"] = prompt
             return "ok"
 
@@ -158,7 +158,7 @@ class TestRunEndpoint:
     async def test_timestamp_injected_by_default(self, client):
         captured = {}
 
-        async def capture(prompt, use_history=False, record=None):
+        async def capture(prompt, use_history=False, record=None, instance=None):
             captured["prompt"] = prompt
             return "ok"
 
@@ -172,7 +172,7 @@ class TestRunEndpoint:
         profile = _make_profile(inject_timestamp=False)
         captured = {}
 
-        async def capture(prompt, use_history=False, record=None):
+        async def capture(prompt, use_history=False, record=None, instance=None):
             captured["prompt"] = prompt
             return "ok"
 
@@ -260,9 +260,8 @@ class TestHistorySidecar:
         import json as _json
         from miragen.runs import RunStore
 
-        monkeypatch.setattr(app_module, "HISTORY_FILE", tmp_path / "history.json")
-        sidecar = tmp_path / "history.runs.jsonl"
-        monkeypatch.setattr(app_module, "HISTORY_SIDECAR", sidecar)
+        monkeypatch.setattr(app_module, "HISTORIES_DIR", tmp_path)
+        sidecar = tmp_path / "default.runs.jsonl"
 
         app_module._profile = profile
         app_module._agent = mock_agent_with_usage
@@ -287,9 +286,8 @@ class TestHistorySidecar:
         import json as _json
         from miragen.runs import RunStore
 
-        monkeypatch.setattr(app_module, "HISTORY_FILE", tmp_path / "history.json")
-        sidecar = tmp_path / "history.runs.jsonl"
-        monkeypatch.setattr(app_module, "HISTORY_SIDECAR", sidecar)
+        monkeypatch.setattr(app_module, "HISTORIES_DIR", tmp_path)
+        sidecar = tmp_path / "default.runs.jsonl"
 
         mock_agent_with_usage.run_stream = MagicMock(return_value=_stream_ctx())
         app_module._profile = profile
@@ -305,9 +303,9 @@ class TestHistorySidecar:
     async def test_sidecar_failure_never_fails_the_run(
         self, profile, mock_agent_with_usage, tmp_path, monkeypatch
     ):
-        monkeypatch.setattr(app_module, "HISTORY_FILE", tmp_path / "history.json")
-        # Point the sidecar at an unwritable location (a directory).
-        monkeypatch.setattr(app_module, "HISTORY_SIDECAR", tmp_path)
+        monkeypatch.setattr(app_module, "HISTORIES_DIR", tmp_path)
+        # Make the sidecar path unwritable (a directory in its place).
+        (tmp_path / "default.runs.jsonl").mkdir()
 
         app_module._profile = profile
         app_module._agent = mock_agent_with_usage
@@ -336,7 +334,7 @@ class TestHistoryEndpoint:
         return msgs
 
     async def test_no_history_file_returns_empty(self, client, tmp_path, monkeypatch):
-        monkeypatch.setattr(app_module, "HISTORY_FILE", tmp_path / "missing.json")
+        monkeypatch.setattr(app_module, "HISTORIES_DIR", tmp_path / "missing")
 
         resp = await client.get("/history")
 
@@ -344,9 +342,9 @@ class TestHistoryEndpoint:
         assert resp.json() == {"message_count": 0, "messages": [], "run_id": None}
 
     async def test_returns_newest_limit_messages(self, client, tmp_path, monkeypatch):
-        history_path = tmp_path / "history.json"
+        history_path = tmp_path / "default.json"
         self._write_history(history_path, self._messages(5))  # 10 messages total
-        monkeypatch.setattr(app_module, "HISTORY_FILE", history_path)
+        monkeypatch.setattr(app_module, "HISTORIES_DIR", tmp_path)
 
         resp = await client.get("/history", params={"limit": 4})
 
@@ -357,18 +355,18 @@ class TestHistoryEndpoint:
         assert [m["content"] for m in data["messages"]] == ["user 3", "assistant 3", "user 4", "assistant 4"]
 
     async def test_default_limit_is_20(self, client, tmp_path, monkeypatch):
-        history_path = tmp_path / "history.json"
+        history_path = tmp_path / "default.json"
         self._write_history(history_path, self._messages(15))  # 30 messages total
-        monkeypatch.setattr(app_module, "HISTORY_FILE", history_path)
+        monkeypatch.setattr(app_module, "HISTORIES_DIR", tmp_path)
 
         resp = await client.get("/history")
 
         assert resp.json()["message_count"] == 20
 
     async def test_limit_is_clamped_to_200(self, client, tmp_path, monkeypatch):
-        history_path = tmp_path / "history.json"
+        history_path = tmp_path / "default.json"
         self._write_history(history_path, self._messages(150))  # 300 messages total
-        monkeypatch.setattr(app_module, "HISTORY_FILE", history_path)
+        monkeypatch.setattr(app_module, "HISTORIES_DIR", tmp_path)
 
         resp = await client.get("/history", params={"limit": 10_000})
 
@@ -377,11 +375,10 @@ class TestHistoryEndpoint:
     async def test_run_id_returns_prefix_slice(self, client, tmp_path, monkeypatch):
         import json as _json
 
-        history_path = tmp_path / "history.json"
-        sidecar_path = tmp_path / "history.runs.jsonl"
+        history_path = tmp_path / "default.json"
+        sidecar_path = tmp_path / "default.runs.jsonl"
         self._write_history(history_path, self._messages(3))  # 6 messages total
-        monkeypatch.setattr(app_module, "HISTORY_FILE", history_path)
-        monkeypatch.setattr(app_module, "HISTORY_SIDECAR", sidecar_path)
+        monkeypatch.setattr(app_module, "HISTORIES_DIR", tmp_path)
 
         sidecar_path.write_text(
             _json.dumps({"run_id": "run-a", "saved_at": "t1", "message_count": 2}) + "\n"
@@ -397,8 +394,7 @@ class TestHistoryEndpoint:
         assert [m["role"] for m in data["messages"]] == ["user", "assistant", "user", "assistant"]
 
     async def test_unknown_run_id_returns_404(self, client, tmp_path, monkeypatch):
-        monkeypatch.setattr(app_module, "HISTORY_FILE", tmp_path / "history.json")
-        monkeypatch.setattr(app_module, "HISTORY_SIDECAR", tmp_path / "history.runs.jsonl")
+        monkeypatch.setattr(app_module, "HISTORIES_DIR", tmp_path)
 
         resp = await client.get("/history", params={"run_id": "nope"})
 
@@ -406,8 +402,7 @@ class TestHistoryEndpoint:
 
     async def test_run_id_with_no_history_saved_returns_404(self, client, tmp_path, monkeypatch):
         """A run_id present in the sidecar but from a use_history=False run never appears there."""
-        monkeypatch.setattr(app_module, "HISTORY_FILE", tmp_path / "history.json")
-        monkeypatch.setattr(app_module, "HISTORY_SIDECAR", tmp_path / "missing.jsonl")
+        monkeypatch.setattr(app_module, "HISTORIES_DIR", tmp_path)
 
         resp = await client.get("/history", params={"run_id": "abc123"})
 
@@ -1213,8 +1208,8 @@ class TestHistoryCap:
     async def test_run_passes_capped_history_to_agent(self, mock_agent_with_usage, tmp_path, monkeypatch):
         from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelRequest, ModelResponse, TextPart
 
-        history_file = tmp_path / "history.json"
-        monkeypatch.setattr(app_module, "HISTORY_FILE", history_file)
+        history_file = tmp_path / "default.json"
+        monkeypatch.setattr(app_module, "HISTORIES_DIR", tmp_path)
         stored = [
             ModelRequest.user_text_prompt("turn 1"),
             ModelResponse(parts=[TextPart(content="reply 1")]),

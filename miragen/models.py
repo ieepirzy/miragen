@@ -39,6 +39,14 @@ class ToolCallRecord(BaseModel):
     ok: bool  # False if the call raised / was denied
 
 
+# Instance names share the agent-name grammar: they key filesystem paths
+# (histories/<instance>.json) exactly like agent names key workspace dirs,
+# so the same traversal-safe restriction applies (instance model ADR:
+# docs/design/instance-model.md).
+INSTANCE_NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,62}$"
+DEFAULT_INSTANCE = "default"
+
+
 class RunUsage(BaseModel):
     requests: int
     input_tokens: Optional[int] = None
@@ -187,6 +195,11 @@ class RunRecord(BaseModel):
     usage: Optional[RunUsage] = None
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
     use_history: bool = False
+    # The named instance this run belongs to (instance model ADR). None =
+    # an ephemeral run with no persistent state scope — the default for
+    # scheduled fires and stateless HTTP runs, and what every pre-instance
+    # record on disk reads back as.
+    instance: Optional[str] = None
     # Executor-tier fields (None for model-tier runs). The thread handle lives
     # on the agent-run record, not any job record — resume re-opens the thread
     # bound to this run. exit_reason qualifies non-succeeded terminal states
@@ -246,6 +259,7 @@ class RunSummary(BaseModel):
     duration_s: Optional[float] = None
     usage: Optional[RunUsage] = None
     use_history: bool = False
+    instance: Optional[str] = None
     snapshot_sha256: Optional[str] = None
     resume_count: int = 0
     # Control-plane correlation (managed schedule provenance, etc.). Omitted
@@ -267,6 +281,7 @@ class RunSummary(BaseModel):
             duration_s=record.duration_s,
             usage=record.usage,
             use_history=record.use_history,
+            instance=record.instance,
             snapshot_sha256=record.snapshot_sha256,
             resume_count=record.resume_count,
             provenance=record.provenance,
@@ -285,6 +300,22 @@ class _ProfileModel(BaseModel):
 
 # ── Triggers ────────────────────────────────────────────────────────────────
 
+# Shared by every self-activating trigger: scheduled fires are stateless and
+# ephemeral by default; naming an instance opts the trigger into persistent
+# state — on the model tier its fires then run with that instance's history
+# (docs/design/instance-model.md).
+_TRIGGER_INSTANCE_FIELD = Field(
+    default=None,
+    pattern=INSTANCE_NAME_PATTERN,
+    description=(
+        "Named instance this trigger's fires belong to. Omitted = each fire "
+        "is an ephemeral anonymous instance (stateless, today's behaviour); "
+        "named = fires serialize on, and (model tier) converse with, that "
+        "instance's persistent state."
+    ),
+)
+
+
 class CronTrigger(_ProfileModel):
     type: Literal["cron"]
     schedule: str = Field(
@@ -295,6 +326,7 @@ class CronTrigger(_ProfileModel):
         default=None,
         description="Prompt injected when the cron fires without an explicit prompt.",
     )
+    instance: Optional[str] = _TRIGGER_INSTANCE_FIELD
 
     @field_validator("schedule")
     @classmethod
@@ -327,6 +359,7 @@ class IntervalTrigger(_ProfileModel):
         default=None,
         description="Prompt injected when the interval fires without an explicit prompt.",
     )
+    instance: Optional[str] = _TRIGGER_INSTANCE_FIELD
 
 
 class StartupTrigger(_ProfileModel):
@@ -340,6 +373,7 @@ class StartupTrigger(_ProfileModel):
         ge=0,
         description="Seconds to wait after container boot before firing.",
     )
+    instance: Optional[str] = _TRIGGER_INSTANCE_FIELD
 
 
 Trigger = Annotated[
@@ -413,13 +447,27 @@ class Limits(_ProfileModel):
         default="skip",
         description="What a blocked cron/interval/startup run does when tokens_per_day is exceeded.",
     )
+    max_concurrent_runs: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Container-wide cap on concurrently running turns across all "
+            "instances (instance model ADR). Overflow answers 429; scheduled "
+            "fires skip. Default 4; the MIRAGEN_MAX_CONCURRENT env var "
+            "overrides per deployment."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_at_least_one_cap(self) -> Limits:
-        if self.tokens_per_run is None and self.tokens_per_day is None:
+        if (
+            self.tokens_per_run is None
+            and self.tokens_per_day is None
+            and self.max_concurrent_runs is None
+        ):
             raise ValueError(
-                "limits block requires at least one of tokens_per_run or tokens_per_day "
-                "(an empty limits: {} block is dead config)"
+                "limits block requires at least one of tokens_per_run, tokens_per_day "
+                "or max_concurrent_runs (an empty limits: {} block is dead config)"
             )
         return self
 

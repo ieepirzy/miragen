@@ -22,7 +22,7 @@ from typing import Optional
 from apscheduler.triggers.cron import CronTrigger as _APCronTrigger
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from miragen.models import RunProvenance
+from miragen.models import INSTANCE_NAME_PATTERN, RunProvenance
 
 BINDING_NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,62}$"
 
@@ -73,6 +73,15 @@ class ScheduleBinding(BaseModel):
         description="COMPLETED prompt, dispatched verbatim — rendering is a control-plane concern.",
     )
     enabled: bool = True
+    instance: Optional[str] = Field(
+        default=None,
+        pattern=INSTANCE_NAME_PATTERN,
+        description=(
+            "Named instance this binding's fires belong to — same opt-in as a "
+            "profile trigger's `instance` (docs/design/instance-model.md). "
+            "None = each fire is ephemeral and stateless."
+        ),
+    )
     provenance: Optional[RunProvenance] = None
     metadata: dict[str, str] = Field(
         default_factory=dict,
@@ -124,6 +133,7 @@ class ScheduleStore:
         schedule: ScheduleSpec,
         prompt: str,
         enabled: bool = True,
+        instance: str | None = None,
         provenance: RunProvenance | None = None,
         metadata: dict[str, str] | None = None,
         expected_version: int | None = None,
@@ -164,6 +174,7 @@ class ScheduleStore:
             schedule=schedule,
             prompt=prompt,
             enabled=enabled,
+            instance=instance,
             provenance=provenance,
             metadata=dict(metadata or {}),
             version=version,
