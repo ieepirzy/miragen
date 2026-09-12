@@ -11,7 +11,6 @@ from httpx import ASGITransport, AsyncClient
 from miragen.daemon.api import DAEMON_CAPABILITIES, create_app
 from miragen.daemon.core import LifecycleCore
 from miragen.daemon.schedules import ScheduleStore
-
 from tests.test_daemon_core import (
     VALID_YAML,
     FakeDocker,
@@ -224,6 +223,31 @@ def test_agent_crud_flow(client):
     resp = client.delete("/agents/alpha")
     assert resp.json() == {"name": "alpha", "deleted": True}
     assert client.get("/agents").json()["count"] == 0
+
+
+def test_create_agent_forwards_labels(client):
+    resp = client.post(
+        "/agents",
+        json={
+            "name": "alpha",
+            "yaml_source": _yaml(),
+            "labels": {"access.mirarun.io/hel1": "granted"},
+        },
+    )
+    assert resp.status_code == 201
+
+
+def test_create_agent_rejects_reserved_labels(client):
+    resp = client.post(
+        "/agents",
+        json={
+            "name": "alpha",
+            "yaml_source": _yaml(),
+            "labels": {"io.miragen.agent": "shadowed"},
+        },
+    )
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "invalid_labels"
 
 
 def test_error_mapping(client):

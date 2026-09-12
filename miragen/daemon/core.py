@@ -16,6 +16,7 @@ maps codes back to its LLM-facing guidance.
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import os
 import re
@@ -51,6 +52,24 @@ logger = logging.getLogger("miragen.daemon")
 # container names — restrict them accordingly (also blocks path traversal).
 AGENT_NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,62}$"
 _AGENT_NAME_RE = re.compile(AGENT_NAME_PATTERN)
+
+# Orchestrator-supplied labels (CreateAgentBody.labels): recorded on the
+# spawned unit, forwarded verbatim to whichever spawn driver is active,
+# never interpreted by miragen — the concrete expression of miragen being
+# one execution substrate multiple orchestrators can drive, not something
+# built around any one caller's vocabulary (mirarun's `access.mirarun.io/*`
+# network-access grants are exactly this: a label mirarun assigns meaning
+# to, that miragen just carries).
+#
+# Validated as Kubernetes label keys/values regardless of which driver is
+# active — Docker accepts nearly anything, Kubernetes does not, and callers
+# should get one rule rather than a validator that only fires once they
+# switch substrates.
+_LABEL_NAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$")
+_LABEL_PREFIX = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
+_LABEL_VALUE = re.compile(r"^([A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?)?$")
+MAX_AGENT_LABELS = 16
+RESERVED_LABEL_PREFIX = "io.miragen."
 
 # Names an agent may never take: they collide with the management containers
 # on miragen-net (container-name DNS), letting an agent shadow the daemon.
@@ -128,6 +147,11 @@ class InvalidPath(DaemonError):
 class InvalidInput(DaemonError):
     status = 400
     code = "invalid_input"
+
+
+class InvalidLabels(DaemonError):
+    status = 422
+    code = "invalid_labels"
 
 
 class AgentNotFound(DaemonError):
@@ -494,18 +518,24 @@ class LifecycleCore:
         runner: Callable = subprocess.run,
         not_found: type[Exception] | None = None,
         sleep: Callable = time.sleep,
+        spawn_driver: object | None = None,
     ) -> None:
         self.workspace = Path(workspace)
         self.agents_dir = self.workspace / "agents"
         self.compose_file = self.workspace / "compose.yml"
         self.exports_dir = self.workspace / "exports"
+        # Image-contract validation (_validated_spawn_ref and friends, below)
+        # stays keyed to a Docker client regardless of which spawn_driver is
+        # active — kubelet exposes no image-inspect API, so there is no
+        # substrate-neutral way to do this check, and every substrate this
+        # daemon supports still needs it done somewhere before spawning.
         self._docker = docker_client
         self._base_image = base_image
         self._internal_token = internal_token
         self._environ = os.environ if environ is None else environ
         self._sleep = sleep
         self._not_found = not_found or _default_not_found()
-        self._spawn_driver = DockerComposeSpawnDriver(
+        self._spawn_driver = spawn_driver or DockerComposeSpawnDriver(
             self.workspace,
             docker_client,
             runner=runner,
@@ -534,6 +564,25 @@ class LifecycleCore:
             raise InvalidAgentName(
                 f"'{name}' is reserved for the miragen management containers"
             )
+
+    def _validate_labels(self, labels: Mapping[str, str]) -> dict[str, str]:
+        if len(labels) > MAX_AGENT_LABELS:
+            raise InvalidLabels(f"at most {MAX_AGENT_LABELS} labels may be set")
+        validated: dict[str, str] = {}
+        for key, value in labels.items():
+            prefix, sep, name = key.rpartition("/")
+            if sep and (len(prefix) > 253 or not _LABEL_PREFIX.fullmatch(prefix)):
+                raise InvalidLabels(f"label '{key}' has an invalid prefix")
+            if key.startswith(RESERVED_LABEL_PREFIX):
+                raise InvalidLabels(
+                    f"label '{key}' uses the reserved {RESERVED_LABEL_PREFIX} prefix"
+                )
+            if not _LABEL_NAME.fullmatch(name):
+                raise InvalidLabels(f"label key '{key}' is not a valid label key")
+            if not _LABEL_VALUE.fullmatch(value):
+                raise InvalidLabels(f"label value for '{key}' is not a valid label value")
+            validated[key] = value
+        return validated
 
     def _agent_dir(self, name: str) -> Path:
         return self.agents_dir / name
@@ -814,6 +863,25 @@ class LifecycleCore:
         except Exception:
             return ""
 
+    def _labels_path(self, name: str) -> Path:
+        return self._agent_dir(name) / "labels.json"
+
+    def _read_agent_labels(self, name: str) -> dict[str, str]:
+        path = self._labels_path(name)
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text())
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write_agent_labels(self, name: str, labels: Mapping[str, str]) -> None:
+        if labels:
+            self._labels_path(name).write_text(json.dumps(dict(labels)))
+        else:
+            self._labels_path(name).unlink(missing_ok=True)
+
     def _build_service_spec(self, name: str, image_ref: str | None = None) -> ServiceSpec:
         secret_names = self._secret_names()
         env = {"AGENT_PROFILE": "agent.yaml"}
@@ -866,10 +934,13 @@ class LifecycleCore:
             # Managed-by markers for host tooling: a spawned unit belongs to
             # no compose stack (or its substrate equivalent) a scoped
             # operator can see, so at minimum it identifies itself (#75
-            # companion).
+            # companion) — merged with whatever the orchestrator that
+            # created this agent asked for (io.miragen.* is reserved, see
+            # _validate_labels, so these two can never be shadowed).
             labels={
                 "io.miragen.agent": "true",
                 "io.miragen.managed-by": "miragend",
+                **self._read_agent_labels(name),
             },
             cpu_limit=cpu_limit,
             mem_limit=mem_limit,
@@ -939,7 +1010,12 @@ class LifecycleCore:
         return sum(1 for entry in self.agents_dir.iterdir() if entry.is_dir())
 
     def create_agent(
-        self, name: str, yaml_source: str, tools_source: str | None = None
+        self,
+        name: str,
+        yaml_source: str,
+        tools_source: str | None = None,
+        *,
+        labels: Mapping[str, str] | None = None,
     ) -> None:
         self.check_name(name)
         d = self._agent_dir(name)
@@ -949,6 +1025,7 @@ class LifecycleCore:
         # Validate before touching the cap/lock: it's pure computation (no
         # effect on _agent_count()), so it belongs outside the critical
         # section — the lock below should cover only the check-then-act pair.
+        validated_labels = self._validate_labels(labels or {})
         profile_name = None
         try:
             summary = validate_profile_text(yaml_source)
@@ -995,6 +1072,7 @@ class LifecycleCore:
                 if tools_source is not None
                 else f"from miragen import register\n\n# Tools for {name}\n"
             )
+            self._write_agent_labels(name, validated_labels)
             self._compose_add_service(name, spawn_ref)
             try:
                 self._compose_up(name)
