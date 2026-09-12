@@ -498,7 +498,7 @@ class TestRunAgentCron:
              patch("miragen.app._handle_on_complete", AsyncMock()) as mock_oc:
             from miragen.app import run_agent_cron
             await run_agent_cron("Run now.")
-            mock_oc.assert_awaited_once_with("done")
+            mock_oc.assert_awaited_once_with("done", run_id=None)
 
     async def test_cron_error_logged_not_raised(self):
         profile = _make_profile(mode="autonomous",

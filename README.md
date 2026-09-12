@@ -64,13 +64,15 @@ Each agent is defined by a YAML profile with two layers:
 | `interactive` | Request-response via `POST /run`, supports streaming |
 | `hybrid` | Long autonomous run with a live HTTP query endpoint mid-run |
 
-### One container, one agent
+### One container, one profile — many instances
 
-Each agent runs in its own Docker container. Containers communicate over a Docker internal network — no host port exposure required for inter-agent calls.
+Each agent **profile** runs in its own Docker container: the container is the environment, permissions and definitions (profile, tools, credentials, resource limits). Containers communicate over a Docker internal network — no host port exposure required for inter-agent calls.
 
 ```http
 http://researcher-agent:8000/run
 ```
+
+Within a container, an **instance** is a named conversation/state scope — arbitrarily many can exist, bounded by resources rather than container count. Pass `instance` on `/run` to converse with a named instance (each keeps its own history at `/agent/histories/<instance>.json`); omit it and history-using runs converse with `default` while stateless runs stay ephemeral. At most one turn runs per instance at a time, and `limits.max_concurrent_runs` (default 4, env `MIRAGEN_MAX_CONCURRENT`) caps concurrent turns per container — overflow answers `429 Retry-After`. Cron/interval/startup triggers and managed schedule bindings fire ephemerally by default and opt into persistent state by naming an `instance:`. Design record: [docs/design/instance-model.md](docs/design/instance-model.md).
 
 ---
 
@@ -476,15 +478,34 @@ capabilities:
 
 ---
 
+## Voice
+
+A `voice:` block gives an agent a mouth ([docs/design/voice.md](docs/design/voice.md)). miragen owns the speak contract: the `http` provider POSTs `{"text", "voice", "agent"}` (optional bearer auth via `api_key_env`) to any endpoint implementing it — the endpoint owns synthesis *and* playback, answering `202/204` (it played the audio) or an `audio/*` body, which miragen stores under the run (`/agent/runs/<run_id>/audio/`, referenced as `audio_artifacts` on the record). Cloud providers (`openai`) synthesize to bytes; the artifact is the deliverable.
+
+```yaml
+voice:
+  provider: http                  # http | openai
+  url: http://tts.lan:8880/speak  # http provider: your endpoint
+  # provider: openai              # cloud: api_key_env defaults to OPENAI_API_KEY
+  # model: gpt-4o-mini-tts        # cloud model override
+  voice: alloy                    # default voice id, provider-defined
+```
+
+The block grants three surfaces: a `speak(text, voice?)` tool on model-tier agents, the `/mcp/voice` MCP mount for executor-tier agents (point an `executor.mcp_servers` entry at it, like `/mcp/ask-human`), and `on_complete.speak: true` to voice a scheduled run's output. Credentials ride the daemon's existing `*_API_KEY` env forwarding.
+
+---
+
 ## HTTP API
 
 Every agent container exposes:
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/health` | GET | Liveness check; includes `last_run` and `pending_approvals` |
-| `/run` | POST | Trigger a run and wait for the result (all modes) |
-| `/run/async` | POST | Trigger a run, return immediately with a `run_id` |
+| `/health` | GET | Liveness check; includes `last_run`, `pending_approvals`, live `concurrency` state |
+| `/run` | POST | Trigger a run and wait for the result (all modes); optional `instance` |
+| `/run/async` | POST | Trigger a run, return immediately with a `run_id`; optional `instance` |
+| `/instances` | GET | Known instances: history sizes, running state, latest run |
+| `/instances/{name}` | DELETE | Discard an instance's conversation state (history + sidecar) |
 | `/run/stream` | POST | Streaming run (interactive / hybrid); the response carries an `X-Miragen-Run-Id` header for correlating with `GET /runs/{id}` |
 | `/runs` | GET | List recent run records, newest first |
 | `/runs/{run_id}` | GET | Full record for one run (accepts a unique id prefix) |
@@ -535,17 +556,17 @@ If the container is killed mid-run, the interrupted record is marked `interrupte
 
 ### History
 
-`GET /history` is a read-only view of the conversation history persisted at `/agent/history.json` (see [Interactive conversation history](#roadmap) below). Messages are flattened to plain `{"role", "content"}` pairs.
+`GET /history` is a read-only view of one instance's conversation history, persisted at `/agent/histories/<instance>.json` (`?instance=` selects it; default `default` — a pre-instance `/agent/history.json` is adopted as `default` on first boot). Messages are flattened to plain `{"role", "content"}` pairs.
 
 ```
 GET /history?limit=20
 → {"message_count": 12, "messages": [{"role": "user", "content": "..."}, ...], "run_id": null}
 
-GET /history?run_id=3f2a1b9c
+GET /history?run_id=3f2a1b9c&instance=support
 → {"message_count": 8, "messages": [...], "run_id": "3f2a1b9c..."}
 ```
 
-Without `run_id`, returns the newest `limit` messages (default 20, max 200). With `run_id`, returns the message slice that existed right after that run saved history, correlated via `history.runs.jsonl`; an unknown or non-history-saving `run_id` returns `404`. If `history.json` doesn't exist yet, returns an empty list rather than erroring.
+Without `run_id`, returns the newest `limit` messages (default 20, max 200). With `run_id`, returns the message slice that existed right after that run saved history, correlated via the instance's `<instance>.runs.jsonl` sidecar; an unknown or non-history-saving `run_id` returns `404`. If the instance has no history yet, returns an empty list rather than erroring.
 
 ---
 

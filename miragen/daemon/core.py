@@ -834,6 +834,12 @@ class LifecycleCore:
         for k, v in self._environ.items():
             if (k.endswith("_API_KEY_FILE") or k.endswith("_API_KEY")) and v:
                 env[k] = v
+        # Host-wide in-container concurrency cap (instances/v1): tuned on the
+        # daemon, effective in every managed agent — without this forward the
+        # env override documented in .env.example would only ever apply to
+        # hand-run containers.
+        if self._environ.get("MIRAGEN_MAX_CONCURRENT"):
+            env["MIRAGEN_MAX_CONCURRENT"] = self._environ["MIRAGEN_MAX_CONCURRENT"]
         # Operator-named passthrough for credentials the suffix filter above
         # cannot see — subscription OAuth env tokens foremost (e.g. the
         # long-lived token Claude Code mints via `claude setup-token`, which

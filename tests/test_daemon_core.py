@@ -269,6 +269,32 @@ def test_env_passthrough_forwards_named_variables_only(tmp_path):
     assert "UNLISTED_SECRET" not in env
 
 
+def test_max_concurrent_forwarded_into_agent_env(tmp_path):
+    """MIRAGEN_MAX_CONCURRENT set on the daemon reaches every managed agent
+    (instances/v1) — the in-container concurrency cap is a host-wide tuning
+    knob, like the per-container cpu/mem limits, not a per-profile secret."""
+    docker_client = FakeDocker()
+    runner = RecordingRunner()
+    runner.on_up = lambda name: docker_client.add(name)
+    core = LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        environ={"MIRAGEN_MAX_CONCURRENT": "8"},
+        runner=runner,
+        not_found=FakeNotFound,
+        sleep=lambda _s: None,
+    )
+    core.create_agent("alpha", _yaml("alpha"))
+
+    import yaml as pyyaml
+
+    env = pyyaml.safe_load((tmp_path / "compose.yml").read_text())["services"]["alpha"][
+        "environment"
+    ]
+    assert env["MIRAGEN_MAX_CONCURRENT"] == "8"
+
+
 EXECUTOR_CLAUDE_YAML = """\
 name: {name}
 mode: interactive

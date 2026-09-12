@@ -200,8 +200,11 @@ class TestRunWithInstance:
         )
         while not app_module._busy_instances:
             await asyncio.sleep(0.01)
-        second = await client.post(
-            "/run", json={"prompt": "2", "use_history": True, "instance": "a"}
+        # wait_for: a broken mutex ADMITS the second turn, which then blocks
+        # on the gate — this must fail fast as a timeout, not hang the suite.
+        second = await asyncio.wait_for(
+            client.post("/run", json={"prompt": "2", "use_history": True, "instance": "a"}),
+            timeout=5,
         )
         assert second.status_code == 429
         gate.set()

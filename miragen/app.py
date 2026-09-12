@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hmac
 import json
 import logging
@@ -83,6 +84,8 @@ from miragen.schedules import (
 )
 from miragen.intervention_mcp import build_ask_human_mcp
 from miragen.telemetry import MiragenTelemetry, telemetry_from_env
+from miragen.voice import SpeechAudio, VoiceBackend, build_voice_backend
+from miragen.voice_mcp import build_voice_mcp
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +102,14 @@ _publication_store: PublicationStore | None = None
 # Test seam: inject a PublicationBackend (or factory) without hitting the network.
 _publication_backend_override: object | None = None
 _telemetry: MiragenTelemetry | None = None
+_voice: "VoiceBackend | None" = None
+
+# The run a model-tier speak tool call belongs to, for artifact storage —
+# set around agent.run() so the closure sees its own run even with several
+# concurrent (different-instance) turns in flight.
+_current_run_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "miragen_current_run_id", default=None
+)
 
 # Per-instance conversation state (instance model ADR: docs/design/
 # instance-model.md). One history file per named instance; the pre-instance
@@ -298,6 +309,88 @@ def _migrate_legacy_history() -> None:
         logger.warning("Failed to migrate legacy history.json", exc_info=True)
 
 
+# ── Voice (docs/design/voice.md) ─────────────────────────────────────────────
+
+
+def _audio_dir(run_id: str) -> Path:
+    assert _run_store is not None
+    return _run_store.root / run_id / "audio"
+
+
+def _store_speech_audio(run_id: str | None, audio: SpeechAudio) -> str | None:
+    """Write synthesized audio into the run's audio/ directory. None run (or
+    no run store) = nowhere to keep it; the caller reports that honestly."""
+    if run_id is None or _run_store is None:
+        return None
+    directory = _audio_dir(run_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    ordinal = sum(1 for p in directory.iterdir() if p.is_file()) + 1
+    path = directory / f"{ordinal:03d}.{audio.extension}"
+    path.write_bytes(audio.data)
+    return str(path)
+
+
+def _resolve_and_store_audio(run_id: str | None, audio: SpeechAudio) -> str | None:
+    """The /mcp/voice store callable: an explicit run_id wins; otherwise the
+    single running run (the common one-agent-one-turn case, same resolution
+    rule as ask_human). Ambiguous or none = not stored."""
+    if _run_store is None:
+        return None
+    if run_id is None:
+        running = _run_store.list(limit=100, status="running")
+        if len(running) == 1:
+            run_id = running[0].run_id
+    if run_id is None:
+        return None
+    return _store_speech_audio(run_id, audio)
+
+
+def _record_audio_artifacts(run_id: str | None) -> None:
+    """Annotate a finished record with the audio files its run produced.
+    Reads the record fresh from the store — never a stale in-memory copy,
+    which a concurrent finish() would clobber. Best effort: the files on
+    disk stay authoritative."""
+    if run_id is None or _run_store is None:
+        return
+    try:
+        directory = _audio_dir(run_id)
+        if not directory.exists():
+            return
+        files = sorted(str(p) for p in directory.iterdir() if p.is_file())
+        if not files:
+            return
+        record = _run_store.get(run_id)
+        if record is not None:
+            _run_store.annotate(record, audio_artifacts=files)
+    except Exception:
+        logger.warning("Failed to annotate audio artifacts", exc_info=True)
+
+
+def _make_speak_tool(backend: "VoiceBackend") -> Callable:
+    async def speak(text: str, voice: str | None = None) -> str:
+        """Speak text aloud through this agent's configured voice provider.
+
+        Args:
+            text: What to say.
+            voice: Provider-defined voice id; the profile's default when omitted.
+        """
+        audio = await backend.speak(text, voice=voice)
+        if audio is None:
+            return "Spoken."
+        saved = _store_speech_audio(_current_run_id.get(), audio)
+        if saved is not None:
+            return f"Audio synthesized and stored at {saved}."
+        return "Audio synthesized (no run to store it against; discarded)."
+
+    return speak
+
+
+def _voice_extra_tools() -> list[Callable] | None:
+    """The runtime tools a `voice:` profile grants — what build_agent
+    receives as extra_tools (both the startup agent and per-run rebuilds)."""
+    return [_make_speak_tool(_voice)] if _voice is not None else None
+
+
 # ── Agent runner ──────────────────────────────────────────────────────────────────
 
 def _append_history_sidecar(instance: str, run_id: str | None, message_count: int) -> None:
@@ -377,7 +470,10 @@ async def run_agent(
     agent, limits = (_agent, _limits)
     if mcp_secret_env:
         agent, limits = build_agent(
-            _profile, telemetry=_telemetry, secret_env=mcp_secret_env
+            _profile,
+            telemetry=_telemetry,
+            secret_env=mcp_secret_env,
+            extra_tools=_voice_extra_tools(),
         )
 
     history_instance = instance or DEFAULT_INSTANCE
@@ -398,6 +494,7 @@ async def run_agent(
         if _telemetry is not None
         else nullcontext()
     )
+    run_id_token = _current_run_id.set(record.run_id if record is not None else None)
     try:
         with run_ctx as run_span:
             result = await agent.run(prompt, usage_limits=limits, message_history=history)
@@ -411,7 +508,10 @@ async def run_agent(
         if record is not None and _run_store is not None:
             _run_store.finish(record, status="failed", error=str(e))
             _write_model_run_events(record.run_id, error=str(e))
+            _record_audio_artifacts(record.run_id)
         raise
+    finally:
+        _current_run_id.reset(run_id_token)
 
     if use_history:
         try:
@@ -437,6 +537,7 @@ async def run_agent(
             tool_call_failures=sum(1 for c in tool_calls if not c.ok),
         )
         _write_model_run_events(record.run_id, tool_calls=tool_calls, usage=usage, output=output)
+        _record_audio_artifacts(record.run_id)
 
     return output
 
@@ -554,6 +655,9 @@ async def _run_executor_turn(
         )
         if prepared_revisions:
             _record_snapshot_commits(record.run_id, prepared_revisions)
+        # Speak calls made through /mcp/voice during this turn land in the
+        # run's audio/ directory; fold them onto the finished record.
+        _record_audio_artifacts(record.run_id)
 
     if _telemetry is not None:
         # Post-hoc, from the turn's slice of the durable event stream — the
@@ -727,7 +831,7 @@ async def run_agent_scheduled(
             return
 
     try:
-        await _handle_on_complete(output)
+        await _handle_on_complete(output, run_id=record.run_id if record else None)
     except Exception as e:
         logger.error(f"[{_profile.name}] on_complete failed: {e}", exc_info=True)
 
@@ -875,7 +979,7 @@ def _assert_on_complete_handlers_registered(profile) -> None:
         )
 
 
-async def _handle_on_complete(output: str) -> None:
+async def _handle_on_complete(output: str, run_id: str | None = None) -> None:
     """Dispatch on_complete side effects after an autonomous run."""
     if not _profile or not _profile.on_complete:
         return
@@ -896,6 +1000,18 @@ async def _handle_on_complete(output: str) -> None:
             resp = await client.post(str(oc.post_to), json={"output": output})
             resp.raise_for_status()
             logger.info(f"[{_profile.name}] posted output to {oc.post_to}")
+
+    if oc.speak and _voice is not None:
+        audio = await _voice.speak(output)
+        if audio is not None:
+            saved = _store_speech_audio(run_id, audio)
+            _record_audio_artifacts(run_id)
+            logger.info(
+                f"[{_profile.name}] output synthesized to "
+                f"{saved or 'nowhere (no run to store against)'}"
+            )
+        else:
+            logger.info(f"[{_profile.name}] output spoken")
 
 
 # ── Secrets loader ───────────────────────────────────────────────────────────────────
@@ -931,7 +1047,7 @@ def _load_file_secrets() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _profile, _agent, _limits, _run_store, _executor, _schedule_store, \
-        _publication_store, _telemetry
+        _publication_store, _telemetry, _voice
 
     _load_file_secrets()
 
@@ -952,12 +1068,23 @@ async def lifespan(app: FastAPI):
     if interrupted:
         logger.warning(f"Marked {interrupted} stale 'running' record(s) as interrupted")
 
+    # Built before the agent: the model tier's speak tool closes over it.
+    _voice = (
+        build_voice_backend(_profile.voice, _profile.name)
+        if _profile.voice is not None
+        else None
+    )
+    if _voice is not None:
+        logger.info(f"Voice enabled (provider: {_profile.voice.provider})")
+
     if _profile.is_executor:
         _executor = build_executor(_profile, runs_root=_run_store.root)
         _executor.prepare()
         logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode (executor tier: {_profile.executor.executor})")
     else:
-        _agent, _limits = build_agent(_profile, telemetry=_telemetry)
+        _agent, _limits = build_agent(
+            _profile, telemetry=_telemetry, extra_tools=_voice_extra_tools()
+        )
         logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode")
 
     _assert_on_complete_handlers_registered(_profile)
@@ -1015,13 +1142,16 @@ async def lifespan(app: FastAPI):
     # window in which an immediate startup trigger fires ahead of `yield`.
     ask_human_mcp = build_ask_human_mcp(lambda: (_run_store, _executor))
     _ask_human_guard.inner = ask_human_mcp.streamable_http_app()
+    voice_mcp = build_voice_mcp(lambda: (_voice, _resolve_and_store_audio))
+    _voice_mcp_guard.inner = voice_mcp.streamable_http_app()
     try:
-        async with ask_human_mcp.session_manager.run():
+        async with ask_human_mcp.session_manager.run(), voice_mcp.session_manager.run():
             _scheduler.start()
             logger.info("Scheduler started")
             yield
     finally:
         _ask_human_guard.inner = _mcp_not_ready
+        _voice_mcp_guard.inner = _mcp_not_ready
 
     _scheduler.shutdown(wait=False)
     logger.info("Scheduler stopped")
@@ -1098,6 +1228,10 @@ async def _mcp_not_ready(scope, receive, send):
 # FastMCP rather than re-running a module-level one.
 _ask_human_guard = _TokenGuardASGI(_mcp_not_ready)
 app.mount("/mcp/ask-human", _ask_human_guard)
+
+# Voice front door (docs/design/voice.md) — same guard/lifespan pattern.
+_voice_mcp_guard = _TokenGuardASGI(_mcp_not_ready)
+app.mount("/mcp/voice", _voice_mcp_guard)
 
 
 # ── HTTP trigger schemas ────────────────────────────────────────────────────────────────
@@ -1179,6 +1313,7 @@ CONTRACT_CAPABILITIES = [
     "reviewed-publication/v1",           # POST /runs/{id}/publications (endpoint; backend config required)
     "model-tier-launch/v1",              # /executor-runs accepts model-tier EDFs (spec.executor.kind: model)
     "instances/v1",                      # named instances: per-instance history + admission control
+    "voice/v1",                          # speak tool + /mcp/voice mount + on_complete.speak
 ]
 
 
@@ -1231,6 +1366,14 @@ async def health():
         # Honest readiness, same pattern as publication: configured ≠ healthy,
         # but a False here explains an empty backend before anyone debugs it.
         "telemetry": {"otlp_configured": _telemetry is not None},
+        # Capability ≠ configured, same pattern as publication: voice/v1 is
+        # always advertised; this says whether THIS profile can actually speak.
+        "voice": {
+            "configured": _voice is not None,
+            "provider": _profile.voice.provider
+            if _profile is not None and _profile.voice is not None
+            else None,
+        },
         # Live admission state (instances/v1): what's running now against the
         # effective cap, so "why am I getting 429" is answerable from /health.
         "concurrency": {
