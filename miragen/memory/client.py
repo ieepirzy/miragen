@@ -153,6 +153,29 @@ class MemoryClient:
             params["as_of_record"] = as_of_record
         return await self._request("GET", "/claims", params=params)
 
+    async def correct_record(self, record_id: str, body: dict[str, Any]) -> dict:
+        return await self._request("POST", f"/records/{record_id}/correct", json=body)
+
+    # -- worker jobs (maintain capability) ---------------------------------
+
+    async def claim_jobs(
+        self, *, kinds: list[str], limit: int = 1, lease_seconds: int = 120
+    ) -> list[dict]:
+        result = await self._request("POST", "/jobs/claim", json={
+            "kinds": kinds, "limit": limit, "lease_seconds": lease_seconds,
+        })
+        return result["items"]
+
+    async def complete_job(self, job_id: str) -> dict:
+        return await self._request("POST", f"/jobs/{job_id}/complete")
+
+    async def fail_job(self, job_id: str, *, error: str, retry: bool = True) -> dict:
+        return await self._request("POST", f"/jobs/{job_id}/fail",
+                                   json={"error": error, "retry": retry})
+
+    async def get_event(self, event_id: str) -> dict:
+        return await self._request("GET", f"/events/{event_id}")
+
     # -- manifests ---------------------------------------------------------
 
     async def create_manifest(self, body: dict[str, Any]) -> dict:

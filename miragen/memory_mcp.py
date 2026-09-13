@@ -95,6 +95,27 @@ def build_memory_mcp(get_state) -> FastMCP:
         return json.dumps(result)
 
     @mcp.tool()
+    async def memory_correct(
+        record_id: str, correction: dict, reason: str = "", run_id: str | None = None
+    ) -> str:
+        """Correct an erroneous stored memory record (evidence-backed;
+        history stays queryable).
+
+        Args:
+            record_id: The record to correct.
+            correction: The corrected payload, e.g. {"text": ...}.
+            reason: Why — quote the user's correction when relaying one.
+            run_id: Only needed when several runs are active.
+        """
+        lifecycle, record = _lifecycle_and_run(run_id)
+        result = await lifecycle.correct(
+            instance=record.instance if record else None,
+            run_id=record.run_id if record else None,
+            record_id=record_id, corrected_payload=correction, reason=reason,
+        )
+        return json.dumps(result)
+
+    @mcp.tool()
     async def memory_read(record_id: str) -> str:
         """Read one memory record by id.
 

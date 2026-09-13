@@ -302,3 +302,65 @@ def memory_hook(harness: str) -> None:
             click.echo(_json.dumps(output))
     except Exception as exc:  # noqa: BLE001 — fail-open by contract
         print(f"miragen memory-hook: {exc}", file=sys.stderr)
+
+
+@cli.command(name="memory-worker")
+@click.option("--once", is_flag=True, default=False,
+              help="One sweep, then exit (default: loop forever).")
+@click.option("--interval", default=30, show_default=True,
+              help="Seconds between sweeps when looping.")
+@click.option("--limit", default=5, show_default=True,
+              help="Jobs claimed per sweep.")
+def memory_worker(once: bool, interval: int, limit: int) -> None:
+    """The bounded extraction worker (memory pass PR 3, §17.5): claims
+    consolidate jobs through /memory/v1 as its own maintain-capable
+    principal and proposes extracted memories through the same admission
+    door as every other principal — no database credential involved.
+
+    Requires the profile's memory.extraction.enabled and a model
+    (memory.extraction.model, defaulting to the profile's spec.model).
+    """
+    import asyncio
+    import time as _time
+
+    from miragen.memory import MemoryClient
+    from miragen.memory.extraction import (
+        build_model_checker,
+        build_model_extractor,
+        run_worker_once,
+    )
+
+    profile = load_profile(os.environ.get("AGENT_PROFILE", "agent.yaml"))
+    if profile.memory is None or not profile.memory.extraction.enabled:
+        raise click.ClickException(
+            "memory.extraction.enabled is not set on this profile — the "
+            "worker only runs where the deployment explicitly enabled it"
+        )
+    model = profile.memory.extraction.model or (
+        profile.spec.model if profile.spec else None
+    )
+    if not model:
+        raise click.ClickException(
+            "no extraction model: set memory.extraction.model (required on "
+            "executor-tier profiles, which have no spec.model)"
+        )
+
+    client = MemoryClient(profile.memory)
+    extract = build_model_extractor(model)
+    check = build_model_checker(model)
+
+    while True:
+        results = asyncio.run(
+            run_worker_once(client, extract=extract, check=check, limit=limit)
+        )
+        for result in results:
+            click.echo(
+                f"job {result.get('job_id')}: {result.get('status')}"
+                + (f" (+{result.get('accepted', 0)} accepted,"
+                   f" {result.get('quarantined', 0)} quarantined,"
+                   f" {len(result.get('dropped', []))} dropped)"
+                   if result.get("status") == "done" else "")
+            )
+        if once:
+            break
+        _time.sleep(interval)

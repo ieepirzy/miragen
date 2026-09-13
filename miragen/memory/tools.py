@@ -53,6 +53,23 @@ def build_memory_tools(
         )
         return json.dumps(result)
 
+    async def memory_correct(record_id: str, correction: dict, reason: str = "") -> str:
+        """Correct an erroneous stored memory record. Use when the user
+        corrects something you previously recorded, or you discover a
+        stored record is wrong. The correction replaces the old value in
+        its own validity period — history stays queryable.
+
+        Args:
+            record_id: The record to correct.
+            correction: The corrected payload, e.g. {"text": ...} or {"value": ...}.
+            reason: Why — quote the user's correction when relaying one.
+        """
+        result = await lifecycle.correct(
+            instance=current_instance(), run_id=current_run_id(),
+            record_id=record_id, corrected_payload=correction, reason=reason,
+        )
+        return json.dumps(result)
+
     async def memory_read(record_id: str) -> str:
         """Read one memory record by id (its current revision, with root
         validity status).
@@ -64,4 +81,4 @@ def build_memory_tools(
         result = await lifecycle.read(record_id)
         return json.dumps(result)
 
-    return [memory_checkpoint, memory_remember, memory_read]
+    return [memory_checkpoint, memory_remember, memory_read, memory_correct]

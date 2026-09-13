@@ -49,6 +49,8 @@ class FakeMemoryService:
         self.events: dict[str, dict] = {}          # idempotency_key -> event
         self.records: dict[str, dict] = {}
         self.manifests: list[dict] = []
+        self.jobs: list[dict] = []
+        self.proposals: list[dict] = []            # raw propose bodies, in order
         self.requests: list[tuple[str, str]] = []  # (method, path)
         self.fail_with: Exception | None = None
         self.auth_seen: list[str] = []
@@ -112,10 +114,15 @@ class FakeMemoryService:
             self.events[key] = event
             return httpx.Response(201, json=event)
         if request.method == "POST" and path == "/records":
+            self.proposals.append(body)
+            if body.get("quarantine"):
+                admission = "quarantined"
+            else:
+                admission = "accepted" if body.get("source_event_ids") else "candidate"
             record = {
                 "record_id": str(uuid.uuid4()), "type": body["type"],
                 "scope_id": body["scope_id"],
-                "admission": "accepted" if body.get("source_event_ids") else "candidate",
+                "admission": admission,
                 "slot_id": None,
                 "revision": {"id": str(uuid.uuid4()), "seq": 1,
                              "payload": body["payload"], "lifecycle": "active"},
@@ -123,6 +130,55 @@ class FakeMemoryService:
             }
             self.records[record["record_id"]] = record
             return httpx.Response(201, json=record)
+        if request.method == "POST" and path.endswith("/correct"):
+            record_id = path.split("/")[-2]
+            record = self.records.get(record_id)
+            if record is None:
+                return httpx.Response(404, json=_err("not_found", "unknown record"))
+            if record["revision"]["seq"] != body["expected_seq"]:
+                return httpx.Response(409, json=_err(
+                    "illegal_transition", "expected_seq does not match",
+                    {"current_seq": record["revision"]["seq"]},
+                ))
+            record["revision"] = {
+                "id": str(uuid.uuid4()), "seq": record["revision"]["seq"] + 1,
+                "payload": body["payload"], "lifecycle": "active",
+                "correction_of": record["revision"]["id"],
+            }
+            return httpx.Response(200, json=record | {
+                "resolution": {"outcome": "corrected", "slot_version": 2},
+            })
+        if request.method == "GET" and path.startswith("/events/"):
+            wanted = path.split("/")[-1]
+            for event in self.events.values():
+                if event["id"] == wanted:
+                    return httpx.Response(200, json=event)
+            return httpx.Response(404, json=_err("not_found", "unknown source event"))
+        if request.method == "POST" and path == "/jobs/claim":
+            claimed = []
+            for job in self.jobs:
+                if len(claimed) >= body.get("limit", 1):
+                    break
+                if job["status"] == "pending" and job["kind"] in body["kinds"]:
+                    job["status"] = "leased"
+                    job["attempts"] = job.get("attempts", 0) + 1
+                    claimed.append(job)
+            return httpx.Response(200, json={"items": claimed})
+        if request.method == "POST" and path.endswith("/complete"):
+            job_id = path.split("/")[-2]
+            for job in self.jobs:
+                if job["id"] == job_id and job["status"] == "leased":
+                    job["status"] = "done"
+                    return httpx.Response(200, json=job)
+            return httpx.Response(404, json=_err("not_found", "no leased job"))
+        if request.method == "POST" and path.endswith("/fail"):
+            job_id = path.split("/")[-2]
+            for job in self.jobs:
+                if job["id"] == job_id and job["status"] == "leased":
+                    job["status"] = "pending" if body.get("retry", True) else "failed"
+                    job["last_error"] = body["error"]
+                    return httpx.Response(200, json=job)
+            return httpx.Response(404, json=_err("not_found", "no leased job"))
         if request.method == "GET" and path.startswith("/records/"):
             record = self.records.get(path.split("/")[-1])
             if record is None:

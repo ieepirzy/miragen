@@ -339,6 +339,64 @@ class MemoryLifecycle:
         except MemoryAPIError as exc:
             return {"status": "rejected", "detail": str(exc)}
 
+    async def correct(
+        self,
+        *,
+        instance: str | None,
+        run_id: str | None,
+        record_id: str,
+        corrected_payload: dict[str, Any],
+        reason: str = "",
+    ) -> dict:
+        """Immediate active correction (§17.5): the correction is captured
+        as its own evidence event — kind `agent_relayed_correction`, never
+        a self-asserted 'human' label (§17.6) — and applied through the
+        CAS-guarded correct route with one concurrent-writer retry. It
+        takes effect for the next read the moment the transaction commits;
+        no vector backfill is waited on."""
+        try:
+            record = await self.client.get_record(record_id)
+            event = await self.client.append_event(
+                scope_id=record["scope_id"],
+                idempotency_key=(
+                    f"correct:{run_id or 'manual'}:{record_id}:"
+                    f"{_stable_digest(json.dumps(corrected_payload, sort_keys=True))}"
+                ),
+                source={"kind": "agent_relayed_correction",
+                        "ref": f"run:{run_id}" if run_id else None},
+                content=reason or f"correction of record {record_id}",
+                attributes={"record_id": record_id, "run_id": run_id,
+                            "instance": instance or DEFAULT_INSTANCE,
+                            "profile": self.profile_name},
+            )
+            body = {
+                "payload": corrected_payload,
+                "source_event_ids": [event["id"]],
+                "expected_seq": record["revision"]["seq"],
+                "reason": reason,
+            }
+            try:
+                result = await self.client.correct_record(record_id, body)
+            except MemoryAPIError as exc:
+                if exc.status_code != 409:
+                    raise
+                fresh = await self.client.get_record(record_id)
+                body["expected_seq"] = fresh["revision"]["seq"]
+                result = await self.client.correct_record(record_id, body)
+            return {
+                "status": "accepted",
+                "record_id": record_id,
+                "new_seq": result["revision"]["seq"],
+                "resolution": result.get("resolution"),
+            }
+        except MemoryUnavailable as exc:
+            return {"status": "persistence_unavailable",
+                    "detail": self._degrade(f"correct: {exc}")}
+        except MemoryAPIError as exc:
+            if exc.status_code == 409:
+                return {"status": "conflict", "detail": str(exc)}
+            return {"status": "rejected", "detail": str(exc)}
+
     async def read(self, record_id: str) -> dict:
         try:
             return await self.client.get_record(record_id)

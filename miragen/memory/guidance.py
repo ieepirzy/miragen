@@ -35,7 +35,8 @@ def build_guidance(
             "Tools: memory_checkpoint (persist durable working state — "
             "goal, constraints, pending actions — before finishing or when "
             "state materially changes), memory_remember (propose a durable "
-            "observation), memory_read (fetch one record by id). A write is "
+            "observation), memory_read (fetch one record by id), memory_correct \
+(fix an erroneous stored record with evidence). A write is "
             "saved only when the tool answers accepted; pending / "
             "persistence_unavailable results must not be reported as saved."
         )
