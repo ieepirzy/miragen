@@ -382,7 +382,7 @@ async def test_model_tier_run_builds_a_per_run_agent_for_ephemeral_credentials(
 
     built: dict = {}
 
-    def fake_build_agent(profile, telemetry=None, *, secret_env=None, extra_tools=None):
+    def fake_build_agent(profile, telemetry=None, *, secret_env=None, extra_tools=None, extra_instructions=None):
         built["secret_env"] = secret_env
         agent = MagicMock()
         result = MagicMock()

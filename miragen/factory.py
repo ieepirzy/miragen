@@ -116,6 +116,7 @@ def build_agent(
     *,
     secret_env: dict[str, str] | None = None,
     extra_tools: list[Callable] | None = None,
+    extra_instructions: str | None = None,
 ) -> tuple[Agent, UsageLimits | None]:
     """
     Construct a live PydanticAI Agent from a validated AgentProfile.
@@ -173,9 +174,16 @@ def build_agent(
             ms["temperature"] = profile.spec.model_settings.temperature
         model_settings = ms or None
 
+    # `extra_instructions` rides the system prompt, NOT message history —
+    # this is what makes a per-run memory packet transient (§17.3): it is
+    # regenerated each run and never persisted into a saved conversation.
+    instructions = profile.spec.instructions
+    if extra_instructions:
+        instructions = f"{instructions}\n\n{extra_instructions}"
+
     agent = Agent(
         model=profile.spec.model,
-        instructions=profile.spec.instructions,
+        instructions=instructions,
         capabilities=capabilities,
         model_settings=model_settings,
     )

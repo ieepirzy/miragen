@@ -465,6 +465,71 @@ class VoiceSpec(_ProfileModel):
         return self
 
 
+# ── Memory (docs/miragen-memory-agent-architecture-pass.md §17–§18) ─────────
+
+class MemoryScopesSpec(_ProfileModel):
+    read: list[str] = Field(
+        default_factory=list,
+        description="Registered scope ids this agent's retrieval may draw from.",
+    )
+    propose: list[str] = Field(
+        default_factory=list,
+        description="Scope ids this agent may propose memories into.",
+    )
+    default_write: str = Field(
+        description="The scope new events/records/working state land in by default.",
+        min_length=1,
+    )
+
+    @model_validator(mode="after")
+    def validate_default_in_propose(self) -> "MemoryScopesSpec":
+        if self.default_write not in self.propose:
+            raise ValueError(
+                "memory.scopes.default_write must be listed in memory.scopes.propose "
+                "— a default the agent cannot write to is dead config"
+            )
+        return self
+
+
+class MemoryHooksSpec(_ProfileModel):
+    mode: Literal["native_required", "boundary_only"] = Field(
+        default="boundary_only",
+        description=(
+            "'boundary_only' injects at miragen's own run boundary (always "
+            "available). 'native_required' additionally demands verified "
+            "harness lifecycle hooks — an adapter without them is an "
+            "explicit integration failure, never a silent wrapper downgrade "
+            "(§18.7)."
+        ),
+    )
+
+
+class MemoryGuidanceSpec(_ProfileModel):
+    required: bool = Field(
+        default=True,
+        description="Supply the versioned memory-use core guide in every prepared context (§18.8).",
+    )
+
+
+class MemorySpec(_ProfileModel):
+    """Central memory service binding. Presence enables the memory
+    lifecycle: working-state restore + guidance injection at the run
+    boundary, durable event capture, and the agent memory tools."""
+
+    backend: Literal["loimi"] = "loimi"
+    endpoint_env: str = Field(
+        default="LOIMI_MEMORY_URL",
+        description="Env var NAME holding the memory service base URL.",
+    )
+    credential_env: str = Field(
+        default="LOIMI_MEMORY_TOKEN",
+        description="Env var NAME holding this agent's minted principal token — never the value.",
+    )
+    scopes: MemoryScopesSpec
+    hooks: MemoryHooksSpec = Field(default_factory=MemoryHooksSpec)
+    guidance: MemoryGuidanceSpec = Field(default_factory=MemoryGuidanceSpec)
+
+
 # ── PydanticAI spec (their layer) ───────────────────────────────────────────
 
 class ModelSettings(_ProfileModel):
@@ -882,6 +947,14 @@ class AgentProfile(_ProfileModel):
             "Speech provider (docs/design/voice.md). Presence grants the "
             "agent a `speak` tool (model tier) and the /mcp/voice mount "
             "(executor tier), and enables on_complete.speak."
+        ),
+    )
+    memory: Optional[MemorySpec] = Field(
+        default=None,
+        description=(
+            "Central memory service binding (memory architecture pass). "
+            "Presence enables working-state restore + guidance at the run "
+            "boundary, durable event capture, and the memory tools."
         ),
     )
     on_complete: Optional[OnComplete] = None

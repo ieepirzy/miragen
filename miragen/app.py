@@ -84,6 +84,9 @@ from miragen.schedules import (
 )
 from miragen.intervention_mcp import build_ask_human_mcp
 from miragen.telemetry import MiragenTelemetry, telemetry_from_env
+from miragen.memory import MemoryClient, MemoryLifecycle
+from miragen.memory.tools import build_memory_tools
+from miragen.memory_mcp import build_memory_mcp
 from miragen.voice import SpeechAudio, VoiceBackend, build_voice_backend
 from miragen.voice_mcp import build_voice_mcp
 
@@ -103,12 +106,16 @@ _publication_store: PublicationStore | None = None
 _publication_backend_override: object | None = None
 _telemetry: MiragenTelemetry | None = None
 _voice: "VoiceBackend | None" = None
+_memory: "MemoryLifecycle | None" = None
 
-# The run a model-tier speak tool call belongs to, for artifact storage —
-# set around agent.run() so the closure sees its own run even with several
-# concurrent (different-instance) turns in flight.
+# The run/instance a model-tier tool call belongs to (speak's artifact
+# storage, memory's state scope) — set around agent.run() so closures see
+# their own run even with several concurrent (different-instance) turns.
 _current_run_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "miragen_current_run_id", default=None
+)
+_current_instance: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "miragen_current_instance", default=None
 )
 
 # Per-instance conversation state (instance model ADR: docs/design/
@@ -391,6 +398,41 @@ def _voice_extra_tools() -> list[Callable] | None:
     return [_make_speak_tool(_voice)] if _voice is not None else None
 
 
+def _build_memory_lifecycle(profile: AgentProfile) -> "MemoryLifecycle | None":
+    """The lifespan's memory construction, including the §18.7 honesty
+    gate: an unsupported REQUIRED hook mode is an explicit boot failure,
+    never a silent wrapper downgrade. Model-tier boundary injection IS the
+    native seam (miragen owns every turn); executor-tier native hooks land
+    with the hook-bridge PR, so a profile demanding them today must refuse
+    to start."""
+    if profile.memory is None:
+        return None
+    if profile.memory.hooks.mode == "native_required" and profile.is_executor:
+        raise ValueError(
+            f"Agent '{profile.name}' sets memory.hooks.mode: native_required, "
+            "but native harness hooks are not yet implemented for "
+            "executor-tier agents — use hooks.mode: boundary_only, or wait "
+            "for the hook bridge."
+        )
+    return MemoryLifecycle(
+        profile.memory,
+        profile.name,
+        MemoryClient(profile.memory),
+        tools_available=not profile.is_executor or bool(profile.executor.mcp_servers),
+    )
+
+
+def _runtime_extra_tools() -> list[Callable] | None:
+    """Every runtime-granted tool for build_agent: voice's speak plus the
+    memory surface (§18.8) when the profile enables them."""
+    tools: list[Callable] = list(_voice_extra_tools() or [])
+    if _memory is not None:
+        tools.extend(
+            build_memory_tools(_memory, _current_run_id.get, _current_instance.get)
+        )
+    return tools or None
+
+
 # ── Agent runner ──────────────────────────────────────────────────────────────────
 
 def _append_history_sidecar(instance: str, run_id: str | None, message_count: int) -> None:
@@ -467,13 +509,26 @@ async def run_agent(
     # values gets its own agent rather than the one built at startup with the
     # deployment-level environment baked in. The startup agent is reused
     # whenever a run supplies none, which is the common case.
+    # Memory boundary (§17.3): restore working state + guidance and carry
+    # it as per-run extra_instructions — transient by construction (it is
+    # regenerated each run, never saved into history). Memory failures
+    # degrade explicitly; they never fail the run.
+    memory_packet = None
+    if _memory is not None:
+        memory_packet = await _memory.prepare_context(
+            instance=instance,
+            run_id=record.run_id if record is not None else None,
+            trigger=record.trigger if record is not None else "direct",
+        )
+
     agent, limits = (_agent, _limits)
-    if mcp_secret_env:
+    if mcp_secret_env or memory_packet is not None:
         agent, limits = build_agent(
             _profile,
             telemetry=_telemetry,
             secret_env=mcp_secret_env,
-            extra_tools=_voice_extra_tools(),
+            extra_tools=_runtime_extra_tools(),
+            extra_instructions=memory_packet.text if memory_packet else None,
         )
 
     history_instance = instance or DEFAULT_INSTANCE
@@ -495,6 +550,7 @@ async def run_agent(
         else nullcontext()
     )
     run_id_token = _current_run_id.set(record.run_id if record is not None else None)
+    instance_token = _current_instance.set(instance)
     try:
         with run_ctx as run_span:
             result = await agent.run(prompt, usage_limits=limits, message_history=history)
@@ -509,9 +565,15 @@ async def run_agent(
             _run_store.finish(record, status="failed", error=str(e))
             _write_model_run_events(record.run_id, error=str(e))
             _record_audio_artifacts(record.run_id)
+            if _memory is not None:
+                await _memory.finish_turn(
+                    instance=instance, run_id=record.run_id, trigger=record.trigger,
+                    status="failed", error=str(e),
+                )
         raise
     finally:
         _current_run_id.reset(run_id_token)
+        _current_instance.reset(instance_token)
 
     if use_history:
         try:
@@ -538,6 +600,11 @@ async def run_agent(
         )
         _write_model_run_events(record.run_id, tool_calls=tool_calls, usage=usage, output=output)
         _record_audio_artifacts(record.run_id)
+        if _memory is not None:
+            await _memory.finish_turn(
+                instance=instance, run_id=record.run_id, trigger=record.trigger,
+                status="succeeded", summary=output,
+            )
 
     return output
 
@@ -585,6 +652,19 @@ async def _run_executor_turn(
             )
             for r in record.repositories
         ]
+
+    # Memory boundary (§17.3), executor tier: boundary injection — the
+    # packet rides the turn prompt (the executor thread persists it; that
+    # is the capability honestly reported as boundary_injection, not
+    # transient context replacement).
+    memory_packet = None
+    if _memory is not None:
+        memory_packet = await _memory.prepare_context(
+            instance=record.instance if record is not None else None,
+            run_id=run_id,
+            trigger=record.trigger if record is not None else "direct",
+        )
+        prompt = f"{memory_packet.text}\n\n{prompt}"
 
     # Cursor + wall clock captured before the turn so its slice of the event
     # stream (and its true span interval) can be exported afterwards.
@@ -658,6 +738,13 @@ async def _run_executor_turn(
         # Speak calls made through /mcp/voice during this turn land in the
         # run's audio/ directory; fold them onto the finished record.
         _record_audio_artifacts(record.run_id)
+        if _memory is not None:
+            await _memory.finish_turn(
+                instance=record.instance, run_id=record.run_id,
+                trigger=record.trigger, status=result.status,
+                summary=result.output, error=result.error,
+                turn=record.resume_count,
+            )
 
     if _telemetry is not None:
         # Post-hoc, from the turn's slice of the durable event stream — the
@@ -1047,7 +1134,7 @@ def _load_file_secrets() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _profile, _agent, _limits, _run_store, _executor, _schedule_store, \
-        _publication_store, _telemetry, _voice
+        _publication_store, _telemetry, _voice, _memory
 
     _load_file_secrets()
 
@@ -1068,6 +1155,11 @@ async def lifespan(app: FastAPI):
     if interrupted:
         logger.warning(f"Marked {interrupted} stale 'running' record(s) as interrupted")
 
+    # Built before the agent: the memory tools close over the lifecycle.
+    _memory = _build_memory_lifecycle(_profile)
+    if _memory is not None:
+        logger.info(f"Memory enabled (backend: {_profile.memory.backend})")
+
     # Built before the agent: the model tier's speak tool closes over it.
     _voice = (
         build_voice_backend(_profile.voice, _profile.name)
@@ -1083,7 +1175,7 @@ async def lifespan(app: FastAPI):
         logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode (executor tier: {_profile.executor.executor})")
     else:
         _agent, _limits = build_agent(
-            _profile, telemetry=_telemetry, extra_tools=_voice_extra_tools()
+            _profile, telemetry=_telemetry, extra_tools=_runtime_extra_tools()
         )
         logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode")
 
@@ -1144,14 +1236,21 @@ async def lifespan(app: FastAPI):
     _ask_human_guard.inner = ask_human_mcp.streamable_http_app()
     voice_mcp = build_voice_mcp(lambda: (_voice, _resolve_and_store_audio))
     _voice_mcp_guard.inner = voice_mcp.streamable_http_app()
+    memory_mcp = build_memory_mcp(lambda: (_memory, _run_store))
+    _memory_mcp_guard.inner = memory_mcp.streamable_http_app()
     try:
-        async with ask_human_mcp.session_manager.run(), voice_mcp.session_manager.run():
+        async with (
+            ask_human_mcp.session_manager.run(),
+            voice_mcp.session_manager.run(),
+            memory_mcp.session_manager.run(),
+        ):
             _scheduler.start()
             logger.info("Scheduler started")
             yield
     finally:
         _ask_human_guard.inner = _mcp_not_ready
         _voice_mcp_guard.inner = _mcp_not_ready
+        _memory_mcp_guard.inner = _mcp_not_ready
 
     _scheduler.shutdown(wait=False)
     logger.info("Scheduler stopped")
@@ -1232,6 +1331,10 @@ app.mount("/mcp/ask-human", _ask_human_guard)
 # Voice front door (docs/design/voice.md) — same guard/lifespan pattern.
 _voice_mcp_guard = _TokenGuardASGI(_mcp_not_ready)
 app.mount("/mcp/voice", _voice_mcp_guard)
+
+# Memory tools for the executor tier (§18.8) — same guard/lifespan pattern.
+_memory_mcp_guard = _TokenGuardASGI(_mcp_not_ready)
+app.mount("/mcp/memory", _memory_mcp_guard)
 
 
 # ── HTTP trigger schemas ────────────────────────────────────────────────────────────────
@@ -1314,6 +1417,7 @@ CONTRACT_CAPABILITIES = [
     "model-tier-launch/v1",              # /executor-runs accepts model-tier EDFs (spec.executor.kind: model)
     "instances/v1",                      # named instances: per-instance history + admission control
     "voice/v1",                          # speak tool + /mcp/voice mount + on_complete.speak
+    "memory/v1",                         # memory lifecycle: boundary injection + tools + /mcp/memory
 ]
 
 
@@ -1373,6 +1477,19 @@ async def health():
             "provider": _profile.voice.provider
             if _profile is not None and _profile.voice is not None
             else None,
+        },
+        # Memory lifecycle readiness (capability != configured, as with
+        # voice) plus the honest degradation counters (§18.8): a nonzero
+        # degraded_count explains missing memories before anyone debugs.
+        "memory": {
+            "configured": _memory is not None,
+            "backend": _profile.memory.backend
+            if _profile is not None and _profile.memory is not None
+            else None,
+            "boundary_injection": _memory is not None,
+            "native_hooks": "pending",  # §18.7 hook bridge: next PR
+            "degraded_count": _memory.degraded_count if _memory else 0,
+            "last_degraded": _memory.last_degraded if _memory else None,
         },
         # Live admission state (instances/v1): what's running now against the
         # effective cap, so "why am I getting 429" is answerable from /health.
@@ -2452,6 +2569,20 @@ async def run_stream(request: RunRequest):
             if _run_store is not None and _profile is not None
             else None
         )
+
+        stream_agent, stream_limits = _agent, _limits
+        if _memory is not None:
+            memory_packet = await _memory.prepare_context(
+                instance=instance,
+                run_id=record.run_id if record is not None else None,
+                trigger="http",
+            )
+            stream_agent, stream_limits = build_agent(
+                _profile,
+                telemetry=_telemetry,
+                extra_tools=_runtime_extra_tools(),
+                extra_instructions=memory_packet.text,
+            )
     except Exception:
         release()
         raise
@@ -2460,7 +2591,7 @@ async def run_stream(request: RunRequest):
         chunks: list[str] = []
         try:
             try:
-                async with _agent.run_stream(prompt, usage_limits=_limits, message_history=history) as stream:
+                async with stream_agent.run_stream(prompt, usage_limits=stream_limits, message_history=history) as stream:
                     async for chunk in stream.stream_text(delta=True):
                         chunks.append(chunk)
                         yield f"data: {chunk}\n\n"
@@ -2476,6 +2607,11 @@ async def run_stream(request: RunRequest):
                 if record is not None and _run_store is not None:
                     _run_store.finish(record, status="failed", error=str(e), output="".join(chunks) or None)
                     _write_model_run_events(record.run_id, error=str(e))
+                    if _memory is not None:
+                        await _memory.finish_turn(
+                            instance=instance, run_id=record.run_id,
+                            trigger="http", status="failed", error=str(e),
+                        )
                 raise
             if record is not None and _run_store is not None:
                 try:
@@ -2494,6 +2630,11 @@ async def run_stream(request: RunRequest):
                 _write_model_run_events(
                     record.run_id, tool_calls=tool_calls, usage=usage, output="".join(chunks)
                 )
+                if _memory is not None:
+                    await _memory.finish_turn(
+                        instance=instance, run_id=record.run_id,
+                        trigger="http", status="succeeded", summary="".join(chunks),
+                    )
             yield "data: [DONE]\n\n"
         finally:
             release()
