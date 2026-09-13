@@ -339,14 +339,24 @@ class TestProfileAndBoot:
                 "scopes": {"read": ["a"], "propose": ["a"], "default_write": "b"},
             })
 
-    def test_native_required_on_executor_refuses_to_boot(self):
+    def test_native_required_without_hook_support_refuses_to_boot(self):
+        """kimi-code has no verified hook contract yet — demanding
+        native hooks there is an explicit boot failure (§18.7)."""
+        profile = AgentProfile.model_validate({
+            "name": "a", "mode": "interactive", "triggers": [{"type": "http"}],
+            "executor": {"executor": "kimi-code", "instructions": "work"},
+            "memory": {**MEMORY_BLOCK, "hooks": {"mode": "native_required"}},
+        })
+        with pytest.raises(ValueError, match="native_required"):
+            app_module._build_memory_lifecycle(profile)
+
+    def test_native_required_on_codex_boots_via_hooks_bridge(self):
         profile = AgentProfile.model_validate({
             "name": "a", "mode": "interactive", "triggers": [{"type": "http"}],
             "executor": {"executor": "codex", "instructions": "work"},
             "memory": {**MEMORY_BLOCK, "hooks": {"mode": "native_required"}},
         })
-        with pytest.raises(ValueError, match="native_required"):
-            app_module._build_memory_lifecycle(profile)
+        assert app_module._build_memory_lifecycle(profile) is not None
 
     def test_boundary_only_executor_boots(self):
         profile = AgentProfile.model_validate({
@@ -450,7 +460,7 @@ class TestAppBoundary:
         body = (await client.get("/health")).json()
         assert body["memory"]["configured"] is True
         assert body["memory"]["backend"] == "loimi"
-        assert body["memory"]["native_hooks"] == "pending"
+        assert body["memory"]["native_hooks"]["mechanism"] == "model_tier_boundary"
         assert "memory/v1" in body["capabilities"]
 
     async def test_health_reports_degradation(self, client, service):

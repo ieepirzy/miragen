@@ -34,6 +34,15 @@ from miragen.models import DEFAULT_INSTANCE, MemorySpec
 
 logger = logging.getLogger(__name__)
 
+def default_state_dir() -> Path:
+    """The context-map home: /agent/memory inside an agent container, or
+    MIRAGEN_MEMORY_STATE_DIR for the hook bridge running in an external
+    harness session (where /agent does not exist)."""
+    import os
+
+    return Path(os.environ.get("MIRAGEN_MEMORY_STATE_DIR", "/agent/memory"))
+
+
 STATE_DIR = Path("/agent/memory")
 
 
@@ -58,13 +67,13 @@ class MemoryLifecycle:
         profile_name: str,
         client: MemoryClient,
         *,
-        state_dir: Path = STATE_DIR,
+        state_dir: Path | None = None,
         tools_available: bool = True,
     ) -> None:
         self.spec = spec
         self.profile_name = profile_name
         self.client = client
-        self.state_dir = Path(state_dir)
+        self.state_dir = Path(state_dir) if state_dir is not None else default_state_dir()
         self.tools_available = tools_available
         # Honest health surface: how often memory degraded, and why last.
         self.degraded_count = 0
@@ -224,6 +233,37 @@ class MemoryLifecycle:
         except (MemoryUnavailable, MemoryAPIError) as exc:
             reason = self._degrade(f"finish: {exc}")
             return {"status": "persistence_unavailable", "detail": reason}
+
+    async def capture_harness_event(self, *, instance: str | None, event) -> dict:
+        """Durable capture of one normalized harness hook event (§18.7).
+        Idempotent per occurrence; fail-open for the harness but counted
+        as degradation, never silent."""
+        from miragen.memory.harness_hooks import event_idempotency_key
+
+        try:
+            result = await self.client.append_event(
+                scope_id=self.spec.scopes.default_write,
+                idempotency_key=event_idempotency_key(event),
+                source={
+                    "kind": f"harness:{event.name}",
+                    "ref": f"session:{event.session_id}" if event.session_id else None,
+                },
+                content=event.content
+                or json.dumps({"event": event.original_event, **event.attributes}),
+                attributes={
+                    "harness": event.harness,
+                    "original_event": event.original_event,
+                    "instance": instance or DEFAULT_INSTANCE,
+                    "profile": self.profile_name,
+                    **event.ids,
+                    **event.attributes,
+                },
+            )
+            return {"status": "captured", "event_id": result["id"],
+                    "created": result.get("created", True)}
+        except (MemoryUnavailable, MemoryAPIError) as exc:
+            return {"status": "persistence_unavailable",
+                    "detail": self._degrade(f"hook capture: {exc}")}
 
     # -- tool backends -----------------------------------------------------
 

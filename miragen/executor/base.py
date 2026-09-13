@@ -188,6 +188,25 @@ class ExecutorBackend(ABC):
         # sentinel file, this in-process one does not).
         self._gate_lock = threading.Lock()
         self._gate_blocks: list[GateOperation] = []
+        # Memory lifecycle (§18.7): set by the app before prepare() when the
+        # profile has a memory block; adapters with a native hook seam use
+        # it for in-loop capture. None = no memory integration.
+        self._memory = None
+
+    def set_memory(self, lifecycle) -> None:
+        """Give the adapter the memory lifecycle to wire its native hooks
+        to — called before prepare(), so config installation can see it."""
+        self._memory = lifecycle
+
+    def memory_hook_capabilities(self) -> dict:
+        """What native memory-hook integration THIS adapter has, honestly
+        (§18.7): kinds without a verified contract report unverified, not
+        unsupported-forever, and never claim completion."""
+        from miragen.memory.harness_hooks import executor_hook_support
+
+        support = dict(executor_hook_support(self.spec.executor))
+        support["memory_enabled"] = self._memory is not None
+        return support
 
     @property
     def leash_enabled(self) -> bool:

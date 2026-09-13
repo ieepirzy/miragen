@@ -88,6 +88,29 @@ class ClaudeCodeExecutor(ExecutorBackend):
             for payload in _normalize(message):
                 yield payload
 
+    def _memory_hooks(self) -> dict[str, Any] | None:
+        """Native in-process hooks (§18.7): miragen drives the SDK, so
+        Python callbacks ARE the native seam — no shell bridge. Capture
+        only; context injection already happens at the run_job boundary,
+        and subscribing SessionStart here would double-inject. Feature-
+        detected against the INSTALLED SDK, never assumed from docs."""
+        if self._memory is None:
+            return None
+        try:
+            from claude_agent_sdk import HookMatcher
+        except ImportError:
+            # memory_hook_capabilities() reports this honestly; the
+            # native_required gate has already refused profiles that
+            # demand what this install cannot do.
+            return None
+        from miragen.memory.harness_hooks import build_sdk_hook_callables
+
+        callables = build_sdk_hook_callables(self._memory, instance=None)
+        return {
+            event: [HookMatcher(matcher=None, hooks=[fn])]
+            for event, fn in callables.items()
+        }
+
     def _options(
         self,
         workspace: Path,
@@ -104,6 +127,9 @@ class ClaudeCodeExecutor(ExecutorBackend):
         }
         if self.leash_enabled:
             options["can_use_tool"] = self._can_use_tool
+        hooks = self._memory_hooks()
+        if hooks is not None:
+            options["hooks"] = hooks
         if self.spec.model:
             options["model"] = self.spec.model
         if self.spec.mcp_servers:

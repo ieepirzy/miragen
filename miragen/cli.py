@@ -256,3 +256,49 @@ def validate(profile: str, tools: str) -> None:
     except Exception as e:
         click.echo(click.style(f"✗ Invalid profile: {e}", fg="red"))
         raise SystemExit(1)
+
+@cli.command(name="memory-hook")
+@click.argument("harness", type=click.Choice(["claude-code", "codex"]))
+def memory_hook(harness: str) -> None:
+    """Hook bridge (§18.7): read ONE harness hook event JSON on stdin,
+    capture it durably / answer context, exit.
+
+    Installed into harness hook configuration by miragen itself (Codex
+    hooks.json; external Claude Code sessions can point their settings at
+    it). Credentials and identity come from the trusted host environment
+    (AGENT_PROFILE + the profile's memory env vars) — never from the
+    payload. Fail-open: any failure logs to stderr and exits 0, because a
+    broken memory service must not block the agent's actual work.
+    """
+    import asyncio
+    import json as _json
+    import sys
+
+    from miragen.memory import MemoryClient, MemoryLifecycle
+    from miragen.memory.harness_hooks import handle_hook_event, normalize_hook_payload
+
+    try:
+        payload = _json.load(sys.stdin)
+        profile = load_profile(os.environ.get("AGENT_PROFILE", "agent.yaml"))
+        if profile.memory is None:
+            return  # memory not enabled: hook is a no-op, not an error
+        lifecycle = MemoryLifecycle(
+            profile.memory, profile.name, MemoryClient(profile.memory)
+        )
+        event = normalize_hook_payload(harness, payload)
+        if event is None:
+            return
+        instance = os.environ.get("MIRAGEN_MEMORY_INSTANCE") or None
+
+        async def _run():
+            # Explicit bound (§18.7) UNDER the harness-side hook timeout,
+            # so the bridge gives up before the harness gives up on it.
+            return await asyncio.wait_for(
+                handle_hook_event(lifecycle, event, instance=instance), timeout=8
+            )
+
+        output = asyncio.run(_run())
+        if output is not None:
+            click.echo(_json.dumps(output))
+    except Exception as exc:  # noqa: BLE001 — fail-open by contract
+        print(f"miragen memory-hook: {exc}", file=sys.stderr)
