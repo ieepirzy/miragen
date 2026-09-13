@@ -504,6 +504,26 @@ class MemoryHooksSpec(_ProfileModel):
     )
 
 
+class MemoryExtractionSpec(_ProfileModel):
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable the bounded extraction worker (`miragen memory-worker`) "
+            "for this profile's scopes. The worker authenticates as its own "
+            "maintain-capable principal; enabling here only configures it."
+        ),
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description=(
+            "Model for extraction/support-checking. Default: the profile's "
+            "own spec.model (§17.2: use the main model initially, not an "
+            "unvalidated cheaper substitute). Executor-tier profiles must "
+            "set it explicitly."
+        ),
+    )
+
+
 class MemoryGuidanceSpec(_ProfileModel):
     required: bool = Field(
         default=True,
@@ -528,6 +548,7 @@ class MemorySpec(_ProfileModel):
     scopes: MemoryScopesSpec
     hooks: MemoryHooksSpec = Field(default_factory=MemoryHooksSpec)
     guidance: MemoryGuidanceSpec = Field(default_factory=MemoryGuidanceSpec)
+    extraction: MemoryExtractionSpec = Field(default_factory=MemoryExtractionSpec)
 
 
 # ── PydanticAI spec (their layer) ───────────────────────────────────────────
