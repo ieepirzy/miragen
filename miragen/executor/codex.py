@@ -94,6 +94,16 @@ class CodexExecutor(ExecutorBackend):
         config_path.write_text(self._render_config())
         logger.info(f"[{self.profile.name}] executor config written: {config_path}")
 
+        if self._memory is not None:
+            # Native hooks (§18.7): Codex runs shell hooks from CODEX_HOME's
+            # hooks.json, so the bridge command IS the native seam here.
+            # Merge-preserving: only miragen-owned entries are replaced.
+            from miragen.memory.harness_hooks import install_codex_hooks
+
+            hooks_path = codex_home / "hooks.json"
+            install_codex_hooks(hooks_path)
+            logger.info(f"[{self.profile.name}] memory hooks installed: {hooks_path}")
+
         has_creds = (codex_home / "auth.json").exists()
         has_key = bool(os.environ.get("CODEX_API_KEY") or os.environ.get("OPENAI_API_KEY"))
         if not has_creds and not has_key:

@@ -408,12 +408,17 @@ def _build_memory_lifecycle(profile: AgentProfile) -> "MemoryLifecycle | None":
     if profile.memory is None:
         return None
     if profile.memory.hooks.mode == "native_required" and profile.is_executor:
-        raise ValueError(
-            f"Agent '{profile.name}' sets memory.hooks.mode: native_required, "
-            "but native harness hooks are not yet implemented for "
-            "executor-tier agents — use hooks.mode: boundary_only, or wait "
-            "for the hook bridge."
-        )
+        from miragen.memory.harness_hooks import executor_hook_support
+
+        support = executor_hook_support(profile.executor.executor)
+        if not support.get("native_hooks"):
+            raise ValueError(
+                f"Agent '{profile.name}' sets memory.hooks.mode: "
+                f"native_required, but executor '{profile.executor.executor}' "
+                f"has no verified native hook integration "
+                f"({support.get('detail', 'unsupported')}) — use "
+                "hooks.mode: boundary_only, or run a hook-capable executor."
+            )
     return MemoryLifecycle(
         profile.memory,
         profile.name,
@@ -1171,6 +1176,9 @@ async def lifespan(app: FastAPI):
 
     if _profile.is_executor:
         _executor = build_executor(_profile, runs_root=_run_store.root)
+        # Before prepare(): config installation (e.g. Codex hooks.json)
+        # must see whether memory is wired (§18.7).
+        _executor.set_memory(_memory)
         _executor.prepare()
         logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode (executor tier: {_profile.executor.executor})")
     else:
@@ -1487,7 +1495,13 @@ async def health():
             if _profile is not None and _profile.memory is not None
             else None,
             "boundary_injection": _memory is not None,
-            "native_hooks": "pending",  # §18.7 hook bridge: next PR
+            # Model tier: miragen owns every turn, so the boundary IS the
+            # native seam. Executor tier: the adapter's honest report.
+            "native_hooks": (
+                None if _memory is None
+                else _executor.memory_hook_capabilities() if _executor is not None
+                else {"native_hooks": True, "mechanism": "model_tier_boundary"}
+            ),
             "degraded_count": _memory.degraded_count if _memory else 0,
             "last_degraded": _memory.last_degraded if _memory else None,
         },
