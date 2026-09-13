@@ -478,6 +478,28 @@ capabilities:
 
 ---
 
+## Memory
+
+A `memory:` block binds the agent to the central memory service (Loimi's `/memory/v1`; design record: [docs/miragen-memory-agent-architecture-pass.md](docs/miragen-memory-agent-architecture-pass.md)). Loimi owns persistence enforcement; miragen owns the lifecycle: at every run boundary the instance's **working state** is restored by identity (no search) and injected together with the versioned memory-use guide as per-run system-prompt data — transient by construction, never saved into conversation history — and the run outcome is captured as an idempotent durable event. Manifests record exactly which revisions were injected.
+
+```yaml
+memory:
+  backend: loimi
+  endpoint_env: LOIMI_MEMORY_URL        # env var NAMES; the minted principal
+  credential_env: LOIMI_MEMORY_TOKEN    # token itself never enters the profile
+  scopes:
+    read: [profile:my-agent, group:project-a]
+    propose: [profile:my-agent]
+    default_write: profile:my-agent
+  hooks:
+    mode: boundary_only                 # native_required refuses to boot on
+                                        # executor tier until the hook bridge lands
+```
+
+Model-tier agents get `memory_checkpoint` / `memory_remember` / `memory_read` tools; executor-tier agents reach the same surface through the `/mcp/memory` mount (point an `executor.mcp_servers` entry at it). A write counts as saved only when the tool answers `accepted` — outages degrade **explicitly** (`persistence_unavailable`, a degraded line in the injected guide, counters on `/health`), never as "no relevant memories". Deliver both env vars into managed containers via `MIRAGEND_AGENT_ENV_PASSTHROUGH`. Semantic retrieval/auto-recall beyond working state arrives with the later memory-pass PRs.
+
+---
+
 ## Voice
 
 A `voice:` block gives an agent a mouth ([docs/design/voice.md](docs/design/voice.md)). miragen owns the speak contract: the `http` provider POSTs `{"text", "voice", "agent"}` (optional bearer auth via `api_key_env`) to any endpoint implementing it — the endpoint owns synthesis *and* playback, answering `202/204` (it played the audio) or an `audio/*` body, which miragen stores under the run (`/agent/runs/<run_id>/audio/`, referenced as `audio_artifacts` on the record). Cloud providers (`openai`) synthesize to bytes; the artifact is the deliverable.
