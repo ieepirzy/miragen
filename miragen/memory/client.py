@@ -173,6 +173,20 @@ class MemoryClient:
         return await self._request("POST", f"/jobs/{job_id}/fail",
                                    json={"error": error, "retry": retry})
 
+    async def search_memory(self, body: dict[str, Any]) -> dict:
+        return await self._request("POST", "/search", json=body)
+
+    async def get_projection(self, revision_id: str) -> dict:
+        return await self._request("GET", f"/projections/{revision_id}")
+
+    async def set_projection_embedding(
+        self, revision_id: str, *, embedding: list[float], space: str
+    ) -> dict:
+        return await self._request(
+            "PUT", f"/projections/{revision_id}/embedding",
+            json={"embedding": embedding, "space": space},
+        )
+
     async def get_event(self, event_id: str) -> dict:
         return await self._request("GET", f"/events/{event_id}")
 

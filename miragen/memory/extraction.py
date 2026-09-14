@@ -80,6 +80,26 @@ class SupportCheck(BaseModel):
 
 ExtractFn = Callable[[str, str], Awaitable[ExtractionResult]]
 CheckFn = Callable[[str, str], Awaitable[SupportCheck]]
+# texts -> (vectors, space identity "model@revision#dim")
+EmbedFn = Callable[[list[str]], Awaitable[tuple[list[list[float]], str]]]
+
+
+def build_http_embedder(url: str) -> EmbedFn:
+    """Client for the embed-endpoint contract (Loimi's embed_server or any
+    equivalent): the space identity is derived from the endpoint's OWN
+    reported model/revision/dim — pinned by what actually embedded the
+    text, never assumed (§17.2/§8.8)."""
+    import httpx
+
+    async def embed(texts: list[str]) -> tuple[list[list[float]], str]:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(f"{url.rstrip('/')}/embed", json={"texts": texts})
+            resp.raise_for_status()
+            data = resp.json()
+        space = f"{data['model']}@{data.get('revision') or 'unpinned'}#{data['dim']}"
+        return data["vectors"], space
+
+    return embed
 
 
 EXTRACTION_INSTRUCTIONS = """\
@@ -238,6 +258,7 @@ async def run_worker_once(
     *,
     extract: ExtractFn,
     check: CheckFn,
+    embed: EmbedFn | None = None,
     limit: int = 5,
     lease_seconds: int = 120,
 ) -> list[dict]:
@@ -245,9 +266,10 @@ async def run_worker_once(
     jurisdiction, process, complete — or fail-for-retry on error. Model
     and store failures never poison the queue: the lease expires or the
     job returns to pending with its error recorded."""
+    kinds = ["consolidate"] + (["index"] if embed is not None else [])
     try:
         jobs = await client.claim_jobs(
-            kinds=["consolidate"], limit=limit, lease_seconds=lease_seconds
+            kinds=kinds, limit=limit, lease_seconds=lease_seconds
         )
     except (MemoryUnavailable, MemoryAPIError) as exc:
         logger.warning(f"job claim failed: {exc}")
@@ -256,8 +278,11 @@ async def run_worker_once(
     results = []
     for job in jobs:
         try:
-            event = await client.get_event(job["payload"]["event_id"])
-            summary = await process_event(client, event, extract=extract, check=check)
+            if job["kind"] == "index":
+                summary = await _process_index_job(client, job, embed)
+            else:
+                event = await client.get_event(job["payload"]["event_id"])
+                summary = await process_event(client, event, extract=extract, check=check)
             await client.complete_job(job["id"])
             results.append(summary | {"job_id": job["id"], "status": "done"})
         except Exception as exc:  # noqa: BLE001 — worker isolation per job
@@ -268,3 +293,18 @@ async def run_worker_once(
                 pass  # lease expiry re-queues it regardless
             results.append({"job_id": job["id"], "status": "failed", "error": str(exc)})
     return results
+
+
+async def _process_index_job(client: MemoryClient, job: dict, embed: EmbedFn) -> dict:
+    """Embedding backfill for one revision's projection. Blank or retired
+    projections complete as no-ops (erasure/supersession won the race —
+    embedding old text would resurrect it in the dense channel)."""
+    revision_id = job["payload"]["revision_id"]
+    projection = await client.get_projection(revision_id)
+    if not projection["search_text"] or not projection["current"]:
+        return {"revision_id": revision_id, "embedded": False, "reason": "not eligible"}
+    vectors, space = await embed([projection["search_text"]])
+    await client.set_projection_embedding(
+        revision_id, embedding=vectors[0], space=space
+    )
+    return {"revision_id": revision_id, "embedded": True, "space": space}

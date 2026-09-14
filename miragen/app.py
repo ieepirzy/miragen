@@ -419,11 +419,23 @@ def _build_memory_lifecycle(profile: AgentProfile) -> "MemoryLifecycle | None":
                 f"({support.get('detail', 'unsupported')}) — use "
                 "hooks.mode: boundary_only, or run a hook-capable executor."
             )
+    selector = None
+    if profile.memory.recall.enabled:
+        selector_model = (
+            profile.memory.recall.model
+            or profile.memory.extraction.model
+            or (profile.spec.model if profile.spec else None)
+        )
+        if selector_model:
+            from miragen.memory.selection import build_model_selector
+
+            selector = build_model_selector(selector_model)
     return MemoryLifecycle(
         profile.memory,
         profile.name,
         MemoryClient(profile.memory),
         tools_available=not profile.is_executor or bool(profile.executor.mcp_servers),
+        selector=selector,
     )
 
 
@@ -524,6 +536,7 @@ async def run_agent(
             instance=instance,
             run_id=record.run_id if record is not None else None,
             trigger=record.trigger if record is not None else "direct",
+            prompt_hint=prompt,
         )
 
     agent, limits = (_agent, _limits)
@@ -668,6 +681,7 @@ async def _run_executor_turn(
             instance=record.instance if record is not None else None,
             run_id=run_id,
             trigger=record.trigger if record is not None else "direct",
+            prompt_hint=prompt,
         )
         prompt = f"{memory_packet.text}\n\n{prompt}"
 
@@ -2590,6 +2604,7 @@ async def run_stream(request: RunRequest):
                 instance=instance,
                 run_id=record.run_id if record is not None else None,
                 trigger="http",
+                prompt_hint=prompt,
             )
             stream_agent, stream_limits = build_agent(
                 _profile,

@@ -524,6 +524,28 @@ class MemoryExtractionSpec(_ProfileModel):
     )
 
 
+class MemoryRecallSpec(_ProfileModel):
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Run the optional recall lane at the boundary: bounded hybrid "
+            "search + a zero-or-more relevance selection (one model call on "
+            "cache misses). Requires a resolvable model; without one the "
+            "lane reports itself unconfigured rather than degrading."
+        ),
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description="Selector model; default extraction.model, then spec.model.",
+    )
+    max_candidates: int = Field(default=20, ge=1, le=50)
+    max_selected: int = Field(default=8, ge=1, le=20)
+    max_optional_chars: int = Field(
+        default=8000, ge=500,
+        description="Budget for the optional section (~2000 tokens; §17.7).",
+    )
+
+
 class MemoryGuidanceSpec(_ProfileModel):
     required: bool = Field(
         default=True,
@@ -549,6 +571,7 @@ class MemorySpec(_ProfileModel):
     hooks: MemoryHooksSpec = Field(default_factory=MemoryHooksSpec)
     guidance: MemoryGuidanceSpec = Field(default_factory=MemoryGuidanceSpec)
     extraction: MemoryExtractionSpec = Field(default_factory=MemoryExtractionSpec)
+    recall: MemoryRecallSpec = Field(default_factory=MemoryRecallSpec)
 
 
 # ── PydanticAI spec (their layer) ───────────────────────────────────────────
