@@ -48,11 +48,19 @@ class MemoryClient:
         spec: MemorySpec,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        base_url: str | None = None,
+        token: str | None = None,
     ) -> None:
         self.spec = spec
         self._transport = transport
+        # Explicit overrides beat env resolution — the ephemeral backend
+        # wires its in-process endpoint/token without any environment.
+        self._base_url_override = base_url
+        self._token_override = token
 
     def _base_url(self) -> str:
+        if self._base_url_override:
+            return self._base_url_override.rstrip("/")
         url = os.environ.get(self.spec.endpoint_env)
         if not url:
             raise MemoryUnavailable(
@@ -61,6 +69,8 @@ class MemoryClient:
         return url.rstrip("/")
 
     def _token(self) -> str:
+        if self._token_override:
+            return self._token_override
         token = os.environ.get(self.spec.credential_env)
         if not token:
             raise MemoryUnavailable(

@@ -430,10 +430,27 @@ def _build_memory_lifecycle(profile: AgentProfile) -> "MemoryLifecycle | None":
             from miragen.memory.selection import build_model_selector
 
             selector = build_model_selector(selector_model)
+    if profile.memory.backend == "ephemeral":
+        from miragen.memory.ephemeral import provision_profile, shared_service
+
+        service = shared_service()
+        token = provision_profile(service, profile.name, profile.memory.scopes)
+        client = MemoryClient(
+            profile.memory,
+            transport=service.transport(),
+            base_url="http://ephemeral.local",
+            token=token,
+        )
+        logger.warning(
+            f"Agent '{profile.name}' uses backend: ephemeral — memory is "
+            "IN-PROCESS and NON-DURABLE (dies with this process); dev/demo only"
+        )
+    else:
+        client = MemoryClient(profile.memory)
     return MemoryLifecycle(
         profile.memory,
         profile.name,
-        MemoryClient(profile.memory),
+        client,
         tools_available=not profile.is_executor or bool(profile.executor.mcp_servers),
         selector=selector,
     )
