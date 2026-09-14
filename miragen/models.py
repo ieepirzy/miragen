@@ -465,6 +465,20 @@ class VoiceSpec(_ProfileModel):
         return self
 
 
+# ── Runtime tool library ─────────────────────────────────────────────────────
+
+class RuntimeToolsSpec(_ProfileModel):
+    schedule: bool = Field(
+        default=True,
+        description=(
+            "The scheduling tools (schedule_wakeup / list_schedules / "
+            "cancel_schedule). Effective on autonomous/hybrid agents only — "
+            "a self-scheduled fire is self-activation, which interactive "
+            "mode promises not to do."
+        ),
+    )
+
+
 # ── Memory (docs/miragen-memory-agent-architecture-pass.md §17–§18) ─────────
 
 class MemoryScopesSpec(_ProfileModel):
@@ -1000,6 +1014,10 @@ class AgentProfile(_ProfileModel):
             "agent a `speak` tool (model tier) and the /mcp/voice mount "
             "(executor tier), and enables on_complete.speak."
         ),
+    )
+    runtime_tools: RuntimeToolsSpec = Field(
+        default_factory=RuntimeToolsSpec,
+        description="The default tool library miragen ships across harnesses.",
     )
     memory: Optional[MemorySpec] = Field(
         default=None,
