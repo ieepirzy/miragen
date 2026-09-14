@@ -369,3 +369,44 @@ def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None) 
         if once:
             break
         _time.sleep(interval)
+
+
+@cli.command(name="memory-conformance")
+@click.argument("base_url", required=False)
+@click.option("--operator-token", envvar="MEMORY_OPERATOR_TOKEN", default=None,
+              help="The implementation's operator credential (provisions fixtures).")
+@click.option("--ephemeral", "self_test", is_flag=True, default=False,
+              help="Run against the built-in ephemeral backend (self-test).")
+def memory_conformance(base_url: str | None, operator_token: str | None,
+                       self_test: bool) -> None:
+    """Run the memory backend protocol conformance suite
+    (docs/memory-backend-protocol.md) against BASE_URL — or against the
+    built-in ephemeral backend with --ephemeral. Exit 0 only on full pass."""
+    import asyncio
+
+    from miragen.memory.conformance import run_conformance
+
+    if self_test:
+        from miragen.memory.ephemeral import EphemeralMemoryService
+
+        service = EphemeralMemoryService()
+        results = asyncio.run(run_conformance(
+            base_url="http://ephemeral.local", operator_token=service.operator_token,
+            transport=service.transport(),
+        ))
+    else:
+        if not base_url or not operator_token:
+            raise click.ClickException(
+                "BASE_URL and --operator-token are required (or use --ephemeral)"
+            )
+        results = asyncio.run(run_conformance(
+            base_url=base_url, operator_token=operator_token,
+        ))
+
+    failed = [r for r in results if not r.passed]
+    for result in results:
+        mark = "PASS" if result.passed else "FAIL"
+        click.echo(f"[{mark}] {result.name}: {result.detail}")
+    click.echo(f"\n{len(results) - len(failed)}/{len(results)} checks passed")
+    if failed:
+        raise SystemExit(1)

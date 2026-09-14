@@ -558,7 +558,15 @@ class MemorySpec(_ProfileModel):
     lifecycle: working-state restore + guidance injection at the run
     boundary, durable event capture, and the agent memory tools."""
 
-    backend: Literal["loimi"] = "loimi"
+    backend: Literal["loimi", "ephemeral"] = Field(
+        default="loimi",
+        description=(
+            "'loimi' (or any implementation of the memory backend protocol "
+            "at endpoint_env) — durable, production. 'ephemeral' — the "
+            "built-in in-process backend: full lifecycle, ZERO durability "
+            "(state dies with the process); dev/demo only."
+        ),
+    )
     endpoint_env: str = Field(
         default="LOIMI_MEMORY_URL",
         description="Env var NAME holding the memory service base URL.",
