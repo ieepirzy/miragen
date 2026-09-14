@@ -187,6 +187,55 @@ async def test_delete_removes_binding_and_job(schedule_client):
     assert (await c.delete("/schedules/nightly")).status_code == 404
 
 
+async def test_externally_fired_binding_is_recorded_without_a_job(schedule_client):
+    """managed-schedules-external-fire/v1: the control plane fires the binding
+    itself, so MiraGen stores and reports it but never schedules it."""
+    c, scheduler = schedule_client
+    resp = await c.put("/schedules/nightly", json={**BINDING, "externally_fired": True})
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["externally_fired"] is True and body["enabled"] is True
+    assert body["next_fire_at"] is None
+    assert scheduler.get_job("managed:nightly") is None
+
+    listed = (await c.get("/schedules")).json()
+    assert listed["schedules"][0]["externally_fired"] is True
+    assert "managed-schedules-external-fire/v1" in app_module.CONTRACT_CAPABILITIES
+
+
+async def test_handing_a_binding_over_and_back_moves_its_job(schedule_client):
+    c, scheduler = schedule_client
+    await c.put("/schedules/nightly", json=BINDING)
+    assert scheduler.get_job("managed:nightly") is not None
+    assert (await c.get("/schedules/nightly")).json()["externally_fired"] is False
+
+    resp = await c.put(
+        "/schedules/nightly",
+        json={**BINDING, "externally_fired": True, "expected_version": 1},
+    )
+    assert resp.status_code == 200
+    assert scheduler.get_job("managed:nightly") is None
+
+    # PUT replaces the whole binding: omitting the flag hands firing back.
+    resp = await c.put("/schedules/nightly", json={**BINDING, "expected_version": 2})
+    assert resp.json()["externally_fired"] is False
+    assert scheduler.get_job("managed:nightly") is not None
+
+
+async def test_startup_registration_skips_externally_fired_bindings(schedule_client):
+    _, scheduler = schedule_client
+    store = app_module._schedule_store
+    store.upsert("here", schedule=ScheduleSpec(cron="0 3 * * *"), prompt="p")
+    store.upsert(
+        "elsewhere", schedule=ScheduleSpec(cron="0 3 * * *"), prompt="p",
+        externally_fired=True,
+    )
+
+    assert app_module._register_managed_schedules() == 1
+    assert scheduler.get_job("managed:here") is not None
+    assert scheduler.get_job("managed:elsewhere") is None
+
+
 async def test_interactive_mode_skips_startup_registration(tmp_path, monkeypatch):
     """Startup reconciliation must honor the mode contract too: a stale
     schedules volume on an interactive redeploy is left on disk but not run."""
@@ -297,6 +346,17 @@ async def test_managed_fire_skips_disabled_or_deleted_binding(fire_env):
     fire_env.upsert("off", schedule=ScheduleSpec(every_s=600), prompt="p",
                     enabled=False, expected_version=b.version)
     await app_module._run_managed_schedule("off")
+    assert app_module._run_store.list() == []
+
+
+async def test_stale_job_never_fires_an_externally_fired_binding(fire_env):
+    """A job registered before the binding was handed over must not fire it:
+    the control plane launches that fire, so a second run would duplicate it."""
+    fire_env.upsert(
+        "nightly", schedule=ScheduleSpec(cron="0 3 * * *"), prompt="p",
+        externally_fired=True,
+    )
+    await app_module._run_managed_schedule("nightly")
     assert app_module._run_store.list() == []
 
 
