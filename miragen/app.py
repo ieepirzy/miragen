@@ -1016,7 +1016,9 @@ async def _run_managed_schedule(name: str) -> None:
     if _schedule_store is None:
         return
     binding = _schedule_store.get(name)
-    if binding is None or not binding.enabled:
+    if binding is None or not binding.fires_here:
+        # Includes a binding handed to the control plane since this job was
+        # scheduled: firing it here too would launch the same fire twice.
         return
     prov = binding.provenance.model_dump() if binding.provenance is not None else {}
     prov["schedule_name"] = name
@@ -1045,8 +1047,9 @@ async def _run_managed_schedule(name: str) -> None:
 
 def _reconcile_managed_job(binding: ScheduleBinding) -> None:
     """Make the scheduler match one binding: enabled → (re)registered job,
-    disabled → no job. Raises on scheduler failure (callers roll back)."""
-    if binding.enabled:
+    disabled or externally fired → no job. Raises on scheduler failure
+    (callers roll back)."""
+    if binding.fires_here:
         _scheduler.add_job(
             _run_managed_schedule,
             _apscheduler_trigger(binding.schedule),
@@ -1073,7 +1076,7 @@ def _register_managed_schedules() -> int:
         # schedules volume could still carry bindings from a prior deployment.
         # Honor the mode contract on startup too: an interactive agent must not
         # self-activate. Bindings are left on disk (not deleted), just not run.
-        pending = [b.name for b in _schedule_store.list() if b.enabled]
+        pending = [b.name for b in _schedule_store.list() if b.fires_here]
         if pending:
             logger.warning(
                 f"[{_profile.name}] mode is interactive — not registering "
@@ -1085,7 +1088,7 @@ def _register_managed_schedules() -> int:
     for binding in _schedule_store.list():
         try:
             _reconcile_managed_job(binding)
-            count += binding.enabled
+            count += binding.fires_here
         except Exception as e:
             logger.error(f"failed to register managed schedule '{binding.name}': {e}", exc_info=True)
     return count
@@ -1508,6 +1511,7 @@ CONTRACT_CAPABILITIES = [
     "events-cursor/v1",                  # GET /runs/{id}/events?after=
     "run-events-unified/v1",             # /runs/{id}/events serves BOTH tiers
     "managed-schedules/v1",              # GET/PUT/DELETE /schedules (CAS reconciliation)
+    "managed-schedules-external-fire/v1",  # bindings with externally_fired: recorded, never fired here
     "interventions/v1",                  # structured question suspension + answered resume
     "ask-human-mcp/v1",                  # /mcp/ask-human MCP tool (writes the sentinel)
     "reviewed-publication/v1",           # POST /runs/{id}/publications (endpoint; backend config required)
@@ -2389,6 +2393,11 @@ class ScheduleBindingRequest(BaseModel):
     )
     provenance: Optional[RunProvenance] = None
     metadata: dict[str, str] = Field(default_factory=dict)
+    externally_fired: bool = Field(
+        default=False,
+        description="The control plane fires this binding; MiraGen records it "
+        "but registers no job (managed-schedules-external-fire/v1).",
+    )
     expected_version: Optional[int] = Field(
         default=None,
         ge=1,
@@ -2450,6 +2459,7 @@ async def put_schedule(name: str, request: ScheduleBindingRequest, response: Res
             instance=request.instance,
             provenance=request.provenance,
             metadata=request.metadata,
+            externally_fired=request.externally_fired,
             expected_version=request.expected_version,
         )
     except BindingConflictError as e:
