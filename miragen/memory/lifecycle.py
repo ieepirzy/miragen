@@ -69,12 +69,19 @@ class MemoryLifecycle:
         *,
         state_dir: Path | None = None,
         tools_available: bool = True,
+        selector=None,
     ) -> None:
         self.spec = spec
         self.profile_name = profile_name
         self.client = client
         self.state_dir = Path(state_dir) if state_dir is not None else default_state_dir()
         self.tools_available = tools_available
+        # The zero-or-more relevance selector (§17.7); None = the optional
+        # recall lane reports itself unconfigured rather than degrading.
+        self.selector = selector
+        # Selector-ID cache (§17.7: permitted, canonical state re-checked
+        # every packet): instance -> (state_revision, query_digest, ids+reasons).
+        self._selection_cache: dict[str, tuple[int, str, list[tuple[str, str]]]] = {}
         # Honest health surface: how often memory degraded, and why last.
         self.degraded_count = 0
         self.last_degraded: str | None = None
@@ -128,7 +135,8 @@ class MemoryLifecycle:
     # -- the boundary ------------------------------------------------------
 
     async def prepare_context(
-        self, *, instance: str | None, run_id: str | None, trigger: str
+        self, *, instance: str | None, run_id: str | None, trigger: str,
+        prompt_hint: str | None = None,
     ) -> MemoryPacket:
         effective_instance = instance or DEFAULT_INSTANCE
         try:
@@ -155,6 +163,10 @@ class MemoryLifecycle:
                 "reason": "required lane: instance working state by identity",
             }],
         )
+
+        optional_status = await self._optional_lane(
+            packet, effective_instance, context, prompt_hint
+        )
         # The manifest records what was ACTUALLY injected (§8.6); its write
         # is best-effort — a manifest failure must not fail the turn.
         try:
@@ -162,14 +174,19 @@ class MemoryLifecycle:
                 "scope_id": self.spec.scopes.default_write,
                 "context_id": context["id"],
                 "run_ref": run_id,
-                "items": [],
+                "items": [
+                    {"revision_id": item["revision_id"], "reason": item["reason"]}
+                    for item in packet.items if item.get("revision_id")
+                ],
                 "policy": {
                     "guidance_version": GUIDANCE_VERSION,
                     "trigger": trigger,
-                    "lane": "required",
+                    "lane": "required+optional",
                     "state_revision": context["state_revision"],
+                    "optional_status": optional_status,
                 },
-                "degraded": None,
+                "degraded": optional_status
+                if optional_status.startswith("degraded") else None,
             })
             packet.manifest_id = manifest["id"]
         except (MemoryUnavailable, MemoryAPIError) as exc:
@@ -193,6 +210,101 @@ class MemoryLifecycle:
             "reference data]\n"
             f"{body}"
         )
+
+    async def _optional_lane(
+        self, packet: MemoryPacket, instance: str, context: dict,
+        prompt_hint: str | None,
+    ) -> str:
+        """The optional recall lane (§17.7): bounded hybrid search, the
+        zero-or-more selector, canonical re-render, budgeted injection.
+        Failure NEVER falls back to stuffing neighbors — required state
+        stands alone and the degradation is explicit in the manifest."""
+        from miragen.memory.selection import clamp_selections, render_optional_section
+
+        if not self.spec.recall.enabled:
+            return "disabled"
+        if self.selector is None:
+            return "unconfigured"
+        state = context.get("state") or {}
+        goal = state.get("goal") if isinstance(state.get("goal"), str) else None
+        query = " ".join(part for part in (goal, prompt_hint) if part)[:2000].strip()
+        if not query:
+            return "no_query"
+
+        query_digest = _stable_digest(query)
+        try:
+            cached = self._selection_cache.get(instance)
+            if cached and cached[0] == context["state_revision"] and cached[1] == query_digest:
+                selected = cached[2]
+            else:
+                found = await self.client.search_memory({
+                    "scope_ids": self.spec.scopes.read,
+                    "query_text": query,
+                    "limit": self.spec.recall.max_candidates,
+                })
+                cards = found["items"]
+                if not cards:
+                    self._selection_cache[instance] = (
+                        context["state_revision"], query_digest, []
+                    )
+                    return "empty"
+                result = await self.selector(query, cards)
+                kept = clamp_selections(result, cards, self.spec.recall.max_selected)
+                selected = [(sel.record_id, sel.reason) for sel in kept]
+                self._selection_cache[instance] = (
+                    context["state_revision"], query_digest, selected
+                )
+
+            if not selected:
+                return "none_selected"
+
+            # Canonical re-render (§17.7 step 5): fetch each selected id
+            # fresh — the selector chose, canonical state speaks.
+            entries = []
+            for record_id, reason in selected:
+                record = await self.client.get_record(record_id)
+                if (
+                    record.get("admission") != "accepted"
+                    or not record.get("roots_valid", False)
+                    or record.get("revision") is None
+                ):
+                    continue
+                payload = record["revision"]["payload"]
+                text = str(payload.get("text") or payload.get("value") or payload)[:500]
+                entries.append({
+                    "record_id": record_id,
+                    "revision_id": record["revision"]["id"],
+                    "type": record["type"],
+                    "text": text,
+                    "reason": reason,
+                })
+            section = render_optional_section(
+                entries, self.spec.recall.max_optional_chars
+            )
+            if not section:
+                return "none_selected"
+            packet.text = f"{packet.text}\n{section}"
+            packet.items.extend({
+                "kind": "recalled",
+                "record_id": entry["record_id"],
+                "revision_id": entry["revision_id"],
+                "reason": entry["reason"],
+            } for entry in entries)
+            return "ok"
+        except (MemoryUnavailable, MemoryAPIError) as exc:
+            self._degrade(f"optional recall: {exc}")
+            packet.text += (
+                "\n[optional recall degraded — memories may exist that could "
+                "not be searched; do not conclude the store is empty]"
+            )
+            return f"degraded: {exc}"
+        except Exception as exc:  # selector failure: inject nothing extra
+            self._degrade(f"relevance selection: {exc}")
+            packet.text += (
+                "\n[optional recall degraded — relevance selection failed; "
+                "memories were not injected]"
+            )
+            return f"degraded: selector: {exc}"
 
     async def finish_turn(
         self,

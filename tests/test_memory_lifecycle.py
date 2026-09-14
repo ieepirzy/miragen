@@ -154,6 +154,25 @@ class FakeMemoryService:
                 if event["id"] == wanted:
                     return httpx.Response(200, json=event)
             return httpx.Response(404, json=_err("not_found", "unknown source event"))
+        if request.method == "POST" and path == "/search":
+            self.searches = getattr(self, "searches", [])
+            self.searches.append(body)
+            items = getattr(self, "search_results", [])
+            return httpx.Response(200, json={
+                "items": items, "channel_hits": {"lexical": len(items)},
+                "skipped": {"stale": 0, "roots_invalid": 0, "ineligible": 0},
+            })
+        if request.method == "GET" and path.startswith("/projections/"):
+            proj = getattr(self, "projections", {}).get(path.split("/")[-1])
+            if proj is None:
+                return httpx.Response(404, json=_err("not_found", "no projection"))
+            return httpx.Response(200, json=proj)
+        if request.method == "PUT" and path.endswith("/embedding"):
+            revision_id = path.split("/")[-2]
+            self.embeddings = getattr(self, "embeddings", {})
+            self.embeddings[revision_id] = body
+            return httpx.Response(200, json={"revision_id": revision_id,
+                                             "space": body["space"], "current": True})
         if request.method == "POST" and path == "/jobs/claim":
             claimed = []
             for job in self.jobs:
@@ -309,7 +328,8 @@ class TestPrepareContext:
         (manifest,) = service.manifests
         assert manifest["run_ref"] == "r1"
         assert manifest["policy"]["guidance_version"] == GUIDANCE_VERSION
-        assert manifest["policy"]["lane"] == "required"
+        assert manifest["policy"]["lane"] == "required+optional"
+        assert manifest["policy"]["optional_status"] == "unconfigured"
 
 
 # ── finish capture ───────────────────────────────────────────────────────────

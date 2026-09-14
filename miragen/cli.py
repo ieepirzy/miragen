@@ -311,7 +311,9 @@ def memory_hook(harness: str) -> None:
               help="Seconds between sweeps when looping.")
 @click.option("--limit", default=5, show_default=True,
               help="Jobs claimed per sweep.")
-def memory_worker(once: bool, interval: int, limit: int) -> None:
+@click.option("--embed-url", envvar="MIRAGEN_MEMORY_EMBED_URL", default=None,
+              help="Embed endpoint (POST /embed); enables index-job backfill.")
+def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None) -> None:
     """The bounded extraction worker (memory pass PR 3, §17.5): claims
     consolidate jobs through /memory/v1 as its own maintain-capable
     principal and proposes extracted memories through the same admission
@@ -325,6 +327,7 @@ def memory_worker(once: bool, interval: int, limit: int) -> None:
 
     from miragen.memory import MemoryClient
     from miragen.memory.extraction import (
+        build_http_embedder,
         build_model_checker,
         build_model_extractor,
         run_worker_once,
@@ -348,10 +351,12 @@ def memory_worker(once: bool, interval: int, limit: int) -> None:
     client = MemoryClient(profile.memory)
     extract = build_model_extractor(model)
     check = build_model_checker(model)
+    embed = build_http_embedder(embed_url) if embed_url else None
 
     while True:
         results = asyncio.run(
-            run_worker_once(client, extract=extract, check=check, limit=limit)
+            run_worker_once(client, extract=extract, check=check, embed=embed,
+                            limit=limit)
         )
         for result in results:
             click.echo(
