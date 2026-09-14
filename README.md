@@ -504,6 +504,12 @@ The wire contract is the miragen-owned **[memory backend protocol](docs/memory-b
 
 ---
 
+## Runtime tool library
+
+Default tools every agent gets across harnesses (`runtime_tools:` block; capability `runtime-tools/v1`). First member: **scheduling** — `schedule_wakeup(prompt, in_minutes|at|cron|every_minutes)` books a future run of the agent itself as a managed schedule binding (one-shots fire once then delete themselves; fires land on the same instance with full provenance/budget/admission), plus `list_schedules` and `cancel_schedule` (an agent can only cancel schedules it created). Model tier gets them as tools; executor tier via the `/mcp/schedule` mount. Interactive-mode agents never get them — a self-scheduled fire is self-activation.
+
+---
+
 ## Voice
 
 A `voice:` block gives an agent a mouth ([docs/design/voice.md](docs/design/voice.md)). miragen owns the speak contract: the `http` provider POSTs `{"text", "voice", "agent"}` (optional bearer auth via `api_key_env`) to any endpoint implementing it — the endpoint owns synthesis *and* playback, answering `202/204` (it played the audio) or an `audio/*` body, which miragen stores under the run (`/agent/runs/<run_id>/audio/`, referenced as `audio_artifacts` on the record). Cloud providers (`openai`) synthesize to bytes; the artifact is the deliverable.

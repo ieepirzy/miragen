@@ -85,6 +85,11 @@ from miragen.schedules import (
 from miragen.intervention_mcp import build_ask_human_mcp
 from miragen.telemetry import MiragenTelemetry, telemetry_from_env
 from miragen.memory import MemoryClient, MemoryLifecycle
+from miragen.runtime_tools.scheduling import (
+    SchedulingBackend,
+    build_scheduling_mcp,
+    build_scheduling_tools,
+)
 from miragen.memory.tools import build_memory_tools
 from miragen.memory_mcp import build_memory_mcp
 from miragen.voice import SpeechAudio, VoiceBackend, build_voice_backend
@@ -107,6 +112,7 @@ _publication_backend_override: object | None = None
 _telemetry: MiragenTelemetry | None = None
 _voice: "VoiceBackend | None" = None
 _memory: "MemoryLifecycle | None" = None
+_scheduling: "SchedulingBackend | None" = None
 
 # The run/instance a model-tier tool call belongs to (speak's artifact
 # storage, memory's state scope) — set around agent.run() so closures see
@@ -463,6 +469,10 @@ def _runtime_extra_tools() -> list[Callable] | None:
     if _memory is not None:
         tools.extend(
             build_memory_tools(_memory, _current_run_id.get, _current_instance.get)
+        )
+    if _scheduling is not None:
+        tools.extend(
+            build_scheduling_tools(_scheduling, _current_run_id.get, _current_instance.get)
         )
     return tools or None
 
@@ -991,6 +1001,12 @@ def _apscheduler_trigger(spec: ScheduleSpec):
         # Managed cron is UTC by contract — timezone rendering is the
         # control plane's problem, not a per-binding knob.
         return CronTrigger.from_crontab(spec.cron, timezone=timezone.utc)
+    if spec.at is not None:
+        # One-shot: a past `at` fires promptly rather than being silently
+        # dropped by a misfire window.
+        run_date = spec.at if spec.at.tzinfo else spec.at.replace(tzinfo=timezone.utc)
+        floor = datetime.now(timezone.utc) + timedelta(seconds=2)
+        return DateTrigger(run_date=max(run_date, floor))
     return APIntervalTrigger(seconds=spec.every_s)
 
 
@@ -1014,6 +1030,17 @@ async def _run_managed_schedule(name: str) -> None:
         stamp=False,  # completed prompt, dispatched verbatim
         instance=binding.instance,
     )
+    if binding.schedule.one_shot:
+        # Fired once: the binding removes itself, mirroring the tool
+        # contract ("fires once, then deletes"). Best-effort — a crash
+        # between fire and delete re-fires promptly on restart, which the
+        # run-side idempotency (instance serialization, memory keys)
+        # tolerates better than a silently-lost wakeup.
+        try:
+            _schedule_store.delete(name)
+        except KeyError:
+            pass
+        _drop_managed_job(name)
 
 
 def _reconcile_managed_job(binding: ScheduleBinding) -> None:
@@ -1182,7 +1209,7 @@ def _load_file_secrets() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _profile, _agent, _limits, _run_store, _executor, _schedule_store, \
-        _publication_store, _telemetry, _voice, _memory
+        _publication_store, _telemetry, _voice, _memory, _scheduling
 
     _load_file_secrets()
 
@@ -1202,6 +1229,18 @@ async def lifespan(app: FastAPI):
     interrupted = _run_store.sweep_interrupted()
     if interrupted:
         logger.warning(f"Marked {interrupted} stale 'running' record(s) as interrupted")
+
+    # The schedule store exists before the agent is built: the scheduling
+    # tools close over it (and managed-schedule registration reuses it
+    # further down, unchanged).
+    _schedule_store = ScheduleStore()
+    if _profile.mode != "interactive" and _profile.runtime_tools.schedule:
+        _scheduling = SchedulingBackend(
+            _schedule_store, _reconcile_managed_job, _drop_managed_job, _next_fire_at
+        )
+        logger.info("Runtime tools enabled: scheduling")
+    else:
+        _scheduling = None
 
     # Built before the agent: the memory tools close over the lifecycle.
     _memory = _build_memory_lifecycle(_profile)
@@ -1273,7 +1312,6 @@ async def lifespan(app: FastAPI):
             logger.info(f"Registered startup trigger: delay {trigger.delay_s}s")
             startup_i += 1
 
-    _schedule_store = ScheduleStore()
     managed = _register_managed_schedules()
     if managed:
         logger.info(f"Registered {managed} managed schedule binding(s)")
@@ -1289,11 +1327,14 @@ async def lifespan(app: FastAPI):
     _voice_mcp_guard.inner = voice_mcp.streamable_http_app()
     memory_mcp = build_memory_mcp(lambda: (_memory, _run_store))
     _memory_mcp_guard.inner = memory_mcp.streamable_http_app()
+    schedule_mcp = build_scheduling_mcp(lambda: (_scheduling, _run_store))
+    _schedule_mcp_guard.inner = schedule_mcp.streamable_http_app()
     try:
         async with (
             ask_human_mcp.session_manager.run(),
             voice_mcp.session_manager.run(),
             memory_mcp.session_manager.run(),
+            schedule_mcp.session_manager.run(),
         ):
             _scheduler.start()
             logger.info("Scheduler started")
@@ -1302,6 +1343,7 @@ async def lifespan(app: FastAPI):
         _ask_human_guard.inner = _mcp_not_ready
         _voice_mcp_guard.inner = _mcp_not_ready
         _memory_mcp_guard.inner = _mcp_not_ready
+        _schedule_mcp_guard.inner = _mcp_not_ready
 
     _scheduler.shutdown(wait=False)
     logger.info("Scheduler stopped")
@@ -1387,6 +1429,10 @@ app.mount("/mcp/voice", _voice_mcp_guard)
 _memory_mcp_guard = _TokenGuardASGI(_mcp_not_ready)
 app.mount("/mcp/memory", _memory_mcp_guard)
 
+# Runtime tool library: scheduling, executor tier — same pattern.
+_schedule_mcp_guard = _TokenGuardASGI(_mcp_not_ready)
+app.mount("/mcp/schedule", _schedule_mcp_guard)
+
 
 # ── HTTP trigger schemas ────────────────────────────────────────────────────────────────
 
@@ -1469,6 +1515,7 @@ CONTRACT_CAPABILITIES = [
     "instances/v1",                      # named instances: per-instance history + admission control
     "voice/v1",                          # speak tool + /mcp/voice mount + on_complete.speak
     "memory/v1",                         # memory lifecycle: boundary injection + tools + /mcp/memory
+    "runtime-tools/v1",                  # default tool library: scheduling (+ /mcp/schedule)
 ]
 
 

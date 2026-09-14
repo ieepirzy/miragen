@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -28,7 +29,8 @@ BINDING_NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,62}$"
 
 
 class ScheduleSpec(BaseModel):
-    """Exactly one of `cron` (5-field, evaluated in UTC) or `every_s`."""
+    """Exactly one of `cron` (5-field, evaluated in UTC), `every_s`, or
+    `at` (a one-shot: fires once, then the binding deletes itself)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -37,6 +39,13 @@ class ScheduleSpec(BaseModel):
         default=None,
         ge=10,
         description="Fire every N seconds; minimum 10s, same hot-loop guard as profile triggers.",
+    )
+    at: Optional[datetime] = Field(
+        default=None,
+        description=(
+            "One-shot fire time (UTC). After firing, the binding is "
+            "deleted — the runtime tool library's self-wakeup shape."
+        ),
     )
 
     @field_validator("cron")
@@ -55,9 +64,14 @@ class ScheduleSpec(BaseModel):
 
     @model_validator(mode="after")
     def validate_exactly_one(self) -> "ScheduleSpec":
-        if (self.cron is None) == (self.every_s is None):
-            raise ValueError("schedule requires exactly one of `cron` or `every_s`")
+        set_fields = [f for f in (self.cron, self.every_s, self.at) if f is not None]
+        if len(set_fields) != 1:
+            raise ValueError("schedule requires exactly one of `cron`, `every_s` or `at`")
         return self
+
+    @property
+    def one_shot(self) -> bool:
+        return self.at is not None
 
 
 class ScheduleBinding(BaseModel):
