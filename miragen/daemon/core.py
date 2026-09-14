@@ -629,6 +629,21 @@ class LifecycleCore:
     def container_status(self, name: str) -> str:
         return self._spawn_driver.status(name)
 
+    def container_lifecycle(self, name: str) -> dict:
+        """Last start/finish time and exit details, for the registry.
+
+        Every key is always present and None when unknown: an out-of-tree
+        driver without `lifecycle`, a missing unit, or a substrate that did
+        not record a value. Clients must treat None as "not known"."""
+        reader = getattr(self._spawn_driver, "lifecycle", None)
+        lifecycle = reader(name) if reader is not None else None
+        return {
+            "started_at": getattr(lifecycle, "started_at", None),
+            "finished_at": getattr(lifecycle, "finished_at", None),
+            "exit_code": getattr(lifecycle, "exit_code", None),
+            "oom_killed": getattr(lifecycle, "oom_killed", None),
+        }
+
     def ensure_network(self) -> None:
         self._spawn_driver.ensure_ready()
 
@@ -990,6 +1005,9 @@ class LifecycleCore:
                         # container-name DNS on miragen-net for Compose, a
                         # different scheme for other substrates.
                         "endpoint": self.endpoint(name),
+                        # started_at / finished_at / exit_code / oom_killed,
+                        # each None when unknown.
+                        **self.container_lifecycle(name),
                     }
                 )
         return result
@@ -1003,6 +1021,7 @@ class LifecycleCore:
             "status": self.container_status(name),
             "has_tools": (d / "tools.py").exists(),
             "endpoint": self.endpoint(name),
+            **self.container_lifecycle(name),
         }
 
     # -- lifecycle ----------------------------------------------------------

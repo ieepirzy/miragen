@@ -22,6 +22,7 @@ from miragen.daemon.spawn.base import (
     ServiceSpec,
     SpawnOperationFailed,
     SpawnUnitNotFound,
+    UnitLifecycle,
 )
 
 
@@ -116,6 +117,24 @@ class DockerComposeSpawnDriver:
         except Exception as exc:
             return f"error: {exc}"
 
+    def lifecycle(self, name: str) -> UnitLifecycle | None:
+        try:
+            state = (self._docker.containers.get(name).attrs or {}).get("State")
+        except Exception:
+            # Display metadata only: a missing container or a Docker error
+            # reports nothing rather than failing the agent listing.
+            return None
+        if not isinstance(state, dict):
+            return None
+        exit_code = state.get("ExitCode")
+        oom_killed = state.get("OOMKilled")
+        return UnitLifecycle(
+            started_at=_docker_time(state.get("StartedAt")),
+            finished_at=_docker_time(state.get("FinishedAt")),
+            exit_code=exit_code if isinstance(exit_code, int) else None,
+            oom_killed=oom_killed if isinstance(oom_killed, bool) else None,
+        )
+
     def logs(self, name: str, *, tail: int) -> str:
         try:
             logs = self._docker.containers.get(name).logs(
@@ -162,3 +181,13 @@ class DockerComposeSpawnDriver:
     def endpoint(self, name: str) -> str:
         # Reachable by any container on miragen-net (container-name DNS).
         return f"http://{name}:8000"
+
+
+# Docker's zero time for a container that has never started or never stopped.
+_DOCKER_ZERO_TIME = "0001-01-01T00:00:00Z"
+
+
+def _docker_time(value) -> str | None:
+    if not isinstance(value, str) or not value or value == _DOCKER_ZERO_TIME:
+        return None
+    return value
