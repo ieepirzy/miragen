@@ -32,6 +32,8 @@ from miragen.daemon.core import (
     validate_profile_text,
 )
 from miragen.daemon.schedules import ScheduleStore
+from miragen.daemon.sessions.plane import SessionPlane
+from miragen.daemon.sessions.routes import SESSIONS_CAPABILITY, register_session_routes
 
 logger = logging.getLogger(__name__)
 
@@ -126,13 +128,18 @@ class ScheduleBody(BaseModel):
 
 
 def create_app(
-    core: LifecycleCore,
+    core: LifecycleCore | None,
     schedules: ScheduleStore | None = None,
     *,
     token: str = "",
     internal_token: str = "",
     contract_transport=None,
+    sessions: SessionPlane | None = None,
 ) -> FastAPI:
+    """`core` is the Docker-bound lifecycle plane; `sessions` the external
+    session plane (docs/design/external-sessions.md). Either may be absent:
+    a developer-machine daemon runs sessions without Docker, a swarm host
+    may run the lifecycle plane alone. /health advertises what is served."""
     app = FastAPI(title="miragend", version=_miragen_version())
 
     async def require_token(request: Request) -> None:
@@ -171,18 +178,35 @@ def create_app(
 
     @app.get("/health")
     def health() -> dict:
-        capabilities = list(DAEMON_CAPABILITIES)
-        if internal_token:
+        capabilities = list(DAEMON_CAPABILITIES) if core is not None else []
+        if core is not None and internal_token:
             # The run-control contract is served only when the shared agent
             # token exists to authenticate it (and to forward downstream), so
             # it is advertised only then — a capability string is a promise.
             capabilities += list(CONTRACT_CAPABILITIES)
-        return {
+        if sessions is not None:
+            capabilities.append(SESSIONS_CAPABILITY)
+        body = {
             "status": "ok",
             "service": "miragend",
             "version": _miragen_version(),
             "capabilities": capabilities,
         }
+        if sessions is not None:
+            body["sessions"] = sessions.describe()
+        return body
+
+    if sessions is not None:
+        register_session_routes(app, sessions, dependencies=guarded)
+
+        # Registered on the router's handler lists directly (what
+        # on_event does minus its deprecation warning) so main() can keep
+        # adding the scheduler's handlers the same way.
+        app.router.on_startup.append(sessions.start)
+        app.router.on_shutdown.append(sessions.stop)
+
+    if core is None:
+        return app
 
     # -- registry -----------------------------------------------------------
 
@@ -336,28 +360,89 @@ def create_app(
 # ---------------------------------------------------------------------------
 
 
+def _build_session_plane(config_path: str):  # pragma: no cover - deployment wiring
+    """The external-session plane from MIRAGEND_SESSIONS_CONFIG: secrets
+    via the *_FILE loader, the recall selector only when a model is
+    configured (pydantic-ai is imported lazily for it), OTLP telemetry
+    under the daemon's own service name when MIRAGEN_OTLP_ENDPOINT is set."""
+    from miragen.daemon.sessions.config import load_sessions_config
+
+    config = load_sessions_config(config_path)
+    selector = None
+    if config.recall.enabled and config.recall.model:
+        from miragen.memory.selection import build_model_selector
+
+        selector = build_model_selector(config.recall.model)
+    telemetry = None
+    otlp_endpoint = os.getenv("MIRAGEN_OTLP_ENDPOINT")
+    if otlp_endpoint:
+        from miragen.telemetry import MiragenTelemetry
+
+        telemetry = MiragenTelemetry(
+            endpoint=otlp_endpoint, agent_name="miragend", agent_mode="daemon",
+            service_name="miragend", service_version=_miragen_version(),
+            deployment_environment=os.getenv("MIRAGEN_DEPLOYMENT_ENV"),
+            token=os.getenv("MIRAGEN_OTLP_TOKEN"), auth_header=os.getenv("MIRAGEN_OTLP_AUTH"),
+        )
+    plane = SessionPlane(config, selector=selector, telemetry=telemetry)
+    logger.info(
+        f"session plane enabled: principal={config.principal} state={plane.state_dir} "
+        f"recall={'on' if selector else 'off'} provision={config.scopes.provision}"
+    )
+    return plane
+
+
 def main() -> None:  # pragma: no cover - exercised only in a real deployment
     import uvicorn
+
+    logging.basicConfig(level=logging.INFO)
+
+    # *_FILE secrets FIRST — before anything reads MIRAGEND_TOKEN or the
+    # Loimi credentials. (Found live: a MIRAGEND_TOKEN_FILE resolved after
+    # the token was read left the API unguarded while logging nothing
+    # worse than the usual empty-token warning.)
+    from miragen.daemon.sessions.config import load_file_secrets
+
+    load_file_secrets()
+
+    token = os.getenv("MIRAGEND_TOKEN", "")
+    if not token:
+        logger.warning(
+            "MIRAGEND_TOKEN is empty — the API is unguarded and relies entirely "
+            "on network isolation (Docker network, or a loopback bind). Set "
+            "MIRAGEND_TOKEN before exposing miragend beyond that."
+        )
+
+    sessions_config = os.getenv("MIRAGEND_SESSIONS_CONFIG")
+    sessions = _build_session_plane(sessions_config) if sessions_config else None
+
+    lifecycle_enabled = os.getenv("MIRAGEND_LIFECYCLE", "on").lower() not in (
+        "off", "0", "false", "no",
+    )
+    if not lifecycle_enabled:
+        if sessions is None:
+            raise SystemExit(
+                "MIRAGEND_LIFECYCLE=off and no MIRAGEND_SESSIONS_CONFIG: nothing to serve"
+            )
+        app = create_app(None, token=token, sessions=sessions)
+        uvicorn.run(
+            app,
+            host=os.getenv("MIRAGEND_HOST", "127.0.0.1"),
+            port=int(os.getenv("MIRAGEND_PORT", "8420")),
+        )
+        return
 
     try:
         import docker
     except ImportError as exc:
         raise SystemExit(
-            "miragend requires the daemon extra: pip install miragen[daemon]"
+            "miragend requires the daemon extra: pip install miragen[daemon] "
+            "(or set MIRAGEND_LIFECYCLE=off to run the session plane alone)"
         ) from exc
 
     from miragen.daemon.schedules import build_scheduler
 
-    logging.basicConfig(level=logging.INFO)
-
     workspace = Path(os.getenv("MIRAGEN_WORKSPACE", "/opt/miragen"))
-    token = os.getenv("MIRAGEND_TOKEN", "")
-    if not token:
-        logger.warning(
-            "MIRAGEND_TOKEN is empty — the lifecycle API is unguarded and relies "
-            "entirely on Docker network isolation. Set MIRAGEND_TOKEN before "
-            "exposing miragend beyond miragen-net."
-        )
 
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "agents").mkdir(parents=True, exist_ok=True)
@@ -399,6 +484,7 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
         schedules,
         token=token,
         internal_token=os.getenv("MIRAGEN_INTERNAL_TOKEN", ""),
+        sessions=sessions,
     )
 
     @app.router.on_event("startup")

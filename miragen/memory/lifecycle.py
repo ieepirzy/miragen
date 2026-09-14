@@ -306,6 +306,84 @@ class MemoryLifecycle:
             )
             return f"degraded: selector: {exc}"
 
+    async def recall_section(
+        self, *, instance: str | None, prompt_hint: str, run_id: str | None = None,
+        trigger: str = "prompt",
+    ) -> tuple[str | None, str]:
+        """Prompt-time recall for an already-opened context: ONLY the
+        optional lane (§17.7), rendered without re-injecting guidance or
+        working state. Returns (section text or None, lane status). The
+        manifest records what was actually injected, as at the boundary."""
+        effective_instance = instance or DEFAULT_INSTANCE
+        if not self.spec.recall.enabled:
+            return None, "disabled"
+        if self.selector is None:
+            return None, "unconfigured"
+        try:
+            context = await self._ensure_context(effective_instance)
+        except MemoryUnavailable as exc:
+            return None, f"degraded: {self._degrade(f'recall: {exc}')}"
+        except MemoryAPIError as exc:
+            return None, f"degraded: {self._degrade(f'recall refused: {exc}')}"
+        packet = MemoryPacket(text="", context_id=context["id"],
+                              state_revision=context["state_revision"])
+        status = await self._optional_lane(packet, effective_instance, context, prompt_hint)
+        section = packet.text.strip() or None
+        if packet.items:
+            try:
+                await self.client.create_manifest({
+                    "scope_id": self.spec.scopes.default_write,
+                    "context_id": context["id"],
+                    "run_ref": run_id,
+                    "items": [
+                        {"revision_id": item["revision_id"], "reason": item["reason"]}
+                        for item in packet.items if item.get("revision_id")
+                    ],
+                    "policy": {
+                        "guidance_version": GUIDANCE_VERSION,
+                        "trigger": trigger,
+                        "lane": "optional",
+                        "state_revision": context["state_revision"],
+                        "optional_status": status,
+                    },
+                    "degraded": None,
+                })
+            except (MemoryUnavailable, MemoryAPIError) as exc:
+                logger.warning(f"[{self.profile_name}] manifest write failed: {exc}")
+        return section, status
+
+    async def capture_episode(
+        self, *, instance: str | None, idempotency_key: str, content: str,
+        source_ref: str | None, attributes: dict[str, Any] | None = None,
+    ) -> dict:
+        """Durable, idempotent capture of a session EPISODE — a digest an
+        external session's daemon assembled from what it observed. Unlike
+        `capture_harness_event` (operational trail, kind `harness:*`, which
+        the extraction worker skips) this lands as kind `session_episode`,
+        so the bounded extractor may later propose memories from it."""
+        effective_instance = instance or DEFAULT_INSTANCE
+        try:
+            mapping = self._read_map()
+            context_id = mapping.get(effective_instance)
+            result = await self.client.append_event(
+                scope_id=self.spec.scopes.default_write,
+                idempotency_key=idempotency_key,
+                source={"kind": "session_episode", "ref": source_ref},
+                content=content[:20_000],
+                attributes={
+                    "instance": effective_instance,
+                    "profile": self.profile_name,
+                    **(attributes or {}),
+                },
+                occurred_at=datetime.now(timezone.utc).isoformat(),
+                context_ids=[context_id] if context_id else None,
+            )
+            return {"status": "captured", "event_id": result["id"],
+                    "created": result.get("created", True)}
+        except (MemoryUnavailable, MemoryAPIError) as exc:
+            return {"status": "persistence_unavailable",
+                    "detail": self._degrade(f"episode capture: {exc}")}
+
     async def finish_turn(
         self,
         *,

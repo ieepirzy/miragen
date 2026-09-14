@@ -250,7 +250,7 @@ class TestCodexInstall:
         install_codex_hooks(path)
         hooks = json.loads(path.read_text())["hooks"]
         assert set(hooks) == {"SessionStart", "UserPromptSubmit", "PreCompact",
-                              "Stop", "SubagentStop", "SessionEnd"}
+                              "PostCompact", "Stop", "SubagentStop", "SessionEnd"}
         session_end = hooks["SessionEnd"][0]["hooks"][0]
         assert session_end["command"] == "miragen memory-hook codex"
         assert session_end["timeout"] == 3  # the documented SessionEnd cap

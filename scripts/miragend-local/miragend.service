@@ -1,0 +1,33 @@
+# systemd USER unit for miragend as the local memory-participation daemon
+# (docs/external-sessions.md). Install:
+#   mkdir -p ~/.config/systemd/user ~/.config/miragend
+#   cp scripts/miragend-local/miragend.service ~/.config/systemd/user/
+#   cp scripts/miragend-local/sessions.example.yaml ~/.config/miragend/sessions.yaml
+#   cp scripts/miragend-local/miragend.env.example  ~/.config/miragend/miragend.env
+#   chmod 600 ~/.config/miragend/miragend.env
+#   systemctl --user daemon-reload && systemctl --user enable --now miragend
+#   systemctl --user status miragend ; curl -s http://127.0.0.1:8420/health | jq .sessions
+[Unit]
+Description=miragend — local memory participation daemon for external agent sessions
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/miragend/miragend.env
+Environment=MIRAGEND_LIFECYCLE=off
+Environment=MIRAGEND_SESSIONS_CONFIG=%h/.config/miragend/sessions.yaml
+Environment=MIRAGEND_HOST=127.0.0.1
+Environment=MIRAGEND_PORT=8420
+Environment=MIRAGEND_STATE_DIR=%h/.local/state/miragend
+# The console script from the venv/uv tool env where `miragen` is installed
+# — edit to match: `which miragend` after `uv tool install miragen` or
+# `pipx install miragen`.
+ExecStart=%h/.local/bin/miragend
+Restart=on-failure
+RestartSec=3
+# The daemon holds a memory principal token: keep its state private.
+UMask=0077
+
+[Install]
+WantedBy=default.target

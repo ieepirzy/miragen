@@ -29,133 +29,23 @@ Two transports for the same logic:
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
-from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
+# The serializers, idempotency keys and installers live in the stdlib-only
+# adapter package (miragen_hook) so external hook invocations never import
+# the agent runtime; they are re-exported here for the in-process paths.
+from miragen_hook.install import install_codex_hooks  # noqa: F401
+from miragen_hook.normalize import (  # noqa: F401
+    CAPTURED as _CAPTURED,
+    CONTEXT_OPENING as _CONTEXT_OPENING,
+    HARNESSES,
+    NormalizedEvent,
+    event_idempotency_key,
+    normalize_hook_payload,
+)
+
 logger = logging.getLogger("miragen.memory.hooks")
-
-HARNESSES = ("claude-code", "codex")
-
-# Tool names whose events must never re-enter memory capture (§18.7:
-# avoid recursion when memory tool calls themselves trigger capture).
-_MEMORY_TOOL_PREFIXES = ("memory_",)
-_MEMORY_TOOL_MARKERS = ("miragen-memory", "mcp__miragen__")
-
-# Normalized events that get durable capture. Tool successes are
-# deliberately NOT captured (routine boilerplate — §17.5); failures are.
-_CAPTURED = {
-    "input.received",
-    "turn.finished",
-    "context.closed",
-    "context.compacting",
-    "context.child_finished",
-    "tool.finished",  # only reaches capture when ok=False (see normalize)
-}
-_CONTEXT_OPENING = {"context.started", "context.restored"}
-
-_CONTENT_CAP = 20_000
-_ERROR_CAP = 500
-
-
-@dataclass
-class NormalizedEvent:
-    name: str
-    harness: str
-    original_event: str
-    session_id: str | None
-    ids: dict[str, str] = field(default_factory=dict)
-    content: str | None = None
-    attributes: dict[str, Any] = field(default_factory=dict)
-
-
-def _is_memory_tool(tool_name: str) -> bool:
-    return tool_name.startswith(_MEMORY_TOOL_PREFIXES) or any(
-        marker in tool_name for marker in _MEMORY_TOOL_MARKERS
-    )
-
-
-def normalize_hook_payload(harness: str, payload: dict) -> NormalizedEvent | None:
-    """One harness hook payload → the normalized vocabulary, or None for
-    events the memory lifecycle has no business with."""
-    if harness not in HARNESSES:
-        raise ValueError(f"unknown harness '{harness}'; expected one of {HARNESSES}")
-    original = payload.get("hook_event_name", "")
-    session_id = payload.get("session_id")
-    ids = {
-        key: str(payload[key])
-        for key in ("prompt_id", "turn_id", "tool_use_id", "agent_id")
-        if payload.get(key)
-    }
-
-    def event(name: str, *, content: str | None = None, **attributes: Any) -> NormalizedEvent:
-        return NormalizedEvent(
-            name=name, harness=harness, original_event=original,
-            session_id=session_id, ids=ids,
-            content=content[:_CONTENT_CAP] if content else content,
-            attributes=attributes,
-        )
-
-    if original == "SessionStart":
-        # Claude Code calls it `reason`; Codex calls it `source`.
-        source = payload.get("reason") or payload.get("source") or "startup"
-        if source in ("resume", "compact"):
-            return event("context.restored", source=source)
-        return event("context.started", source=source)
-
-    if original == "UserPromptSubmit":
-        content = payload.get("user_input") or payload.get("prompt") or ""
-        return event("input.received", content=content)
-
-    if original in ("PostToolUse", "PostToolUseFailure"):
-        tool_name = payload.get("tool_name", "")
-        if _is_memory_tool(tool_name):
-            return None  # recursion guard
-        ok = original == "PostToolUse"
-        error = None if ok else str(payload.get("error", ""))[:_ERROR_CAP]
-        if ok:
-            # Successful tool calls are routine; nothing durable to keep.
-            return None
-        return event("tool.finished", tool_name=tool_name, ok=False, error=error)
-
-    if original == "PreCompact":
-        trigger = payload.get("reason") or payload.get("trigger") or "auto"
-        return event("context.compacting", trigger=trigger)
-
-    if original == "Stop":
-        return event("turn.finished", content=payload.get("last_assistant_message"))
-
-    if original == "SubagentStart":
-        return event("context.child_started", agent_type=payload.get("agent_type"))
-
-    if original == "SubagentStop":
-        return event(
-            "context.child_finished",
-            content=payload.get("last_assistant_message"),
-            agent_type=payload.get("agent_type"),
-        )
-
-    if original == "SessionEnd":
-        return event("context.closed", reason=payload.get("reason"))
-
-    return None
-
-
-def event_idempotency_key(event: NormalizedEvent) -> str:
-    """Stable per-occurrence key: a redelivered hook never writes twice.
-    The discriminator prefers harness-supplied ids; content hash is the
-    fallback for events that carry neither."""
-    discriminator = (
-        event.ids.get("tool_use_id")
-        or event.ids.get("prompt_id")
-        or event.ids.get("turn_id")
-        or event.ids.get("agent_id")
-        or hashlib.sha256((event.content or "").encode()).hexdigest()[:16]
-    )
-    return f"hook:{event.harness}:{event.session_id}:{event.original_event}:{discriminator}"
 
 
 async def handle_hook_event(lifecycle, event: NormalizedEvent, *, instance: str | None) -> dict | None:
@@ -254,64 +144,3 @@ def build_sdk_hook_callables(lifecycle, instance: str | None) -> dict[str, Any]:
         return on_hook
 
     return {name: make(name) for name in SDK_CAPTURE_EVENTS}
-
-
-# ── Codex hooks.json installation ────────────────────────────────────────────
-
-_OWNED_MARKER = "miragen memory-hook"
-
-# (event, timeout_s) — SessionEnd's max is 3 per the Codex reference.
-_CODEX_HOOK_EVENTS = (
-    ("SessionStart", 10),
-    ("UserPromptSubmit", 10),
-    ("PreCompact", 10),
-    ("Stop", 10),
-    ("SubagentStop", 10),
-    ("SessionEnd", 3),
-)
-
-
-def install_codex_hooks(hooks_path: Path) -> None:
-    """Install/refresh miragen's hook entries in a Codex hooks.json,
-    merging: only entries carrying our command marker are owned (removed
-    and re-added); every user entry is preserved verbatim (§18.7)."""
-    try:
-        existing = json.loads(hooks_path.read_text())
-        if not isinstance(existing, dict):
-            existing = {}
-    except FileNotFoundError:
-        existing = {}
-    except ValueError:
-        # A hooks.json we cannot parse is the user's; refusing to touch it
-        # beats silently rewriting their configuration.
-        raise RuntimeError(
-            f"{hooks_path} exists but is not valid JSON — fix or remove it "
-            "before miragen can install its memory hooks"
-        ) from None
-
-    hooks = existing.setdefault("hooks", {})
-    for event_name, timeout in _CODEX_HOOK_EVENTS:
-        groups = [
-            group for group in hooks.get(event_name, [])
-            if not _group_is_owned(group)
-        ]
-        groups.append({
-            "hooks": [{
-                "type": "command",
-                "command": f"{_OWNED_MARKER} codex",
-                "timeout": timeout,
-                "statusMessage": "miragen memory",
-            }]
-        })
-        hooks[event_name] = groups
-
-    hooks_path.parent.mkdir(parents=True, exist_ok=True)
-    hooks_path.write_text(json.dumps(existing, indent=2) + "\n")
-
-
-def _group_is_owned(group: dict) -> bool:
-    return any(
-        _OWNED_MARKER in str(hook.get("command", ""))
-        for hook in group.get("hooks", [])
-        if isinstance(hook, dict)
-    )

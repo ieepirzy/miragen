@@ -1,0 +1,146 @@
+"""Session-plane configuration: one YAML file the daemon owns.
+
+The file names the daemon's memory principal and env-var NAMES for its
+credentials (values never enter configuration — same rule as agent
+profiles), the scope policy that maps a project to Loimi scopes, explicit
+per-project bindings, the recall lane, and housekeeping bounds.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+from typing import Literal, Optional
+
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from miragen.models import MemoryRecallSpec
+
+logger = logging.getLogger(__name__)
+
+_SCOPE_ID = r"^[a-z0-9][a-z0-9_.:-]{0,126}$"
+
+
+class _Model(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class ProjectBinding(_Model):
+    """An explicit project → scope binding; wins over the template."""
+
+    match: str = Field(
+        min_length=1,
+        description=(
+            "Project identity to match: a normalized remote "
+            "('github.com/org/repo'), or an absolute path prefix of the "
+            "repository root."
+        ),
+    )
+    scope: str = Field(pattern=_SCOPE_ID, description="The project's write scope.")
+    read: list[str] = Field(
+        default_factory=list,
+        description="Extra read scopes for sessions in this project.",
+    )
+
+
+class ScopePolicy(_Model):
+    shared_read: list[str] = Field(
+        default_factory=list,
+        description="Read-only scopes every external session may draw from "
+                    "(e.g. the assistant's profile scope).",
+    )
+    project_scope: str = Field(
+        default="group:project.{slug}",
+        description="Template for a project's own scope; {slug} is the "
+                    "normalized project identity.",
+    )
+    project_scope_kind: Literal["instance", "profile", "role", "group", "shared", "fleet"] = "group"
+    provision: Literal["auto", "manual"] = Field(
+        default="auto",
+        description=(
+            "'auto' creates a project scope + grants on first sight through "
+            "the operator surface (requires operator_token_env to resolve); "
+            "'manual' assumes scopes exist — a refusal degrades explicitly."
+        ),
+    )
+    fallback_write: Optional[str] = Field(
+        default=None, pattern=_SCOPE_ID,
+        description="Scope to use when a project scope cannot be provisioned "
+                    "(auto without an operator token). None = degrade.",
+    )
+
+
+class SessionsRecall(MemoryRecallSpec):
+    on_prompt: bool = Field(
+        default=True,
+        description="Also run the optional recall lane on every user prompt "
+                    "(one selector call per new prompt; cache hits are free).",
+    )
+    min_prompt_chars: int = Field(default=20, ge=0)
+
+
+class Housekeeping(_Model):
+    retention_hours: int = Field(default=24, ge=1)
+    stale_after_minutes: int = Field(default=180, ge=1)
+    sweep_interval_seconds: int = Field(default=60, ge=5)
+
+
+class SessionsConfig(_Model):
+    principal: str = Field(
+        pattern=r"^[a-z0-9][a-z0-9_.:-]{0,126}$",
+        description="The daemon's memory principal id (what the token was minted for).",
+    )
+    endpoint_env: str = "LOIMI_MEMORY_URL"
+    credential_env: str = "LOIMI_MEMORY_TOKEN"
+    operator_token_env: str = "LOIMI_OPERATOR_TOKEN"
+    scopes: ScopePolicy = Field(default_factory=ScopePolicy)
+    projects: list[ProjectBinding] = Field(default_factory=list)
+    recall: SessionsRecall = Field(default_factory=SessionsRecall)
+    housekeeping: Housekeeping = Field(default_factory=Housekeeping)
+    state_dir: Optional[Path] = Field(
+        default=None,
+        description="Where sessions.json, the event journal and the memory "
+                    "context map live. Default: MIRAGEND_STATE_DIR or "
+                    "~/.local/state/miragend.",
+    )
+
+    @model_validator(mode="after")
+    def _template_has_slug(self) -> "SessionsConfig":
+        if "{slug}" not in self.scopes.project_scope:
+            raise ValueError("scopes.project_scope must contain {slug}")
+        return self
+
+    def resolved_state_dir(self, environ: dict | None = None) -> Path:
+        env = os.environ if environ is None else environ
+        if self.state_dir is not None:
+            return Path(self.state_dir).expanduser()
+        return Path(env.get("MIRAGEND_STATE_DIR") or Path.home() / ".local" / "state" / "miragend")
+
+
+def load_sessions_config(path: str | Path) -> SessionsConfig:
+    data = yaml.safe_load(Path(path).read_text()) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: top level must be a mapping")
+    return SessionsConfig.model_validate(data)
+
+
+def load_file_secrets(environ: dict | None = None) -> None:
+    """Resolve *_FILE env vars into their plain counterparts — the same
+    contract as the agent runtime's loader (miragen.app._load_file_secrets),
+    kept local so the daemon never imports the agent runtime for it."""
+    env = os.environ if environ is None else environ
+    for file_var, path in list(env.items()):
+        if not file_var.endswith("_FILE"):
+            continue
+        secret_path = Path(path)
+        if not secret_path.exists():
+            logger.warning(f"Secret file referenced by {file_var} not found: {path}")
+            continue
+        target = file_var[: -len("_FILE")]
+        try:
+            env[target] = secret_path.read_text().strip()
+            del env[file_var]
+        except OSError as exc:
+            logger.error(f"Failed to read secret file {path} for {file_var}: {exc}")

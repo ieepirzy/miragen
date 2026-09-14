@@ -204,3 +204,18 @@ class MemoryClient:
 
     async def create_manifest(self, body: dict[str, Any]) -> dict:
         return await self._request("POST", "/manifests", json=body)
+
+    # -- operator surface (store bearer, NOT a principal token) -----------
+    # Used only by a caller that was explicitly given the operator
+    # credential (miragend's session plane provisioning project scopes);
+    # a principal token opens none of these.
+
+    async def admin_create_scope(self, *, scope_id: str, kind: str, description: str = "") -> dict:
+        return await self._request("POST", "/admin/scopes", json={
+            "id": scope_id, "kind": kind, "description": description,
+        })
+
+    async def admin_grant(self, *, principal_id: str, scope_id: str, verbs: list[str]) -> dict:
+        return await self._request("POST", "/admin/grants", json={
+            "principal_id": principal_id, "scope_id": scope_id, "verbs": verbs,
+        })
