@@ -162,7 +162,11 @@ def test_emit_executor_turn_translates_events():
 
     (tool,) = spans["executor tool"]
     assert tool.attributes["miragen.tool.type"] == "command_execution"
-    assert tool.attributes["miragen.tool.command"] == "pytest -q"
+    # §18.2: raw command text stays out of default export — identity and
+    # result codes only, and an unreported duration is declared unknown.
+    assert "miragen.tool.command" not in tool.attributes
+    assert tool.attributes["miragen.tool.duration_unknown"] is True
+    assert tool.end_time == tool.start_time
     assert tool.parent.span_id == root.context.span_id
 
     # Run identity on every synthesized span too.

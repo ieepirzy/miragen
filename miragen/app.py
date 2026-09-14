@@ -769,14 +769,26 @@ async def _run_executor_turn(
         # Post-hoc, from the turn's slice of the durable event stream — the
         # self-harnessed loop can't be instrumented from here, but its events
         # can be translated span-for-span with their own timestamps.
-        page = _executor.read_events_page(run_id, after=events_before, limit=10_000)
-        if page.has_more:
+        # Paginated on the cursor watermark (§18.2): no silent 10k
+        # truncation. The page cap is a guardrail against a pathological
+        # stream; hitting it reports exported vs remaining explicitly.
+        turn_events: list = []
+        cursor = events_before
+        for _page_index in range(20):  # ≤200k events per turn export
+            page = _executor.read_events_page(run_id, after=cursor, limit=10_000)
+            turn_events.extend(page.events)
+            cursor = page.next_after
+            if not page.has_more:
+                break
+        else:
             logger.warning(
-                f"[{_profile.name if _profile else '?'}] run {run_id}: turn produced "
-                ">10k events; telemetry export truncated to the first 10k"
+                f"[{_profile.name if _profile else '?'}] run {run_id}: turn "
+                f"exceeded the 200k-event export guardrail; exported "
+                f"{len(turn_events)} events, remainder stays in the durable "
+                "stream (not silently dropped — re-exportable by cursor)"
             )
         _telemetry.emit_executor_turn(
-            page.events,
+            turn_events,
             run_id=run_id,
             trigger=record.trigger if record is not None else None,
             executor=_executor.spec.executor,
@@ -1491,7 +1503,16 @@ async def health():
         "publication": _publication_health(),
         # Honest readiness, same pattern as publication: configured ≠ healthy,
         # but a False here explains an empty backend before anyone debugs it.
-        "telemetry": {"otlp_configured": _telemetry is not None},
+        "telemetry": {
+            "otlp_configured": _telemetry is not None,
+            # §18.2: export failure/drop visibility — "configured" never
+            # implied "delivered", and now the gap is measurable.
+            "export": {
+                "attempted_batches": _telemetry.export_stats.attempted_batches,
+                "failed_batches": _telemetry.export_stats.failed_batches,
+                "failed_spans": _telemetry.export_stats.failed_spans,
+            } if _telemetry is not None else None,
+        },
         # Capability ≠ configured, same pattern as publication: voice/v1 is
         # always advertised; this says whether THIS profile can actually speak.
         "voice": {
@@ -2618,7 +2639,21 @@ async def run_stream(request: RunRequest):
 
     async def event_stream():
         chunks: list[str] = []
+        # §18.2: streaming runs get the same run-span/context wrapper as
+        # ordinary runs — identity stamped on every child span, cleanup on
+        # cancellation/failure via the try/finally around the generator.
+        run_ctx = (
+            _telemetry.run_span(
+                "agent run",
+                run_id=record.run_id if record is not None else uuid.uuid4().hex,
+                trigger="http",
+                tier="model",
+            )
+            if _telemetry is not None
+            else nullcontext()
+        )
         try:
+          with run_ctx as run_span:
             try:
                 async with stream_agent.run_stream(prompt, usage_limits=stream_limits, message_history=history) as stream:
                     async for chunk in stream.stream_text(delta=True):
@@ -2664,6 +2699,11 @@ async def run_stream(request: RunRequest):
                         instance=instance, run_id=record.run_id,
                         trigger="http", status="succeeded", summary="".join(chunks),
                     )
+                if run_span is not None and usage is not None:
+                    if usage.input_tokens:
+                        run_span.set_attribute("gen_ai.usage.input_tokens", usage.input_tokens)
+                    if usage.output_tokens:
+                        run_span.set_attribute("gen_ai.usage.output_tokens", usage.output_tokens)
             yield "data: [DONE]\n\n"
         finally:
             release()
