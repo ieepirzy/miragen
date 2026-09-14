@@ -399,15 +399,26 @@ class MiragenTelemetry:
             failed = (
                 isinstance(item.get("exit_code"), int) and item["exit_code"] != 0
             ) or item.get("status") in ("failed", "error")
+            # §18.2: raw command text stays OUT of default export — a 500-char
+            # cap is truncation, not redaction; the allowlist is tool
+            # identity and result codes. And an unknown duration stays
+            # unknown: only a harness-reported duration widens the span,
+            # otherwise it is an instant event that says so.
+            duration_ms = item.get("duration_ms")
+            attrs = {
+                "miragen.tool.type": item_type,
+                "miragen.tool.name": item.get("name"),
+                "miragen.tool.exit_code": item.get("exit_code"),
+            }
+            if duration_ms:
+                start_ns = ts_ns - int(duration_ms * 1e6)
+            else:
+                start_ns = ts_ns
+                attrs["miragen.tool.duration_unknown"] = True
             _span(
                 "executor tool",
-                start_ns=ts_ns,
-                attrs={
-                    "miragen.tool.type": item_type,
-                    "miragen.tool.name": item.get("name"),
-                    "miragen.tool.command": item.get("command"),
-                    "miragen.tool.exit_code": item.get("exit_code"),
-                },
+                start_ns=start_ns,
+                attrs=attrs,
                 error="tool failed" if failed else None,
             )
         elif kind == "intervention.requested":
