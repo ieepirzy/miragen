@@ -1,0 +1,52 @@
+# ~/.config/miragend/sessions.yaml — miragend's session plane
+# (docs/external-sessions.md, design record docs/design/external-sessions.md).
+
+# The memory principal the daemon authenticates as (LOIMI_MEMORY_TOKEN was
+# minted for it). New project scopes are granted to this principal.
+principal: assistant
+
+endpoint_env: LOIMI_MEMORY_URL
+credential_env: LOIMI_MEMORY_TOKEN
+operator_token_env: LOIMI_OPERATOR_TOKEN
+
+scopes:
+  # Read-only layers every external session gets (stable assistant/user
+  # context). Must already exist and be granted to the principal.
+  shared_read: [profile:assistant]
+  # One scope per project; {slug} is the normalized repository identity
+  # (remote URL → "github.com-org-repo"; no remote → the path).
+  project_scope: "group:project.{slug}"
+  project_scope_kind: group
+  # auto: create the project scope + grants on first sight (needs the
+  # operator token). manual: assume it exists; a refusal degrades
+  # explicitly in the injected packet and on /health.
+  provision: auto
+  # Where writes go when a project scope cannot be provisioned. null =
+  # degrade explicitly rather than write somewhere unrelated.
+  fallback_write: null
+
+# Explicit bindings beat the template — e.g. two repositories that share
+# one body of project memory, or a project that may also read a shared
+# platform scope.
+projects: []
+#  - match: github.com/ieepirzy/miragen
+#    scope: group:mira-platform
+#    read: [shared:platform]
+#  - match: /home/ilari/Software/Repositories/movingfirm-backend
+#    scope: group:muutto365
+
+recall:
+  enabled: true
+  # The zero-or-more relevance selector (one structured-output model call
+  # per new prompt/state; cache hits are free). Unset = optional lane off.
+  model: null            # e.g. "deepseek:deepseek-chat"
+  on_prompt: true
+  min_prompt_chars: 20
+  max_candidates: 20
+  max_selected: 8
+  max_optional_chars: 8000
+
+housekeeping:
+  retention_hours: 24          # keep ended sessions listed this long
+  stale_after_minutes: 180     # a pid-less session silent this long is finalized
+  sweep_interval_seconds: 60

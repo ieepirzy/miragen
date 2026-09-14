@@ -108,13 +108,16 @@ Documentation = "https://github.com/ieepirzy/miragen/blob/main/README.md"
 [project.scripts]
 miragen = "miragen.cli:cli"
 miragend = "miragen.daemon.api:main"
+# The stdlib-only harness adapter (miragen_hook/): what Claude Code / Codex
+# hook entries invoke. Imports nothing from `miragen` on purpose.
+miragen-hook = "miragen_hook.client:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["miragen"]
+packages = ["miragen", "miragen_hook"]
 
 # ---------------------------------------------------------------------------
 # Code health and provenance telemetry (mira-vitals).
@@ -129,11 +132,11 @@ packages = ["miragen"]
 # this repository maintains outside every series; including its `tests/` would
 # mix test complexity into a maintainability figure, which is why the path
 # names the package directory rather than the project directory.
-paths = ["miragen", "packages/grok-build-client/grok_build_client"]
+paths = ["miragen", "miragen_hook", "packages/grok-build-client/grok_build_client"]
 
 # Lint is measured wider, because an unused import in a test is still a real
 # finding worth trending.
-lint_paths = ["miragen", "packages", "tests"]
+lint_paths = ["miragen", "miragen_hook", "packages", "tests"]
 
 # Measured everywhere, gated nowhere yet. At adoption `miragen/` has 6 ruff
 # findings (4 W292, 2 F401) and `tests/` has 85 (63 E402, 19 F401, ...).
@@ -151,7 +154,7 @@ lint_blocking = false
 # the number with a signal about line width rather than code health.
 lint_select = ["E4", "E7", "E9", "F", "W"]
 
-typecheck_paths = ["miragen", "packages/grok-build-client/grok_build_client"]
+typecheck_paths = ["miragen", "miragen_hook", "packages/grok-build-client/grok_build_client"]
 type_checker = "pyright"
 # Measured from the first run, gated only once the baseline reaches zero.
 typecheck_blocking = false
