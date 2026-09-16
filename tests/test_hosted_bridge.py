@@ -634,3 +634,24 @@ class TestMidLifeSessions:
         await h.send("SessionEnd", reason="exit")
         await h.drain()
         assert [a["properties"]["occurrence"] for a in h.fake_store.artifacts.values()] == ["end"]
+
+
+class TestRawHookShadowing:
+    def test_raw_hooks_are_dropped_for_adapter_known_sessions(self, tmp_path):
+        """Plugin adapter + repository HTTP hooks on one machine: the
+        adapter's session wins, raw hooks for it answer empty."""
+        h = Harness(tmp_path)
+        app = create_app(None, token="secret", sessions=h.plane)
+        headers = {"Authorization": "Bearer secret"}
+        with TestClient(app) as client:
+            adapter = client.post("/sessions/v1/events", headers=headers,
+                                  json=envelope("SessionStart", source="startup").model_dump())
+            assert "[memory guide" in adapter.json()["context"]
+            raw = client.post("/sessions/v1/hooks/claude-code", headers=headers,
+                              json={**RAW_START, "session_id": "s-1", "cwd": "/w/repo"})
+            assert (raw.status_code, raw.json()) == (200, {})
+            # The other way round, a raw-hook-only session still gets context.
+            other = client.post("/sessions/v1/hooks/claude-code", headers=headers, json=RAW_START)
+            assert "[memory guide" in other.json()["hookSpecificOutput"]["additionalContext"]
+        assert h.plane.stats.raw_hooks_shadowed == 1
+        assert h.plane.stats.events_received == 2

@@ -97,6 +97,7 @@ class PlaneStats:
     # Startup provisioning + identity adoption.
     adopted_by_name: int = 0
     remote_sessions: int = 0
+    raw_hooks_shadowed: int = 0
 
     def note_loimi(self, ok: bool, error: str | None = None) -> None:
         if ok:

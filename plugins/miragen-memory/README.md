@@ -56,6 +56,24 @@ The cloud environment must be allowed to reach the daemon's host (network
 access **Custom** with the host listed, or **Full**) and should carry
 `MIRAGEND_URL` and `MIRAGEND_TOKEN` as environment variables.
 
+Found live (2026-09-16): plugins enabled for a claude.ai account did **not**
+sync into Anthropic-hosted VMs, and a repository's `enabledPlugins` did not
+install there either. What does work is the environment's **setup script**
+installing the plugin with the CLI's absolute path and **no token argument**
+(the hooks read `MIRAGEND_TOKEN` from the environment; the `token` option is
+optional for exactly this reason):
+
+```bash
+CLAUDE="$(command -v claude || echo /opt/node22/bin/claude)"
+"$CLAUDE" plugin marketplace add ieepirzy/miragen --scope user || true
+"$CLAUDE" plugin install miragen-memory@miragen --scope user \
+  --config daemon_url=https://memory.muutto365.fi || true
+```
+
+The plugin's bundled MCP server then has no bearer in cloud sessions and shows
+as failed; enable the bridge as a claude.ai connector on the session for tools.
+Repository HTTP hooks (below) work without any plugin.
+
 Alternative without any plugin: `miragen-hook install claude-code --http
 --daemon https://… --settings .claude/settings.json` writes `type: http` hooks
 into a repository's settings — the harness POSTs raw payloads to
