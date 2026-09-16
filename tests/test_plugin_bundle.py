@@ -33,10 +33,18 @@ def test_vendored_adapter_runs_standalone(tmp_path):
     result = subprocess.run(
         [sys.executable, "-m", "miragen_hook", "claude-code"],
         input=json.dumps({"hook_event_name": "PostToolUse", "session_id": "x", "tool_name": "Bash"}),
-        capture_output=True, text=True, timeout=20,
+        capture_output=True, text=True, timeout=20, cwd=tmp_path,  # NOT the repo: cwd shadows PYTHONPATH
         env={"PYTHONPATH": str(PLUGIN), "PATH": "/usr/bin:/bin", "MIRAGEND_URL": "http://127.0.0.1:1"},
     )
     assert (result.returncode, result.stdout) == (0, "")
+    # And the vendored copy really is what ran (the repo checkout is also
+    # importable through the editable install; PYTHONPATH must win).
+    which = subprocess.run(
+        [sys.executable, "-c", "import miragen_hook; print(miragen_hook.__file__)"],
+        capture_output=True, text=True, timeout=20, cwd=tmp_path,
+        env={"PYTHONPATH": str(PLUGIN), "PATH": "/usr/bin:/bin"},
+    )
+    assert which.stdout.strip().startswith(str(PLUGIN))
 
 
 def test_hooks_json_matches_installer_table():

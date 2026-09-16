@@ -483,19 +483,24 @@ class SessionPlane:
         if not text:
             return self._default_project()
         value = text.strip()
-        session = self.registry.get(value)
+        lowered = value.lower()
+        if lowered == self.config.mcp.default_project.lower():
+            return self._default_project()
+        session = self.find_session(value)
         if session is not None and session.project is not None:
             return session.project
-        lowered = value.lower()
+        by_cwd = self._projects.get(value) or self._projects.get(value.rstrip("/"))
+        if by_cwd is not None:
+            return by_cwd
         for project in {**self._projects, **{p.id: p for p in self._known_by_name.values()}}.values():
-            if lowered in (project.id, project.slug, project.name.lower()):
+            if lowered in (project.id, project.slug, project.name.lower(), project.root):
                 return project
-        if "/" in value or value.startswith("git@"):
-            return identity_from_remote(value)
         if lowered.startswith("dir:") or lowered.startswith("path:"):
             return ProjectIdentity(
                 id=lowered, slug=project_slug(lowered), name=lowered.split(":", 1)[1], root="",
             )
+        if "/" in value or value.startswith("git@"):
+            return identity_from_remote(value)
         known = self._known_by_name.get(lowered)
         if known is not None:
             return known
@@ -811,9 +816,10 @@ class SessionPlane:
         """Open this session's Loimi run once. Returns a detail string
         when the store is configured but refused/unreachable (explicit
         degradation for the injected header), None otherwise."""
-        if self.store is None or session.run_id is not None:
+        if self.store is None or not self.store.configured():
             return None
-        if not self.store.configured():
+        if session.run_id is not None:
+            # One run per life; a new life resets this in ExternalSession.new_life().
             return None
         namespace = self.store.namespace_for(session.project)
         project = session.project.id if session.project else "unknown project"
@@ -842,11 +848,12 @@ class SessionPlane:
         self, session: ExternalSession, *, occurrence: str, digest: str,
         memory_event_id: str | None,
     ) -> None:
-        if self.store is None or occurrence in session.artifacts_written:
+        if self.store is None:
             return
-        if session.run_id is None and await self._ensure_run(session):
+        if await self._ensure_run(session) or session.run_id is None:
             return
-        if session.run_id is None:
+        dedupe_key = f"{session.run_id}:{occurrence}"
+        if dedupe_key in session.artifacts_written:
             return
         try:
             artifact = await asyncio.wait_for(self.store.put_artifact(
@@ -866,11 +873,9 @@ class SessionPlane:
             self.stats.note_store(False, f"episode artifact: {exc}")
             logger.warning(f"[{session.key}] episode artifact not written: {exc}")
             return
-        session.artifacts_written.append(occurrence)
+        session.artifacts_written.append(dedupe_key)
         self.stats.artifacts_written += 1
         self.stats.note_store(True)
-        if occurrence == "end":
-            await self._close_run(session)
 
     async def _close_run(self, session: ExternalSession) -> None:
         if self.store is None or session.run_id is None or session.run_status != "running":
@@ -923,10 +928,11 @@ class SessionPlane:
         digest = self.render_episode(session, occurrence=occurrence)
         started = time.monotonic()
         try:
+            life = f":life{session.lives}" if session.lives else ""
             episode = await asyncio.wait_for(
                 lifecycle.capture_episode(
                     instance=instance,
-                    idempotency_key=f"episode:{session.key}:{occurrence}",
+                    idempotency_key=f"episode:{session.key}:{occurrence}{life}",
                     content=digest,
                     source_ref=f"session:{session.key}",
                     attributes={
@@ -963,6 +969,9 @@ class SessionPlane:
             session, occurrence=occurrence, digest=digest,
             memory_event_id=episode.get("event_id"),
         )
+        if occurrence == "end":
+            # Whatever happened to the artifact, the run must not stay open.
+            await self._close_run(session)
 
         patch = {"last_session": {
             "harness": session.harness,

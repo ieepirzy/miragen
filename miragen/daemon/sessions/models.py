@@ -147,6 +147,10 @@ class ExternalSession(_Tolerant):
     namespace: Optional[str] = None
     run_status: Optional[str] = None
     artifacts_written: list[str] = Field(default_factory=list)
+    # How many times an ended/stale session came back under the same id
+    # (a resume, or a >stale_after gap). Each life gets its own run and
+    # its own episode keys.
+    lives: int = 0
     children: dict[str, ChildAgent] = Field(default_factory=dict)
     counters: SessionCounters = Field(default_factory=SessionCounters)
     created_at: str = Field(default_factory=now_iso)
@@ -192,6 +196,20 @@ class ExternalSession(_Tolerant):
         if text:
             self.turns.append(text[:_TURN_CHARS])
             del self.turns[:-_TURN_KEEP]
+
+    def new_life(self) -> None:
+        """An ended/stale session speaks again under the same id: it is
+        active, and its closed store run is history — the next context
+        opens a fresh run with fresh dedupe state."""
+        self.state = "active"
+        self.ended_at = None
+        self.end_reason = None
+        self.lives += 1
+        if self.run_status is not None and self.run_status != "running":
+            self.run_id = None
+            self.namespace = None
+            self.run_status = None
+            self.artifacts_written = []
 
     def end(self, reason: str | None) -> None:
         if self.state != "ended":

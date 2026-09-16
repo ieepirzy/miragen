@@ -528,3 +528,95 @@ class TestBridgeMcp:
             assert ok.status_code == 200
             # Health and the session routes are untouched by origo.
             assert client.get("/sessions/v1/stats", headers={"Authorization": "Bearer secret"}).status_code == 200
+
+
+# ── review findings (PR #97) ─────────────────────────────────────────────────
+
+
+class TestReviewFindings:
+    def test_raw_hook_without_cwd_claims_nothing(self, tmp_path):
+        """The daemon's own working directory is NOT the session's: a
+        payload without cwd yields a session without a project, and a
+        degraded (unscoped) answer — never `dir:<daemon workdir>`."""
+        h = Harness(tmp_path)
+        app = create_app(None, token="secret", sessions=h.plane)
+        headers = {"Authorization": "Bearer secret"}
+        with TestClient(app) as client:
+            payload = {k: v for k, v in RAW_START.items() if k != "cwd"}
+            answer = client.post("/sessions/v1/hooks/claude-code", json=payload, headers=headers)
+            assert answer.status_code == 200 and answer.json() == {}
+            session = h.plane.registry.get("claude-code:cloud-1")
+            assert session.cwd is None and session.project is None
+            # Malformed client facts: counted, empty 200, never a 500.
+            odd = client.post("/sessions/v1/hooks/claude-code", headers=headers,
+                              json={**RAW_START, "session_id": "odd", "transcript_path": 12345})
+            assert (odd.status_code, odd.json()) == (200, {})
+            long = client.post("/sessions/v1/hooks/claude-code", headers=headers,
+                               json={**RAW_START, "session_id": "odd2", "cwd": "x" * 5000})
+            assert (long.status_code, long.json()) == (200, {})
+        assert h.plane.stats.events_rejected == 2
+
+    async def test_second_life_gets_a_fresh_run_and_episodes(self, tmp_path):
+        """A session that went stale (or was resumed under the same id)
+        must not be tied to its closed run: new run, new artifacts, new
+        memory episode keys."""
+        h = Harness(tmp_path, alive={4242})
+        await h.send("SessionStart", source="startup")
+        first_run = h.plane.registry.get("claude-code:s-1").run_id
+        h.alive.clear()
+        await h.plane.sweep(now=datetime.now(timezone.utc) + timedelta(seconds=10))
+        await h.drain()
+        assert h.fake_store.runs[first_run]["status"] == "cancelled"
+        h.alive.add(4242)
+        # The user comes back under the same session id.
+        await h.send("SessionStart", source="resume")
+        session = h.plane.registry.get("claude-code:s-1")
+        assert session.lives == 1 and session.state == "active"
+        assert session.run_id != first_run and session.run_status == "running"
+        await h.send("PreCompact", trigger="auto")
+        await h.send("SessionEnd", reason="exit")
+        await h.drain()
+        by_run = {}
+        for artifact in h.fake_store.artifacts.values():
+            by_run.setdefault(artifact["producer"]["run_id"], []).append(
+                artifact["properties"]["occurrence"])
+        assert by_run[first_run] == ["end"]
+        assert by_run[session.run_id] == ["compact-1", "end"]
+        assert h.fake_store.runs[session.run_id]["status"] == "succeeded"
+        assert h.plane.stats.store_failures == 0
+        episodes = [e for e in h.events("session_episode")]
+        assert len(episodes) == 3  # first life end, second life compact + end
+
+    async def test_run_closed_even_when_end_artifact_fails(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup")
+        session = h.plane.registry.get("claude-code:s-1")
+        # Make the store refuse artifacts for this run while still accepting the close.
+        original = h.fake_store._handle
+
+        def refuse_artifacts(request):
+            if request.method == "POST" and request.url.path == "/v0/artifacts":
+                import httpx
+                return httpx.Response(422, json={"detail": "nope", "code": "invalid"})
+            return original(request)
+
+        h.fake_store._handle = refuse_artifacts
+        h.plane.store._transport = __import__("httpx").MockTransport(refuse_artifacts)
+        await h.send("SessionEnd", reason="exit")
+        await h.drain()
+        assert h.fake_store.runs[session.run_id]["status"] == "succeeded"
+        assert h.plane.stats.store_failures == 1
+
+    def test_resolve_identity_default_and_paths(self, tmp_path):
+        h = Harness(tmp_path)
+        plane = h.plane
+        assert plane.resolve_identity("mcp:default").id == "mcp:default"
+        assert plane.resolve_identity("MCP:DEFAULT").slug == "mcp-default"
+        assert plane.resolve_identity("path:/w/repo").id == "path:/w/repo"
+
+    async def test_resolve_identity_by_cwd(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup")
+        assert h.plane.resolve_identity("/w/repo").id == "github.com/org/repo"
+        assert h.plane.resolve_identity("/w/repo/").id == "github.com/org/repo"
+        assert h.plane.resolve_identity("s-1").id == "github.com/org/repo"  # bare harness id

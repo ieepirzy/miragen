@@ -81,10 +81,16 @@ def register_session_routes(app: FastAPI, plane: SessionPlane, *, dependencies: 
         event = normalize_hook_payload(harness, payload)
         if event is None or event.session_id is None:
             return JSONResponse({})
-        envelope = EventEnvelope.model_validate(build_envelope(
-            harness, payload, event, environ={}, pid=None, host=None, user=None,
-            remote=True, project_remote_url=None,
-        ))
+        try:
+            envelope = EventEnvelope.model_validate(build_envelope(
+                harness, payload, event, environ={}, pid=None, host=None, user=None,
+                remote=True, project_remote_url=None, cwd=payload.get("cwd") or None,
+            ))
+        except ValidationError:
+            # Counted (adapter/harness drift must show on /health) but an
+            # empty 200 — a hook must never surface an error to the user.
+            plane.stats.events_rejected += 1
+            return JSONResponse({})
         envelope.client.adapter = "http-hook"
         result = await plane.handle(envelope)
         if result.context and event.name in CONTEXT_BEARING:

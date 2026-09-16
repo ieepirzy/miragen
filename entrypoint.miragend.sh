@@ -25,7 +25,7 @@ if [ -S "${SOCK}" ]; then
     fi
     usermod -aG "$(getent group "${SOCK_GID}" | cut -d: -f1)" miragend
 else
-    case "${MIRAGEND_LIFECYCLE:-on}" in
+    case "$(printf '%s' "${MIRAGEND_LIFECYCLE:-on}" | tr '[:upper:]' '[:lower:]')" in
         off|0|false|no) ;;  # session plane only: no Docker by design
         *) echo "WARNING: ${SOCK} is not mounted — miragend cannot manage containers" >&2 ;;
     esac

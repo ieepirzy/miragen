@@ -79,9 +79,7 @@ class SessionRegistry:
         elif session.state != "active" and envelope.event.name != "context.closed":
             # A session we thought gone speaks again (late hook, or a
             # resume under the same id): it is active.
-            session.state = "active"
-            session.ended_at = None
-            session.end_reason = None
+            session.new_life()
         session.touch(envelope)
         return session, created
 

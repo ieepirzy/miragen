@@ -45,7 +45,7 @@ HOOKS_PATH = "/sessions/v1/hooks"  # raw harness payloads (HTTP hooks, no adapte
 # as CLAUDE_PLUGIN_OPTION_<KEY>; the bare form is the environment.
 URL_ENV_VARS = ("CLAUDE_PLUGIN_OPTION_DAEMON_URL", "MIRAGEND_URL")
 TOKEN_ENV_VARS = ("CLAUDE_PLUGIN_OPTION_TOKEN", "MIRAGEND_TOKEN")
-_GIT_TIMEOUT_S = 1.0
+_GIT_TIMEOUT_S = 2.0
 
 # Seconds. Context-bearing events wait for retrieval; captures only wait
 # for the daemon to journal + acknowledge (it does the write itself, after
@@ -139,13 +139,16 @@ def _hostname() -> str | None:
 def build_envelope(
     harness: str, payload: dict, event: NormalizedEvent, *, environ: dict | None = None,
     pid: int | None = None, host: str | None = "", user: str | None = "",
-    remote: bool | None = None, project_remote_url: str | None = "",
+    remote: bool | None = None, project_remote_url: str | None = "", cwd: str | None = "",
 ) -> dict[str, Any]:
-    """`host`/`user`/`project_remote_url` default to "observe them here";
-    pass None to leave a field unknown (the daemon does that when it
-    normalizes a raw hook payload — those facts are not its to claim)."""
+    """`host`/`user`/`project_remote_url`/`cwd` default to "observe them
+    here" (the adapter runs on the harness's machine); pass None to leave a
+    field unknown — the daemon does that when it normalizes a raw hook
+    payload, because those facts are not its to claim (its own working
+    directory is NOT the session's)."""
     env = os.environ if environ is None else environ
-    cwd = payload.get("cwd") or os.getcwd()
+    if cwd == "":
+        cwd = payload.get("cwd") or os.getcwd()
     if user == "":
         try:
             user = getpass.getuser()
