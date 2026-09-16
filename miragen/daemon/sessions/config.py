@@ -70,6 +70,63 @@ class ScopePolicy(_Model):
         description="Scope to use when a project scope cannot be provisioned "
                     "(auto without an operator token). None = degrade.",
     )
+    adopt_by_name: bool = Field(
+        default=True,
+        description=(
+            "A session that could only be identified by its directory name "
+            "(a cloud VM reporting a bare path) joins the project the daemon "
+            "already knows under that repository name, instead of opening a "
+            "parallel `dir:` project. Single-operator deployments want this; "
+            "a shared daemon with unrelated same-named repositories does not."
+        ),
+    )
+
+
+class StoreNamespaceBinding(_Model):
+    """project identity (remote form or path prefix) → Loimi namespace."""
+
+    match: str = Field(min_length=1)
+    namespace: str = Field(min_length=1, max_length=128)
+
+
+class StorePolicy(_Model):
+    """Loimi ARTIFACT store participation (the /v0 surface, distinct from
+    /memory/v1): every external session gets a run, its episodes land as
+    artifacts under that run, and the bridge tools let the model file its
+    own artifacts against the same run."""
+
+    enabled: bool = True
+    endpoint_env: str = Field(
+        default="LOIMI_STORE_URL",
+        description="Env var NAME with the store base URL; falls back to the "
+                    "memory endpoint (same Loimi) when unset.",
+    )
+    credential_env: str = Field(
+        default="LOIMI_STORE_TOKEN",
+        description="Env var NAME with the store bearer; falls back to the "
+                    "operator token env (same credential on a Loimi deployment).",
+    )
+    agent_id: str = Field(
+        default="mira", min_length=1,
+        description="Registered Loimi agent every external session runs as.",
+    )
+    namespace: str = Field(
+        default="mira", min_length=1,
+        description="Namespace a session's run opens in when no binding matches.",
+    )
+    namespaces: list[StoreNamespaceBinding] = Field(default_factory=list)
+    episode_kind: str = Field(default="session_episode", min_length=1)
+
+
+class BridgeMcp(_Model):
+    """The bridge's own MCP surface (memory_* + store_* tools) on /mcp."""
+
+    enabled: bool = True
+    default_project: str = Field(
+        default="mcp:default", min_length=1,
+        description="Project identity used by tool calls that name no "
+                    "project and no session (a claude.ai chat, say).",
+    )
 
 
 class SessionsRecall(MemoryRecallSpec):
@@ -95,10 +152,21 @@ class SessionsConfig(_Model):
     endpoint_env: str = "LOIMI_MEMORY_URL"
     credential_env: str = "LOIMI_MEMORY_TOKEN"
     operator_token_env: str = "LOIMI_OPERATOR_TOKEN"
+    provision_principal: bool = Field(
+        default=True,
+        description=(
+            "When the principal credential env is unset and the operator "
+            "token is available, create the principal (or mint a token for "
+            "an existing one) at startup and persist the token in the state "
+            "dir. A hosted daemon then needs exactly one secret: the operator's."
+        ),
+    )
     scopes: ScopePolicy = Field(default_factory=ScopePolicy)
     projects: list[ProjectBinding] = Field(default_factory=list)
     recall: SessionsRecall = Field(default_factory=SessionsRecall)
     housekeeping: Housekeeping = Field(default_factory=Housekeeping)
+    store: StorePolicy = Field(default_factory=StorePolicy)
+    mcp: BridgeMcp = Field(default_factory=BridgeMcp)
     state_dir: Optional[Path] = Field(
         default=None,
         description="Where sessions.json, the event journal and the memory "

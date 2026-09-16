@@ -31,7 +31,75 @@ non-zero exit. A missing daemon costs one connection refusal per hook. A
 missing Loimi degrades **explicitly**: the injected guide says `MEMORY
 DEGRADED`, `/health` counts it, and captures stay journaled for replay.
 
-## Enable it on the development machine
+## Hosted: one daemon for your machine, cloud sessions and claude.ai
+
+The same daemon runs next to a production Loimi and serves every harness
+over HTTPS (design record: [design/hosted-bridge.md](design/hosted-bridge.md)).
+It adds three things to the local picture above:
+
+- **Identity from anywhere.** The adapter reports the repository's origin
+  URL, its hostname and whether the harness declared itself remote; the
+  daemon maps a cloud checkout of `github.com/org/repo` to the same project
+  scope as your laptop's clone. A raw path (HTTP hooks) is identified by
+  directory name and adopts a project the daemon already knows by that name.
+- **The Loimi artifact store.** Each session gets a run; compaction and
+  session-end episodes are filed as `session_episode` artifacts under it;
+  the run closes at session end. The injected header carries `store_run=…`.
+- **The bridge MCP (`/mcp`).** `memory_*` and `store_*` tools for the model,
+  guarded by the daemon bearer and, optionally, origo OAuth for claude.ai.
+
+### Deploy the daemon
+
+Image `ghcr.io/ieepirzy/miragend` with `MIRAGEND_LIFECYCLE=off` needs no
+Docker socket. Environment:
+
+| Variable | Meaning |
+|---|---|
+| `MIRAGEND_SESSIONS_CONFIG` | path to `sessions.yaml` (see `scripts/miragend-local/sessions.example.yaml`) |
+| `MIRAGEND_TOKEN` (`_FILE`) | the bridge bearer every client sends |
+| `MIRAGEND_HOST` / `MIRAGEND_PORT` / `MIRAGEND_STATE_DIR` | bind + state (a volume: sessions, journal, the minted principal token, OAuth state) |
+| `LOIMI_MEMORY_URL` | Loimi base URL (`http://loimi:8400` on the shared network) |
+| `LOIMI_OPERATOR_TOKEN` (`_FILE`) | Loimi's store bearer: provisions the principal and scopes, and is the artifact store credential unless `LOIMI_STORE_TOKEN` is set |
+| `LOIMI_MEMORY_TOKEN` | optional — an operator-minted principal token; unset lets the daemon mint its own |
+| `MCP_BASE_URL`, `MCP_CLIENT_ID`, `MCP_CLIENT_SECRET`, `MCP_AUTO_APPROVE` | all together or none: origo OAuth on `/mcp` for claude.ai custom connectors |
+
+`GET /health` → `sessions.principal_source` (`environment` / `state_dir` /
+`created` / `minted` / `missing`), `sessions.loimi.shared_scopes`,
+`sessions.store`, `sessions.mcp`.
+
+### Join from Claude Code — the plugin
+
+```shell
+/plugin marketplace add ieepirzy/miragen
+/plugin install miragen-memory@miragen
+```
+
+Enter the daemon URL and the bearer when asked. Hooks and the
+`miragen-bridge` MCP server are configured by the plugin; nothing is
+installed on the machine (the adapter is stdlib Python 3). For cloud
+sessions, enable the plugin for your claude.ai account or declare it in the
+repository's `.claude/settings.json` (`extraKnownMarketplaces` +
+`enabledPlugins`), allow the daemon's host in the environment's network
+access, and set `MIRAGEND_URL` / `MIRAGEND_TOKEN` there — see
+[plugins/miragen-memory/README.md](../plugins/miragen-memory/README.md).
+
+### Join from Claude Code — HTTP hooks in a repository
+
+```bash
+MIRAGEND_URL=https://memory.example miragen-hook install claude-code --http \
+    --settings .claude/settings.json
+```
+
+The harness POSTs raw payloads to `/sessions/v1/hooks/claude-code` with
+`Authorization: Bearer $MIRAGEND_TOKEN` from its own environment.
+
+### Join from claude.ai / any MCP client
+
+Custom connector URL `https://<daemon>/mcp` (OAuth, the pre-registered
+client). From a terminal: `claude mcp add --transport http miragen-bridge
+https://<daemon>/mcp --header "Authorization: Bearer <token>"`.
+
+## Enable it on the development machine (local daemon)
 
 Prerequisites: the memory stack from `~/.agents/memory.compose.yml`
 (Loimi on `127.0.0.1:8400`), a minted principal token (`assistant`) and,

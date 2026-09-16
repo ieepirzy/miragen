@@ -46,6 +46,16 @@ class ClientInfo(_Tolerant):
     pid: Optional[int] = Field(default=None, ge=1)
     cwd: Optional[str] = Field(default=None, max_length=4096)
     user: Optional[str] = Field(default=None, max_length=256)
+    # Where the harness runs. A hosted daemon serves sessions from many
+    # hosts: pid liveness only means something on its own host, and a
+    # working directory can only be inspected there. `remote` is the
+    # harness's own declaration (Claude Code sets CLAUDE_CODE_REMOTE in
+    # cloud sessions); `project_remote` is the repository's remote URL as
+    # the adapter observed it, so the project can be identified without
+    # the daemon seeing the filesystem.
+    host: Optional[str] = Field(default=None, max_length=256)
+    remote: Optional[bool] = None
+    project_remote: Optional[str] = Field(default=None, max_length=1024)
     transcript_path: Optional[str] = Field(default=None, max_length=4096)
     project_dir: Optional[str] = Field(default=None, max_length=4096)
     parent_session: Optional[str] = Field(default=None, max_length=256)
@@ -121,12 +131,22 @@ class ExternalSession(_Tolerant):
     pid: Optional[int] = None
     cwd: Optional[str] = None
     user: Optional[str] = None
+    host: Optional[str] = None
+    remote: bool = False
     transcript_path: Optional[str] = None
     parent_session: Optional[str] = None
     agent: Optional[str] = None
     adapter: Optional[str] = None
     project: Optional[ProjectIdentity] = None
     scope: Optional[str] = None
+    # Loimi artifact store participation: the run this session's
+    # artifacts belong to, the namespace it was opened in, and which
+    # episode occurrences already produced an artifact (the store has
+    # no idempotency keys; this is ours).
+    run_id: Optional[str] = None
+    namespace: Optional[str] = None
+    run_status: Optional[str] = None
+    artifacts_written: list[str] = Field(default_factory=list)
     children: dict[str, ChildAgent] = Field(default_factory=dict)
     counters: SessionCounters = Field(default_factory=SessionCounters)
     created_at: str = Field(default_factory=now_iso)
@@ -148,6 +168,10 @@ class ExternalSession(_Tolerant):
             self.cwd = client.cwd
         if client.user and not self.user:
             self.user = client.user
+        if client.host and not self.host:
+            self.host = client.host
+        if client.remote:
+            self.remote = True
         if client.transcript_path and not self.transcript_path:
             self.transcript_path = client.transcript_path
         if client.parent_session and not self.parent_session:

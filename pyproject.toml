@@ -97,6 +97,15 @@ grok-build = [
 daemon = [
     "docker>=7.0",
     "sqlalchemy>=2.0",
+    # The bridge MCP mount's OAuth credential class (claude.ai custom
+    # connectors); the same drop-in provider Loimi/miradeploy/mirarun use.
+    "origo>=0.3.0",
+]
+# The session plane alone (docs/external-sessions.md): a hosted or local
+# miragend that serves Claude Code/Codex sessions and the bridge MCP without
+# Docker. `daemon` is a superset.
+bridge = [
+    "origo>=0.3.0",
 ]
 
 [project.urls]

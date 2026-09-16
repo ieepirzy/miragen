@@ -3,6 +3,18 @@
 A working directory resolves to a repository (git toplevel + remote) or,
 failing that, to itself. The identity is what the scope policy maps to a
 Loimi scope; the mapping is the daemon's, never the session's.
+
+Three ways to arrive at an identity, in order of preference:
+
+- `identity_from_remote`: the adapter observed the repository's remote URL
+  where the harness runs (a hosted daemon never sees that filesystem).
+  Stable across clones, worktrees, machines and cloud VMs.
+- `resolve_project`: the daemon inspects the working directory itself —
+  only meaningful when the harness runs on the daemon's own host.
+- `identity_from_directory`: nothing but a path was reported (a raw HTTP
+  hook from a cloud VM). The directory's basename is the identity, which
+  is exactly the repository name in every cloud checkout we know of; the
+  plane may then adopt a project it already knows by that name.
 """
 
 from __future__ import annotations
@@ -48,6 +60,33 @@ def _git(args: list[str], cwd: Path) -> str | None:
     if result.returncode != 0:
         return None
     return result.stdout.strip() or None
+
+
+def identity_from_remote(remote: str, *, root: str | None = None) -> ProjectIdentity:
+    """A remote URL the adapter reported → the same identity the local
+    resolver would derive from `git remote get-url origin`."""
+    project_id = normalize_remote(remote)
+    name = project_id.rstrip("/").rsplit("/", 1)[-1] or project_id
+    return ProjectIdentity(
+        id=project_id, slug=project_slug(project_id), name=name,
+        root=root or "", remote=remote.strip(),
+    )
+
+
+def identity_from_directory(cwd: str) -> ProjectIdentity:
+    """Path-only fallback for a host the daemon cannot inspect. `dir:` marks
+    the identity as name-derived so the plane can tell it apart from a
+    remote-derived one (and adopt the latter when the names match)."""
+    directory = cwd.rstrip("/") or "/"
+    name = directory.rsplit("/", 1)[-1] or "root"
+    project_id = f"dir:{name.lower()}"
+    return ProjectIdentity(
+        id=project_id, slug=project_slug(project_id), name=name, root=directory, remote=None,
+    )
+
+
+def is_name_derived(project: ProjectIdentity) -> bool:
+    return project.id.startswith("dir:")
 
 
 def resolve_project(cwd: str | None) -> ProjectIdentity:

@@ -14,6 +14,13 @@ from pydantic import ValidationError
 from miragen.daemon.core import DaemonError
 from miragen.daemon.sessions.models import EventEnvelope
 from miragen.daemon.sessions.plane import SessionPlane
+from miragen_hook.client import build_envelope
+from miragen_hook.normalize import (
+    CONTEXT_BEARING,
+    HARNESSES,
+    harness_output,
+    normalize_hook_payload,
+)
 
 SESSIONS_CAPABILITY = "sessions/v1"
 
@@ -21,6 +28,11 @@ SESSIONS_CAPABILITY = "sessions/v1"
 class SessionNotFound(DaemonError):
     status = 404
     code = "session_not_found"
+
+
+class UnknownHarness(DaemonError):
+    status = 404
+    code = "unknown_harness"
 
 
 def register_session_routes(app: FastAPI, plane: SessionPlane, *, dependencies: list) -> None:
@@ -43,6 +55,41 @@ def register_session_routes(app: FastAPI, plane: SessionPlane, *, dependencies: 
             "detail": result.detail,
             "accepted": True,
         })
+
+    @app.post("/sessions/v1/hooks/{harness}", dependencies=dependencies)
+    async def post_raw_hook(harness: str, request: Request) -> JSONResponse:
+        """A harness's RAW hook payload (Claude Code `type: http` hooks):
+        the daemon does what the stdlib adapter would have done on the
+        client — normalize, envelope, handle — and answers in the harness's
+        own output shape. Nothing about the client host is claimed (no pid,
+        user or hostname; the session is remote by construction), and the
+        project is identified by the reported working directory's name
+        unless the payload's cwd is visible here. An unmapped event is an
+        empty 200: the harness must never see an error for a hook."""
+        if harness not in HARNESSES:
+            raise UnknownHarness(f"unknown harness '{harness}'", harness=harness)
+        try:
+            payload = await request.json()
+        except ValueError:
+            plane.stats.events_rejected += 1
+            return JSONResponse(status_code=422,
+                                content={"detail": "hook payload is not JSON", "code": "malformed_event"})
+        if not isinstance(payload, dict):
+            plane.stats.events_rejected += 1
+            return JSONResponse(status_code=422,
+                                content={"detail": "hook payload must be an object", "code": "malformed_event"})
+        event = normalize_hook_payload(harness, payload)
+        if event is None or event.session_id is None:
+            return JSONResponse({})
+        envelope = EventEnvelope.model_validate(build_envelope(
+            harness, payload, event, environ={}, pid=None, host=None, user=None,
+            remote=True, project_remote_url=None,
+        ))
+        envelope.client.adapter = "http-hook"
+        result = await plane.handle(envelope)
+        if result.context and event.name in CONTEXT_BEARING:
+            return JSONResponse(harness_output(harness, event.original_event, result.context))
+        return JSONResponse({})
 
     @app.get("/sessions/v1/sessions", dependencies=dependencies)
     def list_sessions(active: bool = Query(default=False)) -> dict:

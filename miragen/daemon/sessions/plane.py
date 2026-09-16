@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -30,8 +31,18 @@ from miragen.daemon.sessions.models import (
     ProjectIdentity,
     now_iso,
 )
-from miragen.daemon.sessions.projects import ScopeAssignment, assign_scopes, resolve_project
+from miragen.daemon.sessions.projects import (
+    ScopeAssignment,
+    assign_scopes,
+    identity_from_directory,
+    identity_from_remote,
+    is_name_derived,
+    normalize_remote,
+    project_slug,
+    resolve_project,
+)
 from miragen.daemon.sessions.registry import EventJournal, SessionRegistry, pid_alive
+from miragen.daemon.sessions.store import StoreAPIError, StoreClient, StoreUnavailable
 from miragen.memory.client import MemoryAPIError, MemoryClient, MemoryUnavailable
 from miragen.memory.lifecycle import MemoryLifecycle
 from miragen.models import MemoryRecallSpec, MemoryScopesSpec, MemorySpec
@@ -75,6 +86,17 @@ class PlaneStats:
     last_loimi_error: str | None = None
     last_loimi_error_at: str | None = None
     by_harness: dict[str, int] = field(default_factory=dict)
+    # Artifact store (Loimi /v0) participation.
+    runs_opened: int = 0
+    runs_closed: int = 0
+    artifacts_written: int = 0
+    store_failures: int = 0
+    last_store_ok_at: str | None = None
+    last_store_error: str | None = None
+    last_store_error_at: str | None = None
+    # Startup provisioning + identity adoption.
+    adopted_by_name: int = 0
+    remote_sessions: int = 0
 
     def note_loimi(self, ok: bool, error: str | None = None) -> None:
         if ok:
@@ -82,6 +104,14 @@ class PlaneStats:
         else:
             self.last_loimi_error = (error or "unknown")[:300]
             self.last_loimi_error_at = now_iso()
+
+    def note_store(self, ok: bool, error: str | None = None) -> None:
+        if ok:
+            self.last_store_ok_at = now_iso()
+        else:
+            self.store_failures += 1
+            self.last_store_error = (error or "unknown")[:300]
+            self.last_store_error_at = now_iso()
 
     def snapshot(self) -> dict[str, Any]:
         data = {k: v for k, v in self.__dict__.items() if not k.endswith("_total")
@@ -119,12 +149,17 @@ class SessionPlane:
         telemetry=None,
         is_alive: Callable[[int], bool] = pid_alive,
         resolver: Callable[[str | None], ProjectIdentity] = resolve_project,
+        store_client: StoreClient | None = None,
+        local_host: str | None = None,
     ) -> None:
         import os
 
         self.config = config
         self.environ = os.environ if environ is None else environ
         self.state_dir = state_dir or config.resolved_state_dir(self.environ)
+        # Liveness and filesystem inspection only mean something for
+        # harnesses on this host; everything else is a remote session.
+        self.local_host = local_host or socket.gethostname()
         self.registry = SessionRegistry(
             self.state_dir,
             retention_hours=config.housekeeping.retention_hours,
@@ -146,12 +181,140 @@ class SessionPlane:
         self._unprovisionable: dict[str, str] = {}
         self._tasks: set[asyncio.Task] = set()
         self._sweeper: asyncio.Task | None = None
+        self.principal_source: str | None = None
+        self.shared_scopes_ready: dict[str, str] = {}
+        if store_client is not None:
+            self.store: StoreClient | None = store_client
+        elif config.store.enabled:
+            self.store = StoreClient(
+                config.store, environ=self.environ,
+                memory_endpoint_env=config.endpoint_env,
+                operator_token_env=config.operator_token_env,
+            )
+        else:
+            self.store = None
+        # Remote-derived identities seen so far, by repository name, so a
+        # path-only session (cloud VM) can join the project it belongs to.
+        self._known_by_name: dict[str, ProjectIdentity] = {}
+        for session in self.registry.list():
+            if session.project is not None:
+                self._remember_project(session.project)
 
     # ── lifecycle of the plane itself ──────────────────────────────────────
 
     async def start(self) -> None:
+        await self.ensure_principal()
+        await self.ensure_shared_scopes()
         await self.replay_journal()
         self._sweeper = asyncio.create_task(self._sweep_loop(), name="miragend-sessions-sweeper")
+
+    # ── startup provisioning ─────────────────────────────────────────────────
+
+    def _token_file(self) -> Path:
+        return self.state_dir / "principal.token"
+
+    async def ensure_principal(self) -> str:
+        """Make sure the daemon holds a principal token. Order: the
+        credential env (an operator-minted token wins), then the token this
+        daemon minted earlier (state dir), then — with the operator token
+        and `provision_principal: true` — create the principal or mint a
+        fresh token for an existing one, and persist it. Returns where the
+        credential came from; 'missing' means every path failed and the
+        plane will degrade explicitly on first use."""
+        credential_env = self.config.credential_env
+        if self.environ.get(credential_env):
+            self.principal_source = "environment"
+            return self.principal_source
+        token_file = self._token_file()
+        try:
+            stored = token_file.read_text().strip()
+        except OSError:
+            stored = ""
+        if stored:
+            self.environ[credential_env] = stored
+            self.principal_source = "state_dir"
+            return self.principal_source
+        if not self.config.provision_principal:
+            self.principal_source = "missing"
+            return self.principal_source
+        operator = self._operator_client()
+        if operator is None:
+            logger.warning(
+                f"no {credential_env} and no {self.config.operator_token_env}: the daemon "
+                "has no memory principal credential; memory degrades explicitly"
+            )
+            self.principal_source = "missing"
+            return self.principal_source
+        principal = self.config.principal
+        try:
+            try:
+                created = await asyncio.wait_for(
+                    operator.admin_create_principal(
+                        principal_id=principal, kind="agent",
+                        description="miragend session plane (external harness sessions)",
+                    ),
+                    timeout=WRITE_TIMEOUT_S,
+                )
+                token = created["token"]
+                how = "created"
+            except MemoryAPIError as exc:
+                if exc.status_code != 409:
+                    raise
+                minted = await asyncio.wait_for(
+                    operator.admin_mint_token(principal_id=principal), timeout=WRITE_TIMEOUT_S,
+                )
+                token = minted["token"]
+                how = "minted"
+        except (MemoryUnavailable, MemoryAPIError, asyncio.TimeoutError) as exc:
+            self.stats.note_loimi(False, f"provision principal: {exc}")
+            logger.warning(f"could not provision principal {principal}: {exc}")
+            self.principal_source = "missing"
+            return self.principal_source
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        token_file.write_text(token + "\n")
+        try:
+            token_file.chmod(0o600)
+        except OSError:  # pragma: no cover - exotic filesystems
+            pass
+        self.environ[credential_env] = token
+        self.stats.note_loimi(True)
+        self.principal_source = how
+        logger.info(f"principal {principal}: token {how} and persisted at {token_file}")
+        return self.principal_source
+
+    @staticmethod
+    def _scope_kind_for(scope_id: str) -> str:
+        prefix = scope_id.split(":", 1)[0] if ":" in scope_id else ""
+        return prefix if prefix in ("instance", "profile", "role", "group", "shared", "fleet") else "group"
+
+    async def ensure_shared_scopes(self) -> dict[str, str]:
+        """The read-only layers every session gets must exist and be
+        granted; on a fresh Loimi nothing does. Idempotent (409 = exists),
+        best-effort, and reported on /health rather than fatal."""
+        operator = self._operator_client()
+        for scope_id in self.config.scopes.shared_read:
+            if operator is None:
+                self.shared_scopes_ready[scope_id] = "unverified (no operator token)"
+                continue
+            try:
+                try:
+                    await asyncio.wait_for(operator.admin_create_scope(
+                        scope_id=scope_id, kind=self._scope_kind_for(scope_id),
+                        description="shared read layer for miragend external sessions",
+                    ), timeout=WRITE_TIMEOUT_S)
+                except MemoryAPIError as exc:
+                    if exc.status_code != 409:
+                        raise
+                await asyncio.wait_for(operator.admin_grant(
+                    principal_id=self.config.principal, scope_id=scope_id, verbs=["read"],
+                ), timeout=WRITE_TIMEOUT_S)
+                self.shared_scopes_ready[scope_id] = "ready"
+                self.stats.note_loimi(True)
+            except (MemoryUnavailable, MemoryAPIError, asyncio.TimeoutError) as exc:
+                self.shared_scopes_ready[scope_id] = f"failed: {exc}"[:200]
+                self.stats.note_loimi(False, f"shared scope {scope_id}: {exc}")
+                logger.warning(f"shared scope {scope_id} not ensured: {exc}")
+        return dict(self.shared_scopes_ready)
 
     async def stop(self, *, timeout: float = 10.0) -> None:
         if self._sweeper is not None:
@@ -262,21 +425,100 @@ class SessionPlane:
 
     # ── project + scopes ─────────────────────────────────────────────────────
 
+    def _client_is_local(self, envelope: EventEnvelope) -> bool:
+        client = envelope.client
+        if client.remote:
+            return False
+        return client.host is None or client.host == self.local_host
+
+    def _remember_project(self, project: ProjectIdentity) -> None:
+        if project.remote or not is_name_derived(project):
+            self._known_by_name.setdefault(project.name.lower(), project)
+
     async def _attach_project(self, session: ExternalSession, envelope: EventEnvelope) -> None:
-        cwd = envelope.client.cwd or envelope.client.project_dir
-        if not cwd:
+        """Identity, in order of trust in what we can verify: the remote
+        the adapter observed (works from any host), the daemon's own look
+        at the directory (this host only), the directory name (anything
+        else — optionally adopting a known project of that name)."""
+        client = envelope.client
+        cwd = client.cwd or client.project_dir
+        local = self._client_is_local(envelope)
+        if not local and not session.remote:
+            session.remote = True
+        project: ProjectIdentity | None = None
+        if client.project_remote:
+            project = identity_from_remote(client.project_remote, root=cwd)
+        elif not cwd:
             return
-        project = self._projects.get(cwd)
+        elif local:
+            project = self._projects.get(cwd)
+            if project is None:
+                try:
+                    project = await asyncio.to_thread(self._resolve, cwd)
+                except Exception as exc:  # resolution must never fail an event
+                    logger.warning(f"project resolution failed for {cwd}: {exc}")
+                    return
+                self._projects[cwd] = project
+        else:
+            project = identity_from_directory(cwd)
+            known = self._known_by_name.get(project.name.lower())
+            if known is not None and self.config.scopes.adopt_by_name:
+                project = ProjectIdentity(
+                    id=known.id, slug=known.slug, name=known.name, root=cwd, remote=known.remote,
+                )
+                self.stats.adopted_by_name += 1
         if project is None:
-            try:
-                project = await asyncio.to_thread(self._resolve, cwd)
-            except Exception as exc:  # resolution must never fail an event
-                logger.warning(f"project resolution failed for {cwd}: {exc}")
-                return
-            self._projects[cwd] = project
+            return
+        self._remember_project(project)
         session.project = project
         assignment = self._assignment_for(project)
         session.scope = assignment.write
+        if session.remote:
+            self.stats.remote_sessions += 1
+
+    def resolve_identity(self, text: str | None) -> ProjectIdentity:
+        """A project named by a tool call: a session key, a remote URL or
+        its normalized form, a known slug or repository name, or — as a
+        last resort — a bare name. None → the configured default."""
+        if not text:
+            return self._default_project()
+        value = text.strip()
+        session = self.registry.get(value)
+        if session is not None and session.project is not None:
+            return session.project
+        lowered = value.lower()
+        for project in {**self._projects, **{p.id: p for p in self._known_by_name.values()}}.values():
+            if lowered in (project.id, project.slug, project.name.lower()):
+                return project
+        if "/" in value or value.startswith("git@"):
+            return identity_from_remote(value)
+        if lowered.startswith("dir:") or lowered.startswith("path:"):
+            return ProjectIdentity(
+                id=lowered, slug=project_slug(lowered), name=lowered.split(":", 1)[1], root="",
+            )
+        known = self._known_by_name.get(lowered)
+        if known is not None:
+            return known
+        return identity_from_directory(value)
+
+    def _default_project(self) -> ProjectIdentity:
+        project_id = self.config.mcp.default_project.lower()
+        return ProjectIdentity(
+            id=project_id, slug=project_slug(project_id),
+            name=project_id.split(":", 1)[-1], root="",
+        )
+
+    def find_session(self, reference: str | None) -> ExternalSession | None:
+        """A session by key, by bare harness session id, or by store run."""
+        if not reference:
+            return None
+        direct = self.registry.get(reference)
+        if direct is not None:
+            return direct
+        for session in self.registry.list():
+            if reference in (session.session_id, session.run_id):
+                return session
+        return None
 
     def _assignment_for(self, project: ProjectIdentity) -> ScopeAssignment:
         assignment = self._assignments.get(project.id)
@@ -286,15 +528,24 @@ class SessionPlane:
         return assignment
 
     async def _lifecycle_for(self, session: ExternalSession) -> tuple[MemoryLifecycle | None, str | None]:
-        """The lifecycle bound to this session's project scopes, provisioning
-        the project scope first when policy says so. (None, reason) only when
-        the session has no project at all; a scope that could not be
-        provisioned still gets a lifecycle (fallback scope if configured,
-        else the project scope itself) so that Loimi's refusal degrades the
-        packet EXPLICITLY instead of the session silently getting nothing."""
+        """The lifecycle bound to this session's project scopes. (None,
+        reason) only when the session has no project at all."""
         if session.project is None:
             return None, "no working directory reported; memory not scoped"
-        assignment = self._assignment_for(session.project)
+        lifecycle, write, detail = await self.lifecycle_for_project(session.project)
+        session.scope = write
+        return lifecycle, detail
+
+    async def lifecycle_for_project(
+        self, project: ProjectIdentity,
+    ) -> tuple[MemoryLifecycle, str, str | None]:
+        """The lifecycle for a project's scopes, provisioning the project
+        scope first when policy says so. A scope that could not be
+        provisioned still gets a lifecycle (fallback scope if configured,
+        else the project scope itself) so that Loimi's refusal degrades the
+        packet EXPLICITLY instead of the caller silently getting nothing.
+        Returns (lifecycle, effective write scope, detail)."""
+        assignment = self._assignment_for(project)
         write = assignment.write
         read = assignment.read
         policy = self.config.scopes
@@ -329,11 +580,10 @@ class SessionPlane:
             lifecycle = MemoryLifecycle(
                 spec, self.config.principal, client,
                 state_dir=self.state_dir / "memory",
-                tools_available=False, selector=self.selector,
+                tools_available=self.config.mcp.enabled, selector=self.selector,
             )
             self._lifecycles[write] = lifecycle
-        session.scope = write
-        return lifecycle, detail
+        return lifecycle, write, detail
 
     def _operator_client(self) -> MemoryClient | None:
         token = self.environ.get(self.config.operator_token_env)
@@ -392,15 +642,34 @@ class SessionPlane:
         project = session.project
         parts = [
             f"harness={session.harness}",
+            f"session={session.key}",
             f"project={project.id if project else 'unknown'}",
             f"cwd={session.cwd or '?'}",
             f"scope={session.scope or 'none'}",
         ]
+        if session.remote:
+            parts.append(f"host={session.host or 'remote'}")
         if session.parent_session:
             parts.append(f"parent={session.parent_session}")
         if session.agent:
             parts.append(f"agent={session.agent}")
-        return "[session context — attributed reference data] " + " ".join(parts)
+        if session.run_id:
+            parts.append(f"store_run={session.run_id}")
+            parts.append(f"namespace={session.namespace}")
+        lines = ["[session context — attributed reference data] " + " ".join(parts)]
+        if self.config.mcp.enabled:
+            lines.append(
+                "[bridge tools] MCP server `miragen-bridge`, when connected: memory_recall / "
+                "memory_read / memory_remember / memory_correct / memory_checkpoint act on this "
+                f"project when called with project={project.id if project else 'unknown'!r} "
+                f"(or session={session.key!r}); store_put_artifact files an immutable artifact "
+                + (f"under this session's Loimi run {session.run_id} (pass run_id or session) "
+                   if session.run_id else "under a Loimi run (store_open_run first) ")
+                + "with honest direct `sources`; store_search / store_get_artifact / "
+                "store_lineage read the artifact store. A write counts only when the tool "
+                "answers accepted."
+            )
+        return "\n".join(lines)
 
     async def _open_context(
         self, session: ExternalSession, envelope: EventEnvelope,
@@ -410,6 +679,9 @@ class SessionPlane:
         if lifecycle is None:
             self.stats.retrieval_failures += 1
             return None, scope_detail
+        store_detail = await self._ensure_run(session)
+        if store_detail:
+            scope_detail = "; ".join(part for part in (scope_detail, store_detail) if part)
         started = time.monotonic()
         try:
             packet = await asyncio.wait_for(
@@ -530,6 +802,94 @@ class SessionPlane:
             await self._finalize(session, occurrence=occurrence)
         self.registry.save()
 
+    # ── artifact store (Loimi /v0) ───────────────────────────────────────────
+
+    def store_active(self) -> bool:
+        return self.store is not None and self.store.configured()
+
+    async def _ensure_run(self, session: ExternalSession) -> str | None:
+        """Open this session's Loimi run once. Returns a detail string
+        when the store is configured but refused/unreachable (explicit
+        degradation for the injected header), None otherwise."""
+        if self.store is None or session.run_id is not None:
+            return None
+        if not self.store.configured():
+            return None
+        namespace = self.store.namespace_for(session.project)
+        project = session.project.id if session.project else "unknown project"
+        task = f"{session.harness} session {session.session_id} in {project}"
+        started = time.monotonic()
+        try:
+            run = await asyncio.wait_for(
+                self.store.open_run(task=task, namespace=namespace, parent_run_id=None),
+                timeout=WRITE_TIMEOUT_S,
+            )
+        except (StoreUnavailable, StoreAPIError, asyncio.TimeoutError) as exc:
+            self.stats.note_store(False, f"open run: {exc}")
+            logger.warning(f"[{session.key}] store run not opened: {exc}")
+            return f"artifact store run not opened ({exc})"
+        finally:
+            self.stats.write_ms_total += (time.monotonic() - started) * 1000
+            self.stats.write_count += 1
+        session.run_id = str(run["id"])
+        session.namespace = namespace
+        session.run_status = "running"
+        self.stats.runs_opened += 1
+        self.stats.note_store(True)
+        return None
+
+    async def _store_episode(
+        self, session: ExternalSession, *, occurrence: str, digest: str,
+        memory_event_id: str | None,
+    ) -> None:
+        if self.store is None or occurrence in session.artifacts_written:
+            return
+        if session.run_id is None and await self._ensure_run(session):
+            return
+        if session.run_id is None:
+            return
+        try:
+            artifact = await asyncio.wait_for(self.store.put_artifact(
+                run_id=session.run_id, kind=self.config.store.episode_kind, content=digest,
+                properties={
+                    "harness": session.harness, "session": session.key,
+                    "occurrence": occurrence,
+                    "project": session.project.id if session.project else None,
+                    "scope": session.scope, "memory_event_id": memory_event_id,
+                    "prompts": session.counters.prompts, "turns": session.counters.turns,
+                    "tool_failures": session.counters.tool_failures,
+                    "compactions": session.counters.compactions,
+                    "end_reason": session.end_reason, "remote": session.remote,
+                },
+            ), timeout=WRITE_TIMEOUT_S)
+        except (StoreUnavailable, StoreAPIError, asyncio.TimeoutError) as exc:
+            self.stats.note_store(False, f"episode artifact: {exc}")
+            logger.warning(f"[{session.key}] episode artifact not written: {exc}")
+            return
+        session.artifacts_written.append(occurrence)
+        self.stats.artifacts_written += 1
+        self.stats.note_store(True)
+        if occurrence == "end":
+            await self._close_run(session)
+
+    async def _close_run(self, session: ExternalSession) -> None:
+        if self.store is None or session.run_id is None or session.run_status != "running":
+            return
+        status = "cancelled" if session.end_reason in ("process_gone", "silent") else "succeeded"
+        try:
+            await asyncio.wait_for(self.store.close_run(session.run_id, status), timeout=WRITE_TIMEOUT_S)
+        except StoreAPIError as exc:
+            # Already closed (a replayed finalization): the run is what it is.
+            if exc.status_code not in (409, 422):
+                self.stats.note_store(False, f"close run: {exc}")
+                return
+        except (StoreUnavailable, asyncio.TimeoutError) as exc:
+            self.stats.note_store(False, f"close run: {exc}")
+            return
+        session.run_status = status
+        self.stats.runs_closed += 1
+        self.stats.note_store(True)
+
     # ── episode + checkpoint ──────────────────────────────────────────────────
 
     def render_episode(self, session: ExternalSession, *, occurrence: str) -> str:
@@ -597,6 +957,13 @@ class SessionPlane:
             self.stats.capture_failures += 1
             self.stats.note_loimi(False, episode.get("detail"))
 
+        # The same digest becomes an immutable artifact under the session's
+        # run — the store is where a session's output is traceable later.
+        await self._store_episode(
+            session, occurrence=occurrence, digest=digest,
+            memory_event_id=episode.get("event_id"),
+        )
+
         patch = {"last_session": {
             "harness": session.harness,
             "session": session.key,
@@ -608,6 +975,7 @@ class SessionPlane:
             "last_prompt": session.prompts[-1] if session.prompts else None,
             "last_assistant": session.turns[-1][:300] if session.turns else None,
             "end_reason": session.end_reason,
+            "store_run": session.run_id,
         }}
         try:
             checkpoint = await asyncio.wait_for(
@@ -653,7 +1021,9 @@ class SessionPlane:
         return replayed
 
     async def sweep(self, *, now: datetime | None = None) -> int:
-        stale, pruned = self.registry.sweep(now=now, is_alive=self._is_alive)
+        stale, pruned = self.registry.sweep(
+            now=now, is_alive=self._is_alive, local_host=self.local_host,
+        )
         for session in stale:
             self.stats.finalized_by_sweep += 1
             logger.info(f"[{session.key}] finalizing: {session.end_reason}")
@@ -702,6 +1072,8 @@ class SessionPlane:
             by_harness[session.harness] = by_harness.get(session.harness, 0) + 1
         return {
             "principal": self.config.principal,
+            "principal_source": self.principal_source,
+            "host": self.local_host,
             "active_sessions": len(active),
             "active_by_harness": by_harness,
             "known_sessions": len(self.registry.list()),
@@ -709,10 +1081,22 @@ class SessionPlane:
                 "endpoint_configured": bool(self.environ.get(self.config.endpoint_env)),
                 "credential_configured": bool(self.environ.get(self.config.credential_env)),
                 "operator_configured": bool(self.environ.get(self.config.operator_token_env)),
+                "shared_scopes": dict(self.shared_scopes_ready),
                 "last_ok_at": self.stats.last_loimi_ok_at,
                 "last_error": self.stats.last_loimi_error,
                 "last_error_at": self.stats.last_loimi_error_at,
             },
+            "store": {
+                "enabled": self.store is not None,
+                "configured": self.store_active(),
+                "agent_id": self.config.store.agent_id if self.store else None,
+                "default_namespace": self.config.store.namespace if self.store else None,
+                "last_ok_at": self.stats.last_store_ok_at,
+                "last_error": self.stats.last_store_error,
+                "last_error_at": self.stats.last_store_error_at,
+            },
+            "mcp": {"enabled": self.config.mcp.enabled,
+                    "default_project": self.config.mcp.default_project},
             "recall": {
                 "enabled": self.config.recall.enabled,
                 "selector_configured": self.selector is not None,

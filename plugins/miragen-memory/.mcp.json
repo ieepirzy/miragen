@@ -1,0 +1,9 @@
+{
+  "miragen-bridge": {
+    "type": "http",
+    "url": "${user_config.daemon_url}/mcp",
+    "headers": {
+      "Authorization": "Bearer ${user_config.token}"
+    }
+  }
+}

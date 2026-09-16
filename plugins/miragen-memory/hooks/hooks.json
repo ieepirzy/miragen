@@ -1,0 +1,113 @@
+{
+  "description": "miragen memory bridge: forward every lifecycle event to miragend (stdlib adapter, fails open, never blocks the harness).",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}\" python3 -m miragen_hook claude-code",
+            "timeout": 15,
+            "statusMessage": "miragen memory"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}\" python3 -m miragen_hook claude-code",
+            "timeout": 15,
+            "statusMessage": "miragen memory"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}\" python3 -m miragen_hook claude-code",
+            "timeout": 5,
+            "statusMessage": "miragen memory"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}\" python3 -m miragen_hook claude-code",
+            "timeout": 5,
+            "statusMessage": "miragen memory"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}\" python3 -m miragen_hook claude-code",
+            "timeout": 5,
+            "statusMessage": "miragen memory"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}\" python3 -m miragen_hook claude-code",
+            "timeout": 5,
+            "statusMessage": "miragen memory"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}\" python3 -m miragen_hook claude-code",
+            "timeout": 5,
+            "statusMessage": "miragen memory"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}\" python3 -m miragen_hook claude-code",
+            "timeout": 5,
+            "statusMessage": "miragen memory"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}\" python3 -m miragen_hook claude-code",
+            "timeout": 3,
+            "statusMessage": "miragen memory"
+          }
+        ]
+      }
+    ]
+  }
+}
