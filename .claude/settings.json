@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "miragen": {
+      "source": {
+        "source": "github",
+        "repo": "ieepirzy/miragen"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "miragen-memory@miragen": true
+  }
+}
