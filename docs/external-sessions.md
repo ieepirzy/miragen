@@ -83,6 +83,23 @@ repository's `.claude/settings.json` (`extraKnownMarketplaces` +
 access, and set `MIRAGEND_URL` / `MIRAGEND_TOKEN` there — see
 [plugins/miragen-memory/README.md](../plugins/miragen-memory/README.md).
 
+### Join from an environment you do not control — one bootstrap
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ieepirzy/miragen/main/scripts/cloud-bootstrap.sh | bash
+```
+
+`scripts/cloud-bootstrap.sh` installs the plugin (marketplace + plugin, no
+token option — the hooks read `MIRAGEND_TOKEN` from the environment) AND
+writes `type: http` hooks into that user's `~/.claude/settings.json`,
+merging with what is there. Either path alone is enough; the daemon drops
+raw hooks for a session it already knows through the plugin adapter, so
+both together never inject twice. It never fails the caller. Put that one
+line in a Claude Code cloud environment's **setup script** and every
+session in that environment joins the bridge without any repository
+carrying configuration. The environment must set `MIRAGEND_TOKEN` (and
+optionally `MIRAGEND_URL`) and allow the daemon's host.
+
 ### Join from Claude Code — HTTP hooks in a repository
 
 ```bash
