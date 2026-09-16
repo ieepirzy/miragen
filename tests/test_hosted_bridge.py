@@ -309,6 +309,7 @@ class TestArtifactStore:
     async def test_replayed_finalization_does_not_duplicate_artifacts(self, tmp_path):
         h = Harness(tmp_path)
         await h.send("SessionStart", source="startup")
+        await h.send("UserPromptSubmit", prompt="work happened", prompt_id="p-1")
         await h.send("SessionEnd", reason="exit")
         await h.drain()
         session = h.plane.registry.get("claude-code:s-1")
@@ -354,6 +355,7 @@ class TestArtifactStore:
         assert "[memory guide" in result.context
         assert "store_run=" not in result.context
         assert "artifact store run not opened" in result.detail
+        await h.send("UserPromptSubmit", prompt="work happened", prompt_id="p-1")
         await h.send("SessionEnd", reason="exit")
         await h.drain()
         assert h.plane.stats.store_failures >= 2
@@ -563,6 +565,7 @@ class TestReviewFindings:
         memory episode keys."""
         h = Harness(tmp_path, alive={4242})
         await h.send("SessionStart", source="startup")
+        await h.send("UserPromptSubmit", prompt="first life work", prompt_id="p-0")
         first_run = h.plane.registry.get("claude-code:s-1").run_id
         h.alive.clear()
         await h.plane.sweep(now=datetime.now(timezone.utc) + timedelta(seconds=10))
@@ -591,6 +594,7 @@ class TestReviewFindings:
     async def test_run_closed_even_when_end_artifact_fails(self, tmp_path):
         h = Harness(tmp_path)
         await h.send("SessionStart", source="startup")
+        await h.send("UserPromptSubmit", prompt="work happened", prompt_id="p-1")
         session = h.plane.registry.get("claude-code:s-1")
         # Make the store refuse artifacts for this run while still accepting the close.
         original = h.fake_store._handle
@@ -703,3 +707,46 @@ class TestCaptureKeyAttributes:
         assert event_idempotency_key(a) != event_idempotency_key(b)
         assert event_idempotency_key(a) == event_idempotency_key(
             normalize_hook_payload("claude-code", {**base, "stop_reason": "end_turn"}))
+
+
+class TestEmptySessionsAndWorkspaceRoots:
+    async def test_empty_session_leaves_no_trail_and_cancels_its_run(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup")
+        session = h.plane.registry.get("claude-code:s-1")
+        run_id = session.run_id
+        await h.send("SessionEnd", reason="other")
+        await h.drain()
+        assert h.fake_store.artifacts == {}
+        assert h.fake_store.runs[run_id]["status"] == "cancelled"
+        assert h.events("session_episode") == []
+        assert h.plane.stats.empty_sessions == 1 and h.plane.stats.episodes == 0
+        assert h.context_state() is None or "last_session" not in (h.context_state() or {})
+
+    async def test_session_with_a_prompt_is_not_empty(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup")
+        await h.send("UserPromptSubmit", prompt="do the thing", prompt_id="p-1")
+        await h.send("SessionEnd", reason="exit")
+        await h.drain()
+        assert len(h.fake_store.artifacts) == 1 and h.plane.stats.empty_sessions == 0
+
+    async def test_directory_above_several_clones_is_a_workspace(self, tmp_path):
+        h = Harness(tmp_path)
+        # The cloud harness touches each clone first (remote known per repo)...
+        for i, repo in enumerate(("repo", "other")):
+            await h.send("SessionStart", source="startup", session=f"c-{i}", cwd=f"/home/user/{repo}",
+                         host="vm", remote=True, project_remote=f"git@github.com:org/{repo}.git")
+        # ...then the main session runs above them.
+        result = await h.send("SessionStart", source="startup", session="main", cwd="/home/user",
+                              host="vm", remote=True)
+        main = h.plane.registry.get("claude-code:main")
+        assert main.project.id == "workspace:user"
+        assert main.scope == "group:project.workspace-user"
+        assert "project=workspace:user" in result.context
+
+    async def test_lone_remote_directory_is_still_dir(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", session="c-1", cwd="/home/user",
+                     host="vm", remote=True)
+        assert h.plane.registry.get("claude-code:c-1").project.id == "dir:user"

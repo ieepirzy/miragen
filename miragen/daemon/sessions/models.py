@@ -211,6 +211,13 @@ class ExternalSession(_Tolerant):
             self.run_status = None
             self.artifacts_written = []
 
+    def is_empty(self) -> bool:
+        """Nothing happened: no prompt, no turn, no tool failure, no child.
+        Cloud harnesses touch every cloned repository at start with a
+        session that opens and closes in seconds — those leave no trail."""
+        c = self.counters
+        return not (c.prompts or c.turns or c.tool_failures or self.children)
+
     def end(self, reason: str | None) -> None:
         if self.state != "ended":
             self.state = "ended"
