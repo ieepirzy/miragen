@@ -98,6 +98,7 @@ class PlaneStats:
     adopted_by_name: int = 0
     remote_sessions: int = 0
     raw_hooks_shadowed: int = 0
+    late_opens: int = 0
 
     def note_loimi(self, ok: bool, error: str | None = None) -> None:
         if ok:
@@ -390,7 +391,18 @@ class SessionPlane:
             elif event.name == "input.received":
                 session.note_prompt(event.content)
                 self._journal_and_capture(session, envelope)
-                context, detail = await self._prompt_recall(session, envelope)
+                if session.counters.injections == 0:
+                    # The session's start was never answered (a SessionStart
+                    # hook that ran before its credentials existed — seen on
+                    # cloud VMs — or a daemon that was down). The first prompt
+                    # is the next context-bearing event: open the context now,
+                    # so the session still gets its working state and guide.
+                    self.stats.late_opens += 1
+                    context, detail = await self._open_context(session, envelope)
+                recalled, recall_detail = await self._prompt_recall(session, envelope)
+                if recalled:
+                    context = f"{context}\n{recalled}" if context else recalled
+                detail = "; ".join(part for part in (detail, recall_detail) if part) or None
             elif event.name == "turn.finished":
                 session.note_turn(event.content)
                 self._journal_and_capture(session, envelope)

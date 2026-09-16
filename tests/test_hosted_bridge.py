@@ -24,6 +24,7 @@ from miragen.daemon.sessions.config import (
 )
 from miragen.daemon.sessions.projects import identity_from_directory, identity_from_remote
 from miragen.memory.ephemeral import EphemeralMemoryService
+from miragen_hook.normalize import normalize_hook_payload
 from tests.test_sessions_plane import (
     LOCAL_HOST,
     PRINCIPAL,
@@ -655,3 +656,50 @@ class TestRawHookShadowing:
             assert "[memory guide" in other.json()["hookSpecificOutput"]["additionalContext"]
         assert h.plane.stats.raw_hooks_shadowed == 1
         assert h.plane.stats.events_received == 2
+
+
+class TestLateOpen:
+    async def test_first_prompt_opens_context_when_start_was_missed(self, tmp_path):
+        """A SessionStart that never reached the daemon (cloud VMs fire it
+        before their environment variables exist): the first prompt gets
+        the opening context instead, exactly once."""
+        h = Harness(tmp_path)
+        first = await h.send("UserPromptSubmit", prompt="first thing", prompt_id="p-1")
+        assert first.context is not None
+        assert "[memory guide" in first.context and "[session context" in first.context
+        session = h.plane.registry.get("claude-code:s-1")
+        assert session.counters.injections == 1 and session.run_id in h.fake_store.runs
+        assert h.plane.stats.late_opens == 1
+        second = await h.send("UserPromptSubmit", prompt="second thing", prompt_id="p-2")
+        assert second.context is None  # recall lane off; no re-injection
+        assert h.plane.stats.late_opens == 1
+
+    async def test_normal_start_is_not_a_late_open(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup")
+        prompt = await h.send("UserPromptSubmit", prompt="hello there", prompt_id="p-1")
+        assert prompt.context is None and h.plane.stats.late_opens == 0
+
+    def test_raw_first_prompt_gets_context_in_harness_shape(self, tmp_path):
+        h = Harness(tmp_path)
+        app = create_app(None, token="secret", sessions=h.plane)
+        with TestClient(app) as client:
+            answer = client.post("/sessions/v1/hooks/claude-code",
+                                 headers={"Authorization": "Bearer secret"},
+                                 json={**RAW_START, "hook_event_name": "UserPromptSubmit",
+                                       "prompt": "hello from the vm", "prompt_id": "p-1"})
+            out = answer.json()["hookSpecificOutput"]
+            assert out["hookEventName"] == "UserPromptSubmit"
+            assert "[memory guide" in out["additionalContext"]
+
+
+class TestCaptureKeyAttributes:
+    def test_same_message_different_attributes_are_distinct(self):
+        from miragen_hook.normalize import event_idempotency_key
+
+        base = {"session_id": "s", "hook_event_name": "Stop", "last_assistant_message": "Done."}
+        a = normalize_hook_payload("claude-code", {**base, "stop_reason": "end_turn"})
+        b = normalize_hook_payload("claude-code", {**base, "stop_reason": "max_tokens"})
+        assert event_idempotency_key(a) != event_idempotency_key(b)
+        assert event_idempotency_key(a) == event_idempotency_key(
+            normalize_hook_payload("claude-code", {**base, "stop_reason": "end_turn"}))

@@ -169,12 +169,15 @@ def event_idempotency_key(event: NormalizedEvent) -> str:
     """Stable per-occurrence key: a redelivered hook never writes twice.
     The discriminator prefers harness-supplied ids; a hash of the stored
     content is the fallback for events that carry none."""
+    fingerprint = captured_content(event) + json.dumps(
+        event.attributes, sort_keys=True, default=str,
+    )
     discriminator = (
         event.ids.get("tool_use_id")
         or event.ids.get("prompt_id")
         or event.ids.get("turn_id")
         or event.ids.get("agent_id")
-        or hashlib.sha256(captured_content(event).encode()).hexdigest()[:16]
+        or hashlib.sha256(fingerprint.encode()).hexdigest()[:16]
     )
     return f"hook:{event.harness}:{event.session_id}:{event.original_event}:{discriminator}"
 
