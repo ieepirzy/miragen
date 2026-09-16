@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from miragen.daemon.core import DaemonError
-from miragen.daemon.sessions.models import EventEnvelope
+from miragen.daemon.sessions.models import EventEnvelope, session_key
 from miragen.daemon.sessions.plane import SessionPlane
 from miragen_hook.client import build_envelope
 from miragen_hook.normalize import (
@@ -80,6 +80,16 @@ def register_session_routes(app: FastAPI, plane: SessionPlane, *, dependencies: 
                                 content={"detail": "hook payload must be an object", "code": "malformed_event"})
         event = normalize_hook_payload(harness, payload)
         if event is None or event.session_id is None:
+            return JSONResponse({})
+        # A machine that runs BOTH the adapter (plugin) and a repository's
+        # HTTP hooks reports every event twice. The adapter's envelope is
+        # the richer one (pid, host, remote flag, project remote), so once
+        # a session is known through an adapter, its raw hooks are
+        # acknowledged and dropped — otherwise the context would be
+        # injected twice at every start.
+        known = plane.registry.get(session_key(harness, event.session_id))
+        if known is not None and known.adapter and known.adapter != "http-hook":
+            plane.stats.raw_hooks_shadowed += 1
             return JSONResponse({})
         try:
             envelope = EventEnvelope.model_validate(build_envelope(
