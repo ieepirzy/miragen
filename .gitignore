@@ -50,7 +50,10 @@ coverage.xml
 docs/_build/
 
 # local agent configuration
-.claude/
+# Claude Code: personal files stay out; the shared project settings
+# (marketplace + plugin declaration) travel with the repository.
+.claude/*
+!.claude/settings.json
 
 .venv/
 .pytest_cache/
