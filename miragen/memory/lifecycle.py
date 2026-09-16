@@ -429,6 +429,7 @@ class MemoryLifecycle:
         Idempotent per occurrence; fail-open for the harness but counted
         as degradation, never silent."""
         from miragen.memory.harness_hooks import event_idempotency_key
+        from miragen_hook.normalize import captured_content
 
         try:
             result = await self.client.append_event(
@@ -438,8 +439,7 @@ class MemoryLifecycle:
                     "kind": f"harness:{event.name}",
                     "ref": f"session:{event.session_id}" if event.session_id else None,
                 },
-                content=event.content
-                or json.dumps({"event": event.original_event, **event.attributes}),
+                content=captured_content(event),
                 attributes={
                     "harness": event.harness,
                     "original_event": event.original_event,

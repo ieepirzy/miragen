@@ -18,6 +18,7 @@ spelling costs nothing and keeps the adapter working across versions.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -153,16 +154,27 @@ def normalize_hook_payload(harness: str, payload: dict) -> NormalizedEvent | Non
     return None
 
 
+def captured_content(event: NormalizedEvent) -> str:
+    """What a capture stores for this event: its content, or — for events
+    that carry none (a Stop without a last message) — the event name and
+    attributes. One definition, used by the key AND by the write, so the
+    same key always names the same content (Loimi refuses a reused key
+    with different content, 409)."""
+    return event.content or json.dumps(
+        {"event": event.original_event, **event.attributes}, sort_keys=True, default=str,
+    )
+
+
 def event_idempotency_key(event: NormalizedEvent) -> str:
     """Stable per-occurrence key: a redelivered hook never writes twice.
-    The discriminator prefers harness-supplied ids; content hash is the
-    fallback for events that carry neither."""
+    The discriminator prefers harness-supplied ids; a hash of the stored
+    content is the fallback for events that carry none."""
     discriminator = (
         event.ids.get("tool_use_id")
         or event.ids.get("prompt_id")
         or event.ids.get("turn_id")
         or event.ids.get("agent_id")
-        or hashlib.sha256((event.content or "").encode()).hexdigest()[:16]
+        or hashlib.sha256(captured_content(event).encode()).hexdigest()[:16]
     )
     return f"hook:{event.harness}:{event.session_id}:{event.original_event}:{discriminator}"
 

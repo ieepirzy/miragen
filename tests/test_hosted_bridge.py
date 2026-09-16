@@ -620,3 +620,17 @@ class TestReviewFindings:
         assert h.plane.resolve_identity("/w/repo").id == "github.com/org/repo"
         assert h.plane.resolve_identity("/w/repo/").id == "github.com/org/repo"
         assert h.plane.resolve_identity("s-1").id == "github.com/org/repo"  # bare harness id
+
+
+class TestMidLifeSessions:
+    async def test_session_first_seen_on_a_capture_gets_a_run(self, tmp_path):
+        """Hooks installed while a session was already running: the first
+        event the daemon sees is a prompt, not a SessionStart."""
+        h = Harness(tmp_path)
+        await h.send("UserPromptSubmit", prompt="already running", prompt_id="p-1")
+        await h.drain()
+        session = h.plane.registry.get("claude-code:s-1")
+        assert session.run_id in h.fake_store.runs
+        await h.send("SessionEnd", reason="exit")
+        await h.drain()
+        assert [a["properties"]["occurrence"] for a in h.fake_store.artifacts.values()] == ["end"]
