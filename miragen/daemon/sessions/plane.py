@@ -99,6 +99,7 @@ class PlaneStats:
     remote_sessions: int = 0
     raw_hooks_shadowed: int = 0
     late_opens: int = 0
+    empty_sessions: int = 0
 
     def note_loimi(self, ok: bool, error: str | None = None) -> None:
         if ok:
@@ -474,8 +475,13 @@ class SessionPlane:
                 self._projects[cwd] = project
         else:
             project = identity_from_directory(cwd)
+            if self._looks_like_workspace_root(cwd):
+                project = ProjectIdentity(
+                    id=f"workspace:{project.name.lower()}", slug=project_slug(f"workspace-{project.name}"),
+                    name=project.name, root=cwd, remote=None,
+                )
             known = self._known_by_name.get(project.name.lower())
-            if known is not None and self.config.scopes.adopt_by_name:
+            if known is not None and self.config.scopes.adopt_by_name and not project.id.startswith("workspace:"):
                 project = ProjectIdentity(
                     id=known.id, slug=known.slug, name=known.name, root=cwd, remote=known.remote,
                 )
@@ -488,6 +494,19 @@ class SessionPlane:
         session.scope = assignment.write
         if session.remote:
             self.stats.remote_sessions += 1
+
+    def _looks_like_workspace_root(self, cwd: str) -> bool:
+        """A remote cwd that other known remote-derived projects sit
+        directly under (a multi-repository cloud workspace such as
+        /home/user with one clone per repository) is a workspace, not a
+        project of its own."""
+        prefix = cwd.rstrip("/") + "/"
+        children = 0
+        for project in list(self._known_by_name.values()) + list(self._projects.values()):
+            root = (project.root or "").rstrip("/")
+            if root.startswith(prefix) and "/" not in root[len(prefix):] and project.remote:
+                children += 1
+        return children >= 2
 
     def resolve_identity(self, text: str | None) -> ProjectIdentity:
         """A project named by a tool call: a session key, a remote URL or
@@ -893,10 +912,11 @@ class SessionPlane:
         self.stats.artifacts_written += 1
         self.stats.note_store(True)
 
-    async def _close_run(self, session: ExternalSession) -> None:
+    async def _close_run(self, session: ExternalSession, *, status: str | None = None) -> None:
         if self.store is None or session.run_id is None or session.run_status != "running":
             return
-        status = "cancelled" if session.end_reason in ("process_gone", "silent") else "succeeded"
+        if status is None:
+            status = "cancelled" if session.end_reason in ("process_gone", "silent") else "succeeded"
         try:
             await asyncio.wait_for(self.store.close_run(session.run_id, status), timeout=WRITE_TIMEOUT_S)
         except StoreAPIError as exc:
@@ -939,6 +959,16 @@ class SessionPlane:
         lifecycle, reason = await self._lifecycle_for(session)
         if lifecycle is None:
             logger.info(f"[{session.key}] finalize skipped: {reason}")
+            return
+        if session.is_empty():
+            # No episode, no artifact, no checkpoint for a session that did
+            # nothing; its run (opened at start, before we could know) is
+            # closed as cancelled so the store shows what it was.
+            self.stats.empty_sessions += 1
+            if occurrence == "end":
+                session.end_reason = session.end_reason or "empty"
+                await self._close_run(session, status="cancelled")
+                self.journal.clear(session.key)
             return
         instance = session.project.slug if session.project else None
         digest = self.render_episode(session, occurrence=occurrence)
