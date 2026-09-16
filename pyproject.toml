@@ -66,6 +66,9 @@ dev = [
     # it the snapshot records coverage as unmeasured, which is honest but
     # leaves a real gap in the series.
     "pytest-cov>=5.0",
+    # The bridge MCP's OAuth guard is exercised by tests/test_hosted_bridge.py;
+    # CI installs `.[dev]` only.
+    "origo>=0.3.0",
 ]
 # Executor backend tier (self-harnessed executors). `openai-codex` is OpenAI's
 # App Server JSON-RPC SDK (AsyncCodex → threads → turns → notifications), which
@@ -97,6 +100,15 @@ grok-build = [
 daemon = [
     "docker>=7.0",
     "sqlalchemy>=2.0",
+    # The bridge MCP mount's OAuth credential class (claude.ai custom
+    # connectors); the same drop-in provider Loimi/miradeploy/mirarun use.
+    "origo>=0.3.0",
+]
+# The session plane alone (docs/external-sessions.md): a hosted or local
+# miragend that serves Claude Code/Codex sessions and the bridge MCP without
+# Docker. `daemon` is a superset.
+bridge = [
+    "origo>=0.3.0",
 ]
 
 [project.urls]

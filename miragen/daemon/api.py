@@ -135,11 +135,16 @@ def create_app(
     internal_token: str = "",
     contract_transport=None,
     sessions: SessionPlane | None = None,
+    bridge_oauth: dict | None = None,
 ) -> FastAPI:
     """`core` is the Docker-bound lifecycle plane; `sessions` the external
     session plane (docs/design/external-sessions.md). Either may be absent:
     a developer-machine daemon runs sessions without Docker, a swarm host
-    may run the lifecycle plane alone. /health advertises what is served."""
+    may run the lifecycle plane alone. /health advertises what is served.
+
+    `bridge_oauth` (optional, with `sessions`): origo settings for the
+    bridge MCP mount — {"base_url", "client_id", "client_secret",
+    "auto_approve", "redirect_uris", "storage_path"}; None = bearer only."""
     app = FastAPI(title="miragend", version=_miragen_version())
 
     async def require_token(request: Request) -> None:
@@ -186,6 +191,8 @@ def create_app(
             capabilities += list(CONTRACT_CAPABILITIES)
         if sessions is not None:
             capabilities.append(SESSIONS_CAPABILITY)
+            if sessions.config.mcp.enabled:
+                capabilities.append(BRIDGE_MCP_CAPABILITY)
         body = {
             "status": "ok",
             "service": "miragend",
@@ -194,6 +201,7 @@ def create_app(
         }
         if sessions is not None:
             body["sessions"] = sessions.describe()
+            body["sessions"]["mcp"]["oauth"] = bridge_oauth is not None
         return body
 
     if sessions is not None:
@@ -204,6 +212,9 @@ def create_app(
         # adding the scheduler's handlers the same way.
         app.router.on_startup.append(sessions.start)
         app.router.on_shutdown.append(sessions.stop)
+
+        if sessions.config.mcp.enabled:
+            mount_bridge_mcp(app, sessions, token=token, oauth=bridge_oauth)
 
     if core is None:
         return app
@@ -356,6 +367,156 @@ def create_app(
 
 
 # ---------------------------------------------------------------------------
+# Bridge MCP mount (/mcp): bearer OR origo OAuth
+# ---------------------------------------------------------------------------
+
+BRIDGE_MCP_CAPABILITY = "bridge-mcp/v1"
+
+
+class _BridgeMcpGuard:
+    """ASGI guard for the mounted FastMCP app. Route dependencies don't
+    reach a mounted sub-app, so the two credential classes are checked
+    here: the daemon bearer (automation, `claude mcp add --header`) and,
+    when configured, an origo access token (claude.ai custom connector).
+    An empty daemon token keeps the existing "network isolation" contract
+    — the mount is then open unless origo is configured, in which case
+    origo is the only gate."""
+
+    def __init__(self, token: str) -> None:
+        self.token = token
+        self.provider = None
+        self.inner = _bridge_not_ready
+
+    def _authorized(self, auth_header: bytes) -> bool:
+        if self.token and hmac.compare_digest(auth_header, f"Bearer {self.token}".encode()):
+            return True
+        if self.provider is not None:
+            value = auth_header.decode("latin-1", "replace")
+            scheme, _, token = value.partition(" ")
+            if scheme.lower() == "bearer" and token and self.provider.verify_token(
+                token, resource=self.provider.resource_identifier
+            ) is not None:
+                return True
+            return False
+        return not self.token  # unguarded daemon, no origo: network isolation
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            supplied = b""
+            for raw_name, raw_value in scope.get("headers") or []:
+                if raw_name == b"authorization":
+                    supplied = raw_value
+                    break
+            if not self._authorized(supplied):
+                headers = [(b"content-type", b"application/json")]
+                if self.provider is not None:
+                    # RFC 9728 challenge: an OAuth-capable client discovers
+                    # the authorization server from resource_metadata.
+                    headers.append((b"www-authenticate", (
+                        f'Bearer realm="{self.provider.base_url}", '
+                        f'resource_metadata="{self.provider.protected_resource_metadata_url}"'
+                    ).encode()))
+                await send({"type": "http.response.start", "status": 401, "headers": headers})
+                await send({"type": "http.response.body",
+                            "body": b'{"detail": "missing or invalid bearer token", "code": "unauthorized"}'})
+                return
+        await self.inner(scope, receive, send)
+
+
+async def _bridge_not_ready(scope, receive, send):
+    if scope["type"] == "http":
+        await send({"type": "http.response.start", "status": 503,
+                    "headers": [(b"content-type", b"application/json")]})
+        await send({"type": "http.response.body",
+                    "body": b'{"detail": "bridge MCP not started", "code": "unavailable"}'})
+
+
+def mount_bridge_mcp(app: FastAPI, sessions: SessionPlane, *, token: str, oauth: dict | None) -> None:
+    from contextlib import AsyncExitStack
+
+    from miragen.daemon.sessions.bridge_mcp import build_bridge_mcp
+
+    guard = _BridgeMcpGuard(token)
+    mcp = build_bridge_mcp(lambda: sessions)
+    app.state.bridge_mcp = mcp
+
+    if oauth is not None:
+        from origo import OAuthProvider
+
+        provider = OAuthProvider(
+            base_url=oauth["base_url"],
+            clients={oauth["client_id"]: oauth["client_secret"]},
+            client_redirect_uris={oauth["client_id"]: list(oauth["redirect_uris"])},
+            auto_approve=bool(oauth.get("auto_approve", False)),
+            mcp_path="/mcp",
+            storage_path=oauth.get("storage_path"),
+        )
+        guard.provider = provider
+        # Adopt origo's flow routes AND its state (its endpoints read
+        # request.app.state; the set grows between releases — README:
+        # never hand-copy a subset).
+        oauth_app = provider.asgi_app()
+        for route in reversed(oauth_app.routes):
+            app.router.routes.insert(0, route)
+        for key, value in vars(oauth_app.state)["_state"].items():
+            setattr(app.state, key, value)
+        logger.info(f"bridge MCP: origo OAuth enabled for client {oauth['client_id']!r}")
+
+    @app.middleware("http")
+    async def _mcp_mount_slash(request: Request, call_next):
+        # claude.ai's connector client POSTs to /mcp exactly and does not
+        # follow the mount's 307 to /mcp/ (Loimi, observed live 2026-08-12).
+        if request.scope["path"] == "/mcp":
+            request.scope["path"] = "/mcp/"
+        return await call_next(request)
+
+    app.mount("/mcp", guard)
+
+    stack = AsyncExitStack()
+
+    async def _start() -> None:
+        guard.inner = mcp.streamable_http_app()
+        await stack.enter_async_context(mcp.session_manager.run())
+
+    async def _stop() -> None:
+        guard.inner = _bridge_not_ready
+        await stack.aclose()
+
+    app.router.on_startup.append(_start)
+    app.router.on_shutdown.append(_stop)
+
+
+def bridge_oauth_from_env(state_dir: Path) -> dict | None:  # pragma: no cover - deployment wiring
+    """MCP_BASE_URL + MCP_CLIENT_ID + MCP_CLIENT_SECRET, all three or none
+    (the miradeploy/mirarun/Loimi convention). Token storage persists in
+    the state dir so a restart does not log every connector out."""
+    base_url = os.getenv("MCP_BASE_URL")
+    client_id = os.getenv("MCP_CLIENT_ID")
+    client_secret = os.getenv("MCP_CLIENT_SECRET")
+    if not (base_url and client_id and client_secret):
+        if any((base_url, client_id, client_secret)):
+            logger.warning("bridge MCP: MCP_BASE_URL/MCP_CLIENT_ID/MCP_CLIENT_SECRET are all "
+                           "required together; OAuth disabled, bearer only")
+        return None
+    extras = [u.strip() for u in os.getenv("MCP_CLIENT_REDIRECT_URIS", "").split(",") if u.strip()]
+    redirect_uris = list(BRIDGE_DEFAULT_REDIRECT_URIS) + [
+        u for u in extras if u not in BRIDGE_DEFAULT_REDIRECT_URIS
+    ]
+    return {
+        "base_url": base_url, "client_id": client_id, "client_secret": client_secret,
+        "auto_approve": os.getenv("MCP_AUTO_APPROVE", "false").lower() == "true",
+        "redirect_uris": redirect_uris,
+        "storage_path": str(state_dir / "oauth-state.sqlite"),
+    }
+
+
+BRIDGE_DEFAULT_REDIRECT_URIS = (
+    "https://claude.ai/api/mcp/auth_callback",
+    "https://claude.com/api/mcp/auth_callback",
+)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -424,7 +585,10 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
             raise SystemExit(
                 "MIRAGEND_LIFECYCLE=off and no MIRAGEND_SESSIONS_CONFIG: nothing to serve"
             )
-        app = create_app(None, token=token, sessions=sessions)
+        app = create_app(
+            None, token=token, sessions=sessions,
+            bridge_oauth=bridge_oauth_from_env(sessions.state_dir) if sessions.config.mcp.enabled else None,
+        )
         uvicorn.run(
             app,
             host=os.getenv("MIRAGEND_HOST", "127.0.0.1"),
@@ -485,6 +649,10 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
         token=token,
         internal_token=os.getenv("MIRAGEN_INTERNAL_TOKEN", ""),
         sessions=sessions,
+        bridge_oauth=(
+            bridge_oauth_from_env(sessions.state_dir)
+            if sessions is not None and sessions.config.mcp.enabled else None
+        ),
     )
 
     @app.router.on_event("startup")

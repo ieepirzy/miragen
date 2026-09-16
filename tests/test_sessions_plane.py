@@ -29,6 +29,7 @@ from miragen.daemon.sessions.config import (
 from miragen.daemon.sessions.models import EventEnvelope, ProjectIdentity
 from miragen.daemon.sessions.plane import SessionPlane
 from miragen.daemon.sessions.projects import assign_scopes, normalize_remote, project_slug
+from miragen.daemon.sessions.store import StoreClient
 from miragen.memory.client import MemoryClient
 from miragen.memory.ephemeral import EphemeralMemoryService, provision_profile
 from miragen.memory.selection import Selection, SelectionResult
@@ -51,8 +52,13 @@ CLAUDE = {"session_id": "s-1", "transcript_path": "/t.jsonl", "cwd": "/w/repo",
           "permission_mode": "default"}
 
 
+LOCAL_HOST = "desk"
+STORE_TOKEN = "store-secret"
+
+
 def envelope(hook_event: str, *, harness="claude-code", session="s-1", cwd="/w/repo",
-             pid=4242, client_extra=None, **payload) -> EventEnvelope:
+             pid=4242, client_extra=None, host=None, remote=None, project_remote=None,
+             **payload) -> EventEnvelope:
     """An envelope exactly as miragen_hook would post it for this hook."""
     raw = {**CLAUDE, "session_id": session, "cwd": cwd, "hook_event_name": hook_event, **payload}
     event = normalize_hook_payload(harness, raw)
@@ -60,8 +66,87 @@ def envelope(hook_event: str, *, harness="claude-code", session="s-1", cwd="/w/r
     return EventEnvelope.model_validate({
         "harness": harness, "session_id": session, "event": event.to_dict(),
         "client": {"pid": pid, "cwd": cwd, "user": "ilari", "adapter": "miragen-hook/1",
+                   "host": host, "remote": remote, "project_remote": project_remote,
                    **(client_extra or {})},
     })
+
+
+class FakeStore:
+    """Loimi's /v0 artifact store, enough of it for the plane and the
+    bridge tools: runs, artifacts, lineage, search, namespaces. Bearer
+    must be the store token — the operator credential, never a memory
+    principal's."""
+
+    def __init__(self, token: str = STORE_TOKEN, namespaces=("mira", "infra", "muutto365")):
+        self.token = token
+        self.namespaces = {n: {"id": n, "description": n} for n in namespaces}
+        self.runs: dict[str, dict] = {}
+        self.artifacts: dict[str, dict] = {}
+        self.requests: list[tuple[str, str]] = []
+
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self._handle)
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        import uuid
+
+        path = request.url.path
+        self.requests.append((request.method, path))
+        if request.headers.get("authorization") != f"Bearer {self.token}":
+            return httpx.Response(401, json={"detail": "unauthenticated", "code": "unauthenticated"})
+        body = json.loads(request.content) if request.content else {}
+        if request.method == "POST" and path == "/v0/runs":
+            if body["namespace"] not in self.namespaces:
+                return httpx.Response(422, json={"detail": "unknown namespace", "code": "unknown_namespace"})
+            run = {"id": str(uuid.uuid4()), "agent_id": body["agent_id"], "task": body["task"],
+                   "namespace": body["namespace"], "parent_run_id": body.get("parent_run_id"),
+                   "status": "running", "finished_at": None}
+            self.runs[run["id"]] = run
+            return httpx.Response(201, json=run)
+        if request.method == "PATCH" and path.startswith("/v0/runs/"):
+            run = self.runs.get(path.rsplit("/", 1)[-1])
+            if run is None:
+                return httpx.Response(404, json={"detail": "no run", "code": "not_found"})
+            if run["status"] != "running":
+                return httpx.Response(409, json={"detail": "closed", "code": "illegal_transition"})
+            run["status"] = body["status"]
+            return httpx.Response(200, json=run)
+        if request.method == "GET" and path.endswith("/tree"):
+            run_id = path.split("/")[3]
+            return httpx.Response(200, json={"run": self.runs.get(run_id), "artifacts": [
+                a for a in self.artifacts.values() if a["producer"]["run_id"] == run_id
+            ], "children": []})
+        if request.method == "POST" and path == "/v0/artifacts":
+            run = self.runs.get(str(body["run_id"]))
+            if run is None or run["status"] != "running":
+                return httpx.Response(409, json={"detail": "run not open", "code": "illegal_transition"})
+            artifact = {"id": str(uuid.uuid4()), "kind": body["kind"], "content": body.get("content"),
+                        "properties": body.get("properties", {}),
+                        "producer": {"agent_id": run["agent_id"], "run_id": run["id"]},
+                        "sources": body.get("sources", []),
+                        "namespaces": [{"namespace": run["namespace"], "tier": "provenance",
+                                        "status": "confirmed", "source": "run"}]}
+            self.artifacts[artifact["id"]] = artifact
+            return httpx.Response(201, json=artifact)
+        if request.method == "GET" and path.startswith("/v0/artifacts/"):
+            parts = path.split("/")
+            artifact = self.artifacts.get(parts[3])
+            if artifact is None:
+                return httpx.Response(404, json={"detail": "no artifact", "code": "not_found"})
+            if path.endswith("/lineage"):
+                return httpx.Response(200, json={"id": artifact["id"], "children": [
+                    {"id": s, "children": []} for s in artifact["sources"]]})
+            return httpx.Response(200, json={**artifact, "edges": [
+                {"other_id": s, "edge_type": "derived_from", "direction": "out"} for s in artifact["sources"]]})
+        if request.method == "POST" and path == "/v0/search":
+            q = (body.get("q") or "").lower()
+            items = [{"id": a["id"], "kind": a["kind"], "preview": (a["content"] or "")[:200],
+                      "namespaces": [n["namespace"] for n in a["namespaces"]]}
+                     for a in self.artifacts.values() if q in (a["content"] or "").lower()]
+            return httpx.Response(200, json={"items": items[: body.get("limit") or 50], "next_cursor": None})
+        if request.method == "GET" and path == "/v0/namespaces":
+            return httpx.Response(200, json=list(self.namespaces.values()))
+        return httpx.Response(404, json={"detail": f"no route {request.method} {path}", "code": "not_found"})
 
 
 def _resolver(cwd):
@@ -77,8 +162,9 @@ class Harness:
 
     def __init__(self, tmp_path, *, config: SessionsConfig | None = None,
                  operator=True, alive=None, transport_error=False, selector=None,
-                 telemetry=None, service=None):
+                 telemetry=None, service=None, store=True, store_error=False, environ=None):
         self.service = service or EphemeralMemoryService()
+        self.fake_store = FakeStore()
         self.token = provision_profile(self.service, PRINCIPAL, MemoryScopesSpec(
             read=[SHARED], propose=[SHARED], default_write=SHARED,
         ))
@@ -89,6 +175,8 @@ class Harness:
             housekeeping=Housekeeping(retention_hours=1, stale_after_minutes=30, sweep_interval_seconds=5),
         )
         self.environ = {"LOIMI_MEMORY_URL": "http://loimi.test", "LOIMI_MEMORY_TOKEN": self.token}
+        if environ is not None:
+            self.environ = environ
         if operator:
             self.environ["LOIMI_OPERATOR_TOKEN"] = self.service.operator_token
         self.alive = set(alive or {4242})
@@ -99,6 +187,15 @@ class Harness:
 
         transport = httpx.MockTransport(failing_transport) if transport_error else self.service.transport()
         self.transport = transport
+        if store:
+            store_transport = (httpx.MockTransport(failing_transport) if store_error
+                               else self.fake_store.transport())
+            store_client = StoreClient(
+                self.config.store, environ=self.environ, transport=store_transport,
+                base_url="http://loimi.test", token=STORE_TOKEN,
+            )
+        else:
+            store_client = None
         self.plane = SessionPlane(
             self.config, state_dir=self.state_dir, environ=self.environ,
             client_factory=lambda spec: MemoryClient(
@@ -107,7 +204,10 @@ class Harness:
                 _dummy_spec(), transport=transport, base_url="http://loimi.test", token=tok),
             resolver=_resolver, is_alive=lambda pid: pid in self.alive,
             selector=selector, telemetry=telemetry,
+            store_client=store_client, local_host=LOCAL_HOST,
         )
+        if not store:
+            self.plane.store = None
 
     async def send(self, *args, **kwargs):
         result = await self.plane.handle(envelope(*args, **kwargs))
@@ -528,8 +628,11 @@ class TestHttp:
         h, client = self._client(tmp_path)
         with client:
             body = client.get("/health").json()
-        assert body["capabilities"] == ["sessions/v1"]
+        assert body["capabilities"] == ["sessions/v1", "bridge-mcp/v1"]
         assert not set(DAEMON_CAPABILITIES) & set(body["capabilities"])
+        assert body["sessions"]["mcp"] == {"enabled": True, "default_project": "mcp:default",
+                                           "oauth": False}
+        assert body["sessions"]["store"]["configured"] is True
         assert body["sessions"]["principal"] == PRINCIPAL
         assert body["sessions"]["loimi"]["credential_configured"] is True
         assert body["sessions"]["stats"]["events_received"] == 0

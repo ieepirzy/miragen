@@ -345,3 +345,94 @@ def test_adapter_package_imports_only_stdlib():
     loaded = json.loads(out.stdout.replace("'", '"'))
     assert not any(m.startswith("pydantic") for m in loaded)
     assert not any(m == "miragen" or m.startswith("miragen.") for m in loaded)
+
+
+# ── hosted bridge additions ─────────────────────────────────────────────────
+
+
+class TestHostedBridgeAdapter:
+    def test_envelope_carries_host_remote_and_project_remote(self, tmp_path, monkeypatch):
+        import subprocess
+
+        from miragen_hook.client import build_envelope, project_remote
+        from miragen_hook.normalize import normalize_hook_payload
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin",
+                        "git@github.com:org/repo.git"], check=True)
+        assert project_remote(str(repo)) == "git@github.com:org/repo.git"
+        assert project_remote(str(tmp_path)) is None  # no git here
+        assert project_remote(None) is None
+
+        payload = {"session_id": "s", "hook_event_name": "SessionStart", "cwd": str(repo)}
+        event = normalize_hook_payload("claude-code", payload)
+        env = {"CLAUDE_CODE_REMOTE": "true"}
+        envelope = build_envelope("claude-code", payload, event, environ=env, pid=7)
+        client = envelope["client"]
+        assert client["project_remote"] == "git@github.com:org/repo.git"
+        assert client["remote"] is True and client["host"]  # this machine's name
+        # The daemon's own normalization claims none of that.
+        raw = build_envelope("claude-code", payload, event, environ={}, pid=None, host=None,
+                             user=None, remote=True, project_remote_url=None)
+        assert (raw["client"]["host"], raw["client"]["user"], raw["client"]["project_remote"],
+                raw["client"]["pid"]) == (None, None, None, None)
+        local = build_envelope("claude-code", payload, event, environ={}, pid=7)
+        assert local["client"]["remote"] is False
+
+    def test_plugin_options_supply_url_and_token(self, tmp_path):
+        from miragen_hook.client import read_token, resolve_daemon_url
+
+        env = {"CLAUDE_PLUGIN_OPTION_DAEMON_URL": "https://memory.example",
+               "CLAUDE_PLUGIN_OPTION_TOKEN": "opt", "MIRAGEND_TOKEN": "env",
+               "MIRAGEND_URL": "http://env"}
+        assert resolve_daemon_url(None, env) == "https://memory.example"
+        assert read_token(None, env) == "opt"
+        assert resolve_daemon_url(None, {"MIRAGEND_URL": "http://env"}) == "http://env"
+        assert read_token(None, {"MIRAGEND_TOKEN": "env"}) == "env"
+        assert resolve_daemon_url(None, {}) == "http://127.0.0.1:8420"
+        assert resolve_daemon_url("http://x", env) == "http://x"
+        f = tmp_path / "t"
+        f.write_text("filetoken\n")
+        assert read_token(str(f), env) == "filetoken"
+
+    def test_http_install_for_a_repository(self, tmp_path):
+        from miragen_hook.install import CLAUDE_CODE_EVENTS, install_hooks, uninstall_hooks
+
+        settings = tmp_path / ".claude" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": "echo user-owned"}]}]}}))
+        install_hooks("claude-code", daemon_url="https://memory.example/", token_file=None,
+                      settings_path=settings, http=True)
+        data = json.loads(settings.read_text())
+        for event, timeout in CLAUDE_CODE_EVENTS:
+            owned = [g for g in data["hooks"][event] if g["hooks"][0].get("type") == "http"]
+            assert len(owned) == 1
+            entry = owned[0]["hooks"][0]
+            assert entry == {
+                "type": "http",
+                "url": f"https://memory.example/sessions/v1/hooks/claude-code",
+                "headers": {"Authorization": "Bearer $MIRAGEND_TOKEN"},
+                "allowedEnvVars": ["MIRAGEND_TOKEN"],
+                "timeout": timeout,
+            }
+        assert data["hooks"]["Stop"][0]["hooks"][0]["command"] == "echo user-owned"
+        # Idempotent, then removable, user entry intact.
+        install_hooks("claude-code", daemon_url="https://memory.example", token_file=None,
+                      settings_path=settings, http=True)
+        assert len(json.loads(settings.read_text())["hooks"]["Stop"]) == 2
+        uninstall_hooks("claude-code", settings_path=settings)
+        assert json.loads(settings.read_text())["hooks"] == {"Stop": [{"hooks": [
+            {"type": "command", "command": "echo user-owned"}]}]}
+
+    def test_http_install_refuses_codex_and_missing_url(self, tmp_path):
+        from miragen_hook.install import install_hooks
+
+        with pytest.raises(RuntimeError, match="Claude Code"):
+            install_hooks("codex", daemon_url="http://x", token_file=None,
+                          settings_path=tmp_path / "h.json", http=True)
+        with pytest.raises(RuntimeError, match="daemon URL"):
+            install_hooks("claude-code", daemon_url=None, token_file=None,
+                          settings_path=tmp_path / "s.json", http=True)

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "miragen",
+  "description": "Mira ecosystem plugins: join Claude Code sessions to the miragen memory bridge (Loimi memory + artifact store).",
+  "owner": { "name": "ieepirzy", "url": "https://github.com/ieepirzy" },
+  "plugins": [
+    {
+      "name": "miragen-memory",
+      "description": "Every Claude Code session joins the miragen memory bridge: working state and selective recall injected at start, prompts and outcomes captured, episodes filed as Loimi artifacts, plus memory_* and store_* MCP tools. Works locally and in cloud sessions.",
+      "source": "./plugins/miragen-memory",
+      "category": "productivity",
+      "keywords": ["memory", "loimi", "miragen", "hooks", "mcp"]
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "name": "miragen-memory",
+  "version": "0.1.0",
+  "description": "Join this Claude Code session to the miragen memory bridge: context injected at start, prompts/outcomes captured, episodes filed as Loimi artifacts, memory_* and store_* tools via MCP.",
+  "author": { "name": "ieepirzy", "url": "https://github.com/ieepirzy" },
+  "homepage": "https://github.com/ieepirzy/miragen/tree/main/plugins/miragen-memory",
+  "repository": "https://github.com/ieepirzy/miragen",
+  "license": "MIT",
+  "keywords": ["memory", "loimi", "miragen", "hooks", "mcp"],
+  "userConfig": {
+    "daemon_url": {
+      "type": "string",
+      "title": "miragend URL",
+      "description": "Base URL of the hosted miragend bridge (no trailing slash), e.g. https://memory.muutto365.fi",
+      "default": "https://memory.muutto365.fi",
+      "required": true
+    },
+    "token": {
+      "type": "string",
+      "title": "Bridge bearer token",
+      "description": "MIRAGEND_TOKEN of that daemon. Sent as Authorization: Bearer on every hook and MCP call.",
+      "sensitive": true,
+      "required": true
+    }
+  }
+}

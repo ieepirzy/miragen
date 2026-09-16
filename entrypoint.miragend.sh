@@ -10,6 +10,13 @@ WORKSPACE="${MIRAGEN_WORKSPACE:-/opt/miragen}"
 mkdir -p "${WORKSPACE}/agents"
 chown -R miragend "${WORKSPACE}"
 
+# The session plane's state (registry, journal, minted principal token,
+# OAuth state) lives on a volume: own it too, whatever path it is mounted at.
+if [ -n "${MIRAGEND_STATE_DIR:-}" ]; then
+    mkdir -p "${MIRAGEND_STATE_DIR}"
+    chown -R miragend "${MIRAGEND_STATE_DIR}"
+fi
+
 SOCK=/var/run/docker.sock
 if [ -S "${SOCK}" ]; then
     SOCK_GID="$(stat -c %g "${SOCK}")"
@@ -18,7 +25,10 @@ if [ -S "${SOCK}" ]; then
     fi
     usermod -aG "$(getent group "${SOCK_GID}" | cut -d: -f1)" miragend
 else
-    echo "WARNING: ${SOCK} is not mounted — miragend cannot manage containers" >&2
+    case "$(printf '%s' "${MIRAGEND_LIFECYCLE:-on}" | tr '[:upper:]' '[:lower:]')" in
+        off|0|false|no) ;;  # session plane only: no Docker by design
+        *) echo "WARNING: ${SOCK} is not mounted — miragend cannot manage containers" >&2 ;;
+    esac
 fi
 
 exec gosu miragend miragend

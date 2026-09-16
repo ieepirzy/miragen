@@ -25,6 +25,38 @@ scopes:
   # degrade explicitly rather than write somewhere unrelated.
   fallback_write: null
 
+  # A session that could only be identified by its directory name (a cloud
+  # VM posting a bare path) joins the project already known under that
+  # repository name instead of opening a parallel `dir:` project.
+  adopt_by_name: true
+
+# When the credential env is unset and the operator token is available, the
+# daemon creates its principal (or mints a token for an existing one) at
+# startup and keeps the token in the state dir. One secret to deploy.
+provision_principal: true
+
+# Loimi ARTIFACT store (/v0): each session gets a run; episodes are filed as
+# artifacts under it; the bridge's store_* tools write against it. The store
+# bearer comes from LOIMI_STORE_TOKEN or, failing that, the operator token
+# (they are the same credential on a Loimi deployment).
+store:
+  enabled: true
+  agent_id: mira            # registered Loimi agent the runs belong to
+  namespace: mira           # default namespace for a session's run
+  namespaces: []            # project → namespace bindings, e.g.
+  #  - match: github.com/muutto365/movingfirm-backend
+  #    namespace: muutto365
+  #  - match: github.com/ieepirzy/loimi
+  #    namespace: infra
+  episode_kind: session_episode
+
+# The bridge MCP mount (/mcp): memory_* + store_* tools for external sessions.
+# Guarded by the daemon bearer and, when MCP_BASE_URL/MCP_CLIENT_ID/
+# MCP_CLIENT_SECRET are set, by origo OAuth (claude.ai custom connectors).
+mcp:
+  enabled: true
+  default_project: "mcp:default"   # tool calls that name no project
+
 # Explicit bindings beat the template — e.g. two repositories that share
 # one body of project memory, or a project that may also read a shared
 # platform scope.

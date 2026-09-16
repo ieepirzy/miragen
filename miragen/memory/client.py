@@ -210,6 +210,19 @@ class MemoryClient:
     # credential (miragend's session plane provisioning project scopes);
     # a principal token opens none of these.
 
+    async def admin_create_principal(
+        self, *, principal_id: str, kind: str = "agent", description: str = "",
+    ) -> dict:
+        """Operator surface: register a principal. The answer carries the
+        ONE-TIME token (Loimi keeps only its hash); 409 when it exists."""
+        return await self._request(
+            "POST", "/admin/principals",
+            json={"id": principal_id, "kind": kind, "description": description},
+        )
+
+    async def admin_mint_token(self, *, principal_id: str) -> dict:
+        return await self._request("POST", f"/admin/principals/{principal_id}/tokens")
+
     async def admin_create_scope(self, *, scope_id: str, kind: str, description: str = "") -> dict:
         return await self._request("POST", "/admin/scopes", json={
             "id": scope_id, "kind": kind, "description": description,

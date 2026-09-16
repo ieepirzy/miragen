@@ -79,9 +79,7 @@ class SessionRegistry:
         elif session.state != "active" and envelope.event.name != "context.closed":
             # A session we thought gone speaks again (late hook, or a
             # resume under the same id): it is active.
-            session.state = "active"
-            session.ended_at = None
-            session.end_reason = None
+            session.new_life()
         session.touch(envelope)
         return session, created
 
@@ -98,25 +96,31 @@ class SessionRegistry:
 
     def sweep(
         self, *, now: datetime | None = None, is_alive: Callable[[int], bool] | None = None,
+        local_host: str | None = None,
     ) -> tuple[list[ExternalSession], list[str]]:
         """Returns (sessions that just went stale — to finalize, keys of
         old ended sessions that were pruned). A session with a known pid
-        goes stale when the process is gone; one without goes stale after
-        `stale_after` of silence."""
+        ON THIS HOST goes stale when the process is gone; any other (a
+        remote harness, a cloud VM, no pid) goes stale after `stale_after`
+        of silence — a pid from another machine says nothing here."""
         current = now or datetime.now(timezone.utc)
         went_stale: list[ExternalSession] = []
         pruned: list[str] = []
         for key, session in list(self._sessions.items()):
             if session.state == "active":
                 silent_for = current - _parse(session.last_seen_at)
-                if session.pid is not None and is_alive is not None:
+                pid_checkable = (
+                    session.pid is not None and is_alive is not None and not session.remote
+                    and (session.host is None or local_host is None or session.host == local_host)
+                )
+                if pid_checkable:
                     gone = not is_alive(session.pid) and silent_for > timedelta(seconds=5)
                 else:
                     gone = silent_for > self.stale_after
                 if gone:
                     session.state = "stale"
                     session.ended_at = now_iso()
-                    session.end_reason = "process_gone" if session.pid else "silent"
+                    session.end_reason = "process_gone" if pid_checkable else "silent"
                     went_stale.append(session)
             elif session.ended_at and current - _parse(session.ended_at) > self.retention:
                 del self._sessions[key]
