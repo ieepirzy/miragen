@@ -436,3 +436,21 @@ class TestHostedBridgeAdapter:
         with pytest.raises(RuntimeError, match="daemon URL"):
             install_hooks("claude-code", daemon_url=None, token_file=None,
                           settings_path=tmp_path / "s.json", http=True)
+
+
+class TestCaptureKeys:
+    def test_content_free_events_get_distinct_stable_keys(self):
+        """Two Stops without a last message but with different attributes
+        must not share a key (Loimi 409s a reused key with new content);
+        the same event twice must (idempotent redelivery)."""
+        from miragen_hook.normalize import captured_content, event_idempotency_key
+
+        base = {"session_id": "s", "hook_event_name": "Stop"}
+        a = normalize_hook_payload("claude-code", {**base, "stop_reason": "end_turn"})
+        b = normalize_hook_payload("claude-code", {**base, "stop_reason": "max_tokens"})
+        again = normalize_hook_payload("claude-code", {**base, "stop_reason": "end_turn"})
+        assert a.content is None
+        assert event_idempotency_key(a) != event_idempotency_key(b)
+        assert event_idempotency_key(a) == event_idempotency_key(again)
+        assert captured_content(a) == captured_content(again)
+        assert "end_turn" in captured_content(a)

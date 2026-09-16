@@ -770,6 +770,9 @@ class SessionPlane:
             session.counters.capture_failures += 1
             logger.info(f"[{session.key}] capture skipped: {reason}")
             return
+        # A session the daemon first hears of mid-life (hooks installed
+        # while it ran, or a daemon restart) still gets its store run.
+        await self._ensure_run(session)
         normalized = NormalizedEvent(
             name=event.name, harness=envelope.harness, original_event=event.original_event,
             session_id=envelope.session_id, ids=dict(event.ids), content=event.content,
