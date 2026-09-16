@@ -127,3 +127,12 @@ the harness's output shape; `miragen-hook install claude-code --http
 - Codex has no HTTP hooks; it uses the adapter (plugin or `install codex`).
 - The extraction worker and a recall selector model are deployment
   choices, not part of this record.
+- **No secret redaction of captured prompts (decided 2026-09-16).** Prompts
+  and turn ends are captured verbatim; a token pasted into a prompt lands in
+  the project's memory scope. Pattern lists for secrets are brittle and
+  fail open, so the decision is to keep captures faithful. If redaction is
+  ever added, it should be an entropy-based detector on whitespace-delimited
+  tokens (high Shannon entropy over a minimum length), applied at the adapter
+  before the envelope leaves the harness host, with the redaction counted on
+  `/health` — never a denylist of known prefixes. Erasure exists today
+  through Loimi's operator surface (`POST /memory/v1/events/{id}/erase`).
