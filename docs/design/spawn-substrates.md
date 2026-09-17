@@ -31,7 +31,13 @@ branching inside two dozen methods.
 After: those operations sit behind `SpawnDriver`
 (`miragen/daemon/spawn/base.py`) — `ensure_ready`, `define_service`, `up`,
 `remove_service`, `status`, `logs`, `restart`, `stop`, `teardown`,
-`current_image`, `endpoint`. `LifecycleCore` keeps everything that *isn't*
+`current_image`, `endpoint`, and the optional `lifecycle`. `lifecycle`
+returns a `UnitLifecycle` (last `started_at`/`finished_at`, `exit_code`,
+`oom_killed`, each optional); `GET /agents` and `GET /agents/{name}` expose
+those four keys, `null` when unknown. A driver without the method reports all
+four as `null`, so out-of-tree drivers keep working. Control planes use them
+to tell their own stop apart from a later start-then-exit they didn't see,
+and a crash from a stop. `LifecycleCore` keeps everything that *isn't*
 about where an agent runs: naming, workspace layout, profile/contract
 validation, credential-env assembly, boot-watching, rollback ordering. Two
 implementations exist:
