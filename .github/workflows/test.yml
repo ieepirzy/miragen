@@ -84,7 +84,7 @@ jobs:
     #
     # This is the same commit `@main` resolved to when this PR's runs were
     # measured, so pinning changes no number here.
-    uses: ieepirzy/mira-vitals/.github/workflows/measure.yml@ca82e5f0bfd3da46d9794a0dfb45df5d1fa49c81
+    uses: ieepirzy/mira-vitals/.github/workflows/measure.yml@97fe42fc57884a80689e856b84d68ea791013230
     with:
       # Both packages, installed so pyright resolves their imports. Without
       # the project's own dependencies the error count is dominated by
