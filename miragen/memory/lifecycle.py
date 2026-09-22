@@ -58,6 +58,9 @@ class MemoryPacket:
     manifest_id: str | None = None
     guidance_version: str = GUIDANCE_VERSION
     items: list[dict[str, Any]] = field(default_factory=list)
+    # The optional lane's outcome ("ok", "empty", "unconfigured", …) so the
+    # caller can say what happened instead of leaving silence to interpret.
+    optional_status: str | None = None
 
 
 class MemoryLifecycle:
@@ -167,6 +170,7 @@ class MemoryLifecycle:
         optional_status = await self._optional_lane(
             packet, effective_instance, context, prompt_hint
         )
+        packet.optional_status = optional_status
         # The manifest records what was ACTUALLY injected (§8.6); its write
         # is best-effort — a manifest failure must not fail the turn.
         try:

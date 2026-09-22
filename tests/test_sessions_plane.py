@@ -704,3 +704,44 @@ class TestHttp:
         assert attrs["mira.run.trigger"] == "input.received"
         assert attrs["mira.project.id"] == "github.com/org/repo"
         assert "secret plan" not in json.dumps(attrs)
+
+
+class TestStatusLine:
+    """The opening context always ends with one `[memory status]` line, so
+    an agent never has to read meaning into silence (memory-effectiveness
+    P3)."""
+
+    async def test_recall_off_is_said_out_loud(self, tmp_path):
+        h = Harness(tmp_path)
+        result = await h.send("SessionStart", source="startup")
+        status = result.context.splitlines()[-1]
+        assert status.startswith("[memory status] automatic recall is OFF")
+        assert "memory_recall searches on demand" in status
+        assert status.endswith("capture ok")
+
+    async def test_recall_on_without_a_query_says_it_runs_per_prompt(self, tmp_path):
+        async def selector(request, cards):
+            return SelectionResult(selections=[])
+
+        h = Harness(tmp_path, selector=selector)
+        result = await h.send("SessionStart", source="startup")
+        assert "automatic recall on; it runs on each prompt" in result.context.splitlines()[-1]
+
+    async def test_recent_capture_failures_are_announced(self, tmp_path):
+        h = Harness(tmp_path)
+        h.plane.stats.note_capture(True)
+        h.plane.stats.note_capture(False)
+        result = await h.send("SessionStart", source="startup")
+        assert "capture FAILING: 1 of the last" in result.context.splitlines()[-1]
+        snapshot = h.plane.stats.snapshot()
+        assert snapshot["recent_capture_failures"] == 1
+        assert "recent_captures" not in snapshot  # the deque never reaches /health
+
+    async def test_injected_memories_are_counted_and_citation_asked(self, tmp_path):
+        from miragen.memory.lifecycle import MemoryPacket
+
+        h = Harness(tmp_path)
+        packet = MemoryPacket(text="", optional_status="ok", items=[
+            {"kind": "working_state"}, {"revision_id": "r1"}, {"revision_id": "r2"}])
+        line = h.plane._status_line(packet, project_scope="group:project.x")
+        assert "2 memories in group:project.x injected above — cite the ids" in line

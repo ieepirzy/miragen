@@ -17,6 +17,7 @@ import asyncio
 import logging
 import socket
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -54,6 +55,9 @@ logger = logging.getLogger("miragend.sessions")
 RETRIEVAL_TIMEOUT_S = 8.0
 WRITE_TIMEOUT_S = 15.0
 _PROVISION_VERBS = ["read", "propose", "resolve", "retract"]
+
+
+RECENT_CAPTURE_WINDOW = 50
 
 
 @dataclass
@@ -100,6 +104,17 @@ class PlaneStats:
     raw_hooks_shadowed: int = 0
     late_opens: int = 0
     empty_sessions: int = 0
+    # Outcomes of the most recent hook captures (True = captured). The
+    # lifetime counters above never forget an old outage; the status line
+    # agents see must reflect what is failing now.
+    recent_captures: deque = field(default_factory=lambda: deque(maxlen=RECENT_CAPTURE_WINDOW))
+
+    def note_capture(self, ok: bool) -> None:
+        if ok:
+            self.captures += 1
+        else:
+            self.capture_failures += 1
+        self.recent_captures.append(ok)
 
     def note_loimi(self, ok: bool, error: str | None = None) -> None:
         if ok:
@@ -118,7 +133,9 @@ class PlaneStats:
 
     def snapshot(self) -> dict[str, Any]:
         data = {k: v for k, v in self.__dict__.items() if not k.endswith("_total")
-                and k not in ("retrieval_count", "write_count")}
+                and k not in ("retrieval_count", "write_count", "recent_captures")}
+        data["recent_capture_failures"] = self.recent_captures.count(False)
+        data["recent_capture_window"] = len(self.recent_captures)
         data["retrieval_ms_avg"] = (
             round(self.retrieval_ms_total / self.retrieval_count, 1) if self.retrieval_count else None
         )
@@ -746,7 +763,40 @@ class SessionPlane:
         self.stats.injections += 1
         session.counters.injections += 1
         detail = "; ".join(part for part in (scope_detail, packet.degraded) if part) or None
-        return f"{self._session_header(session)}\n{packet.text}", detail
+        status = self._status_line(packet, project_scope=lifecycle.spec.scopes.default_write)
+        return f"{self._session_header(session)}\n{packet.text}\n{status}", detail
+
+    def _status_line(self, packet, *, project_scope: str | None) -> str:
+        """One line that always says what memory did for this context, so
+        silence never has to be interpreted: recall mode and result, and
+        whether captures are currently being lost."""
+        status = packet.optional_status or "unknown"
+        injected = sum(1 for item in packet.items if item.get("revision_id"))
+        where = f" in {project_scope}" if project_scope else ""
+        if packet.degraded or status.startswith("degraded"):
+            recall = "recall DEGRADED — memories may exist that could not be searched"
+        elif status == "ok":
+            recall = (f"{injected} memor{'y' if injected == 1 else 'ies'}{where} injected above "
+                      "— cite the ids you rely on")
+        elif status == "empty":
+            recall = f"searched{where}: nothing stored matches yet"
+        elif status == "none_selected":
+            recall = f"searched{where}: nothing relevant to this"
+        elif status == "no_query":
+            recall = "automatic recall on; it runs on each prompt"
+        elif status in ("unconfigured", "disabled"):
+            recall = ("automatic recall is OFF on this bridge — nothing is injected on its "
+                      "own; memory_recall searches on demand")
+        else:
+            recall = f"recall: {status}"
+        recent = self.stats.recent_captures
+        failed = recent.count(False)
+        if failed:
+            capture = (f"capture FAILING: {failed} of the last {len(recent)} captures lost "
+                       "— this session's trail may be incomplete")
+        else:
+            capture = "capture ok"
+        return f"[memory status] {recall} · {capture}"
 
     async def _prompt_recall(
         self, session: ExternalSession, envelope: EventEnvelope,
@@ -826,11 +876,11 @@ class SessionPlane:
             self.stats.write_ms_total += (time.monotonic() - started) * 1000
             self.stats.write_count += 1
         if result.get("status") == "captured":
-            self.stats.captures += 1
+            self.stats.note_capture(True)
             session.counters.captures += 1
             self.stats.note_loimi(True)
         else:
-            self.stats.capture_failures += 1
+            self.stats.note_capture(False)
             session.counters.capture_failures += 1
             self.stats.note_loimi(False, result.get("detail"))
 
