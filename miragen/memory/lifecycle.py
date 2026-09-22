@@ -223,7 +223,11 @@ class MemoryLifecycle:
         zero-or-more selector, canonical re-render, budgeted injection.
         Failure NEVER falls back to stuffing neighbors — required state
         stands alone and the degradation is explicit in the manifest."""
-        from miragen.memory.selection import clamp_selections, render_optional_section
+        from miragen.memory.selection import (
+            clamp_selections,
+            fit_optional_entries,
+            render_optional_section,
+        )
 
         if not self.spec.recall.enabled:
             return "disabled"
@@ -288,12 +292,16 @@ class MemoryLifecycle:
             if not section:
                 return "none_selected"
             packet.text = f"{packet.text}\n{section}"
+            # The renderer emits a prefix of `entries` and stops at the first
+            # that does not fit; only those are injected — the manifest and
+            # the "cite these ids" status line must not name the rest.
+            emitted = fit_optional_entries(entries, self.spec.recall.max_optional_chars)
             packet.items.extend({
                 "kind": "recalled",
                 "record_id": entry["record_id"],
                 "revision_id": entry["revision_id"],
                 "reason": entry["reason"],
-            } for entry in entries)
+            } for entry in emitted)
             return "ok"
         except (MemoryUnavailable, MemoryAPIError) as exc:
             self._degrade(f"optional recall: {exc}")

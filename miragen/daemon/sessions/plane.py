@@ -57,7 +57,8 @@ WRITE_TIMEOUT_S = 15.0
 _PROVISION_VERBS = ["read", "propose", "resolve", "retract"]
 
 
-RECENT_CAPTURE_WINDOW = 50
+RECENT_CAPTURE_WINDOW = 200
+RECENT_CAPTURE_SECONDS = 30 * 60
 
 
 @dataclass
@@ -104,17 +105,27 @@ class PlaneStats:
     raw_hooks_shadowed: int = 0
     late_opens: int = 0
     empty_sessions: int = 0
-    # Outcomes of the most recent hook captures (True = captured). The
-    # lifetime counters above never forget an old outage; the status line
-    # agents see must reflect what is failing now.
+    # Recent write outcomes as (monotonic time, scope, ok) — hook captures,
+    # episodes and checkpoints alike. The lifetime counters above never
+    # forget an old outage; the status line an agent sees must reflect what
+    # is failing now, for its own project.
     recent_captures: deque = field(default_factory=lambda: deque(maxlen=RECENT_CAPTURE_WINDOW))
 
-    def note_capture(self, ok: bool) -> None:
+    def note_outcome(self, ok: bool, scope: str | None) -> None:
+        self.recent_captures.append((time.monotonic(), scope, ok))
+
+    def note_capture(self, ok: bool, scope: str | None) -> None:
         if ok:
             self.captures += 1
         else:
             self.capture_failures += 1
-        self.recent_captures.append(ok)
+        self.note_outcome(ok, scope)
+
+    def recent_outcomes(self, scope: str | None = None) -> list[bool]:
+        """Outcomes within RECENT_CAPTURE_SECONDS, for one scope or all."""
+        cutoff = time.monotonic() - RECENT_CAPTURE_SECONDS
+        return [ok for at, sc, ok in self.recent_captures
+                if at >= cutoff and (scope is None or sc == scope)]
 
     def note_loimi(self, ok: bool, error: str | None = None) -> None:
         if ok:
@@ -134,8 +145,9 @@ class PlaneStats:
     def snapshot(self) -> dict[str, Any]:
         data = {k: v for k, v in self.__dict__.items() if not k.endswith("_total")
                 and k not in ("retrieval_count", "write_count", "recent_captures")}
-        data["recent_capture_failures"] = self.recent_captures.count(False)
-        data["recent_capture_window"] = len(self.recent_captures)
+        recent = self.recent_outcomes()
+        data["recent_capture_failures"] = recent.count(False)
+        data["recent_capture_window"] = len(recent)
         data["retrieval_ms_avg"] = (
             round(self.retrieval_ms_total / self.retrieval_count, 1) if self.retrieval_count else None
         )
@@ -732,7 +744,10 @@ class SessionPlane:
         self.stats.retrievals += 1
         if lifecycle is None:
             self.stats.retrieval_failures += 1
-            return None, scope_detail
+            # A session with no project was never going to get memory (no cwd,
+            # nothing to scope) — silence is correct there. One WITH a project
+            # that still has no lifecycle is an outage, and says so.
+            return (self._unavailable_line(scope_detail) if session.project else None), scope_detail
         store_detail = await self._ensure_run(session)
         if store_detail:
             scope_detail = "; ".join(part for part in (scope_detail, store_detail) if part)
@@ -750,7 +765,7 @@ class SessionPlane:
             self.stats.timeouts += 1
             self.stats.retrieval_failures += 1
             self.stats.note_loimi(False, "retrieval timed out")
-            return None, "retrieval timed out"
+            return self._unavailable_line("retrieval timed out"), "retrieval timed out"
         finally:
             elapsed = (time.monotonic() - started) * 1000
             self.stats.retrieval_ms_total += elapsed
@@ -765,6 +780,13 @@ class SessionPlane:
         detail = "; ".join(part for part in (scope_detail, packet.degraded) if part) or None
         status = self._status_line(packet, project_scope=lifecycle.spec.scopes.default_write)
         return f"{self._session_header(session)}\n{packet.text}\n{status}", detail
+
+    @staticmethod
+    def _unavailable_line(reason: str | None) -> str:
+        """An outage is exactly when silence misleads most."""
+        return (f"[memory status] memory UNAVAILABLE for this session ({reason or 'unknown'}) — "
+                "nothing was recalled and this session may not be remembered; do not "
+                "conclude that nothing is stored")
 
     def _status_line(self, packet, *, project_scope: str | None) -> str:
         """One line that always says what memory did for this context, so
@@ -783,17 +805,19 @@ class SessionPlane:
         elif status == "none_selected":
             recall = f"searched{where}: nothing relevant to this"
         elif status == "no_query":
-            recall = "automatic recall on; it runs on each prompt"
+            recall = (f"automatic recall on; it runs on each prompt of {self.config.recall.min_prompt_chars}+ characters"
+                      if self.config.recall.on_prompt else
+                      "automatic recall on, but only at session open (not per prompt)")
         elif status in ("unconfigured", "disabled"):
-            recall = ("automatic recall is OFF on this bridge — nothing is injected on its "
-                      "own; memory_recall searches on demand")
+            recall = "automatic recall is OFF on this bridge — nothing is injected on its own" + (
+                "; memory_recall searches on demand" if self.config.mcp.enabled else "")
         else:
             recall = f"recall: {status}"
-        recent = self.stats.recent_captures
+        recent = self.stats.recent_outcomes(project_scope)
         failed = recent.count(False)
         if failed:
-            capture = (f"capture FAILING: {failed} of the last {len(recent)} captures lost "
-                       "— this session's trail may be incomplete")
+            capture = (f"capture FAILING: {failed} of {len(recent)} recent writes to this "
+                       "project were lost — this session's trail may be incomplete")
         else:
             capture = "capture ok"
         return f"[memory status] {recall} · {capture}"
@@ -848,7 +872,7 @@ class SessionPlane:
             return
         lifecycle, reason = await self._lifecycle_for(session)
         if lifecycle is None:
-            self.stats.capture_failures += 1
+            self.stats.note_capture(False, None)
             session.counters.capture_failures += 1
             logger.info(f"[{session.key}] capture skipped: {reason}")
             return
@@ -876,11 +900,11 @@ class SessionPlane:
             self.stats.write_ms_total += (time.monotonic() - started) * 1000
             self.stats.write_count += 1
         if result.get("status") == "captured":
-            self.stats.note_capture(True)
+            self.stats.note_capture(True, lifecycle.spec.scopes.default_write)
             session.counters.captures += 1
             self.stats.note_loimi(True)
         else:
-            self.stats.note_capture(False)
+            self.stats.note_capture(False, lifecycle.spec.scopes.default_write)
             session.counters.capture_failures += 1
             self.stats.note_loimi(False, result.get("detail"))
 
@@ -1051,13 +1075,16 @@ class SessionPlane:
         finally:
             self.stats.write_ms_total += (time.monotonic() - started) * 1000
             self.stats.write_count += 1
+        scope = lifecycle.spec.scopes.default_write
         if episode.get("status") == "captured":
             self.stats.episodes += 1
             session.episodes_written.append(occurrence)
             self.stats.note_loimi(True)
+            self.stats.note_outcome(True, scope)
         else:
             self.stats.capture_failures += 1
             self.stats.note_loimi(False, episode.get("detail"))
+            self.stats.note_outcome(False, scope)
 
         # The same digest becomes an immutable artifact under the session's
         # run — the store is where a session's output is traceable later.
@@ -1091,8 +1118,10 @@ class SessionPlane:
             checkpoint = {"status": "persistence_unavailable"}
         if checkpoint.get("status") == "accepted":
             self.stats.checkpoints += 1
+            self.stats.note_outcome(True, scope)
         else:
             self.stats.capture_failures += 1
+            self.stats.note_outcome(False, scope)
         if occurrence == "end" and episode.get("status") == "captured":
             self.journal.clear(session.key)
 
