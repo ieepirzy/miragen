@@ -167,18 +167,26 @@ def captured_content(event: NormalizedEvent) -> str:
 
 def event_idempotency_key(event: NormalizedEvent) -> str:
     """Stable per-occurrence key: a redelivered hook never writes twice.
-    The discriminator prefers harness-supplied ids; a hash of the stored
-    content is the fallback for events that carry none."""
+
+    Harness ids name *where* an event happened, not *which* occurrence it
+    is: Claude Code stamps one prompt_id on every hook fired during a
+    prompt, so a Stop that fires again after a blocking Stop hook, a
+    background notification or a wakeup — or a second subagent in the same
+    prompt — would reuse the key with new content, and Loimi refuses that
+    with 409 (395 of 405 VPS captures, 2026-09-22). So the key is the most
+    specific id plus a digest of what is stored: a redelivery (same
+    content) still dedupes, a new occurrence never collides."""
     fingerprint = captured_content(event) + json.dumps(
         event.attributes, sort_keys=True, default=str,
     )
-    discriminator = (
+    digest = hashlib.sha256(fingerprint.encode()).hexdigest()[:16]
+    anchor = (
         event.ids.get("tool_use_id")
+        or event.ids.get("agent_id")
         or event.ids.get("prompt_id")
         or event.ids.get("turn_id")
-        or event.ids.get("agent_id")
-        or hashlib.sha256(fingerprint.encode()).hexdigest()[:16]
     )
+    discriminator = f"{anchor}:{digest}" if anchor else digest
     return f"hook:{event.harness}:{event.session_id}:{event.original_event}:{discriminator}"
 
 

@@ -439,3 +439,30 @@ class TestAdapterIntegration:
         options = executor._options(tmp_path / "ws", None)
         assert "hooks" not in options
         assert executor.memory_hook_capabilities()["native_hooks"] is False
+
+
+class TestRepeatedEventsInOnePrompt:
+    """Claude Code stamps one prompt_id on every hook in a prompt. Events
+    that repeat within it must not reuse a key with different content —
+    Loimi answers that with 409 and the capture is lost (2026-09-22)."""
+
+    def test_second_stop_in_same_prompt_gets_its_own_key(self):
+        base = {**CLAUDE_COMMON, "hook_event_name": "Stop", "prompt_id": "p-1"}
+        a = event_idempotency_key(normalize_hook_payload(
+            "claude-code", {**base, "last_assistant_message": "first answer"}))
+        b = event_idempotency_key(normalize_hook_payload(
+            "claude-code", {**base, "last_assistant_message": "answer after the Stop hook blocked"}))
+        assert a != b
+
+    def test_subagents_in_same_prompt_get_their_own_keys(self):
+        base = {**CLAUDE_COMMON, "hook_event_name": "SubagentStop", "prompt_id": "p-1",
+                "last_assistant_message": "done"}
+        a = event_idempotency_key(normalize_hook_payload("claude-code", {**base, "agent_id": "ag-1"}))
+        b = event_idempotency_key(normalize_hook_payload("claude-code", {**base, "agent_id": "ag-2"}))
+        assert a != b
+
+    def test_redelivered_stop_still_dedupes(self):
+        payload = {**CLAUDE_COMMON, "hook_event_name": "Stop", "prompt_id": "p-1",
+                   "last_assistant_message": "same answer"}
+        assert event_idempotency_key(normalize_hook_payload("claude-code", payload)) == \
+            event_idempotency_key(normalize_hook_payload("claude-code", dict(payload)))
