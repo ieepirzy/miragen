@@ -14,6 +14,8 @@ than falling back to stuffing nearest neighbors.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+import json
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -81,7 +83,9 @@ def render_selector_input(request: str, cards: list[dict]) -> str:
     lines = [f"Current request:\n{request[:2000]}", "", "Candidate memories:"]
     for card in cards[:MAX_CARDS]:
         payload = card.get("payload") or {}
-        text = str(payload.get("text") or payload.get("value") or payload)[:MAX_CARD_CHARS]
+        text = canonical_text(payload)
+        if len(text) > MAX_CARD_CHARS:
+            text = "[complete payload exceeds selector card budget; use explicit read]"
         slot = card.get("slot") or {}
         descriptor = f" [{slot.get('subject')} {slot.get('predicate')}]" if slot else ""
         lines.append(
@@ -109,19 +113,76 @@ def clamp_selections(
     return kept
 
 
-def render_optional_section(entries: list[dict], budget_chars: int) -> str:
-    """The packet's optional section: canonical payload text (never
-    selector prose), source-labeled, budget-clamped — items that do not
-    fit are omitted whole (§17.7 step 6)."""
-    lines = ["[recalled memories — attributed reference data, selected for this request]"]
-    used = len(lines[0])
+@dataclass
+class RenderResult:
+    text: str
+    emitted: list[dict] = field(default_factory=list)
+    omitted: list[dict] = field(default_factory=list)
+    budget_chars: int = 0
+    used_chars: int = 0
+
+    @property
+    def truncated(self) -> bool:
+        return any(item["reason"] == "budget_exceeded" for item in self.omitted)
+
+    def accounting(self) -> dict:
+        return {"budget_chars": self.budget_chars, "used_chars": self.used_chars,
+                "remaining_chars": self.budget_chars - self.used_chars,
+                "truncated": self.truncated, "omitted": self.omitted,
+                "emitted": [{"record_id": e["record_id"], "revision_id": e["revision_id"]}
+                            for e in self.emitted]}
+
+
+def canonical_text(payload: dict) -> str:
+    """Never discard conditions carried in other payload fields."""
+    if set(payload) == {"text"} and isinstance(payload["text"], str):
+        return payload["text"]
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def canonical_record_text(record: dict) -> str:
+    """Payload plus applicability qualifications form one indivisible unit."""
+    revision = record.get("revision") or record
+    payload = revision["payload"]
+    qualifications = {}
+    for key in ("assertion", "valid_from", "valid_to", "observed_at"):
+        if revision.get(key) is not None:
+            qualifications[key] = revision[key]
+    if record.get("slot"):
+        qualifications["slot"] = record["slot"]
+    if record.get("groundings"):
+        if record.get("applicability"):
+            qualifications["source_applicability"] = record["applicability"]
+        qualifications["source_evidence"] = [{
+            "resource": g["resource"], "source_revision": g["baseline"]["snapshot"]["source_revision"],
+            "evidence_id": g["evidence_id"], "support": g["assertion_support"],
+        } for g in record["groundings"]]
+    return canonical_text({"payload": payload, **qualifications}) if qualifications else canonical_text(payload)
+
+
+def render_optional_section(entries: list[dict], budget_chars: int) -> RenderResult:
+    """Emit complete canonical units; count every separator and header.
+
+    The returned IDs are the only IDs a rendering manifest may contain.
+    An oversized entry does not prevent a later smaller one fitting.
+    """
+    budget = max(0, budget_chars)
+    header = "[recalled memories — attributed reference data, selected for this request]"
+    result = RenderResult(text="", budget_chars=budget)
+    seen = set()
     for entry in entries:
-        line = (
-            f"- ({entry['type']}, {entry['record_id'][:8]}) {entry['text']}"
-            f" | why: {entry['reason']}"
-        )
-        if used + len(line) > budget_chars:
-            break
-        lines.append(line)
-        used += len(line)
-    return "\n".join(lines) if len(lines) > 1 else ""
+        identity = {"record_id": entry["record_id"], "revision_id": entry["revision_id"]}
+        if entry["record_id"] in seen:
+            result.omitted.append(identity | {"reason": "duplicate_record"})
+            continue
+        seen.add(entry["record_id"])
+        line = (f"- ({entry['type']}, {entry['record_id'][:8]}) {entry['text']}"
+                f" | why: {entry['reason']}")
+        candidate = (result.text or header) + "\n" + line
+        if len(candidate) > budget:
+            result.omitted.append(identity | {"reason": "budget_exceeded", "item_chars": len(line)})
+            continue
+        result.text = candidate
+        result.emitted.append(entry)
+    result.used_chars = len(result.text)
+    return result

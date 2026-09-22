@@ -116,3 +116,13 @@ The `/memory/v1` prefix is the compatibility contract: additive changes
 (new optional fields, new routes) do not bump it; a breaking change ships
 as `/memory/v2` alongside. The conformance suite is versioned with this
 document and is the acceptance test for any claim of compatibility.
+
+### Source grounding extension
+
+Loimi migration 0011 adds immutable revision/resource baselines, explicit check
+receipts, scoped `POST /memory/v1/resources/lookup`, and bounded transactional
+consolidation. Miragen's ephemeral backend does not implement this extension.
+See [source-grounded memory](source-grounded-memory.md) for contracts, capability
+requirements, the CLI/MCP workflow and a runnable HTTP example. Injection
+manifests describe rendered content with unconfirmed delivery; they are not
+harness acknowledgements.

@@ -228,3 +228,13 @@ A session's memory is scoped by the daemon, never by the session:
 - Memory MCP tools for external sessions (`memory_remember` etc.) are not
   wired; the guide tells the model so. The `/mcp/memory` mount of a
   MiraGen agent remains the explicit interface.
+
+### Exact resource recall
+
+The bridge exposes `memory_for_resources` for explicitly named Python files and
+qualified symbols in an observed local session. Pass that session's key as
+`project`. Remote/default/guessed checkouts return unverified. Existing hooks do
+not supply a trustworthy symbol stream, so source identities are not inferred
+from prompts or synthesized into hook events. See
+[source-grounded memory](source-grounded-memory.md) for examples and limitations.
+`injections` counters mean prepared contexts; delivery remains unconfirmed.

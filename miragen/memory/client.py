@@ -232,3 +232,23 @@ class MemoryClient:
         return await self._request("POST", "/admin/grants", json={
             "principal_id": principal_id, "scope_id": scope_id, "verbs": verbs,
         })
+
+    # -- source evidence and bounded representation maintenance ------------
+
+    async def add_evidence(self, revision_id: str, body: dict) -> dict:
+        return await self._request("POST", f"/revisions/{revision_id}/evidence", json=body)
+
+    async def create_grounding(self, record_id: str, body: dict) -> dict:
+        return await self._request("POST", f"/records/{record_id}/groundings", json=body)
+
+    async def check_grounding(self, grounding_id: str, body: dict) -> dict:
+        return await self._request("POST", f"/groundings/{grounding_id}/checks", json=body)
+
+    async def lookup_resources(self, body: dict) -> dict:
+        return await self._request("POST", "/resources/lookup", json=body)
+
+    async def consolidate(self, body: dict) -> dict:
+        return await self._request("POST", "/consolidations", json=body)
+
+    async def queue_consolidation(self, body: dict) -> dict:
+        return await self._request("POST", "/consolidations/queue", json=body)
