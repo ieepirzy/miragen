@@ -1,6 +1,8 @@
 # Memory effectiveness: from plumbing to agents that remember
 
-Status: **Scoping proposal**, 2026-09-23. Nothing here is built.
+Status: **Scoping proposal**, 2026-09-23. P0 is in PR #111; nothing else is built.
+Revised after an agent fact-check against main: P1b already exists (undeployed),
+and P2 follows §17.7's mandatory selector.
 Owner: Mira (leads testing). Decided by Ilari 2026-09-23: **the VPS bridge
 (`10.8.0.4:8420` / `memory.muutto365.fi`) is the single memory store.** Local
 miragend is not the driver.
@@ -34,17 +36,23 @@ reuse one idempotency key with different content, and Loimi rejects them with a
 409. Root cause and fix: §6. Either way,
 a 97% failure rate must never again be visible only on `/health`. See §2.4.
 
-### 2.2 Nothing admits harness sessions into memory, by design
-`miragen/memory/extraction.py` skips `SKIP_SOURCE_PREFIXES = ("harness:",)`.
-Coding-session turns count as an "operational trail", not statements to mine.
-The extraction worker (`miragen extract`) and its model are also "deployment
-choices" that were never deployed (`docs/design/hosted-bridge.md` §5). So for
-Claude Code and Codex, the **only** way in is the agent voluntarily calling
+### 2.2 The admission path exists; its worker was never deployed
+`miragen/memory/extraction.py` skips per-turn `harness:*` events
+(`SKIP_SOURCE_PREFIXES`) by design. The session **episode** (`capture_episode`,
+`lifecycle.py:355`, filed at session end or compaction from `plane.py` `_finalize`)
+*is* eligible (`docs/external-sessions.md`: "`session_episode` events are
+eligible, `harness:*` trail is not"). What's missing is the runner:
+`miragen memory-worker` and its model are "deployment choices"
+(`docs/design/hosted-bridge.md` §5), and no deployment runs them. So today
+the only way in that actually runs is the agent voluntarily calling
 `memory_remember` / `memory_checkpoint`, and agents don't.
 
 ### 2.3 Retrieval is off by construction
-- Per-prompt recall needs `recall.model` in `MIRAGEND_SESSIONS_CONFIG`. It's
-  unset on both daemons, so `SessionPlane(selector=None)`.
+- Per-prompt recall needs `recall.model` in `MIRAGEND_SESSIONS_CONFIG`
+  (`BRIDGE_RECALL_MODEL` in the agent-stack). It's unset on both daemons, so
+  `SessionPlane(selector=None)`. That's by design: §17.7 of the architecture
+  pass makes the relevance selector mandatory ("No rank threshold or top-k
+  list alone means 'relevant enough'").
 - The start lane derives its query from working state `goal`. Nothing writes a
   goal, so it returns `no_query`.
 - `memory_recall` works (lexical), but only when an agent thinks to call it.
@@ -85,18 +93,24 @@ Loimi admission, so nothing mints authority.
   This is the proven pattern: miradesign's Stop continuation blocks exactly
   once and agents answer (verified live 2026-09-18). Cheap, and needs no model
   on the server.
-- *(b) Server-side distillation.* Let the extraction worker process
-  **`session_episode`** events only, one per session end or compaction, still
-  skipping per-turn `harness:` events. The existing span check + checker +
-  admission apply unchanged. Needs the worker deployed on the VPS with a model.
+- *(b) Server-side distillation. Already built, never deployed.* Run
+  `miragen memory-worker` next to the bridge in the agent-stack with a model.
+  It already consumes `session_episode` events and already applies the span
+  check, checker and Loimi admission. The work is deployment (a compose
+  service, a principal holding `maintain`, a model credential) plus a live
+  check that one real episode yields zero or more admitted records. Blocked
+  on decision 1 (§7).
 
-**P2: retrieval on.**
-- Deterministic first: per-prompt lexical recall (Loimi's existing lexical
-  search), top-k, with a score floor. No model and no cost, and it fails
-  visibly.
-- Selector as an optional reranker once there's enough data for it to matter.
-- Start lane: query from project scope + repo + branch + first prompt when
-  there is no `goal`, instead of `no_query`.
+**P2: retrieval on, the accepted way.** Configure the selector model
+(`BRIDGE_RECALL_MODEL`, e.g. `deepseek:deepseek-chat` +
+`BRIDGE_DEEPSEEK_API_KEY`, as movingfirm-agents#28 already proposes). §17.7
+requires the selector: lexical top-k alone is explicitly rejected as a
+relevance signal, so no model-free "interim" recall. Also:
+- Start lane: when there is no `goal`, the session-start query can come from
+  project + repo + branch, instead of `no_query`. That's a candidate change;
+  it only matters once the selector exists.
+- Measure the selector's cost per cache miss, as §17.7 asks.
+Blocked on decision 1 (§7).
 
 **P3: announce itself.** Every injection gets one status line, always:
 `miragen: 14 memories in group:project.miradesign · 2 match this prompt (below) · capture ok`.
@@ -172,8 +186,10 @@ that triggers this bug, so P1a must land after P0.
 
 ## 7. Open decisions for Ilari
 
-1. **Distillation model on the VPS (P1b, P2 rerank).** Which model and what
-   budget. P1a + P2-lexical need none, so this can wait.
+1. **Model for the selector (P2) and the memory worker (P1b) on the VPS.**
+   Which model and what budget. One cheap structured-output model can serve
+   both. Nothing that makes memory *flow* can land without it; P0, P1a and P3
+   can.
 2. **Stop nudge intrusiveness (P1a).** Once per session above a work
    threshold, or opt-in per project?
 3. **`MEMORY.md` coexistence.** Claude Code's file memory is where the real
