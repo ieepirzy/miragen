@@ -199,6 +199,8 @@ class SessionPlane:
         )
         self.journal = EventJournal(self.state_dir)
         self.stats = PlaneStats()
+        # Sessions already told memory is unavailable (cleared on recovery).
+        self._outage_announced: set[str] = set()
         self._client_factory = client_factory
         self._operator_client_factory = operator_client_factory
         self.selector = selector
@@ -744,10 +746,7 @@ class SessionPlane:
         self.stats.retrievals += 1
         if lifecycle is None:
             self.stats.retrieval_failures += 1
-            # A session with no project was never going to get memory (no cwd,
-            # nothing to scope) — silence is correct there. One WITH a project
-            # that still has no lifecycle is an outage, and says so.
-            return (self._unavailable_line(scope_detail) if session.project else None), scope_detail
+            return None, scope_detail
         store_detail = await self._ensure_run(session)
         if store_detail:
             scope_detail = "; ".join(part for part in (scope_detail, store_detail) if part)
@@ -765,6 +764,11 @@ class SessionPlane:
             self.stats.timeouts += 1
             self.stats.retrieval_failures += 1
             self.stats.note_loimi(False, "retrieval timed out")
+            # Say it once per session: while the outage lasts every prompt
+            # retries the open (late-open path), and 20 copies are noise.
+            if session.key in self._outage_announced:
+                return None, "retrieval timed out"
+            self._outage_announced.add(session.key)
             return self._unavailable_line("retrieval timed out"), "retrieval timed out"
         finally:
             elapsed = (time.monotonic() - started) * 1000
@@ -775,6 +779,7 @@ class SessionPlane:
             self.stats.note_loimi(False, packet.degraded)
         else:
             self.stats.note_loimi(True)
+        self._outage_announced.discard(session.key)
         self.stats.injections += 1
         session.counters.injections += 1
         detail = "; ".join(part for part in (scope_detail, packet.degraded) if part) or None
@@ -872,7 +877,9 @@ class SessionPlane:
             return
         lifecycle, reason = await self._lifecycle_for(session)
         if lifecycle is None:
-            self.stats.note_capture(False, None)
+            # Unscoped (no project), not a lost write: lifetime counter only,
+            # never the recent window the status line reads.
+            self.stats.capture_failures += 1
             session.counters.capture_failures += 1
             logger.info(f"[{session.key}] capture skipped: {reason}")
             return

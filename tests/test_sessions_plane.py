@@ -770,15 +770,22 @@ class TestStatusLine:
         status = (await h.send("SessionStart", source="startup")).context.splitlines()[-1]
         assert "only at session open" in status and "each prompt" not in status
 
-    async def test_outage_is_announced_not_silent(self, tmp_path):
+    async def test_retrieval_timeout_is_announced_once_not_every_prompt(self, tmp_path, monkeypatch):
+        import asyncio as _asyncio
+
+        from miragen.daemon.sessions import plane as plane_mod
+        from miragen.memory.lifecycle import MemoryLifecycle
+
+        async def hang(self, **kwargs):
+            await _asyncio.sleep(1)
+
+        monkeypatch.setattr(plane_mod, "RETRIEVAL_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(MemoryLifecycle, "prepare_context", hang)
         h = Harness(tmp_path)
-
-        async def no_lifecycle(session):
-            return None, "no project scope"
-
-        h.plane._lifecycle_for = no_lifecycle
-        result = await h.send("SessionStart", source="startup")
-        assert result.context.startswith("[memory status] memory UNAVAILABLE for this session (no project scope)")
+        first = await h.send("SessionStart", source="startup")
+        assert first.context.startswith("[memory status] memory UNAVAILABLE for this session (retrieval timed out)")
+        again = await h.send("UserPromptSubmit", prompt="still slow?", prompt_id="p-1")
+        assert again.context is None  # the late-open retry stays quiet
 
     async def test_injected_memories_are_counted_and_citation_asked(self, tmp_path):
         from miragen.memory.lifecycle import MemoryPacket
