@@ -466,3 +466,10 @@ class TestRepeatedEventsInOnePrompt:
                    "last_assistant_message": "same answer"}
         assert event_idempotency_key(normalize_hook_payload("claude-code", payload)) == \
             event_idempotency_key(normalize_hook_payload("claude-code", dict(payload)))
+
+    def test_resumed_subagent_content_free_events_stay_distinct_across_prompts(self):
+        base = {**CLAUDE_COMMON, "hook_event_name": "PreCompact", "agent_id": "ag-1",
+                "trigger": "auto"}
+        a = event_idempotency_key(normalize_hook_payload("claude-code", {**base, "prompt_id": "p-1"}))
+        b = event_idempotency_key(normalize_hook_payload("claude-code", {**base, "prompt_id": "p-2"}))
+        assert a != b

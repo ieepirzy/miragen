@@ -176,9 +176,12 @@ def event_idempotency_key(event: NormalizedEvent) -> str:
     with 409 (395 of 405 VPS captures, 2026-09-22). So the key is the most
     specific id plus a digest of what is stored: a redelivery (same
     content) still dedupes, a new occurrence never collides."""
+    # Every id goes into the digest, not just the anchor: a resumed
+    # subagent keeps its agent_id across prompts, and a content-free
+    # PreCompact from a later prompt must not replay-collapse into the first.
     fingerprint = captured_content(event) + json.dumps(
         event.attributes, sort_keys=True, default=str,
-    )
+    ) + json.dumps(event.ids, sort_keys=True, default=str)
     digest = hashlib.sha256(fingerprint.encode()).hexdigest()[:16]
     anchor = (
         event.ids.get("tool_use_id")
