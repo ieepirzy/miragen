@@ -410,13 +410,15 @@ class TestAdapterCopy:
 
 def test_setup_cli(tmp_path):
     home = _codex_home(tmp_path)
+    env = {**os.environ, "HOME": str(tmp_path), "CODEX_HOME": str(home),
+           "GROK_HOME": str(tmp_path / ".grok")}
     ran = subprocess.run([sys.executable, "-m", "miragen_hook", "setup", "codex", "--home", str(home),
                           "--daemon", "https://m.example"], capture_output=True, text=True, timeout=30,
-                         check=False, cwd=Path(__file__).resolve().parents[1])
+                         check=False, cwd=Path(__file__).resolve().parents[1], env=env)
     assert ran.returncode == 0, ran.stderr
     assert json.loads(ran.stdout)["current"] is True
     ran = subprocess.run([sys.executable, "-m", "miragen_hook", "setup", "codex", "--home", str(home),
-                          "--remove"], capture_output=True, text=True, timeout=30, check=False,
+                          "--remove"], capture_output=True, text=True, timeout=30, check=False, env=env,
                          cwd=Path(__file__).resolve().parents[1])
     assert ran.returncode == 0 and "miragen-bridge" not in (home / "config.toml").read_text()
 
@@ -591,3 +593,48 @@ def test_a_source_changing_mid_copy_is_not_published(tmp_path, monkeypatch):
     with pytest.raises(hs.SetupError, match="changed while it was copied"):
         hs.ensure_adapter_copy(tmp_path / "home", [], src)
     assert not [p for p in (tmp_path / "home" / "miragen-adapter").iterdir() if not p.name.startswith(".")]
+
+
+
+# ── the memory-bridge skill ──────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("harness", ["codex", "grok-build"])
+def test_the_skill_is_installed_ours_by_marker(tmp_path, harness):
+    home = tmp_path / "home"
+    home.mkdir()
+    ensure = hs.ensure_codex if harness == "codex" else hs.ensure_grok
+    remove = hs.remove_codex if harness == "codex" else hs.remove_grok
+    status = ensure(home, url="https://m.example")
+    skill = home / "skills" / "memory-bridge"
+    assert status["skills"] == {"memory-bridge": "written"}
+    assert (skill / "SKILL.md").read_bytes() == (hs.adapter_source() / "skills" / "memory-bridge" / "SKILL.md").read_bytes()
+    assert (skill / hs.SKILL_MARKER).is_file()
+    mtime = (skill / "SKILL.md").stat().st_mtime_ns
+    again = ensure(home, url="https://m.example")
+    assert again["skills"] == {"memory-bridge": "current"} and again["changed"] == []
+    assert (skill / "SKILL.md").stat().st_mtime_ns == mtime
+    (skill / "SKILL.md").write_text("tampered")  # ours, drifted: restored
+    assert ensure(home, url="https://m.example")["skills"] == {"memory-bridge": "written"}
+    assert (skill / "SKILL.md").read_text() != "tampered"
+    assert not [p for p in (home / "skills").iterdir() if p.name.startswith(".")]  # no staging left
+    remove(home)
+    assert not skill.exists()
+
+
+@pytest.mark.parametrize("harness", ["codex", "grok-build"])
+def test_a_users_same_named_skill_is_never_touched(tmp_path, harness):
+    home = tmp_path / "home"
+    (home / "skills" / "memory-bridge").mkdir(parents=True)
+    (home / "skills" / "memory-bridge" / "SKILL.md").write_text("mine")
+    ensure = hs.ensure_codex if harness == "codex" else hs.ensure_grok
+    remove = hs.remove_codex if harness == "codex" else hs.remove_grok
+    status = ensure(home, url="https://m.example")
+    assert status["skills"]["memory-bridge"].startswith("skipped")
+    remove(home)
+    assert (home / "skills" / "memory-bridge" / "SKILL.md").read_text() == "mine"
+
+
+def test_the_snapshot_carries_the_skill(tmp_path):
+    snap = hs.snapshot_adapter(tmp_path)
+    assert [s.name for s in hs.skill_sources(snap)] == ["memory-bridge"]

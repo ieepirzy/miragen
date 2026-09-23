@@ -99,6 +99,7 @@ class HarnessStatus:
     last_changed_at: float | None = None
     last_changed: list[str] = field(default_factory=list)
     last_error: str | None = None
+    skills: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -184,6 +185,7 @@ class HarnessSetupService:
             status.home = result.get("home")
             status.binary = result.get("binary")
             status.current = bool(result.get("current"))
+            status.skills = dict(result.get("skills") or {})
             status.last_error = None
             changed = list(result.get("changed") or []) + list(result.get("pruned") or [])
             if changed:

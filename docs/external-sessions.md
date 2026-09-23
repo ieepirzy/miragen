@@ -178,10 +178,19 @@ the daemon's (`miragend`); the proxy's fallback record (`plugin`) is not.
 **Grok Build ≥ 1.0.41 is required**: 0.2.114 gives stdio MCP servers
 neither `GROK_SESSION_ID` nor `GROK_PLUGIN_ROOT`, so the plugin's MCP entry
 does not start and, started by hand, the proxy sends no session header (it
-logs this once). `default_tools_approval_mode = "approve"` is pending
-Ilari's decision and lives in one constant
+logs this once). `default_tools_approval_mode = "approve"` (decided
+2026-09-23) applies to our own server table only and lives in one constant
 (`harness_setup.CODEX_TOOLS_APPROVAL_MODE`, mirrored in the plugin's
-`codex.mcp.json`). A second run with
+`codex.mcp.json`).
+
+**The `memory-bridge` skill** is installed too: the plugin's
+`skills/memory-bridge/` (vendored into the package as
+`miragen_hook/skills/`) is copied atomically into the user skills dir each
+harness reads at startup — `$CODEX_HOME/skills/memory-bridge/` (Codex
+0.156) and `$GROK_HOME/skills/memory-bridge/` (Grok ≥ 1.0.41). It is ours
+only by the `.miragen-managed` marker inside it (holding its digest): a
+same-named skill without the marker is the user's and is skipped, reported
+on `/health` (`skills`). Unchanged runs only read; `remove_*` deletes it. A second run with
 nothing to change writes nothing. `GET /health` → `harness_setup`: enabled,
 reason, url, and per harness installed / current / last_changed /
 last_error. By hand (debug, or a machine without a daemon):

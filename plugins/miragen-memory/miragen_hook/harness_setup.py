@@ -66,11 +66,11 @@ MANAGED_BY_CLI = "cli"          # `miragen-hook setup`: authoritative like the d
 MANAGED_BY_PLUGIN = "plugin"    # the proxy's fallback: only mirrors the resolution chain
 AUTHORITATIVE = frozenset({MANAGED_BY_DAEMON, MANAGED_BY_CLI})
 
-# ── PENDING ILARI'S DECISION: the ONE place the Codex tool approval is set
-# (mirrored by hand in plugins/miragen-memory/codex.mcp.json). `codex exec`
-# runs with approval policy `never` and refuses any MCP tool that needs
-# approval ("MCP tool call requires approval, but approval policy is never",
-# found live), so without "approve" the bridge tools do not work headless.
+# The ONE place the Codex tool approval is set (decided by Ilari 2026-09-23;
+# mirrored by hand in plugins/miragen-memory/codex.mcp.json), scoped to our
+# own server table. `codex exec` runs with approval policy `never` and
+# refuses any MCP tool that needs approval ("MCP tool call requires
+# approval, but approval policy is never", found live).
 CODEX_TOOLS_APPROVAL_MODE = "approve"
 
 # A superseded adapter copy is deleted this long after it stopped being
@@ -230,9 +230,86 @@ def snapshot_adapter(dest: Path) -> Path:
         package.mkdir(parents=True)
         for path in _package_files(source):
             shutil.copy2(path, package / path.name)
+        if (source / SKILLS_DIR).is_dir():
+            shutil.copytree(source / SKILLS_DIR, package / SKILLS_DIR,
+                            ignore=shutil.ignore_patterns("__pycache__"))
         if adapter_digest(package) == digest:
             return package
     raise SetupError(f"{source} kept changing while it was snapshotted")
+
+
+# ── the memory-bridge skill ──────────────────────────────────────────────────
+#
+# The plugin's skill, vendored into this package (miragen_hook/skills/, kept
+# identical by scripts/sync_plugin_adapter.sh + a test), installed into the
+# harness's USER skills dir — the dirs each reads at startup (source-read):
+# Codex 0.156 `$CODEX_HOME/skills/<name>/SKILL.md` (ext/skills host_roots.rs,
+# the user config layer's folder), Grok ≥ 1.0.41 `$GROK_HOME/skills/<name>/
+# SKILL.md` (xai-grok-agent prompt/skills.rs: grok_home + SKILL_SUBDIRS).
+# Ours only by a marker file inside it; a same-named skill without it is the
+# user's and is never touched (skipped, reported).
+
+SKILLS_DIR = "skills"
+SKILL_MARKER = ".miragen-managed"
+
+
+def skill_sources(source: Path | None = None) -> list[Path]:
+    root = (source or adapter_source()) / SKILLS_DIR
+    return sorted(d for d in root.iterdir() if (d / "SKILL.md").is_file()) if root.is_dir() else []
+
+
+def _tree_digest(directory: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(p for p in directory.rglob("*") if p.is_file() and p.name != SKILL_MARKER
+                       and "__pycache__" not in p.parts):
+        digest.update(str(path.relative_to(directory)).encode() + b"\0" + path.read_bytes() + b"\0")
+    return digest.hexdigest()[:16]
+
+
+def ensure_skills(home: Path, changed: list[str], source: Path | None = None) -> dict[str, str]:
+    """Install/refresh our skills under `<home>/skills/`. Returns name →
+    'current' | 'written' | 'skipped: …'. Pure read when current."""
+    result: dict[str, str] = {}
+    root = home / SKILLS_DIR
+    for skill in skill_sources(source):
+        target = root / skill.name
+        digest = _tree_digest(skill)
+        marker = target / SKILL_MARKER
+        if target.exists() and not marker.is_file():
+            result[skill.name] = "skipped: a skill of that name exists and is not ours"
+            continue
+        if marker.is_file() and marker.read_text().strip() == digest and _tree_digest(target) == digest:
+            result[skill.name] = "current"
+            continue
+        root.mkdir(exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=f".{skill.name}.", dir=root))
+        try:
+            shutil.copytree(skill, staging, dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("__pycache__", SKILL_MARKER))
+            (staging / SKILL_MARKER).write_text(digest + "\n")
+            if _tree_digest(staging) != digest:
+                raise SetupError(f"{skill} changed while it was copied — retrying next run")
+            old = None
+            if target.exists():
+                old = root / f".{skill.name}.old-{os.getpid()}"
+                os.rename(target, old)
+            os.rename(staging, target)
+            if old is not None:
+                shutil.rmtree(old, ignore_errors=True)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        changed.append(str(target))
+        result[skill.name] = "written"
+    return result
+
+
+def remove_skills(home: Path, changed: list[str], source: Path | None = None) -> None:
+    for skill in skill_sources(source):
+        target = home / SKILLS_DIR / skill.name
+        if (target / SKILL_MARKER).is_file():
+            shutil.rmtree(target)
+            changed.append(str(target))
 
 
 def ensure_adapter_copy(home: Path, changed: list[str], source: Path | None = None) -> Path:
@@ -439,6 +516,7 @@ def ensure_grok(
         _write_hooks_json(hook_file, current, merged, changed)
         _write_if_changed(home / ADAPTER_DIR / SETUP_FILE, _setup_record(url, token_file, managed_by),
                           changed)
+        status["skills"] = ensure_skills(home, changed, source)
         status["pruned"] = prune_adapter_copies(home, copy_root)
     status["current"] = True
     status["hook_file"] = str(hook_file)
@@ -460,6 +538,7 @@ def remove_grok(home: Path | str | None = None, *, environ: dict | None = None) 
             else:
                 hook_file.unlink()
                 changed.append(str(hook_file))
+        remove_skills(home, changed)
         if (home / ADAPTER_DIR).is_dir():
             shutil.rmtree(home / ADAPTER_DIR)
             changed.append(str(home / ADAPTER_DIR))
@@ -885,6 +964,7 @@ def ensure_codex(
         _write_hooks_json(hooks_path, current, merged, changed)
         _write_if_changed(home / ADAPTER_DIR / SETUP_FILE,
                           _setup_record(url, token_file, managed_by), changed)
+        status["skills"] = ensure_skills(home, changed, source)
         status["pruned"] = prune_adapter_copies(home, copy_root)
     status["current"] = True
     status["trusted_hooks"] = len(trust)
@@ -908,6 +988,7 @@ def remove_codex(home: Path | str | None = None, *, environ: dict | None = None)
             if rendered != text:
                 _atomic_write(config_path, rendered)
                 changed.append(str(config_path))
+        remove_skills(home, changed)
         if (home / ADAPTER_DIR).is_dir():
             shutil.rmtree(home / ADAPTER_DIR)
             changed.append(str(home / ADAPTER_DIR))

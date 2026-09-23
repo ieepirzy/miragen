@@ -94,3 +94,14 @@ def test_codex_manifest():
     assert set(server["env_vars"]) == {"MIRAGEND_URL", "MIRAGEND_TOKEN", "CODEX_HOME"}
     assert server["default_tools_approval_mode"] == "approve"  # codex exec refuses tools needing approval
     assert "${" not in json.dumps(server)  # never expanded by Codex
+
+
+def test_the_skill_is_vendored_into_the_package():
+    """The daemon installs the skill into Codex/Grok from the PACKAGE (an
+    installed miragen has no plugins/ dir): it must be the plugin's skill."""
+    def tree(root: Path) -> dict[str, bytes]:
+        return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+    plugin_skills = tree(PLUGIN / "skills")
+    assert plugin_skills == tree(ROOT / "miragen_hook" / "skills") == tree(PLUGIN / "miragen_hook" / "skills"), \
+        "run scripts/sync_plugin_adapter.sh"
+    assert "memory-bridge/SKILL.md" in plugin_skills
