@@ -44,8 +44,10 @@ class AssistantMessage:
     content: list = []
 
 
-def _factory(*messages, delay: float = 0.0, seen: list | None = None, closed: list | None = None):
-    """A query_factory yielding `messages`; records (prompt, options)."""
+def _factory(*messages, delay: float = 0.0, seen: list | None = None, closed: list | None = None,
+             teardown: float = 0.0):
+    """A query_factory yielding `messages`; records (prompt, options).
+    `teardown` models the SDK's graceful CLI shutdown after a cancel."""
 
     def factory(prompt, options):
         if seen is not None:
@@ -58,6 +60,8 @@ def _factory(*messages, delay: float = 0.0, seen: list | None = None, closed: li
                 for message in messages:
                     yield message
             finally:
+                if teardown:
+                    await asyncio.sleep(teardown)
                 if closed is not None:
                     closed.append(True)
 
@@ -155,7 +159,25 @@ class TestClaudeCodeSelector:
                      delay=5.0, timeout_s=0.05, closed=closed)
         with pytest.raises(SelectorError, match="timed out after 0.05s"):
             await asyncio.wait_for(select("q", CARDS), timeout=2.0)
+        for _ in range(50):
+            if closed:
+                break
+            await asyncio.sleep(0.01)
         assert closed == [True]  # the stream was torn down, not left running
+
+    async def test_timeout_does_not_wait_for_the_cli_teardown(self):
+        # The SDK gives a cancelled CLI up to 5 s to exit gracefully; the
+        # hook must get its failure at the deadline, not after that.
+        closed = []
+        select = _cc(ResultMessage(structured_output={"selections": []}),
+                     delay=5.0, timeout_s=0.05, teardown=0.6, closed=closed)
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(SelectorError, match="timed out"):
+            await select("q", CARDS)
+        assert asyncio.get_running_loop().time() - started < 0.4
+        assert closed == []          # teardown still running in the background
+        await asyncio.sleep(0.8)
+        assert closed == [True]      # ...and it completes
 
     def test_building_imports_nothing(self, monkeypatch):
         monkeypatch.setitem(__import__("sys").modules, "claude_agent_sdk", None)

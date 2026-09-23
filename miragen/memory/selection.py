@@ -142,21 +142,45 @@ def build_model_selector(
     return select
 
 
+# Selections abandoned at their deadline, still unwinding (strong refs so the
+# loop does not garbage-collect a task mid-cleanup).
+_abandoned: set[asyncio.Task] = set()
+
+
 def _bounded(inner: SelectFn, timeout_s: float | None) -> SelectFn:
     """A hard bound on one selection: a slow model is a selector FAILURE
-    (inject nothing, the lane reports degraded), never a stalled hook. The
-    cancellation reaches the backend — for claude-code it tears down the
-    CLI subprocess."""
+    (inject nothing, the lane reports degraded), never a stalled hook.
+
+    The caller gets the failure AT the deadline. The selection itself is
+    cancelled but not awaited: claude-agent-sdk's shutdown gives the CLI a
+    graceful-exit window of up to 5 s (then SIGTERM, then SIGKILL) after the
+    cancel, and `asyncio.wait_for` would make the hook sit through it
+    (measured: a 0.4 s bound returned after 2.6 s). That teardown finishes
+    in the background instead."""
 
     async def select(request: str, cards: list[dict]) -> SelectionResult:
         if not timeout_s:
             return await inner(request, cards)
+        task = asyncio.ensure_future(inner(request, cards))
         try:
-            return await asyncio.wait_for(inner(request, cards), timeout=timeout_s)
-        except asyncio.TimeoutError:
-            raise SelectorError(f"selector timed out after {timeout_s:g}s") from None
+            done, _ = await asyncio.wait({task}, timeout=timeout_s)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        if done:
+            return task.result()
+        task.cancel()
+        _abandoned.add(task)
+        task.add_done_callback(_reap_abandoned)
+        raise SelectorError(f"selector timed out after {timeout_s:g}s")
 
     return select
+
+
+def _reap_abandoned(task: asyncio.Task) -> None:
+    _abandoned.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.debug(f"abandoned selection ended with: {task.exception()!r}")
 
 
 # ── pydantic-ai ──────────────────────────────────────────────────────────────
