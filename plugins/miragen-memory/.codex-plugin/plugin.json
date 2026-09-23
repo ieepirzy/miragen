@@ -1,6 +1,6 @@
 {
   "name": "miragen-memory",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "miragen memory bridge for Codex: memory_* and store_* tools via a stdio MCP proxy. Lifecycle hooks are native Codex hooks (harness codex, trusted) that the local miragend writes into $CODEX_HOME.",
   "author": {
     "name": "ieepirzy",
