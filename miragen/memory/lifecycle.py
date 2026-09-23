@@ -392,7 +392,21 @@ class MemoryLifecycle:
             )
             return {"status": "captured", "event_id": result["id"],
                     "created": result.get("created", True)}
-        except (MemoryUnavailable, MemoryAPIError) as exc:
+        except MemoryAPIError as exc:
+            error = exc.body.get("error", {}) if isinstance(exc.body, dict) else {}
+            if exc.status_code == 409 and error.get("code") == "illegal_transition" \
+                    and "idempotency_key" in str(error.get("message", "")):
+                # Episode keys are one per occurrence ON PURPOSE: the first
+                # digest filed for `end` / `compact-N` wins. A re-finalize
+                # (sweep after SessionEnd, journal replay rebuilding the
+                # digest from events that now capture) carries different
+                # content for an occurrence that is already filed — that is
+                # the dedupe working, not a lost write.
+                return {"status": "captured", "created": False, "already_filed": True,
+                        "event_id": (error.get("details") or {}).get("event_id")}
+            return {"status": "persistence_unavailable",
+                    "detail": self._degrade(f"episode capture: {exc}")}
+        except MemoryUnavailable as exc:
             return {"status": "persistence_unavailable",
                     "detail": self._degrade(f"episode capture: {exc}")}
 
