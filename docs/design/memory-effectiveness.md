@@ -25,7 +25,9 @@ Built, reviewed and green in CI, **not merged or deployed** (merge and deploy wa
 | Deploy prerequisites (Claude Code in the image, worker grants) | #129 | |
 | Compose: bridge token, worker service | Muutto365/movingfirm-agents#43 | Deploy **only after** the miragen image contains all of the above |
 
-Deferred, with issues: #116 redaction, #119 pinning, #120 async recall for HTTP hooks, #121 learned adapter, #122 `MEMORY.md` import, #123 judgment log into Loimi, #124 Codex/Grok parity, #125 run namespace after a switch, #130 poison-job retry cap. The P1.1 eval is running; its results gate turning the worker on.
+Deferred, with issues: #116 redaction, #119 pinning, #120 async recall for HTTP hooks, #121 learned adapter, #122 `MEMORY.md` import, #123 judgment log into Loimi, #124 Codex/Grok parity, #125 run namespace after a switch, #130 poison-job retry cap, #133 other agents' messages recorded as the user's.
+
+**P1.1 eval done** (full report in the PR #110 comments). The selector is `claude-code:haiku` with the v2 instructions: recall 0.83, false injections 10%, both bars met. Extraction is `claude-code:sonnet`: recall 0.70, precision 0.89. Haiku's extraction recall of 0.26–0.35 fails the bar.
 
 ## 1. Why this exists
 
