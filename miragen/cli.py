@@ -321,8 +321,12 @@ def memory_hook(harness: str) -> None:
                    "plus its checks can take a minute).")
 @click.option("--max-backoff", default=900, show_default=True,
               help="Upper bound (seconds) of the pause after sweeps where every job failed.")
+@click.option("--skip-before", envvar="MIRAGEN_WORKER_SKIP_BEFORE", default=None,
+              help="ISO timestamp: jobs for events received earlier are completed without "
+                   "a model call. Every captured event queues a job, so a first deployment "
+                   "would otherwise extract the whole history on the model's quota.")
 def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None,
-                  lease_seconds: int, max_backoff: int) -> None:
+                  lease_seconds: int, max_backoff: int, skip_before: str | None) -> None:
     """The bounded extraction worker (memory pass PR 3, §17.5): claims
     consolidate jobs through /memory/v1 as its own maintain-capable
     principal and proposes extracted memories through the same admission
@@ -362,11 +366,22 @@ def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None,
     check = build_model_checker(model)
     embed = build_http_embedder(embed_url) if embed_url else None
 
+    cutoff = None
+    if skip_before:
+        from datetime import UTC, datetime
+
+        try:
+            cutoff = datetime.fromisoformat(skip_before.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise click.ClickException(f"--skip-before: not an ISO timestamp: {skip_before}") from exc
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=UTC)
+
     backoff = 0
     while True:
         results = asyncio.run(
             run_worker_once(client, extract=extract, check=check, embed=embed,
-                            limit=limit, lease_seconds=lease_seconds)
+                            limit=limit, lease_seconds=lease_seconds, skip_before=cutoff)
         )
         for result in results:
             click.echo(
