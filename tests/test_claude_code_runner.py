@@ -44,6 +44,9 @@ FAKE = textwrap.dedent(
         "stdin": sys.stdin.read(), "env": dict(os.environ), "start": time.time(),
     }}
     mode = os.environ.get("FAKE_MODE", "ok")
+    if os.environ.get("FAKE_PIDFILE"):
+        with open(os.environ["FAKE_PIDFILE"], "w") as fh:
+            fh.write(str(os.getpid()))
     if mode == "sleep":
         time.sleep(float(os.environ.get("FAKE_SLEEP", "5")))
     record["end"] = time.time()
@@ -143,12 +146,50 @@ def test_output_that_breaks_the_schema_raises(fake, monkeypatch):
         run(ClaudeCodeRunner("claude-code:haiku").run("i", "p", SelectionResult))
 
 
-def test_a_hung_call_is_killed_at_the_timeout(fake, monkeypatch):
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+@pytest.fixture
+def pidfile(tmp_path, monkeypatch):
+    path = tmp_path / "child.pid"
+    monkeypatch.setenv("FAKE_PIDFILE", str(path))
     monkeypatch.setenv("FAKE_MODE", "sleep")
+    monkeypatch.setenv("FAKE_SLEEP", "30")
+    return path
+
+
+def _wait_for_file(path, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not path.exists() or not path.read_text():
+        assert time.monotonic() < deadline, "the fake never started"
+        time.sleep(0.02)
+    return int(path.read_text())
+
+
+def test_a_hung_call_is_killed_at_the_timeout(fake, pidfile):
     started = time.monotonic()
     with pytest.raises(ClaudeCodeError, match="timed out"):
-        run(ClaudeCodeRunner("claude-code:haiku", timeout=0.5).run("i", "p", Echo))
-    assert time.monotonic() - started < 4
+        run(ClaudeCodeRunner("claude-code:haiku", timeout=1.0).run("i", "p", Echo))
+    assert time.monotonic() - started < 5
+    assert not _alive(_wait_for_file(pidfile)), "the child outlived its timeout"
+
+
+def test_a_cancelled_call_kills_its_child(fake, pidfile):
+    """The daemon wraps recall in its own wait_for: when that fires, the
+    runner is CANCELLED, not timed out. The child must die with it."""
+    runner = ClaudeCodeRunner("claude-code:haiku", timeout=60)
+
+    async def cancelled():
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(runner.run("i", "p", Echo), timeout=1.0)
+
+    run(cancelled())
+    assert not _alive(_wait_for_file(pidfile)), "a cancelled call leaked its claude process"
 
 
 def test_a_missing_binary_raises(monkeypatch):

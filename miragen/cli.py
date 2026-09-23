@@ -277,6 +277,8 @@ def memory_hook(harness: str) -> None:
     from miragen.memory import MemoryClient, MemoryLifecycle
     from miragen.memory.harness_hooks import handle_hook_event, normalize_hook_payload
 
+    if os.environ.get("MIRAGEN_WORKER"):
+        return  # a memory model call miragen started: never captured (claude_code.py)
     try:
         payload = _json.load(sys.stdin)
         profile = load_profile(os.environ.get("AGENT_PROFILE", "agent.yaml"))
@@ -313,7 +315,7 @@ def memory_hook(harness: str) -> None:
               help="Jobs claimed per sweep.")
 @click.option("--embed-url", envvar="MIRAGEN_MEMORY_EMBED_URL", default=None,
               help="Embed endpoint (POST /embed); enables index-job backfill.")
-@click.option("--lease", "lease_seconds", default=120, show_default=True,
+@click.option("--lease", "lease_seconds", default=600, show_default=True,
               help="Job lease in seconds. Jobs in a sweep run one after another, so keep "
                    "it above limit × the slowest extraction (a claude-code: extraction "
                    "plus its checks can take a minute).")

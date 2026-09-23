@@ -43,10 +43,21 @@ PREFIX = "claude-code:"
 
 # Credentials that outrank the subscription token (CLAUDE_CODE_OAUTH_TOKEN)
 # or route the call to a metered provider. Never inherited by the child.
+# (https://code.claude.com/docs/en/authentication, "Authentication
+# precedence"). A gateway login or managed `forceLoginMethod` is host
+# configuration, not environment: keep it off hosts that run the worker.
 SCRUBBED_ENV = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_PROFILE",
+    "ANTHROPIC_FEDERATION_RULE_ID",
+    "ANTHROPIC_ORGANIZATION_ID",
+    "ANTHROPIC_SERVICE_ACCOUNT_ID",
+    "ANTHROPIC_WORKSPACE_ID",
+    "ANTHROPIC_IDENTITY_TOKEN",
+    "ANTHROPIC_IDENTITY_TOKEN_FILE",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
@@ -132,6 +143,21 @@ def parse_result[M: BaseModel](
         raise ClaudeCodeError(f"structured_output does not match the schema: {exc}") from exc
 
 
+async def _reap(proc: asyncio.subprocess.Process) -> None:
+    """Kill the child and wait for it, even while the caller is being
+    cancelled (the wait is shielded; a second cancel still leaves it
+    killed)."""
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        await asyncio.shield(proc.wait())
+    except asyncio.CancelledError:
+        pass
+
+
 class ClaudeCodeRunner:
     """One isolated `claude -p` structured call per `run()`."""
 
@@ -162,9 +188,14 @@ class ClaudeCodeRunner:
                         proc.communicate(prompt.encode()), timeout=self.timeout
                     )
                 except TimeoutError as exc:
-                    proc.kill()
-                    await proc.wait()
+                    await _reap(proc)
                     raise ClaudeCodeError(f"claude timed out after {self.timeout:.0f}s") from exc
+                except BaseException:
+                    # Cancelled from outside (a caller's wait_for around the
+                    # whole recall): the child must not outlive the call,
+                    # hold its deleted cwd, or escape the concurrency cap.
+                    await _reap(proc)
+                    raise
         return parse_result(
             stdout.decode(errors="replace"),
             proc.returncode if proc.returncode is not None else -1,
