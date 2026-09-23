@@ -758,6 +758,9 @@ def _owned_values(parsed: dict, state_keys: set[str]) -> dict:
     }
 
 
+HTTP_TRANSPORT_KEYS = ("url", "bearer_token_env_var", "http_headers", "env_http_headers")
+
+
 def desired_server(parsed: dict, server: dict | None) -> dict | None:
     """Our server table as it should be: our fields over whatever the user
     added to the same table (`enabled = false`, `[….tools.<t>] approval_mode`
@@ -767,6 +770,12 @@ def desired_server(parsed: dict, server: dict | None) -> dict | None:
         return None
     existing = _owned_values(parsed, set())["server"]
     merged = {k: v for k, v in existing.items() if k not in server} if isinstance(existing, dict) else {}
+    for key in HTTP_TRANSPORT_KEYS:
+        # An earlier hand-made http entry's transport: the stdio proxy replaces
+        # it, and Codex refuses the whole config.toml when a stdio server also
+        # carries `url` ("url is not supported for stdio") — found live on
+        # Ilari's machine, 2026-09-23.
+        merged.pop(key, None)
     merged.update(server)
     return json.loads(json.dumps(merged, default=str))
 
