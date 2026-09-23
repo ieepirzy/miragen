@@ -638,3 +638,21 @@ def test_a_users_same_named_skill_is_never_touched(tmp_path, harness):
 def test_the_snapshot_carries_the_skill(tmp_path):
     snap = hs.snapshot_adapter(tmp_path)
     assert [s.name for s in hs.skill_sources(snap)] == ["memory-bridge"]
+
+
+def test_an_old_http_entry_loses_its_transport_keys():
+    """A hand-made `[mcp_servers.miragen-bridge]` http entry (url + bearer)
+    becomes our stdio proxy: its transport keys go — Codex rejects the whole
+    config when a stdio server carries `url` — while other user keys stay."""
+    from miragen_hook.harness_setup import desired_server
+    parsed = {"mcp_servers": {"miragen-bridge": {
+        "url": "http://127.0.0.1:8420/mcp", "bearer_token_env_var": "MIRAGEND_TOKEN",
+        "http_headers": {"X": "y"}, "env_http_headers": {"A": "B"}, "enabled": False,
+        "startup_timeout_sec": 20,
+    }}}
+    ours = {"command": "python3", "args": ["x"], "default_tools_approval_mode": "approve"}
+    merged = desired_server(parsed, ours)
+    for key in ("url", "bearer_token_env_var", "http_headers", "env_http_headers"):
+        assert key not in merged
+    assert merged["enabled"] is False and merged["startup_timeout_sec"] == 20
+    assert merged["command"] == "python3"
