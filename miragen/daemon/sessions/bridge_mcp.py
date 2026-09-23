@@ -21,9 +21,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Callable
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from miragen.daemon.sessions.store import StoreAPIError, StoreUnavailable
@@ -38,8 +39,18 @@ INSTRUCTIONS = (
     "session header's store_run=…) or `session`, or open one with "
     "store_open_run. Provenance is one hop: list only DIRECT sources. A write "
     "is saved only when the result says accepted/captured; pending or "
-    "persistence_unavailable is not saved."
+    "persistence_unavailable is not saved. Harnesses that cannot show you "
+    "the session header (Grok Build) identify the session on the connection: "
+    "there, omitting `project`/`session` in the memory_* tools, store_open_run "
+    "and store_put_artifact means this session's project/run."
 )
+
+# Sent by harnesses whose model never sees the injected session header
+# (Grok Build expands `{{session_id}}` in plugin MCP headers). A routing
+# hint with exactly the authority of the `session` argument the model could
+# type itself — it can only select a session the daemon already knows.
+HARNESS_SESSION_HEADER = "x-harness-session"
+_SESSION_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}:[A-Za-z0-9._-]{1,128}$")
 
 
 def _dump(value: Any) -> str:
@@ -59,6 +70,20 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
         # guarded by bearer/OAuth instead (see api.py).
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
+
+    def _connection_session(ctx: Context | None) -> str | None:
+        """The session named by the connection's X-Harness-Session header,
+        if it is one the daemon knows (an unknown key would otherwise be
+        read as a directory name and provision a junk scope)."""
+        try:
+            request = ctx.request_context.request if ctx is not None else None
+        except (AttributeError, LookupError, ValueError):
+            return None
+        headers = getattr(request, "headers", None)
+        value = headers.get(HARNESS_SESSION_HEADER, "").strip() if headers is not None else ""
+        if not _SESSION_KEY_RE.match(value):
+            return None
+        return value if get_plane().find_session(value) is not None else None
 
     async def _lifecycle(project: str | None):
         plane = get_plane()
@@ -132,6 +157,7 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
     @mcp.tool()
     async def memory_recall(
         query: str, project: str | None = None, limit: int = 8, types: list[str] | None = None,
+        ctx: Context | None = None,
     ) -> str:
         """Search memory readable from a project (its own scope plus the
         shared read layers): lexical recall over accepted records. An empty
@@ -143,7 +169,8 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
             limit: Max records (1-50).
             types: Restrict to record types: observation, claim, procedure, intention.
         """
-        plane, identity, lifecycle, write, detail = await _lifecycle(project)
+        plane, identity, lifecycle, write, detail = await _lifecycle(
+            project or _connection_session(ctx))
         body: dict[str, Any] = {
             "scope_ids": list(lifecycle.spec.scopes.read), "query_text": query,
             "limit": max(1, min(int(limit), 50)),
@@ -159,18 +186,23 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
                       "scope_detail": detail, **found})
 
     @mcp.tool()
-    async def memory_read(record_id: str, project: str | None = None) -> str:
+    async def memory_read(
+        record_id: str, project: str | None = None, ctx: Context | None = None,
+    ) -> str:
         """Read one memory record by id (current revision; history stays queryable).
 
         Args:
             record_id: The record id.
             project: Which project's principal view to read through (usually irrelevant).
         """
-        _, _, lifecycle, _, _ = await _lifecycle(project)
+        _, _, lifecycle, _, _ = await _lifecycle(project or _connection_session(ctx))
         return _dump(await lifecycle.read(record_id))
 
     @mcp.tool()
-    async def memory_remember(content: str, project: str | None = None, session: str | None = None) -> str:
+    async def memory_remember(
+        content: str, project: str | None = None, session: str | None = None,
+        ctx: Context | None = None,
+    ) -> str:
         """Propose one focused, self-contained durable observation into a
         project's memory scope. Rooted in its own source event (the agent
         said this, then). Saved only when status is accepted.
@@ -180,6 +212,8 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
             project: Repository remote/name or session key; omit for the default project.
             session: Session key to attribute the note to (its run ref).
         """
+        if not session and not project:
+            session = _connection_session(ctx)
         plane, identity, lifecycle, write, detail = await _lifecycle(session or project)
         result = await lifecycle.remember(
             instance=identity.slug, run_id=session, content=content,
@@ -189,6 +223,7 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
     @mcp.tool()
     async def memory_correct(
         record_id: str, correction: dict, reason: str = "", project: str | None = None,
+        ctx: Context | None = None,
     ) -> str:
         """Correct an erroneous stored memory record with evidence; the
         correction is its own event and history stays queryable.
@@ -199,14 +234,16 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
             reason: Why — quote the user's correction when relaying one.
             project: Repository remote/name or session key.
         """
-        _, identity, lifecycle, _, _ = await _lifecycle(project)
+        _, identity, lifecycle, _, _ = await _lifecycle(project or _connection_session(ctx))
         return _dump(await lifecycle.correct(
             instance=identity.slug, run_id=None, record_id=record_id,
             corrected_payload=correction, reason=reason,
         ))
 
     @mcp.tool()
-    async def memory_checkpoint(state: dict, project: str | None = None) -> str:
+    async def memory_checkpoint(
+        state: dict, project: str | None = None, ctx: Context | None = None,
+    ) -> str:
         """Persist durable working state for a project (shallow-merged; a
         null value removes a key). Use before finishing or when the goal,
         constraints or pending actions materially change.
@@ -215,7 +252,7 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
             state: Fields to merge, e.g. {"goal": ..., "pending_actions": [...]}.
             project: Repository remote/name or session key; omit for the default project.
         """
-        _, identity, lifecycle, write, _ = await _lifecycle(project)
+        _, identity, lifecycle, write, _ = await _lifecycle(project or _connection_session(ctx))
         result = await lifecycle.checkpoint(instance=identity.slug, patch=state)
         return _dump({**result, "project": identity.id, "scope": write})
 
@@ -231,6 +268,7 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
     async def store_open_run(
         task: str, namespace: str | None = None, project: str | None = None,
         parent_run_id: str | None = None,
+        ctx: Context | None = None,
     ) -> str:
         """Open a Loimi run — the unit of provenance — for work that is not
         already covered by this session's run. Returns the Run; pass its id
@@ -245,6 +283,7 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
         plane = get_plane()
         store = _store(plane)
         if namespace is None:
+            project = project or _connection_session(ctx)
             identity = plane.resolve_identity(project) if project else None
             namespace = store.namespace_for(identity)
         return _dump(await _store_call(plane, store.open_run(
@@ -275,6 +314,7 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
         suggested_namespaces: list[str] | None = None,
         as_of: str | None = None,
         skip_provenance: bool = False,
+        ctx: Context | None = None,
     ) -> str:
         """Write an immutable artifact to Loimi under a run. Pass `run_id`, or
         `session` (this session's key from the injected header) to use its
@@ -297,6 +337,8 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
         """
         plane = get_plane()
         store = _store(plane)
+        if not run_id and not session:
+            session = _connection_session(ctx)
         resolved = _resolve_run(plane, run_id, session)
         if not resolved:
             return _dump({"status": "rejected", "detail": (

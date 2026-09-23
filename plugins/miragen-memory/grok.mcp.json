@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "miragen-bridge": {
+      "type": "http",
+      "url": "${MIRAGEND_URL:-https://memory.muutto365.fi}/mcp",
+      "bearer_token_env_var": "MIRAGEND_TOKEN",
+      "headers": {
+        "X-Harness-Session": "grok-build:{{session_id}}"
+      }
+    }
+  }
+}

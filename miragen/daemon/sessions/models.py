@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 HARNESS_PATTERN = r"^[a-z0-9][a-z0-9-]{0,31}$"
 EVENT_NAMES = (
@@ -61,6 +61,15 @@ class ClientInfo(_Tolerant):
     parent_session: Optional[str] = Field(default=None, max_length=256)
     agent: Optional[str] = Field(default=None, max_length=256)
     adapter: Optional[str] = Field(default=None, max_length=64)
+    # "deferred": the harness discards start/prompt hook output, so context
+    # answered now reaches the model only with a later tool result (Grok
+    # Build). Free-form on purpose — a newer adapter's value must not 422.
+    context_delivery: Optional[str] = None
+
+    @field_validator("context_delivery", mode="before")
+    @classmethod
+    def _clip_delivery(cls, value: Any) -> Any:
+        return value[:32] if isinstance(value, str) else None
 
 
 class EventBody(_Tolerant):
@@ -115,6 +124,9 @@ class SessionCounters(_Tolerant):
     tool_failures: int = 0
     compactions: int = 0
     injections: int = 0
+    # Of `injections`, how many were queued for a later tool result rather
+    # than shown at once (harnesses that discard start/prompt output).
+    deferred_injections: int = 0
     captures: int = 0
     capture_failures: int = 0
 

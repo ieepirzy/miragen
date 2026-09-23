@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import socket
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -30,6 +32,8 @@ from typing import Any
 from miragen_hook import ADAPTER_VERSION
 from miragen_hook.normalize import (
     CONTEXT_BEARING,
+    CONTEXT_OPENING,
+    DEFERRED_CONTEXT_HARNESSES,
     HARNESSES,
     NormalizedEvent,
     harness_output,
@@ -42,9 +46,15 @@ HOOKS_PATH = "/sessions/v1/hooks"  # raw harness payloads (HTTP hooks, no adapte
 
 # Where the daemon URL / token come from, first match wins. The plugin
 # form (plugins/miragen-memory) hands its user options to hook processes
-# as CLAUDE_PLUGIN_OPTION_<KEY>; the bare form is the environment.
+# as CLAUDE_PLUGIN_OPTION_<KEY> — but only Claude Code does: Codex and Grok
+# Build load the same plugin and set none of them (Grok 1.0.41 source; the
+# Codex break of 2026-09-22), so the URL then falls through to the
+# environment, the option the user saved in Claude Code's settings, and the
+# manifest's default — never silently to a daemon nobody configured.
 URL_ENV_VARS = ("CLAUDE_PLUGIN_OPTION_DAEMON_URL", "MIRAGEND_URL")
 TOKEN_ENV_VARS = ("CLAUDE_PLUGIN_OPTION_TOKEN", "MIRAGEND_TOKEN")
+PLUGIN_NAME = "miragen-memory"
+PLUGIN_ROOT_ENV_VARS = ("GROK_PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT")
 _GIT_TIMEOUT_S = 2.0
 
 # Seconds. Context-bearing events wait for retrieval; captures only wait
@@ -57,7 +67,12 @@ TIMEOUT_SESSION_END_S = 1.0
 _HARNESS_PROCESS_MARKERS = {
     "claude-code": ("claude",),
     "codex": ("codex",),
+    "grok-build": ("grok",),
 }
+
+# Grok Build honours additionalContext on tool results up to 10,000 chars.
+DEFERRED_CONTEXT_CAP = 10_000
+_DELIVERY_EVENTS = ("PostToolUse", "PostToolUseFailure")
 
 
 def timeout_for(event: NormalizedEvent) -> float:
@@ -178,6 +193,11 @@ def build_envelope(
             "parent_session": env.get("MIRAGEN_PARENT_SESSION"),
             "agent": env.get("MIRAGEN_AGENT"),
             "adapter": ADAPTER_VERSION,
+            # "deferred": context answered for this event reaches the model
+            # only on the next tool result (Grok Build), not now.
+            "context_delivery": (
+                "deferred" if harness in DEFERRED_CONTEXT_HARNESSES else "immediate"
+            ),
         },
         "sent_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -227,17 +247,206 @@ def read_token(token_file: str | None, environ: dict | None = None) -> str | Non
     return None
 
 
-def resolve_daemon_url(explicit: str | None, environ: dict | None = None) -> str:
+def _read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def saved_plugin_option(key: str, *, settings_path: Path | None = None) -> str | None:
+    """The value the user saved for this plugin's option in Claude Code
+    (`pluginConfigs["miragen-memory@<marketplace>"].options`) — what Claude
+    Code itself would have exported as CLAUDE_PLUGIN_OPTION_<KEY>. Read for
+    the harnesses that load the plugin without exporting it. Sensitive
+    options (the token) are not stored there."""
+    home = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+    path = settings_path or Path(home) / "settings.json"
+    configs = _read_json(path).get("pluginConfigs")
+    if not isinstance(configs, dict):
+        return None
+    for plugin_key in sorted(configs):
+        if not str(plugin_key).startswith(f"{PLUGIN_NAME}@"):
+            continue
+        options = configs[plugin_key].get("options") if isinstance(configs[plugin_key], dict) else None
+        value = options.get(key) if isinstance(options, dict) else None
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def own_plugin_root() -> Path | None:
+    """This adapter's plugin directory when it runs as the plugin's vendored
+    copy (a native Grok hook file points straight at it), else None."""
+    root = Path(__file__).resolve().parent.parent
+    return root if (root / ".claude-plugin" / "plugin.json").is_file() else None
+
+
+def _plugin_roots(env: dict) -> list[Path]:
+    roots = [Path(env[name]) for name in PLUGIN_ROOT_ENV_VARS if env.get(name)]
+    own = own_plugin_root()
+    if own is not None:
+        roots.append(own)
+    return roots
+
+
+def manifest_option_default(key: str, environ: dict | None = None) -> str | None:
+    """The plugin manifest's declared default for an option — the URL the
+    plugin was published to talk to, found through the plugin root the
+    harness exports to hooks, or the plugin this adapter was vendored into."""
+    env = os.environ if environ is None else environ
+    for root in _plugin_roots(env):
+        spec = _read_json(root / ".claude-plugin" / "plugin.json").get("userConfig")
+        option = spec.get(key) if isinstance(spec, dict) else None
+        default = option.get("default") if isinstance(option, dict) else None
+        if isinstance(default, str) and default:
+            return default
+    return None
+
+
+def resolve_daemon_url(
+    explicit: str | None, environ: dict | None = None, *, settings_path: Path | None = None,
+) -> str:
+    """explicit → plugin option env (Claude Code) → MIRAGEND_URL → the option
+    saved in Claude Code's settings → the manifest default → loopback."""
     env = os.environ if environ is None else environ
     if explicit:
         return explicit
     for name in URL_ENV_VARS:
         if env.get(name):
             return env[name]
+    if _plugin_roots(env):
+        # Only the plugin's adapter has an option to recover; a bare
+        # `miragen-hook` install keeps its explicit/env/loopback contract.
+        return (
+            saved_plugin_option("daemon_url", settings_path=settings_path)
+            or manifest_option_default("daemon_url", env)
+            or DEFAULT_DAEMON_URL
+        )
     return DEFAULT_DAEMON_URL
 
 
 # ── entry point ──────────────────────────────────────────────────────────────
+
+
+# ── deferred context (harnesses that ignore start/prompt stdout) ──────────────
+
+
+def pending_dir(environ: dict | None = None) -> Path:
+    """Where context waits for its next delivery point: the harness's plugin
+    data dir if one is exported (Grok exports none to native hook files, so
+    in practice the user's state dir). Never the repository."""
+    env = os.environ if environ is None else environ
+    base = env.get("GROK_PLUGIN_DATA") or env.get("CLAUDE_PLUGIN_DATA")
+    if base:
+        return Path(base) / "pending"
+    state = env.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(state) / "miragen-hook" / "pending"
+
+
+# A queued block older than this is from a session that never reached its
+# SessionEnd (crash, kill): stale, never delivered into a later resume.
+PENDING_TTL_S = 12 * 3600
+
+
+def _pending_file(session_id: str, environ: dict | None) -> Path:
+    name = hashlib.sha256(session_id.encode()).hexdigest()[:32]
+    return pending_dir(environ) / f"{name}.jsonl"
+
+
+def _read_entries(path: Path) -> list[dict]:
+    entries = []
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return entries
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and isinstance(entry.get("text"), str):
+            entries.append(entry)
+    return entries
+
+
+def stash_context(
+    session_id: str, context: str, environ: dict | None = None, *, origin: str = "SessionStart",
+) -> None:
+    """Queue context for the session's next tool result. A start (SessionStart)
+    replaces everything queued — it is the whole picture; a prompt's context
+    replaces the previous prompt's, so one turn's recall never reaches the
+    model in a later turn next to a newer one."""
+    path = _pending_file(session_id, environ)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if origin == "SessionStart":
+            kept: list[dict] = []
+        else:
+            kept = [e for e in _read_entries(path) if e.get("from") != origin]
+        kept.append({"from": origin, "text": context})
+        data = "".join(json.dumps(e) + "\n" for e in kept).encode()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        _sweep_stale(path.parent)
+    except OSError as exc:
+        print(f"miragen-hook: could not queue context ({exc})", file=sys.stderr)
+
+
+def _sweep_stale(directory: Path) -> None:
+    """Queues of sessions that never reached SessionEnd (crash, kill) and
+    claims orphaned mid-delivery: nothing will ever take them."""
+    cutoff = time.time() - PENDING_TTL_S
+    for stale in directory.glob("*"):
+        try:
+            if stale.stat().st_mtime < cutoff:
+                stale.unlink()
+        except OSError:
+            continue
+
+
+def take_context(session_id: str, environ: dict | None = None) -> str | None:
+    """The queued context, removed so it is delivered exactly once (the
+    rename claims it atomically against a concurrent tool hook). Over the
+    harness cap the OLDEST text goes: a start block superseded by a newer
+    prompt's context is the lesser loss."""
+    path = _pending_file(session_id, environ)
+    claimed = path.with_suffix(f".taking-{os.getpid()}")
+    try:
+        path.rename(claimed)
+    except OSError:
+        return None
+    try:
+        if time.time() - claimed.stat().st_mtime > PENDING_TTL_S:
+            return None
+        text = "\n\n".join(e["text"] for e in _read_entries(claimed))
+        return text[-DEFERRED_CONTEXT_CAP:] or None
+    except OSError:
+        return None
+    finally:
+        claimed.unlink(missing_ok=True)
+
+
+def discard_context(session_id: str, environ: dict | None = None) -> None:
+    _pending_file(session_id, environ).unlink(missing_ok=True)
+
+
+def foreign_entry_under_grok(harness: str, environ: dict | None = None) -> bool:
+    """Grok Build also runs the hook entries it finds in Claude Code's
+    settings files and plugins (compat is on by default) — a
+    `miragen-hook claude-code` entry there would forward every event a
+    second time next to the native `~/.grok/hooks/miragen.json`. Only the
+    entry that names `grok-build` speaks for a Grok session; GROK_HOOK_EVENT
+    (set for every Grok hook) marks the others, which then do nothing."""
+    env = os.environ if environ is None else environ
+    return bool(env.get("GROK_HOOK_EVENT")) and harness != "grok-build"
+
+
+def _session_id_of(payload: dict) -> str | None:
+    value = payload.get("session_id") or payload.get("sessionId")
+    return str(value) if value else None
 
 
 def run(
@@ -246,9 +455,31 @@ def run(
 ) -> dict | None:
     """The whole adapter, testable: returns the harness stdout JSON (or
     None when nothing is to be printed)."""
+    if foreign_entry_under_grok(harness, environ):
+        return None
+    deferred = harness in DEFERRED_CONTEXT_HARNESSES
+    event_name = payload.get("hook_event_name") or ""
+    delivered = None
+    if deferred and event_name in _DELIVERY_EVENTS:
+        session_id = _session_id_of(payload)
+        delivered = take_context(session_id, environ) if session_id else None
+
+    output = _forward(harness, payload, daemon_url=daemon_url, token=token,
+                      environ=environ, opener=opener, pid=pid, deferred=deferred)
+    if delivered:
+        return harness_output(harness, event_name, delivered)
+    return output
+
+
+def _forward(
+    harness: str, payload: dict, *, daemon_url: str, token: str | None,
+    environ: dict | None, opener, pid: int | None, deferred: bool,
+) -> dict | None:
     event = normalize_hook_payload(harness, payload)
     if event is None or event.session_id is None:
         return None
+    if deferred and event.name == "context.closed":
+        discard_context(event.session_id, environ)
     if pid is None:
         pid = harness_pid(harness)
     envelope = build_envelope(harness, payload, event, environ=environ, pid=pid)
@@ -260,6 +491,10 @@ def run(
         return None
     context = answer.get("context")
     if context and event.name in CONTEXT_BEARING:
+        if deferred:
+            stash_context(event.session_id, context, environ,
+                          origin="SessionStart" if event.name in CONTEXT_OPENING else "UserPromptSubmit")
+            return None
         return harness_output(harness, event.original_event, context)
     return None
 
@@ -296,16 +531,48 @@ def main(argv: list[str] | None = None) -> int:
     daemon_url = resolve_daemon_url(args.daemon)
 
     if args.command == "install":
+        if args.harness == "grok-build" and not args.daemon and not args.uninstall:
+            explicit = os.environ.get("MIRAGEND_URL")
+            if explicit:
+                daemon_url = explicit  # what the installer was told: keep it
+            elif own_plugin_root() is not None:
+                # The plugin's copy resolves per event (env → saved option →
+                # manifest default), so a later URL change needs no reinstall.
+                daemon_url = None
+                hooks_url = resolve_daemon_url(None)
+                mcp_url = manifest_option_default("daemon_url") or DEFAULT_DAEMON_URL
+                if hooks_url.rstrip("/") != mcp_url.rstrip("/"):
+                    print(f"note: the hooks will use {hooks_url} (your saved Claude Code option) "
+                          f"but Grok's bridge MCP server reads MIRAGEND_URL only (default {mcp_url}) "
+                          f"— export MIRAGEND_URL={hooks_url} where grok starts if those differ")
+            else:
+                # A checkout/console install has no manifest to fall back
+                # on: at runtime that would be the loopback — possibly a
+                # different daemon than the one meant (split memory).
+                print("miragen-hook: install grok-build needs --daemon URL (or MIRAGEND_URL), "
+                      "or run it from the plugin: PYTHONPATH=<plugin dir> python3 -m "
+                      "miragen_hook install grok-build", file=sys.stderr)
+                return 2
         from miragen_hook.install import install_hooks, uninstall_hooks
 
-        path = install_hooks(
-            args.harness, daemon_url=daemon_url, token_file=args.token_file,
-            settings_path=Path(args.settings) if args.settings else None,
-            http=args.http,
-        ) if not args.uninstall else uninstall_hooks(
-            args.harness, settings_path=Path(args.settings) if args.settings else None
-        )
+        try:
+            path = install_hooks(
+                args.harness, daemon_url=daemon_url, token_file=args.token_file,
+                settings_path=Path(args.settings) if args.settings else None,
+                http=args.http,
+            ) if not args.uninstall else uninstall_hooks(
+                args.harness, settings_path=Path(args.settings) if args.settings else None
+            )
+        except RuntimeError as exc:
+            print(f"miragen-hook: {exc}", file=sys.stderr)
+            return 2
         print(f"{'removed from' if args.uninstall else 'installed into'} {path}")
+        if (args.harness == "grok-build" and not args.uninstall and daemon_url
+                and daemon_url != os.environ.get("MIRAGEND_URL")):
+            # The plugin's MCP server reads only the environment.
+            print(f"note: Grok's bridge MCP server reads MIRAGEND_URL only — export "
+                  f"MIRAGEND_URL={daemon_url} where grok starts, or tools and hooks "
+                  "reach different daemons")
         return 0
 
     try:

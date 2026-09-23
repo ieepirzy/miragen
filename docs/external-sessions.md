@@ -1,4 +1,4 @@
-# External sessions: Claude Code and Codex on the memory substrate
+# External sessions: Claude Code, Codex and Grok Build on the memory substrate
 
 `miragend` can run on a developer machine as the **local memory-participation
 daemon**: every ordinary `claude` or `codex` process joins the same memory
@@ -109,6 +109,40 @@ MIRAGEND_URL=https://memory.example miragen-hook install claude-code --http \
 
 The harness POSTs raw payloads to `/sessions/v1/hooks/claude-code` with
 `Authorization: Bearer $MIRAGEND_TOKEN` from its own environment.
+
+### Join from Grok Build
+
+Grok Build ≥ 1.0 loads the Claude Code plugin when it is enabled in
+`~/.claude/settings.json`; `.grok-plugin/plugin.json` gives it a Grok-only MCP
+config and an empty hooks file. The lifecycle hooks (harness `grok-build`,
+session key `grok-build:<sessionId>`) are a hook FILE,
+`PYTHONPATH=<plugin dir> python3 -m miragen_hook install grok-build` →
+`~/.grok/hooks/miragen.json` (from a checkout or the console script, pass
+`--daemon` — there is no manifest default to fall back on),
+because Grok 1.0.41 registers plugin hooks only after a plugin reload, never
+at session start (source: `spawn.rs` builds the session registry with
+`discover_hooks`, plugin hooks arrive only via `apply_plugin_registry_snapshot`;
+confirmed live). Contract facts, read from the xai-org/grok-build source at 1.0.41
+(2026-09-23), that shaped the adapter:
+
+| Fact | Consequence |
+|---|---|
+| camelCase payload with a closed list of snake aliases (`hook_event_name`, `session_id` yes; `promptId`, `stopHookActive`, `lastAssistantMessage` no) | normalizer reads both spellings |
+| SessionStart `source` is `new`/`load`; an extra observe-only Stop fires at session end (`reason` `channel_closed`/`shutdown`) | `load` restores; that Stop is dropped |
+| SessionStart/UserPromptSubmit stdout is discarded; `additionalContext` is honoured on Pre/PostToolUse and Stop | context queued and delivered on the next tool result (`client.context_delivery = "deferred"`) |
+| no `CLAUDE_PLUGIN_OPTION_*`, no `${user_config.*}`; the hook inherits grok's process env; `GROK_HOOK_EVENT` is set for every hook (and `CLAUDE_PROJECT_DIR` too) | URL: env → saved Claude option → manifest default; `GROK_HOOK_EVENT` marks a Grok session even under a `claude-code` entry |
+| subagents run as their own sessions, marked `subagentType` | only the parent's Subagent* events are recorded |
+| HTTP hooks have no `headers` | the `--http` install is Claude Code only |
+| plugin hooks load only after `/reload-plugins` | hooks installed as a file; the plugin declares none |
+| Claude Code hook entries (settings files, plugins) also run under Grok | a non-`grok-build` miragen entry does nothing when `GROK_HOOK_EVENT` is set; the repository's `type: http` hooks still fire and get 401 (Grok http hooks carry no headers) — noise only |
+
+Live-verified 2026-09-23 against the real 1.0.41 binary, driven by a scripted
+OpenAI-compatible stub model (a BYOK `[model.*]` entry; no xAI credentials)
+and this daemon over in-memory Loimi fakes: every lifecycle event arrived as
+`grok-build`, the start block reached the model as a system reminder after
+the first tool result exactly once, `memory_checkpoint` without `project`
+landed in the session's project scope, and the hooks found the daemon via
+the saved Claude option with no `MIRAGEND_URL`.
 
 ### Join from claude.ai / any MCP client
 
