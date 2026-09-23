@@ -1037,6 +1037,8 @@ class SessionPlane:
         return "\n".join(lines)
 
     async def _finalize(self, session: ExternalSession, *, occurrence: str) -> None:
+        if occurrence == "end":
+            self._outage_announced.discard(session.key)
         lifecycle, reason = await self._lifecycle_for(session)
         if lifecycle is None:
             logger.info(f"[{session.key}] finalize skipped: {reason}")
