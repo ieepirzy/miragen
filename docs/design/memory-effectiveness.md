@@ -188,11 +188,12 @@ go through Loimi admission, so nothing mints authority.
     waiting" continuation. So neither hook decides from the shared flag. Each
     keeps its own per-session "last blocked" state. **Prerequisite:** a
     small MiraDesign PR, split out of miradesign#23, that stops keying its
-    continuation on `stop_hook_active`. Until that lands, §5 item 8 fails by
-    construction, so P1a ships after it. Whether Claude Code runs two
-    blocking Stop hooks in parallel and merges their reasons is not
-    verified. The design must work either way, and §5 tests both hooks
-    together.
+    continuation on `stop_hook_active` (miradesign#24). Until that lands,
+    §5 item 8 fails by construction, so P1a ships after it. **Verified
+    live** (Claude Code 2.1.280, 2026-09-23): two blocking Stop hooks run in
+    parallel, the model sees **both** reasons in one continuation, and
+    `stop_hook_active` is true for both hooks on the next Stop, whichever
+    one blocked. §5 still tests both hooks together.
   - *Build:* three pieces that don't exist yet: Stop-block output in
     `miragen_hook` (today it only emits `additionalContext`), per-session
     nudge state in miragend, and bridge-side counting of `memory_*` calls per
@@ -272,7 +273,9 @@ there's no model-free "interim" recall.
   - a new `PostToolUse` hook, gated on a local per-session "recall pending"
     marker, so it exits without touching the network when nothing is
     outstanding. When the result is ready, it goes out as `additionalContext`
-    on that tool result. Fetching it is the atomic delivery claim, so
+    on that tool result. **Verified live:** PostToolUse `additionalContext`
+    reaches the model, and a subagent's tool calls carry `agent_id` and
+    `agent_type` (null on the main thread), so delivery skips subagents. Fetching it is the atomic delivery claim, so
     injections are counted when **delivered**, not when prepared;
   - if the turn ends first, the miragen Stop handler waits a short, bounded
     time and blocks only for a **non-empty** selection. This is the same
@@ -281,7 +284,7 @@ there's no model-free "interim" recall.
   - a result is dropped when a newer prompt arrived, the context compacted,
     or the session ended;
   - HTTP-hook (cloud) sessions have no local marker, so they get no async
-    delivery in v1 (issue filed).
+    delivery in v1 (#120).
   Selector latency (2.5–18 s through the runner) stops mattering to the
   prompt path. Runner calls share a small concurrency cap, since each one is
   a Node process on a memory-constrained VPS. Trivial prompts ("yes", "merge it", under ~20 chars with no
