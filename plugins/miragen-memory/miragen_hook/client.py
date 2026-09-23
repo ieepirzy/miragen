@@ -385,10 +385,25 @@ def stash_context(
         else:
             kept = [e for e in _read_entries(path) if e.get("from") != origin]
         kept.append({"from": origin, "text": context})
-        path.write_text("".join(json.dumps(e) + "\n" for e in kept))
-        path.chmod(0o600)
+        data = "".join(json.dumps(e) + "\n" for e in kept).encode()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        _sweep_stale(path.parent)
     except OSError as exc:
         print(f"miragen-hook: could not queue context ({exc})", file=sys.stderr)
+
+
+def _sweep_stale(directory: Path) -> None:
+    """Queues of sessions that never reached SessionEnd (crash, kill) and
+    claims orphaned mid-delivery: nothing will ever take them."""
+    cutoff = time.time() - PENDING_TTL_S
+    for stale in directory.glob("*"):
+        try:
+            if stale.stat().st_mtime < cutoff:
+                stale.unlink()
+        except OSError:
+            continue
 
 
 def take_context(session_id: str, environ: dict | None = None) -> str | None:
@@ -533,14 +548,24 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
         from miragen_hook.install import install_hooks, uninstall_hooks
 
-        path = install_hooks(
-            args.harness, daemon_url=daemon_url, token_file=args.token_file,
-            settings_path=Path(args.settings) if args.settings else None,
-            http=args.http,
-        ) if not args.uninstall else uninstall_hooks(
-            args.harness, settings_path=Path(args.settings) if args.settings else None
-        )
+        try:
+            path = install_hooks(
+                args.harness, daemon_url=daemon_url, token_file=args.token_file,
+                settings_path=Path(args.settings) if args.settings else None,
+                http=args.http,
+            ) if not args.uninstall else uninstall_hooks(
+                args.harness, settings_path=Path(args.settings) if args.settings else None
+            )
+        except RuntimeError as exc:
+            print(f"miragen-hook: {exc}", file=sys.stderr)
+            return 2
         print(f"{'removed from' if args.uninstall else 'installed into'} {path}")
+        if (args.harness == "grok-build" and not args.uninstall and daemon_url
+                and daemon_url != os.environ.get("MIRAGEND_URL")):
+            # The plugin's MCP server reads only the environment.
+            print(f"note: Grok's bridge MCP server reads MIRAGEND_URL only — export "
+                  f"MIRAGEND_URL={daemon_url} where grok starts, or tools and hooks "
+                  "reach different daemons")
         return 0
 
     try:

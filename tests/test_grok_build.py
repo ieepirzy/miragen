@@ -246,6 +246,23 @@ class TestDeferredContext:
             environ=env, opener=_opener({}), pid=1)
         assert take_context("g-1", env) is None
 
+    def test_abandoned_queues_are_swept(self, tmp_path):
+        """A crashed session never reaches SessionEnd, and a crash between
+        claim and unlink leaves a claimed file: both go once stale."""
+        import os
+        import time
+        env = self._env(tmp_path)
+        stash_context("dead", "never taken", env)
+        orphan = pending_dir(env) / "x.taking-123"
+        orphan.write_text("claimed then crashed")
+        old = time.time() - 13 * 3600
+        for path in pending_dir(env).iterdir():
+            os.utime(path, (old, old))
+        stash_context("alive", "fresh", env)
+        assert [p.name for p in pending_dir(env).iterdir()] == [
+            next(p.name for p in pending_dir(env).iterdir())]
+        assert take_context("alive", env) == "fresh"
+
     def test_pending_files_are_private_and_outside_the_repo(self, tmp_path):
         env = self._env(tmp_path)
         stash_context("g-1", "x", env)
@@ -372,6 +389,22 @@ class TestGrokInstallAndPlugin:
                                 capture_output=True, text=True, check=False)
         assert echoed.stdout.split("|")[0] == str(weird)
         assert "grok-build|--daemon|http://d|--token-file|/tmp/my tok|" in echoed.stdout
+
+    def test_a_dollar_in_a_baked_value_is_refused(self, tmp_path, capsys):
+        """Grok scans hook commands for `$VAR` ignoring quotes and refuses a
+        hook whose variable is unset: a `$` would silently disable it."""
+        from miragen_hook.client import main
+        target = tmp_path / "miragen.json"
+        assert main(["install", "grok-build", "--daemon", "http://d", "--token-file", "/tmp/a$b",
+                     "--settings", str(target)]) == 2
+        assert not target.exists() and "'$'" in capsys.readouterr().err
+
+    def test_a_hook_url_the_mcp_does_not_share_is_pointed_out(self, tmp_path, monkeypatch, capsys):
+        from miragen_hook.client import main
+        monkeypatch.delenv("MIRAGEND_URL", raising=False)
+        assert main(["install", "grok-build", "--daemon", "http://elsewhere:8420",
+                     "--settings", str(tmp_path / "m.json")]) == 0
+        assert "export MIRAGEND_URL=http://elsewhere:8420" in capsys.readouterr().out
 
     def test_owned_marker_is_the_module_not_a_prefix(self):
         from miragen_hook.install import _group_is_owned

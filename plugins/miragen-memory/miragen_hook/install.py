@@ -101,6 +101,15 @@ def adapter_root() -> Path:
 
 def hook_command(harness: str, *, daemon_url: str | None, token_file: str | None) -> str:
     if harness == "grok-build":
+        # Grok scans hook commands for `$VAR` references WITHOUT regard to
+        # quoting (and refuses to run one whose variable is unset), so a `$`
+        # in a baked value would silently disable the hook.
+        for value in (str(adapter_root()), daemon_url, token_file):
+            if value and "$" in value:
+                raise RuntimeError(
+                    f"'{value}' contains '$': Grok would read it as a variable and "
+                    "not run the hook — use a path/URL without '$'"
+                )
         # Grok runs shell-form commands through `sh -c`: quote every part.
         parts = [f"PYTHONPATH={shlex.quote(str(adapter_root()))}", "python3", "-m",
                  "miragen_hook", harness]
