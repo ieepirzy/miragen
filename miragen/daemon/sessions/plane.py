@@ -218,6 +218,7 @@ class SessionPlane:
         self._projects: dict[str, ProjectIdentity] = {}
         self._provisioned: set[str] = set()
         self._unprovisionable: dict[str, str] = {}
+        self._worker_ungranted: set[str] = set()
         self._tasks: set[asyncio.Task] = set()
         self._sweeper: asyncio.Task | None = None
         self.principal_source: str | None = None
@@ -333,12 +334,16 @@ class SessionPlane:
                 principal_id=worker, scope_id=scope_id, verbs=_WORKER_VERBS,
             ), timeout=WRITE_TIMEOUT_S)
             self.stats.worker_grants += 1
+            self._worker_ungranted.discard(scope_id)
         except MemoryAPIError as exc:
             if exc.status_code == 409:
+                self._worker_ungranted.discard(scope_id)
                 return
+            self._worker_ungranted.add(scope_id)
             self.stats.worker_grant_failures += 1
             logger.warning(f"worker grant on {scope_id} for {worker} refused: {exc}")
         except (MemoryUnavailable, asyncio.TimeoutError) as exc:
+            self._worker_ungranted.add(scope_id)
             self.stats.worker_grant_failures += 1
             logger.warning(f"worker grant on {scope_id} for {worker} failed: {exc}")
 
@@ -644,6 +649,13 @@ class SessionPlane:
         read = assignment.read
         policy = self.config.scopes
         detail: str | None = None
+        if write in self._worker_ungranted:
+            # The worker's grant failed earlier (its principal did not exist
+            # yet, or Loimi was away): retry on the scope's next use instead
+            # of waiting for a bridge restart.
+            operator = self._operator_client()
+            if operator is not None:
+                await self._grant_worker(operator, write)
         if assignment.templated and policy.provision == "auto" and write not in self._provisioned:
             failure = self._unprovisionable.get(write)
             if failure is None:

@@ -874,3 +874,17 @@ class TestWorkerGrants:
         h = Harness(tmp_path)
         await h.send("SessionStart", source="startup")
         assert not any(p == "mira-worker" for p, _, _ in h.service.grants)
+
+
+async def test_a_failed_worker_grant_is_retried_when_the_scope_is_used_again(tmp_path):
+    config = SessionsConfig(
+        principal=PRINCIPAL,
+        scopes=ScopePolicy(shared_read=[SHARED], provision="auto", worker_principal="mira-worker"),
+        recall=SessionsRecall(enabled=False),
+    )
+    h = Harness(tmp_path, config=config)
+    await h.send("SessionStart", source="startup")
+    assert ("mira-worker", PROJECT_SCOPE, "maintain") not in h.service.grants
+    h.service.principals["mira-worker"] = {"kind": "agent"}  # the worker started later
+    await h.send("SessionStart", source="startup", session="s-2", pid=4243)
+    assert ("mira-worker", PROJECT_SCOPE, "maintain") in h.service.grants
