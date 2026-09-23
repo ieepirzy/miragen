@@ -649,7 +649,11 @@ def codex_mcp_server(copy_root: Path, *, url: str, token_file: str | None) -> di
             "--daemon", url]
     if token_file:
         args += ["--token-file", token_file]
-    return {"command": "python3", "args": args}
+    # `codex exec` runs with approval policy `never`, under which a tool that
+    # needs approval is refused outright ("MCP tool call requires approval,
+    # but approval policy is never" — found live): the bridge's own tools are
+    # approved up front, like its hooks are trusted.
+    return {"command": "python3", "args": args, "default_tools_approval_mode": "approve"}
 
 
 def ensure_codex(

@@ -125,6 +125,7 @@ class TestEnsureCodex:
         assert _strip(config) == _strip(tomllib.loads(USER_CONFIG))  # nothing else changed
         server = config["mcp_servers"]["miragen-bridge"]
         assert server["command"] == "python3"
+        assert server["default_tools_approval_mode"] == "approve"  # codex exec: approval policy never
         assert server["args"] == [f"{copy}/miragen_hook/__main__.py", "mcp-proxy", "--harness", "codex",
                                   "--daemon", "https://m.example", "--token-file", "/secrets/t"]
         state = config["hooks"]["state"]

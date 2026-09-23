@@ -92,4 +92,5 @@ def test_codex_manifest():
     assert server["args"] == ["./miragen_hook/__main__.py", "mcp-proxy", "--harness", "codex"]
     assert (PLUGIN / server["args"][0]).is_file()
     assert set(server["env_vars"]) == {"MIRAGEND_URL", "MIRAGEND_TOKEN", "CODEX_HOME"}
+    assert server["default_tools_approval_mode"] == "approve"  # codex exec refuses tools needing approval
     assert "${" not in json.dumps(server)  # never expanded by Codex

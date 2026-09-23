@@ -13,7 +13,8 @@
         "MIRAGEND_URL",
         "MIRAGEND_TOKEN",
         "CODEX_HOME"
-      ]
+      ],
+      "default_tools_approval_mode": "approve"
     }
   }
 }
