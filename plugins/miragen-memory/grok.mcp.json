@@ -1,12 +1,13 @@
 {
   "mcpServers": {
     "miragen-bridge": {
-      "type": "http",
-      "url": "${MIRAGEND_URL:-https://memory.muutto365.fi}/mcp",
-      "bearer_token_env_var": "MIRAGEND_TOKEN",
-      "headers": {
-        "X-Harness-Session": "grok-build:{{session_id}}"
-      }
+      "command": "python3",
+      "args": [
+        "${GROK_PLUGIN_ROOT}/miragen_hook/__main__.py",
+        "mcp-proxy",
+        "--harness",
+        "grok-build"
+      ]
     }
   }
 }

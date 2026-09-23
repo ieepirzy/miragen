@@ -136,6 +136,7 @@ def create_app(
     contract_transport=None,
     sessions: SessionPlane | None = None,
     bridge_oauth: dict | None = None,
+    harness_setup=None,
 ) -> FastAPI:
     """`core` is the Docker-bound lifecycle plane; `sessions` the external
     session plane (docs/design/external-sessions.md). Either may be absent:
@@ -144,7 +145,11 @@ def create_app(
 
     `bridge_oauth` (optional, with `sessions`): origo settings for the
     bridge MCP mount — {"base_url", "client_id", "client_secret",
-    "auto_approve", "redirect_uris", "storage_path"}; None = bearer only."""
+    "auto_approve", "redirect_uris", "storage_path"}; None = bearer only.
+
+    `harness_setup` (optional): a HarnessSetupService — the daemon keeps
+    Grok Build / Codex on this machine joined (miragen/daemon/harness_setup.py);
+    its status is on /health."""
     app = FastAPI(title="miragend", version=_miragen_version())
 
     async def require_token(request: Request) -> None:
@@ -202,7 +207,13 @@ def create_app(
         if sessions is not None:
             body["sessions"] = sessions.describe()
             body["sessions"]["mcp"]["oauth"] = bridge_oauth is not None
+        if harness_setup is not None:
+            body["harness_setup"] = harness_setup.describe()
         return body
+
+    if harness_setup is not None:
+        app.router.on_startup.append(harness_setup.start)
+        app.router.on_shutdown.append(harness_setup.stop)
 
     if sessions is not None:
         register_session_routes(app, sessions, dependencies=guarded)
@@ -553,6 +564,17 @@ def _build_session_plane(config_path: str):  # pragma: no cover - deployment wir
     return plane
 
 
+def _build_harness_setup(sessions: SessionPlane | None):
+    """The harness setup service from sessions.yaml's `harness_setup` block
+    (+ MIRAGEND_HARNESS_SETUP_* env). A daemon without a session plane has
+    no bridge to point harnesses at, and none is built."""
+    if sessions is None:
+        return None
+    from miragen.daemon.harness_setup import HarnessSetupService, resolve_harness_setup
+
+    return HarnessSetupService(resolve_harness_setup(sessions.config.harness_setup))
+
+
 def main() -> None:  # pragma: no cover - exercised only in a real deployment
     import uvicorn
 
@@ -576,6 +598,7 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
 
     sessions_config = os.getenv("MIRAGEND_SESSIONS_CONFIG")
     sessions = _build_session_plane(sessions_config) if sessions_config else None
+    harness_setup = _build_harness_setup(sessions)
 
     lifecycle_enabled = os.getenv("MIRAGEND_LIFECYCLE", "on").lower() not in (
         "off", "0", "false", "no",
@@ -588,6 +611,7 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
         app = create_app(
             None, token=token, sessions=sessions,
             bridge_oauth=bridge_oauth_from_env(sessions.state_dir) if sessions.config.mcp.enabled else None,
+            harness_setup=harness_setup,
         )
         uvicorn.run(
             app,
@@ -653,6 +677,7 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
             bridge_oauth_from_env(sessions.state_dir)
             if sessions is not None and sessions.config.mcp.enabled else None
         ),
+        harness_setup=harness_setup,
     )
 
     @app.router.on_event("startup")

@@ -1,0 +1,4 @@
+{
+  "description": "Intentionally empty. Under Codex the lifecycle hooks are native entries in $CODEX_HOME/hooks.json with their trusted_hash in config.toml, written by the local miragend (harness_setup) \u2014 untrusted plugin hooks never run under `codex exec`, and declaring them here too would fire every event twice once trusted. Without this file Codex would fall back to the Claude hooks/hooks.json and label every event claude-code.",
+  "hooks": {}
+}

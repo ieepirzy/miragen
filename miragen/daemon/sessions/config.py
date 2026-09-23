@@ -144,6 +144,32 @@ class Housekeeping(_Model):
     sweep_interval_seconds: int = Field(default=60, ge=5)
 
 
+class HarnessSetup(_Model):
+    """The daemon writes Grok Build and Codex hook + MCP setup into the
+    harness homes on THIS machine (miragen_hook/harness_setup.py), at
+    startup and every `interval_s`. The URL is where harness sessions should
+    report — the hosted bridge, not necessarily this daemon. Environment
+    overrides: MIRAGEND_HARNESS_SETUP (on/off), MIRAGEND_HARNESS_SETUP_URL,
+    MIRAGEND_HARNESS_SETUP_TOKEN_PATH, MIRAGEND_HARNESS_SETUP_INTERVAL_S."""
+
+    enabled: bool | None = Field(
+        default=None,
+        description="None = on when a URL is configured and the daemon is not in a "
+                    "container; each harness is skipped while its home does not exist.",
+    )
+    url: str | None = Field(
+        default=None, pattern=r"^https?://[^\s$]+$",
+        description="Base URL harness sessions report to (hooks + MCP proxy). No default: "
+                    "never silently the loopback.",
+    )
+    token_file: Path | None = Field(
+        default=None,
+        description="0600 file with that daemon's bearer, baked into the hook commands "
+                    "(the token itself is never written into harness config).",
+    )
+    interval_s: int = Field(default=600, ge=30)
+
+
 class SessionsConfig(_Model):
     principal: str = Field(
         pattern=r"^[a-z0-9][a-z0-9_.:-]{0,126}$",
@@ -167,6 +193,7 @@ class SessionsConfig(_Model):
     housekeeping: Housekeeping = Field(default_factory=Housekeeping)
     store: StorePolicy = Field(default_factory=StorePolicy)
     mcp: BridgeMcp = Field(default_factory=BridgeMcp)
+    harness_setup: HarnessSetup = Field(default_factory=HarnessSetup)
     state_dir: Optional[Path] = Field(
         default=None,
         description="Where sessions.json, the event journal and the memory "
