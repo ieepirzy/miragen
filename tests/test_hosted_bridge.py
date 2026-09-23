@@ -393,10 +393,21 @@ class TestBridgeMcp:
         names = {t.name for t in await mcp.list_tools()}
         assert names == {
             "bridge_status", "bridge_sessions",
-            "memory_recall", "memory_read", "memory_remember", "memory_correct", "memory_checkpoint",
+            "memory_recall", "memory_for_resources", "memory_read", "memory_remember", "memory_correct", "memory_checkpoint",
             "store_open_run", "store_close_run", "store_put_artifact", "store_get_artifact",
             "store_lineage", "store_search", "store_list_namespaces", "store_run_tree",
         }
+
+    async def test_resource_tool_requires_observed_local_session(self, tmp_path):
+        h, mcp = self._mcp(tmp_path)
+        missing = _text(await mcp.call_tool("memory_for_resources", {
+            "resources": [{"path": "pricing.py", "symbol": "price"}]}))
+        assert missing["status"] == "unverified"
+        await h.send("SessionStart", source="startup", session="remote", cwd="/workspace/repo",
+                     remote=True, host="cloud", project_remote="https://github.com/org/repo.git")
+        remote = _text(await mcp.call_tool("memory_for_resources", {
+            "resources": [{"path": "pricing.py", "symbol": "price"}], "project": "claude-code:remote"}))
+        assert remote["status"] == "unverified"
 
     async def test_memory_tools_are_scoped_by_project(self, tmp_path):
         h, mcp = self._mcp(tmp_path)

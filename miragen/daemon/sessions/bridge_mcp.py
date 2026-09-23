@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 from typing import Any, Callable
 
 from mcp.server.fastmcp import FastMCP
@@ -157,6 +158,35 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
                           "project": identity.id, "scopes": body["scope_ids"]})
         return _dump({"status": "ok", "project": identity.id, "scopes": body["scope_ids"],
                       "scope_detail": detail, **found})
+
+    @mcp.tool()
+    async def memory_for_resources(
+        resources: list[dict], project: str | None = None, query: str = "",
+        inspect: bool = False,
+    ) -> str:
+        """Recall by exact observed Python path/qualified symbol in a local checkout.
+
+        resources: explicit {path, symbol?} locators obtained from source inspection.
+        inspect: include labelled historical/stale evidence for revalidation only.
+        project must be a local session key. Remote harness filesystems are unavailable.
+        """
+        from miragen.memory.grounded import recall
+        from miragen.memory.resources import snapshot
+        from pathlib import Path
+        import asyncio
+        plane = get_plane()
+        # Require an observed local session, never a guessed or remote path.
+        session = plane.registry.get(project) if project else None
+        if session is None or session.remote:
+            return _dump({"status": "unverified", "detail": "provide an observed local session key; remote checkout inspection unavailable"})
+        plane, identity, lifecycle, _, _ = await _lifecycle(project)
+        try:
+            observed = await asyncio.to_thread(snapshot, Path(identity.root).resolve())
+            if observed["repository"] != identity.id:
+                return _dump({"status": "unverified", "detail": "project/checkout identity mismatch"})
+            return _dump(await recall(lifecycle, identity.root, resources, query=query, inspect=inspect))
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            return _dump({"status": "unverified", "detail": str(exc)})
 
     @mcp.tool()
     async def memory_read(record_id: str, project: str | None = None) -> str:

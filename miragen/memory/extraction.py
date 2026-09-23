@@ -40,7 +40,7 @@ EXTRACTOR_VERSION = "miragen-extractor/1"
 # agent_note events are created by memory_remember (which records them
 # itself), and harness turn captures are operational trail, not statements
 # to re-interpret as facts about the world.
-SKIP_SOURCE_KINDS = ("agent_note",)
+SKIP_SOURCE_KINDS = ("agent_note", "code_observation")
 SKIP_SOURCE_PREFIXES = ("harness:",)
 
 
@@ -261,12 +261,13 @@ async def run_worker_once(
     embed: EmbedFn | None = None,
     limit: int = 5,
     lease_seconds: int = 120,
+    overlap_proposer=None,
 ) -> list[dict]:
     """One worker sweep: claim consolidate jobs in this principal's
     jurisdiction, process, complete — or fail-for-retry on error. Model
     and store failures never poison the queue: the lease expires or the
     job returns to pending with its error recorded."""
-    kinds = ["consolidate"] + (["index"] if embed is not None else [])
+    kinds = ["consolidate", "consolidate_overlap"] + (["index"] if embed is not None else [])
     try:
         jobs = await client.claim_jobs(
             kinds=kinds, limit=limit, lease_seconds=lease_seconds
@@ -278,7 +279,10 @@ async def run_worker_once(
     results = []
     for job in jobs:
         try:
-            if job["kind"] == "index":
+            if job["kind"] == "consolidate_overlap":
+                from miragen.memory.consolidation import process_overlap
+                summary = await process_overlap(client, job, overlap_proposer)
+            elif job["kind"] == "index":
                 summary = await _process_index_job(client, job, embed)
             else:
                 event = await client.get_event(job["payload"]["event_id"])
@@ -288,7 +292,12 @@ async def run_worker_once(
         except Exception as exc:  # noqa: BLE001 — worker isolation per job
             logger.warning(f"consolidation job {job['id']} failed: {exc}")
             try:
-                await client.fail_job(job["id"], error=str(exc)[:500], retry=True)
+                from miragen.memory.consolidation import ConsolidationConflict
+                retry = not (job["kind"] == "consolidate_overlap" and (
+                    isinstance(exc, ConsolidationConflict)
+                    or isinstance(exc, MemoryAPIError) and exc.status_code in (400, 404, 409)
+                ))
+                await client.fail_job(job["id"], error=str(exc)[:500], retry=retry)
             except (MemoryUnavailable, MemoryAPIError):
                 pass  # lease expiry re-queues it regardless
             results.append({"job_id": job["id"], "status": "failed", "error": str(exc)})

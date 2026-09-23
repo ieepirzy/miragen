@@ -58,6 +58,8 @@ class MemoryPacket:
     manifest_id: str | None = None
     guidance_version: str = GUIDANCE_VERSION
     items: list[dict[str, Any]] = field(default_factory=list)
+    rendering: dict[str, Any] = field(default_factory=dict)
+    delivery_status: str = "unconfirmed"
 
 
 class MemoryLifecycle:
@@ -136,7 +138,7 @@ class MemoryLifecycle:
 
     async def prepare_context(
         self, *, instance: str | None, run_id: str | None, trigger: str,
-        prompt_hint: str | None = None,
+        prompt_hint: str | None = None, resources: list[dict] | None = None,
     ) -> MemoryPacket:
         effective_instance = instance or DEFAULT_INSTANCE
         try:
@@ -165,9 +167,9 @@ class MemoryLifecycle:
         )
 
         optional_status = await self._optional_lane(
-            packet, effective_instance, context, prompt_hint
+            packet, effective_instance, context, prompt_hint, resources
         )
-        # The manifest records what was ACTUALLY injected (§8.6); its write
+        # The manifest records what was rendered for delivery (§8.6); its write
         # is best-effort — a manifest failure must not fail the turn.
         try:
             manifest = await self.client.create_manifest({
@@ -184,6 +186,8 @@ class MemoryLifecycle:
                     "lane": "required+optional",
                     "state_revision": context["state_revision"],
                     "optional_status": optional_status,
+                    "stage": "rendered", "delivery_status": "unconfirmed",
+                    "rendering": packet.rendering,
                 },
                 "degraded": optional_status
                 if optional_status.startswith("degraded") else None,
@@ -213,97 +217,92 @@ class MemoryLifecycle:
 
     async def _optional_lane(
         self, packet: MemoryPacket, instance: str, context: dict,
-        prompt_hint: str | None,
+        prompt_hint: str | None, resources: list[dict] | None = None,
+        resource_reader=None,
     ) -> str:
-        """The optional recall lane (§17.7): bounded hybrid search, the
-        zero-or-more selector, canonical re-render, budgeted injection.
-        Failure NEVER falls back to stuffing neighbors — required state
-        stands alone and the degradation is explicit in the manifest."""
-        from miragen.memory.selection import clamp_selections, render_optional_section
+        """Exact resource joins and selected ordinary recall share one renderer."""
+        from miragen.memory.selection import clamp_selections, render_optional_section, canonical_record_text
 
         if not self.spec.recall.enabled:
             return "disabled"
-        if self.selector is None:
+        if self.selector is None and not resources:
             return "unconfigured"
         state = context.get("state") or {}
         goal = state.get("goal") if isinstance(state.get("goal"), str) else None
         query = " ".join(part for part in (goal, prompt_hint) if part)[:2000].strip()
-        if not query:
+        if not query and not resources:
             return "no_query"
-
-        query_digest = _stable_digest(query)
+        entries, omitted = [], []
+        retrieval_truncated = False
         try:
-            cached = self._selection_cache.get(instance)
-            if cached and cached[0] == context["state_revision"] and cached[1] == query_digest:
-                selected = cached[2]
-            else:
-                found = await self.client.search_memory({
-                    "scope_ids": self.spec.scopes.read,
-                    "query_text": query,
-                    "limit": self.spec.recall.max_candidates,
-                })
-                cards = found["items"]
-                if not cards:
-                    self._selection_cache[instance] = (
-                        context["state_revision"], query_digest, []
-                    )
-                    return "empty"
-                result = await self.selector(query, cards)
-                kept = clamp_selections(result, cards, self.spec.recall.max_selected)
-                selected = [(sel.record_id, sel.reason) for sel in kept]
-                self._selection_cache[instance] = (
-                    context["state_revision"], query_digest, selected
-                )
-
-            if not selected:
-                return "none_selected"
-
-            # Canonical re-render (§17.7 step 5): fetch each selected id
-            # fresh — the selector chose, canonical state speaks.
-            entries = []
+            selected = []
+            if query and self.selector is not None:
+                query_digest = _stable_digest(query)
+                cached = self._selection_cache.get(instance)
+                if cached and cached[0] == context["state_revision"] and cached[1] == query_digest:
+                    selected = cached[2]
+                else:
+                    found = await self.client.search_memory({
+                        "scope_ids": self.spec.scopes.read, "query_text": query,
+                        "limit": self.spec.recall.max_candidates,
+                    })
+                    cards = found["items"]
+                    if cards:
+                        result = await self.selector(query, cards)
+                        selected = [(sel.record_id, sel.reason) for sel in
+                                    clamp_selections(result, cards, self.spec.recall.max_selected)]
+                    self._selection_cache[instance] = (context["state_revision"], query_digest, selected)
             for record_id, reason in selected:
                 record = await self.client.get_record(record_id)
-                if (
-                    record.get("admission") != "accepted"
-                    or not record.get("roots_valid", False)
-                    or record.get("revision") is None
-                ):
+                revision = record.get("revision") or {}
+                if (record.get("admission") != "accepted" or not record.get("roots_valid", False)
+                        or not revision or revision.get("lifecycle") != "active"
+                        or record.get("recall_eligible") is False or record.get("groundings")
+                        or record.get("scope_id") not in self.spec.scopes.read):
+                    omitted.append({"record_id": record_id, "revision_id": revision.get("id"), "reason": "canonical_ineligible"})
                     continue
-                payload = record["revision"]["payload"]
-                text = str(payload.get("text") or payload.get("value") or payload)[:500]
-                entries.append({
-                    "record_id": record_id,
-                    "revision_id": record["revision"]["id"],
-                    "type": record["type"],
-                    "text": text,
-                    "reason": reason,
+                entries.append({"record_id": record_id, "revision_id": revision["id"],
+                                "type": record["type"], "text": canonical_record_text(record),
+                                "reason": reason})
+            if resources:
+                if resource_reader is not None:
+                    resources = await resource_reader()
+                found = await self.client.lookup_resources({
+                    "scope_ids": self.spec.scopes.read, "resources": resources,
+                    "limit": self.spec.recall.max_candidates,
                 })
-            section = render_optional_section(
-                entries, self.spec.recall.max_optional_chars
-            )
-            if not section:
-                return "none_selected"
-            packet.text = f"{packet.text}\n{section}"
-            packet.items.extend({
-                "kind": "recalled",
-                "record_id": entry["record_id"],
-                "revision_id": entry["revision_id"],
-                "reason": entry["reason"],
-            } for entry in entries)
-            return "ok"
+                omitted.extend(found.get("omitted", []))
+                retrieval_truncated = found.get("truncated", False)
+                if found.get("candidate_truncated"):
+                    omitted.append({"reason": "candidate_limit", "limit": found.get("candidate_limit")})
+                resource_entries = []
+                for card in found["items"]:
+                    resource_entries.append({
+                        "record_id": card["record_id"], "revision_id": card["revision_id"],
+                        "type": card["type"], "text": canonical_record_text(card),
+                        "reason": "exact resources: " + ", ".join(
+                            m["resource"]["path"] + ("::" + m["resource"]["symbol"] if m["resource"].get("symbol") else "")
+                            for m in card["matches"]),
+                    })
+                entries = resource_entries + entries
+            result = render_optional_section(entries, self.spec.recall.max_optional_chars)
+            packet.rendering = result.accounting()
+            packet.rendering["omitted"] = omitted + result.omitted
+            packet.rendering["retrieval_truncated"] = retrieval_truncated
+            packet.rendering["truncated"] = result.truncated or retrieval_truncated
+            if result.text:
+                packet.text += ("\n" if packet.text else "") + result.text
+            packet.items.extend({"kind": "recalled", "record_id": entry["record_id"],
+                                 "revision_id": entry["revision_id"], "reason": entry["reason"]}
+                                for entry in result.emitted)
+            return "ok" if result.text else "omitted" if packet.rendering["omitted"] else "none_selected"
         except (MemoryUnavailable, MemoryAPIError) as exc:
             self._degrade(f"optional recall: {exc}")
-            packet.text += (
-                "\n[optional recall degraded — memories may exist that could "
-                "not be searched; do not conclude the store is empty]"
-            )
+            packet.text += "\n[optional recall degraded — memories may exist that could not be searched]"
             return f"degraded: {exc}"
-        except Exception as exc:  # selector failure: inject nothing extra
+        except Exception as exc:
             self._degrade(f"relevance selection: {exc}")
-            packet.text += (
-                "\n[optional recall degraded — relevance selection failed; "
-                "memories were not injected]"
-            )
+            packet.text += "\n[optional recall degraded — relevance selection failed; memories were not injected]"
             return f"degraded: selector: {exc}"
 
     async def recall_section(
@@ -313,7 +312,7 @@ class MemoryLifecycle:
         """Prompt-time recall for an already-opened context: ONLY the
         optional lane (§17.7), rendered without re-injecting guidance or
         working state. Returns (section text or None, lane status). The
-        manifest records what was actually injected, as at the boundary."""
+        manifest records what was rendered (delivery remains unconfirmed), as at the boundary."""
         effective_instance = instance or DEFAULT_INSTANCE
         if not self.spec.recall.enabled:
             return None, "disabled"
@@ -329,7 +328,7 @@ class MemoryLifecycle:
                               state_revision=context["state_revision"])
         status = await self._optional_lane(packet, effective_instance, context, prompt_hint)
         section = packet.text.strip() or None
-        if packet.items:
+        if packet.items or packet.rendering:
             try:
                 await self.client.create_manifest({
                     "scope_id": self.spec.scopes.default_write,
@@ -345,6 +344,8 @@ class MemoryLifecycle:
                         "lane": "optional",
                         "state_revision": context["state_revision"],
                         "optional_status": status,
+                        "stage": "rendered", "delivery_status": "unconfirmed",
+                        "rendering": packet.rendering,
                     },
                     "degraded": None,
                 })
