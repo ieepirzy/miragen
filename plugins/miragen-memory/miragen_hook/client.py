@@ -334,8 +334,9 @@ def resolve_daemon_url(
 
 
 def pending_dir(environ: dict | None = None) -> Path:
-    """Where context waits for its next delivery point: the plugin's data
-    dir under Grok Build, else the user's state dir. Never the repository."""
+    """Where context waits for its next delivery point: the harness's plugin
+    data dir if one is exported (Grok exports none to native hook files, so
+    in practice the user's state dir). Never the repository."""
     env = os.environ if environ is None else environ
     base = env.get("GROK_PLUGIN_DATA") or env.get("CLAUDE_PLUGIN_DATA")
     if base:
@@ -530,7 +531,7 @@ def main(argv: list[str] | None = None) -> int:
     daemon_url = resolve_daemon_url(args.daemon)
 
     if args.command == "install":
-        if args.harness == "grok-build" and not args.daemon:
+        if args.harness == "grok-build" and not args.daemon and not args.uninstall:
             explicit = os.environ.get("MIRAGEND_URL")
             if explicit:
                 daemon_url = explicit  # what the installer was told: keep it
@@ -538,6 +539,12 @@ def main(argv: list[str] | None = None) -> int:
                 # The plugin's copy resolves per event (env → saved option →
                 # manifest default), so a later URL change needs no reinstall.
                 daemon_url = None
+                hooks_url = resolve_daemon_url(None)
+                mcp_url = manifest_option_default("daemon_url") or DEFAULT_DAEMON_URL
+                if hooks_url.rstrip("/") != mcp_url.rstrip("/"):
+                    print(f"note: the hooks will use {hooks_url} (your saved Claude Code option) "
+                          f"but Grok's bridge MCP server reads MIRAGEND_URL only (default {mcp_url}) "
+                          f"— export MIRAGEND_URL={hooks_url} where grok starts if those differ")
             else:
                 # A checkout/console install has no manifest to fall back
                 # on: at runtime that would be the loopback — possibly a

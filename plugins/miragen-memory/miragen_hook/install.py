@@ -26,8 +26,9 @@ import shlex
 from pathlib import Path
 
 OWNED_MARKERS = ("miragen-hook", "miragen memory-hook")
-# `python3 -m miragen_hook …` (the Grok entry), not `-m miragen_hook_wrapper`.
-_OWNED_MODULE = re.compile(r"-m miragen_hook(\s|$)")
+# The Grok entry (`python3 …/miragen_hook/__main__.py`, formerly
+# `python3 -m miragen_hook`), not `-m miragen_hook_wrapper`.
+_OWNED_MODULE = re.compile(r"(-m miragen_hook|miragen_hook/__main__\.py'?)(\s|$)")
 OWNED_URL_MARKER = "/sessions/v1/hooks/"
 
 # (event, timeout_s). Timeouts sit above the adapter's own bounds
@@ -110,9 +111,14 @@ def hook_command(harness: str, *, daemon_url: str | None, token_file: str | None
                     f"'{value}' contains '$': Grok would read it as a variable and "
                     "not run the hook — use a path/URL without '$'"
                 )
-        # Grok runs shell-form commands through `sh -c`: quote every part.
-        parts = [f"PYTHONPATH={shlex.quote(str(adapter_root()))}", "python3", "-m",
-                 "miragen_hook", harness]
+        # Grok runs shell-form commands through `sh -c` with the repository
+        # as working directory: quote every part, and run the adapter by FILE
+        # — `python3 -m` puts the working directory ahead of PYTHONPATH, so
+        # inside a miragen checkout it would import the checkout's copy (no
+        # manifest → loopback URL → every event silently lost).
+        root = adapter_root()
+        parts = [f"PYTHONPATH={shlex.quote(str(root))}", "python3",
+                 shlex.quote(str(root / "miragen_hook" / "__main__.py")), harness]
     else:
         parts = ["miragen-hook", harness]
     if daemon_url:

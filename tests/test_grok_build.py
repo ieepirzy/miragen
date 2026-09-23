@@ -348,13 +348,14 @@ class TestGrokInstallAndPlugin:
             == dict(GROK_BUILD_EVENTS)
         assert "PostToolUse" in hooks  # the delivery point
         root = Path(__import__("miragen_hook").__file__).resolve().parent.parent
-        assert hooks["Stop"][0]["hooks"][0]["command"] == \
-            f"PYTHONPATH={shlex_quote(str(root))} python3 -m miragen_hook grok-build --daemon http://d"
+        assert hooks["Stop"][0]["hooks"][0]["command"] == (
+            f"PYTHONPATH={shlex_quote(str(root))} python3 "
+            f"{shlex_quote(str(root / 'miragen_hook' / '__main__.py'))} grok-build --daemon http://d")
         # Re-installing replaces our entries instead of adding a second set.
         install_hooks("grok-build", daemon_url=None, token_file=None, settings_path=path)
         again = json.loads(path.read_text())["hooks"]
         assert len(again["Stop"]) == 1
-        assert again["Stop"][0]["hooks"][0]["command"].endswith("miragen_hook grok-build")
+        assert again["Stop"][0]["hooks"][0]["command"].endswith("__main__.py grok-build")
 
     def test_cli_install_from_a_checkout_refuses_without_a_url(self, tmp_path, monkeypatch, capsys):
         """A checkout has no manifest to fall back on: the runtime answer
@@ -375,20 +376,66 @@ class TestGrokInstallAndPlugin:
         command = json.loads(target.read_text())["hooks"]["Stop"][0]["hooks"][0]["command"]
         assert command.endswith("grok-build --daemon https://memory.example")
 
-    def test_commands_survive_awkward_paths(self, tmp_path):
-        """Grok runs shell-form commands via `sh -c`: every part is quoted."""
+    @staticmethod
+    def _fake_plugin(root: Path, probe: str) -> None:
+        package = root / "miragen_hook"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("")
+        (package / "__main__.py").write_text(probe)
+
+    def test_commands_survive_awkward_paths(self, tmp_path, monkeypatch):
+        """Grok runs shell-form commands via `sh -c`: every part is quoted —
+        executed for real, not string-compared."""
         import subprocess
 
         from miragen_hook import install
-        weird = tmp_path / 'we$ird dir/x"y'
+        weird = tmp_path / 'we ird dir/x"y'
+        self._fake_plugin(weird, "import os, sys\n"
+                                 "print('|'.join([os.environ['PYTHONPATH'], *sys.argv[1:]]), end='|')\n")
+        monkeypatch.setattr(install, "adapter_root", lambda: weird)
         command = install.hook_command("grok-build", daemon_url="http://d", token_file="/tmp/my tok")
-        command = command.replace(shlex_quote(str(install.adapter_root())), shlex_quote(str(weird)))
-        probe = ("python3 -c 'import os, sys; "
-                 "print(\"|\".join([os.environ[\"PYTHONPATH\"], *sys.argv[1:]]), end=\"|\")'")
-        echoed = subprocess.run(["sh", "-c", command.replace("python3 -m miragen_hook", probe)],
-                                capture_output=True, text=True, check=False)
-        assert echoed.stdout.split("|")[0] == str(weird)
+        echoed = subprocess.run(["sh", "-c", command], capture_output=True, text=True, check=False,
+                                cwd=tmp_path)
+        assert echoed.stdout.split("|")[0] == str(weird), echoed.stderr
         assert "grok-build|--daemon|http://d|--token-file|/tmp/my tok|" in echoed.stdout
+
+    def test_a_checkout_in_the_working_directory_never_shadows_the_plugin(self, tmp_path, monkeypatch):
+        """Grok runs hooks with the repository as working directory, and
+        `python3 -m` would import a `miragen_hook` found THERE first — inside
+        a miragen checkout that copy has no manifest, so every event went to
+        the loopback and was lost. The adapter runs by file path instead."""
+        import subprocess
+
+        from miragen_hook import install
+        plugin, checkout = tmp_path / "plugin", tmp_path / "checkout"
+        self._fake_plugin(plugin, "import miragen_hook\nprint(miragen_hook.__file__)\n")
+        self._fake_plugin(checkout, "print('SHADOWED')\n")
+        monkeypatch.setattr(install, "adapter_root", lambda: plugin)
+        command = install.hook_command("grok-build", daemon_url=None, token_file=None)
+        ran = subprocess.run(["sh", "-c", command], capture_output=True, text=True, check=False,
+                             cwd=checkout, env={"PATH": "/usr/bin:/bin"})
+        assert ran.stdout.strip() == str(plugin / "miragen_hook" / "__init__.py"), ran.stdout + ran.stderr
+
+    def test_uninstall_needs_no_url(self, tmp_path, monkeypatch):
+        from miragen_hook import client
+        monkeypatch.delenv("MIRAGEND_URL", raising=False)
+        monkeypatch.setattr(client, "own_plugin_root", lambda: None)
+        target = tmp_path / "miragen.json"
+        assert client.main(["install", "grok-build", "--daemon", "http://d", "--settings", str(target)]) == 0
+        assert client.main(["install", "grok-build", "--uninstall", "--settings", str(target)]) == 0
+        assert "hooks" not in json.loads(target.read_text())
+
+    def test_plugin_install_points_out_a_saved_url_the_mcp_will_not_use(
+            self, tmp_path, monkeypatch, capsys):
+        """The hooks follow the option saved in Claude Code; Grok's MCP server
+        reads MIRAGEND_URL or the manifest default — say so when they differ."""
+        from miragen_hook import client
+        monkeypatch.delenv("MIRAGEND_URL", raising=False)
+        monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_DAEMON_URL", raising=False)
+        monkeypatch.setattr(client, "own_plugin_root", lambda: PLUGIN)
+        monkeypatch.setattr(client, "resolve_daemon_url", lambda explicit, *a, **k: explicit or "http://10.8.0.4:8420")
+        assert client.main(["install", "grok-build", "--settings", str(tmp_path / "m.json")]) == 0
+        assert "export MIRAGEND_URL=http://10.8.0.4:8420" in capsys.readouterr().out
 
     def test_a_dollar_in_a_baked_value_is_refused(self, tmp_path, capsys):
         """Grok scans hook commands for `$VAR` ignoring quotes and refuses a
@@ -411,6 +458,9 @@ class TestGrokInstallAndPlugin:
         mine = {"hooks": [{"command": "PYTHONPATH=/p python3 -m miragen_hook grok-build"}]}
         theirs = {"hooks": [{"command": "python3 -m miragen_hook_wrapper x"}]}
         assert _group_is_owned(mine) and not _group_is_owned(theirs)
+        current = {"hooks": [{"command": "PYTHONPATH=/p python3 /p/miragen_hook/__main__.py grok-build"}]}
+        quoted = {"hooks": [{"command": "PYTHONPATH='/a b' python3 '/a b/miragen_hook/__main__.py' grok-build"}]}
+        assert _group_is_owned(current) and _group_is_owned(quoted)
 
     def test_cli_install_does_not_bake_the_loopback(self, tmp_path, monkeypatch):
         """Without --daemon the URL stays resolved per event (env → saved
