@@ -823,3 +823,23 @@ def test_status_line_recall_states(tmp_path, status, degraded, expected):
     h = Harness(tmp_path)
     packet = MemoryPacket(text="", optional_status=status, degraded=degraded)
     assert expected in h.plane._status_line(packet, project_scope="group:project.x")
+
+
+class TestEpisodeRefinalize:
+    async def test_refinalize_with_a_different_digest_is_dedupe_not_failure(self, tmp_path):
+        """First digest per occurrence wins. A re-finalize whose digest
+        differs (journal replay rebuilding it from events that now capture —
+        seen on the VPS right after the #111 deploy) must not count as a
+        lost write or degrade memory."""
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup")
+        await h.send("UserPromptSubmit", prompt="hello there", prompt_id="p-1")
+        await h.send("SessionEnd", reason="prompt_input_exit")
+        await h.drain()
+        session = h.plane.registry.get("claude-code:s-1")
+        failures = h.plane.stats.capture_failures
+        session.turns.append("a turn the first digest never saw")
+        await h.plane._finalize(session, occurrence="end")
+        assert len(h.events("session_episode")) == 1
+        assert h.plane.stats.capture_failures == failures
+        assert "episode capture" not in (h.plane.stats.last_loimi_error or "")
