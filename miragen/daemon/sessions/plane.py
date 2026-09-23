@@ -443,6 +443,7 @@ class SessionPlane:
                     # is the next context-bearing event: open the context now,
                     # so the session still gets its working state and guide.
                     self.stats.late_opens += 1
+                    session.reopen_pending = False
                     context, detail = await self._open_context(session, envelope)
                 recalled, recall_detail = await self._prompt_recall(session, envelope)
                 if recalled:
@@ -529,6 +530,10 @@ class SessionPlane:
                     project = await asyncio.to_thread(self._resolve, cwd)
                 except Exception as exc:  # resolution must never fail an event
                     logger.warning(f"project resolution failed for {cwd}: {exc}")
+                    # Not retried on every event from the same place (each
+                    # attempt is a blocking git call on the hook path).
+                    if session.project is not None:
+                        session.resolved_from = fingerprint
                     return
                 self._projects[cwd] = project
         else:
@@ -548,6 +553,12 @@ class SessionPlane:
             return
         session.resolved_from = fingerprint
         current = session.project
+        # A dotfiles repository at ~ covers every subdirectory without its
+        # own repository: its toplevel IS home. (Only visible when the daemon
+        # resolved the directory itself; a remote adapter reports cwd only.)
+        at_home = at_home or bool(
+            local and client.home and project.root and _same_dir(project.root, client.home)
+        )
         is_repository = bool(project.remote) and not at_home
         if current is not None and (not is_repository or project.id == current.id):
             return  # sticky: only another repository replaces a binding
@@ -909,17 +920,29 @@ class SessionPlane:
 
     def _journal_and_capture(self, session: ExternalSession, envelope: EventEnvelope) -> None:
         self.journal.append(envelope)
-        self._spawn(self._locked(session, self._capture(session, envelope)))
+        # The project is fixed NOW: captures queue behind the session lock,
+        # and an agent that cd's into another repository meanwhile must not
+        # have this event written to the new project's scope.
+        project = session.project
+        self._spawn(self._locked(session, self._capture(session, envelope, project)))
 
     async def _locked(self, session: ExternalSession, coro: Awaitable[Any]) -> Any:
         async with self._lock(session.key):
             return await coro
 
-    async def _capture(self, session: ExternalSession, envelope: EventEnvelope) -> None:
+    async def _capture(
+        self, session: ExternalSession, envelope: EventEnvelope,
+        project: ProjectIdentity | None = None,
+    ) -> None:
         event = envelope.event
         if event.name not in CAPTURED:
             return
-        lifecycle, reason = await self._lifecycle_for(session)
+        if project is None:
+            project = session.project
+        if project is None:
+            lifecycle, reason = None, "no working directory reported; memory not scoped"
+        else:
+            lifecycle, _write, reason = await self.lifecycle_for_project(project)
         if lifecycle is None:
             # Unscoped (no project), not a lost write: lifetime counter only,
             # never the recent window the status line reads.
@@ -939,7 +962,7 @@ class SessionPlane:
         try:
             result = await asyncio.wait_for(
                 lifecycle.capture_harness_event(
-                    instance=session.project.slug if session.project else None,
+                    instance=project.slug,
                     event=normalized,
                 ),
                 timeout=WRITE_TIMEOUT_S,

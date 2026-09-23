@@ -940,5 +940,36 @@ class TestProjectReResolution:
         h.plane._projects.clear()
         await h.send("SessionStart", source="startup")
         for _ in range(3):
+            # Empty the per-cwd cache so only the session's fingerprint can
+            # prevent the (blocking, git-spawning) resolution.
+            h.plane._projects.clear()
             await h.send("UserPromptSubmit", prompt="again please")
         assert calls == ["/w/repo"]
+        await h.send("UserPromptSubmit", prompt="elsewhere now", cwd="/w/other")
+        assert calls == ["/w/repo", "/w/other"]
+
+    async def test_a_capture_queued_before_a_switch_stays_in_its_project(self, tmp_path):
+        """Captures queue behind the session lock; a prompt from another
+        repository must not move an earlier turn into that repository."""
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", cwd="/w/repo", host="laptop",
+                     project_remote=REPO.remote)
+        await h.send("Stop", last_assistant_message="work done IN REPO", cwd="/w/repo",
+                     host="laptop", project_remote=REPO.remote)
+        await h.send("UserPromptSubmit", prompt="now the other repository", cwd="/w/other",
+                     host="laptop", project_remote=OTHER.remote)
+        await h.drain()
+        (turn,) = [e for e in h.events("harness:") if "IN REPO" in (e.get("content") or "")]
+        assert turn["scope_id"] == PROJECT_SCOPE
+
+    async def test_a_dotfiles_home_covers_its_subdirectories(self, tmp_path):
+        h = Harness(tmp_path)
+        dotfiles = ProjectIdentity(id="github.com/ilari/dotfiles", slug="github.com-ilari-dotfiles",
+                                   name="dotfiles", root=HOME, remote="git@github.com:ilari/dotfiles.git")
+        original = h.plane._resolve
+        h.plane._resolve = lambda cwd: dotfiles if (cwd or "").startswith(HOME) else original(cwd)
+        home = {"home": HOME}
+        await h.send("SessionStart", source="startup", cwd="/w/repo", client_extra=home)
+        await h.send("UserPromptSubmit", prompt="look at my notes", cwd=f"{HOME}/Documents",
+                     client_extra=home)
+        assert h.plane.registry.get("claude-code:s-1").project.id == REPO.id
