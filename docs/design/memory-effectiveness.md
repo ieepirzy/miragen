@@ -2,7 +2,9 @@
 
 Status: **Scoping proposal**, 2026-09-23. **Shipped:** P0 (#111, deployed; VPS
 capture failures went from 395/405 to 2/251, and those 2 were dedupe, fixed in
-#115) and P3 (#112, deployed). Everything else is unbuilt.
+#115) and P3 (#112, deployed). Everything else is unbuilt. P1/P2 revised after
+the §9 design round (decisions 3–7); **nothing gets built until Ilari
+approves.**
 Revised after an agent fact-check against main: P1b already exists (undeployed),
 and P2 follows §17.7's mandatory selector.
 Owner: Mira (leads testing). Decided by Ilari 2026-09-23: **the VPS bridge
@@ -87,32 +89,184 @@ Each item is one PR with a live check against the VPS, not only a suite.
 **P0: capture works.** Fix the idempotency-key defect (§6). Add
 `capture_failure_rate` to the status line in P3 so it can never hide again.
 
-**P1: admission for harness sessions.** Two independent paths. Both go through
-Loimi admission, so nothing mints authority.
-- *(a) Agent-side nudge.* A Stop hook blocks **once** per session, after a
-  session that did real work (tool calls and file edits over a threshold). It
-  asks: "Anything durable learned? `memory_remember` it, or reply 'nothing'."
-  This is the proven pattern: miradesign's Stop continuation blocks exactly
-  once and agents answer (verified live 2026-09-18). Cheap, and needs no model
-  on the server.
-- *(b) Server-side distillation. Already built, never deployed.* Run
-  `miragen memory-worker` next to the bridge in the agent-stack with a model.
-  It already consumes `session_episode` events and already applies the span
-  check, checker and Loimi admission. The work is deployment (a compose
-  service, a principal holding `maintain`, a model credential) plus a live
-  check that one real episode yields zero or more admitted records. Blocked
-  on decision 1 (§7).
+**P1.0: model runner. Headless Claude Code on Ilari's subscription** (decision
+3, §7). The selector (P2), extractor and checker (P1b) all run through one
+`claude -p` invocation. No API key, no per-token bill. The code already has
+the seam: `ExtractFn`, `CheckFn` and `SelectFn` are plain async callables, so
+the runner is a fourth implementation next to the PydanticAI ones, not a
+rewrite. Verified 2026-09-23 on Dakiaim (Claude Code 2.1.280):
+```
+claude -p <input> --model haiku --output-format json --json-schema <schema> \
+  --system-prompt <instructions> --tools "" --setting-sources "" \
+  --strict-mcp-config --mcp-config <empty> --no-session-persistence
+```
+run from an empty working directory with `MIRAGEN_WORKER=1`.
+- **Isolation, measured:** debug log `Registered 0 hooks from 2 plugins`;
+  1,180 input tokens (so no CLAUDE.md, auto-memory or tool schemas); the model
+  did not know it was "Mira". `structured_output` came back schema-valid in 6/6
+  calls.
+- **Latency, measured:** 2.5–2.8 s wall per call (1.3–1.6 s API), 3.4–4.0 s
+  with a longer prompt. This matters only for the selector, which sits in
+  `UserPromptSubmit` (see P2).
+- **`--bare` is unusable:** it never reads OAuth ("Anthropic auth is strictly
+  `ANTHROPIC_API_KEY`"), so it can't use the subscription. Isolation comes
+  from the flags above instead.
+- **Recursion guard, required:** a worker call must never be captured as a
+  harness session, or every memory call spawns a session that spawns an
+  episode that spawns extraction. The flags already keep plugin hooks out.
+  `miragen_hook` also exits immediately when `MIRAGEN_WORKER=1`, as a second
+  guard, with a test for both.
+- **Credential boundary:** the runner shells out to the `claude` binary, and
+  only that. The subscription OAuth token is never lifted into PydanticAI or
+  raw API calls; that would stop being Claude Code usage. On a headless host
+  the token comes from `claude setup-token` (`CLAUDE_CODE_OAUTH_TOKEN`).
+- **Where it runs:** open question 7C (§7).
+- **§17.2 amendment:** §17.2 says to start on the main model, "rather than an
+  unvalidated cheaper substitute". Decision 3 overrides that for Haiku, on
+  one condition: the eval in P1.1 passes first. Until it does, the runner can
+  be pointed at `--model sonnet` with the same flags.
+- **Usage share:** at the measured ~36 sessions/week, that is about 50–150
+  selector calls and 5–10 extraction runs a day, each around 2–4k tokens of
+  Haiku. P4 reports calls per day, so the share of the Max 5x allowance is
+  watched, not guessed.
 
-**P2: retrieval on, the accepted way.** Configure the selector model
-(`BRIDGE_RECALL_MODEL`, e.g. `deepseek:deepseek-chat` +
-`BRIDGE_DEEPSEEK_API_KEY`, as movingfirm-agents#28 already proposes). §17.7
-requires the selector: lexical top-k alone is explicitly rejected as a
-relevance signal, so no model-free "interim" recall. Also:
-- Start lane: when there is no `goal`, the session-start query can come from
-  project + repo + branch, instead of `no_query`. That's a candidate change;
-  it only matters once the selector exists.
-- Measure the selector's cost per cache miss, as §17.7 asks.
-Blocked on decision 1 (§7).
+**P1.1: eval gate for the model.** Before P1b/P2 deploy: 30 real
+`session_episode` events from the VPS, labelled for durable items (Mira
+labels, Ilari spot-checks 10); 40 seeded records and 40 real prompts labelled
+with the ids that should apply. Run Haiku and Sonnet (as the ceiling) 3× each
+through the runner. Proposed pass bars: extraction precision ≥ 0.9 and recall
+≥ 0.6; selector recall ≥ 0.7 with ≤ 10% false injections. On the
+subscription this costs no money, only about half a day.
+
+**P1: admission for harness sessions.** Two paths with different jobs. Both
+go through Loimi admission, so nothing mints authority.
+- *(a) Pushy agent-side save (the main write path).* Today agents barely use
+  miragen, and Claude Code's `MEMORY.md` gets the writes (§1). Ilari wants
+  agents nudged hard (decision 2). What agents discover (gotchas,
+  environment facts, procedures) exists only in their turns, and the episode
+  doesn't carry those (see b). So this path is where that knowledge comes in.
+  - *When it fires:* Ilari usually ends sessions with `/clear`, which no hook
+    can block. So the nudge can't wait for the end. It fires at the first
+    Stop once the session has ≥ 5 prompts, then again after every 15 more
+    prompts or after a compaction, at most 3 times per session. It never
+    fires in child sessions, and never when `memory_remember` or
+    `memory_checkpoint` was already called since the last nudge.
+  - *Wording:* pushy and concrete. It names the categories (decisions,
+    gotchas, environment facts, Ilari's preferences, open intentions) and
+    demands exactly one of two outcomes: `memory_remember` calls, or the
+    literal reply `nothing durable`.
+  - *Engagement check:* the bridge sees the `memory_*` call for this session,
+    or the reply matches. If it's ignored, one firmer re-ask, then log
+    `nudge_ignored` (P4).
+  - *Guidance, every session:* the SessionStart guide says durable project
+    learnings go to `memory_remember`. How that relates to `MEMORY.md` is
+    open question 7A.
+  - *Coexisting with MiraDesign's Stop hook:* MiraDesign only continues when
+    `stop_hook_active` is false (`harness/ingest.py`). A memory block sets
+    that flag on the next Stop, which would silence MiraDesign's "someone is
+    waiting" continuation. So neither hook decides from the shared flag. Each
+    keeps its own per-session "last blocked" state (miradesign#23 tracks
+    MiraDesign's side). Whether Claude Code runs two blocking Stop hooks in
+    parallel and merges their reasons is not verified. The design must work
+    either way, and §5 tests both hooks together.
+  - *Build:* three pieces that don't exist yet: Stop-block output in
+    `miragen_hook` (today it only emits `additionalContext`), per-session
+    nudge state in miragend, and bridge-side counting of `memory_*` calls per
+    session (`SessionCounters` has none). One PR, no model.
+- *(b) Server-side extraction (built, never deployed).* `miragen
+  memory-worker` consumes `session_episode` events and already runs the span
+  check, the checker and Loimi admission. It gets the P1.0 runner and a
+  compose service or unit, plus a principal holding `maintain`.
+  - *What it can find:* the episode holds up to 20 prompts cut to 300 chars
+    and only the **last** assistant message (`sessions/models.py`,
+    `render_episode`). So extraction mostly captures what **Ilari said**
+    (decisions, preferences, intentions), which are exactly the records that
+    carry authority. Raising the caps is cheap and optional.
+  - *Priority:* user-stated beats agent-observed beats inferred.
+    "Durable" means a future session in this project would act differently
+    knowing it, with the concrete future-use reason §17.5 already requires.
+  - *Near-duplicates:* at admission, look up similar records in the scope and
+    let the model choose new, same-as-X (add the source) or supersedes-X.
+    This reuses the grounded branch's consolidation instead of building a
+    second one.
+  - *Situation field:* each proposal also carries a short `situation` ("while
+    redeploying agent-stack on the VPS"). This is the store side of task
+    vectors (P2). It changes `ProposedMemory` (`extra="forbid"`) and the
+    record payload. Before building, check it doesn't touch the grounding
+    contract this doc promises to leave alone (§1).
+
+**P2: retrieval on, the accepted way.** The §17.7 selector, run through the
+P1.0 runner. Lexical top-k alone is still rejected as a relevance signal, so
+there's no model-free "interim" recall.
+- *Project resolution, tiered (port MiraDesign's rule).* Today miragen binds
+  a session's project **once**, at its first event (`plane.py`
+  `_attach_project`, only when `session.project is None`). Ilari launches
+  most sessions from `~`, so they bind to `dir:ilari` for good, and their
+  memories are written there even when the work was in miragen. MiraDesign
+  already solved this (`application/presence.py` `heartbeat`): it
+  re-resolves on every event from the reported cwd/remote, unless an
+  explicit attach pinned the session. Tiers, highest first:
+  1. pinned: an explicit attach, or the project MiraDesign bound this
+     session to;
+  2. the repository of the **current** cwd, re-resolved on every event
+     (Claude Code's hook `cwd` follows the agent's `cd`);
+  3. no project (`~`, or another workspace root): profile scope only.
+  The **write** scope follows the same resolution at write time, so a memory
+  learned inside miragen lands in miragen's scope.
+- *Session start, per tier:* tier 1/2 query from project, repo, branch and
+  working-state goal, plus the previous session's last prompt. Tier 3 has no
+  meaningful query at start: inject only the required lane (profile-scope
+  open intentions, pinned records) and let the first prompt drive recall.
+- *Each prompt: facets* (≤ 4, §17.7): the prompt itself; the **task
+  descriptor**: repo, branch, the claimed MiraDesign work item and the last
+  two prompts; the working-state goal when set. Lexical and (later) dense
+  channels are fused by RRF, as §17.7 specifies.
+- *Small scopes:* while a scope has ≤ 20 eligible records, all of them go to
+  the selector and search is skipped. They pass the **same eligibility
+  filter** as search: current heads only, nothing superseded, quarantined or
+  tentative. Otherwise this would reopen the §17.1 finding. It's consistent
+  with §17.7 because the selector still decides relevance; only candidate
+  generation is trivial.
+- *Latency:* the selector runs synchronously with a hard 4 s timeout. On
+  timeout, optional recall degrades to nothing for that prompt and the status
+  line says so. Trivial prompts ("yes", "merge it", under ~20 chars with no
+  new facet) skip the selector call. That decides *whether* recall runs, not
+  what's relevant, so it doesn't bend §17.7's rule.
+- *Budget:* tighter than §17.7's 2,000-token ceiling: about 800 tokens or
+  4 cards per prompt, and never an id already injected in this session.
+- *Dense retrieval: deferred.* §17.2 already fixes bge-m3 at 1024 dims.
+  Deploying it is movingfirm-agents#29 and waits until scopes outgrow the
+  whole-scope path.
+- *Task vectors* (Ilari's term; origin miradb #600/#231/#225): a multi-facet
+  **situation** representation (domain, activity, entities, outcome, a
+  running average of recent turns), so recall finds structurally similar
+  situations even when the wording differs. The cosine mismatch between a
+  task and a stated fact is handled three ways:
+  1. the selector sits after retrieval, so dense search only needs the right
+     memory in the top 20 (recall@20), not ranked first;
+  2. like-with-like: query situations are compared with stored `situation`
+     fields (P1b), not with statements;
+  3. later, a small learned **linear adapter** on frozen embeddings, trained
+     on the judgment log below.
+  Until an embedder exists, the task vector is the structured task
+  descriptor above, fed to lexical search and to the selector.
+- *Retrieval judgment log (autonomous training data).* Every selector call
+  writes one row per candidate, with no human in the loop:
+  - the scope, session and a hash of the facets, plus the facet and card
+    **text**, so vectors can be computed later, after the embedder ships;
+  - each candidate's id and its rank per channel;
+  - selected or not, with the selector's reason (teacher labels: a
+    non-selected candidate is a hard negative);
+  - the model and the embedding-space identity (null for now).
+  A second, weaker label joins later from P4 use signals: whether an
+  injected id was cited, read, corrected or ignored. Requirements:
+  - a test that a selector call writes its rows;
+  - a `judgments` count on `/health`, so an empty log is visible;
+  - §17.8 erasure covers these rows, since they hold prompt text.
+  Per §17.6.4, the adapter only reshapes candidate **generation**. It never
+  changes authority or truth, and use frequency never feeds back into
+  ranking by itself. This gives the dataset the small net needs; "later"
+  means once a few hundred positive rows exist.
 
 **P3: announce itself.** Every injection gets one status line, always:
 `miragen: 14 memories in group:project.miradesign · 2 match this prompt (below) · capture ok`.
@@ -123,7 +277,10 @@ The guidance lane asks the agent to cite ids it used.
 **P4: measure use, not preparation.** Count per session: injected ids, ids the
 agent cited, `memory_*` tool calls, corrections. A session-level "memory used"
 ratio on `/health` and in telemetry. This is the number that answers "is it
-doing anything".
+doing anything". Also count: nudges fired, answered and ignored; runner calls
+per day and their failures or timeouts; judgment rows written. For the
+`MEMORY.md` comparison (decision 4), count per session which system got the
+writes and which one the agent actually used.
 
 ## 5. Acceptance test (what I will run)
 
@@ -137,6 +294,23 @@ approach as the MiraDesign live QA on 2026-09-18:
    rediscovering it, and the status line was present in both sessions.
 4. Negative controls: an unrelated repo sees no leak, a wrong memory corrected
    in B is not injected to C, and a joke or hypothetical in A is not admitted.
+
+Added with the P1/P2 revision:
+5. **Nudge, not instruction:** A is never told to remember anything. The fact
+   has to arrive through the P1a nudge. Separately, one of A's prompts states
+   a preference, and P1b extraction has to admit it.
+6. **Recall without asking:** B's context shows the memory without B calling
+   `memory_recall`.
+7. **Launched from `~`:** A and B both start in `~` and `cd` into the repo.
+   The memory is written to the repo's scope, not `dir:ilari`, and B's recall
+   finds it after its `cd`.
+8. **Two Stop hooks:** with MiraDesign's plugin active and a directed message
+   waiting, a session that also gets the memory nudge still receives the
+   MiraDesign continuation, in both orders (nudge first, message first).
+9. **Recursion guard:** a runner call creates no bridge session, no episode
+   and no capture.
+10. **Judgment log:** every selector call in B wrote rows, and `/health`
+    `judgments` went up.
 
 Run it after each of P0–P3, so each PR shows what it moved.
 
@@ -198,17 +372,52 @@ Decided by Ilari, 2026-09-23:
    Order constraint from §6: it adds repeated Stop events, so it lands after
    P0, which is now live.
 
+Decided by Ilari, 2026-09-23 (design round, answering §9):
+3. **Runner: headless Claude Code on the Max 5x subscription, Haiku.** No API
+   costs. Codex's subscription is the fallback, but it's usually spent on
+   side projects. Mechanics and measurements: P1.0. This overrides §17.2's
+   "main model first", once the P1.1 eval passes. It also removes the
+   data-residency question a third-party API (DeepSeek) would have raised:
+   prompts go only to Anthropic, where these sessions already run.
+4. **miragen, not `MEMORY.md`, is the intended memory.** Ilari prefers
+   miragen's record store over Claude Code's wiki-like file memory, so agents
+   get nudged hard to write to it (P1a). If P4 shows miragen performing worse,
+   switching gets reconsidered.
+5. **"Task vectors" = the situation representation** from miradb #600: facets
+   plus like-with-like situation matching, and later a small adapter. The
+   dataset for that adapter must build itself (P2 judgment log).
+6. **Session-start resolution is tiered**, using the rule MiraDesign already
+   has (P2).
+7. **Stop-hook coexistence with MiraDesign is proven by a test** (§5 item 8),
+   not argued.
+
 Still open:
-A. **`MEMORY.md` coexistence.** Claude Code's file memory is where the real
-   knowledge lives today (~60 entries). Options: (a) leave it alone and let
-   miragen earn its place; (b) a one-time import into `profile:mira` / project
-   scopes; (c) make it a generated view of miragen. Recommendation: (a) until
-   §5 passes, then (b).
+A. **`MEMORY.md` coexistence during the trial.** Claude Code's system prompt
+   tells agents to write file memory, and that competes with the nudge.
+   Options: (a) leave auto-memory on as the baseline and let P4 compare;
+   (b) turn off Claude Code auto-memory while the §5 trial runs, and route
+   everything to miragen; (c) a one-time import of the ~60 `MEMORY.md` entries
+   into `profile:mira` and project scopes. Recommendation: (a) for the first
+   week to get a baseline, then (b) with (c).
 B. **Prompt capture + secrets.** Distilling session episodes (P1b) mines
    verbatim prompts. The 2026-09-16 decision was "no redaction". Confirm it
    still holds once content gets *promoted*, not just stored.
+C. **Where the runner lives.** Either on the VPS next to the bridge (it needs
+   the `claude` CLI in the image and a `setup-token` credential there; that
+   puts a personal subscription credential on the company VPS), or on
+   Dakiaim, where Claude Code is already logged in. Dakiaim is off at times:
+   extraction can queue, but per-prompt selection from cloud sessions would
+   degrade while it's off. Recommendation: the VPS, if Ilari accepts the
+   credential there.
+D. **Selector latency.** Is +2.5–4 s per non-trivial prompt acceptable? If
+   not, the selector runs asynchronously and the result is delivered at the
+   next Stop continuation instead of up front.
 
 ## 9. Handoff: design questions for a fresh session
+
+**Status 2026-09-23: answered.** The answers are in P1.0–P2 and decisions 3–7
+(§7). The model question was decided by the runner choice (decision 3), and
+quality is gated by the P1.1 eval. The questions stay below for the record.
 
 Ilari wants these answered in a dedicated design session. They decide what
 P1 and P2 actually become. **Read first:** this doc, then
