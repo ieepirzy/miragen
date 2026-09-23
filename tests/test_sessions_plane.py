@@ -1151,3 +1151,96 @@ class TestAsyncRecallReviewFixes:
         await h.plane.sweep(now=datetime.now(timezone.utc) + timedelta(days=3))
         assert "claude-code:s-1" not in h.plane._recalls
         assert h.plane.describe()["recall"]["pending"] == 0
+
+# ── end-of-work save nudge (P1a) ─────────────────────────────────────────────
+
+NUDGE_CAPS = {"capabilities": ["async-recall", "stop-continue"]}
+
+
+class TestEndOfWorkNudge:
+    async def _work(self, h, prompts, *, start=0, extra=NUDGE_CAPS):
+        for i in range(start, start + prompts):
+            await h.send("UserPromptSubmit", prompt=f"do step {i} of the work", client_extra=extra)
+
+    async def _stop(self, h, message="done", extra=NUDGE_CAPS):
+        return (await h.send("Stop", last_assistant_message=message, client_extra=extra)).continue_with
+
+    async def test_no_nudge_before_real_work(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        await self._work(h, 4)
+        assert await self._stop(h) is None
+
+    async def test_it_fires_asks_again_once_then_lets_go(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        await self._work(h, 5)
+        first = await self._stop(h)
+        assert "end-of-work save" in first and "session='claude-code:s-1'" in first
+        assert "> do step 4 of the work" in first, "the session's own prompts are quoted"
+        again = await self._stop(h, "I think we're done")
+        assert "asked again" in again
+        assert await self._stop(h, "still done") is None, "at most one re-ask"
+        stats = h.plane.stats
+        assert (stats.nudges_fired, stats.nudges_reasked, stats.nudges_ignored) == (1, 1, 1)
+
+    async def test_saving_or_saying_nothing_durable_answers_it(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        await self._work(h, 5)
+        assert await self._stop(h) is not None
+        h.plane.note_memory_write("claude-code:s-1")
+        assert await self._stop(h, "saved two memories") is None
+        await self._work(h, 15, start=5)
+        assert await self._stop(h) is not None, "the next one comes 15 prompts later"
+        assert await self._stop(h, "Nothing durable.") is None
+        assert h.plane.stats.nudges_answered == 2
+
+    async def test_an_agent_that_already_saved_is_not_nagged(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        await self._work(h, 3)
+        h.plane.note_memory_write("claude-code:s-1")
+        await self._work(h, 2, start=3)
+        assert await self._stop(h) is None
+        assert h.plane.stats.nudges_fired == 0
+
+    async def test_compaction_makes_the_next_one_due_and_the_cap_holds(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        await self._work(h, 5)
+        fired = 0
+        for round_ in range(6):
+            if await self._stop(h):
+                fired += 1
+                await self._stop(h, "nothing durable")
+            await h.send("PreCompact", trigger="auto", client_extra=NUDGE_CAPS)
+            await self._work(h, 1, start=10 + round_)
+        assert fired == 3, "max_per_session"
+
+    async def test_adapters_without_the_capability_and_child_sessions_are_never_nudged(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup")
+        await self._work(h, 6, extra=None)
+        assert await self._stop(h, extra=None) is None
+        await h.send("SessionStart", source="startup", session="kid",
+                     client_extra={**NUDGE_CAPS, "parent_session": "claude-code:s-1"})
+        for i in range(6):
+            await h.send("UserPromptSubmit", prompt=f"child step {i} here", session="kid",
+                         client_extra={**NUDGE_CAPS, "parent_session": "claude-code:s-1"})
+        child = await h.send("Stop", last_assistant_message="x", session="kid",
+                             client_extra={**NUDGE_CAPS, "parent_session": "claude-code:s-1"})
+        assert child.continue_with is None
+
+    async def test_bridge_writes_are_attributed_to_the_session(self, tmp_path):
+        from miragen.daemon.sessions.bridge_mcp import build_bridge_mcp
+
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        mcp = build_bridge_mcp(lambda: h.plane)
+        await mcp.call_tool("memory_remember", {"content": "tests need port 55433",
+                                                "session": "claude-code:s-1"})
+        assert h.plane.registry.get("claude-code:s-1").counters.memory_writes == 1
+        await mcp.call_tool("memory_checkpoint", {"state": {"goal": "x"},
+                                                  "project": "claude-code:s-1"})
+        assert h.plane.registry.get("claude-code:s-1").counters.memory_writes == 2

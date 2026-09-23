@@ -136,6 +136,9 @@ class SessionCounters(_Tolerant):
     deferred_injections: int = 0
     captures: int = 0
     capture_failures: int = 0
+    # memory_remember / memory_checkpoint / memory_correct calls attributed
+    # to this session through the bridge (the end-of-work nudge reads it).
+    memory_writes: int = 0
 
 
 class ExternalSession(_Tolerant):
@@ -167,6 +170,13 @@ class ExternalSession(_Tolerant):
     # The binding changed since the model last got this project's context:
     # the next prompt opens it.
     reopen_pending: bool = False
+    # End-of-work save nudge (P1a): how many fired, where the clock was
+    # last reset, and whether one is awaiting an answer ("asked"/"reasked").
+    nudges_fired: int = 0
+    nudge_prompt_mark: int = 0
+    nudge_compaction_mark: int = 0
+    nudge_writes_mark: int = 0
+    nudge_state: Optional[str] = None
     # Loimi artifact store participation: the run this session's
     # artifacts belong to, the namespace it was opened in, and which
     # episode occurrences already produced an artifact (the store has

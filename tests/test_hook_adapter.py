@@ -495,7 +495,7 @@ class TestBackgroundRecall:
         from miragen_hook.normalize import normalize_hook_payload
 
         payload = {**LIVE, "hook_event_name": "UserPromptSubmit", "prompt": "hi"}
-        for harness, caps in (("claude-code", ["async-recall"]), ("codex", [])):
+        for harness, caps in (("claude-code", ["async-recall", "stop-continue"]), ("codex", [])):
             event = normalize_hook_payload(harness, payload)
             envelope = build_envelope(harness, payload, event, environ=env, pid=1)
             assert envelope["client"]["capabilities"] == caps
@@ -605,3 +605,32 @@ def test_an_unreachable_daemon_on_a_new_prompt_still_clears_the_old_marker(tmp_p
     run("claude-code", {**LIVE, "hook_event_name": "UserPromptSubmit", "prompt": "next"},
         daemon_url="http://127.0.0.1:1", token=None, opener=down, pid=1, environ=env)
     assert read_recall_marker(LIVE["session_id"], env) is None
+
+class TestStopBlockMerging:
+    EVENTS = "/sessions/v1/events"
+    CLAIM = "/sessions/v1/recall/claim"
+
+    @pytest.fixture
+    def env(self, tmp_path):
+        return {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+
+    def _stop(self, routes, env):
+        return run("claude-code", {**LIVE, "hook_event_name": "Stop", "last_assistant_message": "x"},
+                   daemon_url="http://127.0.0.1:1", token=None, opener=_router(routes), pid=1,
+                   environ=env)
+
+    def test_the_nudge_alone_blocks(self, env):
+        out = self._stop({self.EVENTS: {"continue_with": "SAVE-NUDGE"}}, env)
+        assert out == {"decision": "block", "reason": "SAVE-NUDGE"}
+
+    def test_a_late_recall_and_the_nudge_share_one_block(self, env):
+        from miragen_hook.client import write_recall_marker
+
+        write_recall_marker(LIVE["session_id"], 1, env)
+        out = self._stop({self.EVENTS: {"continue_with": "SAVE-NUDGE"},
+                          self.CLAIM: {"state": "ready", "context": "RECALLED"}}, env)
+        assert out["decision"] == "block"
+        assert out["reason"].index("RECALLED") < out["reason"].index("SAVE-NUDGE")
+
+    def test_nothing_to_say_means_no_block(self, env):
+        assert self._stop({self.EVENTS: {"continue_with": None}}, env) is None

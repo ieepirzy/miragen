@@ -54,6 +54,7 @@ def register_session_routes(app: FastAPI, plane: SessionPlane, *, dependencies: 
             "context": result.context,
             "detail": result.detail,
             "recall_pending": result.recall_pending,
+            "continue_with": result.continue_with,
             "accepted": True,
         })
 
