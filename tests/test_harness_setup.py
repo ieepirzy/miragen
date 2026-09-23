@@ -220,6 +220,17 @@ class TestEnsureCodex:
         assert (home / "config.toml").read_text() == config
         assert (home / "hooks.json").read_text() == hooks_before  # no untrusted hooks left behind
 
+    def test_a_misread_table_is_refused_not_dropped(self, tmp_path, monkeypatch):
+        """The text cut is checked against the parsed file: if the block
+        reader ever took a user table for ours, nothing is written."""
+        home = _codex_home(tmp_path)
+        original_is_ours = hs._is_ours
+        monkeypatch.setattr(hs, "_is_ours", lambda key, marked, keys: key == ["projects", "/w/repo"]
+                            or original_is_ours(key, marked, keys))
+        with pytest.raises(hs.SetupError, match="change other settings"):
+            hs.ensure_codex(home, url="https://m.example")
+        assert (home / "config.toml").read_text() == USER_CONFIG
+
     def test_invalid_files_are_refused(self, tmp_path):
         home = _codex_home(tmp_path, config="this is = = not toml")
         with pytest.raises(hs.SetupError, match="not valid TOML"):
