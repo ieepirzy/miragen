@@ -218,6 +218,8 @@ class TestClaudeCodeInTheLane:
             instance="ops", run_id="r1", trigger="http", prompt_hint="q")
         assert [i["record_id"] for i in packet.items if i["kind"] == "recalled"] == [card["record_id"]]
         assert "legit candidate" in packet.text
+        injected = [i for m in service.manifests for i in m.get("items", [])]
+        assert [i["revision_id"] for i in injected] == [card["revision_id"]]  # manifest shape the failure test relies on
 
     @pytest.mark.parametrize("kw", [
         {"messages": (ResultMessage(result="not json"),)},
@@ -233,7 +235,9 @@ class TestClaudeCodeInTheLane:
         section, status = await lifecycle.recall_section(instance="ops", prompt_hint="q")
         assert status.startswith("degraded: selector")
         assert "would be relevant" not in (section or "")
-        assert not any(i["kind"] == "recalled" for m in service.manifests for i in m.get("items", []))
+        # A manifest records what was injected (items = revision_id + reason);
+        # a failed selection injected nothing, so none may name an item.
+        assert not [m for m in service.manifests if m.get("items")]
 
 
 # ── pydantic-ai path + base_url ──────────────────────────────────────────────
