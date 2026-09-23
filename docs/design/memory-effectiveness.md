@@ -1,6 +1,8 @@
 # Memory effectiveness: from plumbing to agents that remember
 
-Status: **Scoping proposal**, 2026-09-23. P0 is in PR #111; nothing else is built.
+Status: **Scoping proposal**, 2026-09-23. **Shipped:** P0 (#111, deployed; VPS
+capture failures went from 395/405 to 2/251, and those 2 were dedupe, fixed in
+#115) and P3 (#112, deployed). Everything else is unbuilt.
 Revised after an agent fact-check against main: P1b already exists (undeployed),
 and P2 follows §17.7's mandatory selector.
 Owner: Mira (leads testing). Decided by Ilari 2026-09-23: **the VPS bridge
@@ -184,22 +186,93 @@ Run it after each of P0–P3, so each PR shows what it moved.
 **Consequence for P1a:** a Stop nudge adds exactly the repeated-Stop traffic
 that triggers this bug, so P1a must land after P0.
 
-## 7. Open decisions for Ilari
+## 7. Decisions
 
-1. **Model for the selector (P2) and the memory worker (P1b) on the VPS.**
-   Which model and what budget. One cheap structured-output model can serve
-   both. Nothing that makes memory *flow* can land without it; P0, P1a and P3
-   can.
-2. **Stop nudge intrusiveness (P1a).** Once per session above a work
-   threshold, or opt-in per project?
-3. **`MEMORY.md` coexistence.** Claude Code's file memory is where the real
+Decided by Ilari, 2026-09-23:
+1. **Model: the cheapest one that can do the job.** One structured-output model
+   serves the selector (P2) and the memory worker (P1b). Which model it is goes
+   to the design session (§9), chosen by measured quality and cost, not
+   reputation.
+2. **The end-of-session save prompt (P1a) is pushy.** The goal is to get the
+   agent to actually engage, not to be polite. Design and wording are in §9.
+   Order constraint from §6: it adds repeated Stop events, so it lands after
+   P0, which is now live.
+
+Still open:
+A. **`MEMORY.md` coexistence.** Claude Code's file memory is where the real
    knowledge lives today (~60 entries). Options: (a) leave it alone and let
    miragen earn its place; (b) a one-time import into `profile:mira` / project
    scopes; (c) make it a generated view of miragen. Recommendation: (a) until
    §5 passes, then (b).
-4. **Prompt capture + secrets.** Distilling session episodes (P1b) mines
+B. **Prompt capture + secrets.** Distilling session episodes (P1b) mines
    verbatim prompts. The 2026-09-16 decision was "no redaction". Confirm it
    still holds once content gets *promoted*, not just stored.
+
+## 9. Handoff: design questions for a fresh session
+
+Ilari wants these answered in a dedicated design session. They decide what
+P1 and P2 actually become. **Read first:** this doc, then
+`docs/miragen-memory-agent-architecture-pass.md` §17 (accepted design; §17.5
+extraction, §17.7 retrieval) and §18. That's where earlier answers live, and
+proposals must not quietly contradict them (this doc's first draft did, see
+PR #110 comments).
+
+**Facts established 2026-09-22/23 (verified, not assumed):**
+- Loimi already supports **hybrid search**: lexical OR-query plus
+  `query_embedding` in a locked 1024-dim projection space (pgvector,
+  migrations 0004/0005/0010; `service.py` search). **No embedding server is
+  deployed**, so production recall is lexical-only. Tracked in
+  Muutto365/movingfirm-agents#29 (embed server + Loimi worker) and
+  miragen#109 (memory worker: extraction, projection embeddings, predicate
+  registry).
+- The write path exists but never runs: `miragen memory-worker` extracts from
+  `session_episode` events (span check + checker + Loimi admission; may
+  propose zero). It skips per-turn `harness:*` events by design. It isn't
+  deployed and has no model.
+- The selector (§17.7) is mandatory for automatic recall. Nothing injects
+  until `BRIDGE_RECALL_MODEL` is set (agent-stack env, declared in compose).
+  movingfirm-agents#28 tracks it.
+- Episodes are built from what hooks carry (prompts, last assistant messages,
+  failures, children). There's no transcript reading.
+- The status line (P3) now tells agents the recall mode on every open, so the
+  effect of any change is visible per session.
+
+**Questions to answer, each with a recommendation and its cost:**
+1. **Cheapest adequate model** for (a) the selector and (b) extraction. Both
+   need structured output. Candidates must be measured on a small fixed eval:
+   real `session_episode` events from the VPS store as extraction input, and
+   real prompts against seeded records for the selector. Report
+   precision/recall and cost per 1k sessions. Is one model enough for both?
+2. **Write: based on what?** Is the session episode the right unit? Should
+   agent-authored `memory_remember` calls outweigh extraction? What makes
+   something "durable" (decisions, gotchas, environment facts, user
+   preferences) versus noise? How is the stream of near-duplicates
+   deduplicated or consolidated (the grounded branch has consolidation)?
+3. **Recall: based on what?** The query source at session open (repo, branch,
+   first prompt, working-state goal) and per prompt. How lexical and dense
+   combine (§17.7 already specifies RRF over facets). What the selector sees.
+   The injection budget.
+4. **Semantic/vector similarity for automatic recall.** It's designed and the
+   store supports it; what's missing is an embedding model and a deployment.
+   Which embedding model fits 1024 dims cheaply (or local on the VPS)? Is it
+   worth it before the selector exists? Per §17.7, similarity alone never
+   decides relevance.
+5. **"Task vectors".** Ilari's term. Clarify with him first: (a) embedding the
+   *current task* (prompt + goal + repo) as the recall query, which is §17.7
+   facets; or (b) task vectors in the model-editing sense, which don't fit a
+   retrieval store; or (c) clustering memories by task type. Recommend one.
+6. **Pushy end-of-session save (P1a, decided pushy).** Mechanism: a Stop hook
+   that blocks once after real work, like the proven MiraDesign Stop
+   continuation. Needs: a threshold for "real work", wording that makes the
+   agent actually call `memory_remember`/`memory_checkpoint` (or say
+   "nothing durable"), how to verify it engaged (tool call observed before the
+   next Stop), and what happens when it ignores the prompt (block once more?).
+   It must not fight MiraDesign's Stop hook. Two blocking Stop hooks in one
+   harness need an order.
+
+**Deliverable:** a revision of this doc's P1/P2 sections with the answers, a
+model choice Ilari can approve with a cost estimate, and the §5 acceptance
+test adjusted to prove the loop end to end.
 
 ## 8. Out of scope
 
