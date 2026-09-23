@@ -70,6 +70,15 @@ class ScopePolicy(_Model):
         description="Scope to use when a project scope cannot be provisioned "
                     "(auto without an operator token). None = degrade.",
     )
+    worker_principal: Optional[str] = Field(
+        default=None,
+        description=(
+            "The extraction worker's Loimi principal (`miragen memory-worker`). "
+            "Every project scope this daemon provisions is also granted to it "
+            "with read/propose/maintain, so the worker can claim that scope's "
+            "consolidate jobs. Unset: no worker grants."
+        ),
+    )
     adopt_by_name: bool = Field(
         default=True,
         description=(

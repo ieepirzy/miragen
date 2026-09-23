@@ -55,6 +55,8 @@ logger = logging.getLogger("miragend.sessions")
 RETRIEVAL_TIMEOUT_S = 8.0
 WRITE_TIMEOUT_S = 15.0
 _PROVISION_VERBS = ["read", "propose", "resolve", "retract"]
+# The extraction worker reads events, proposes records and claims jobs.
+_WORKER_VERBS = ["read", "propose", "maintain"]
 
 
 RECENT_CAPTURE_WINDOW = 200
@@ -103,6 +105,8 @@ class PlaneStats:
     # Startup provisioning + identity adoption.
     adopted_by_name: int = 0
     remote_sessions: int = 0
+    worker_grants: int = 0
+    worker_grant_failures: int = 0
     raw_hooks_shadowed: int = 0
     late_opens: int = 0
     empty_sessions: int = 0
@@ -316,6 +320,27 @@ class SessionPlane:
         self.principal_source = how
         logger.info(f"principal {principal}: token {how} and persisted at {token_file}")
         return self.principal_source
+
+    async def _grant_worker(self, operator: MemoryClient, scope_id: str) -> None:
+        """The extraction worker's grant on a scope this daemon provisioned.
+        Best-effort: a missing worker principal (not created yet) must not
+        cost the session its own scope; it is counted and logged instead."""
+        worker = self.config.scopes.worker_principal
+        if not worker:
+            return
+        try:
+            await asyncio.wait_for(operator.admin_grant(
+                principal_id=worker, scope_id=scope_id, verbs=_WORKER_VERBS,
+            ), timeout=WRITE_TIMEOUT_S)
+            self.stats.worker_grants += 1
+        except MemoryAPIError as exc:
+            if exc.status_code == 409:
+                return
+            self.stats.worker_grant_failures += 1
+            logger.warning(f"worker grant on {scope_id} for {worker} refused: {exc}")
+        except (MemoryUnavailable, asyncio.TimeoutError) as exc:
+            self.stats.worker_grant_failures += 1
+            logger.warning(f"worker grant on {scope_id} for {worker} failed: {exc}")
 
     @staticmethod
     def _scope_kind_for(scope_id: str) -> str:
@@ -690,6 +715,7 @@ class SessionPlane:
                 except MemoryAPIError as exc:
                     if exc.status_code != 409:
                         raise
+            await self._grant_worker(operator, scope_id)
         except MemoryAPIError as exc:
             self.stats.provisioning_failures += 1
             self.stats.note_loimi(True)  # it answered — a refusal, not an outage
