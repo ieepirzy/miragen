@@ -28,7 +28,10 @@ miragend copies them into `$CODEX_HOME/skills` and `$GROK_HOME/skills`
 `.miragen-managed`, and it skips a same-named skill that isn't ours.
 `scripts/sync_plugin_adapter.sh` keeps the second copy in `miragen_hook/skills/`,
 and `tests/test_plugin_bundle.py` pins the two copies together. **A new skill
-directory reaches all three harnesses with no code change.** That settles the
+directory reaches all three harnesses with no code change.** There are two
+conditions. The session must have the `miragen-memory` plugin installed. For
+Codex and Grok, miragend's harness setup must also be running, which means a
+URL is configured and the daemon is not in a container. That settles the
 "base agent" half of the requirement for harness sessions.
 
 **Profile agents and the executor tier have no skill loader.** PydanticAI
@@ -62,7 +65,7 @@ right precedent for a librarian:
   counters.
 
 **Evidence that a skill alone may not trigger.** The memory-effectiveness audit
-(#110, `docs/design/memory-effectiveness.md` §1) found that the
+(#110, `docs/design/memory-effectiveness.md` §1, on that PR's branch) found that the
 `memory-bridge` skill was loaded **0 times in 36 Claude Code sessions**.
 
 ## Integration point
