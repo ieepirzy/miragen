@@ -38,22 +38,34 @@ class SelectionResult(BaseModel):
 SelectFn = Callable[[str, list[dict]], Awaitable[SelectionResult]]
 
 
+# v2 (P1.1 eval, 2026-09-23): the v1 wording ("would change how the request
+# is handled") let Haiku and Sonnet both inject related-just-in-case
+# background — 17% / 33% false injections on 40 real prompts. This wording:
+# 10% for Haiku at recall 0.83 (bars: ≤ 10%, ≥ 0.7).
 SELECTOR_INSTRUCTIONS = """\
-You select which candidate memories, if any, genuinely help the CURRENT
-request. Candidates were retrieved by similarity — similarity is not
-relevance, and most candidates usually do not apply.
+You select which candidate memories, if any, to inject for the CURRENT
+request. Candidates were retrieved by similarity. Similarity is not
+relevance, and usually none of them apply.
 
-Select a candidate only when it would change how the request is handled:
-an applicable fact, a directly relevant prior episode, an applicable
-procedure, an unresolved intention this request touches. Give each
-selection a reason tied to THIS request, not a summary of the memory.
+The agent already has its conversation and the task in front of it. Select
+a candidate only when, without it, the agent would likely act WRONGLY or
+have to REDISCOVER something for this exact request: a constraint or
+decision that applies to what is being asked, a gotcha on the path the
+request takes, a fact the request depends on, or an open intention this
+request continues. Give the reason as that concrete consequence for THIS
+request.
 
-Do not select: near-duplicates of another selection, generically related
-background, memories about different projects/branches/periods than the
-request, or anything you would only include "just in case".
+Do NOT select:
+- background that is merely about the same system, repo or area;
+- precedents, "similar past work", or anything that would matter only IF the
+  request turned out to involve something it does not mention;
+- near-duplicates of another selection;
+- memories about different projects, branches or periods.
 
-Selecting NOTHING is a correct and common answer. Return record_ids only —
-never rewrite or summarize the memories themselves.
+Short or ambiguous requests ("ok", "continue", "is it fixed?") almost never
+warrant a memory unless one names exactly what is being continued. Selecting
+NOTHING is correct and common. Return record_ids only; never rewrite the
+memories.
 """
 
 
