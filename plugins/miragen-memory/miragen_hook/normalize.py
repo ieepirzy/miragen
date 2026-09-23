@@ -13,6 +13,13 @@ UserPromptSubmit and `reason` on SessionEnd; the published reference also
 documents `how_session_started` / `user_input` / `how_session_ended`; Codex
 documents `source`, `prompt`, `turn_id` and `trigger`. Reading every
 spelling costs nothing and keeps the adapter working across versions.
+
+Grok Build (source-read at 1.0.41, 2026-09-23) sends a camelCase envelope
+plus a CLOSED list of snake aliases: `hook_event_name` (PascalCase) and
+`session_id` exist, but `promptId`, `stopHookActive` and
+`lastAssistantMessage` only exist in camelCase. Its SessionStart `source`
+is `new`/`load`, and it fires one extra, observe-only Stop at session end
+(`reason` channel_closed/shutdown) that is not a turn.
 """
 
 from __future__ import annotations
@@ -22,7 +29,10 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-HARNESSES = ("claude-code", "codex")
+HARNESSES = ("claude-code", "codex", "grok-build")
+# Harnesses that ignore SessionStart/UserPromptSubmit stdout: context meant
+# for those events is delivered later, on the next tool result (client.py).
+DEFERRED_CONTEXT_HARNESSES = frozenset({"grok-build"})
 
 # Tool names whose events must never re-enter memory capture (§18.7:
 # avoid recursion when memory tool calls themselves trigger capture).
@@ -47,6 +57,14 @@ CONTEXT_BEARING = CONTEXT_OPENING | {"input.received"}
 _CONTENT_CAP = 20_000
 _ERROR_CAP = 500
 _ID_KEYS = ("prompt_id", "turn_id", "tool_use_id", "agent_id")
+# camelCase spellings (Grok Build) of the same ids, read when the snake one
+# is absent. Grok's subagent id is `subagentId`.
+_ID_ALIASES = {
+    "prompt_id": ("promptId",), "turn_id": ("turnId",),
+    "tool_use_id": ("toolUseId",), "agent_id": ("agentId", "subagentId"),
+}
+# Grok Build's session-end Stop: observe-only, fired as the session closes.
+_SESSION_CLOSING_STOP_REASONS = ("channel_closed", "shutdown")
 
 
 @dataclass
@@ -83,15 +101,40 @@ def _first(payload: dict, *keys: str) -> Any:
     return None
 
 
+def _event_name(payload: dict) -> str:
+    """The PascalCase hook event name. Every harness sends
+    `hook_event_name` in PascalCase except a bare Grok payload, whose
+    camelCase `hookEventName` carries the snake value (`session_start`)."""
+    name = payload.get("hook_event_name")
+    if name:
+        return str(name)
+    name = str(payload.get("hookEventName") or "")
+    if "_" in name or (name and name[0].islower()):
+        return "".join(part[:1].upper() + part[1:] for part in name.split("_"))
+    return name
+
+
 def normalize_hook_payload(harness: str, payload: dict) -> NormalizedEvent | None:
     """One harness hook payload → the normalized vocabulary, or None for
     events the memory lifecycle has no business with."""
     if harness not in HARNESSES:
         raise ValueError(f"unknown harness '{harness}'; expected one of {HARNESSES}")
-    original = str(payload.get("hook_event_name") or "")
-    session_id = payload.get("session_id")
-    session_id = str(session_id) if session_id not in (None, "") else None
-    ids = {key: str(payload[key]) for key in _ID_KEYS if payload.get(key)}
+    original = _event_name(payload)
+    session_id = _first(payload, "session_id", "sessionId")
+    session_id = str(session_id) if session_id is not None else None
+    ids = {}
+    for key in _ID_KEYS:
+        value = _first(payload, key, *_ID_ALIASES.get(key, ()))
+        if value is not None:
+            ids[key] = str(value)
+
+    if (harness == "grok-build" and payload.get("subagentType")
+            and original not in ("SubagentStart", "SubagentStop")):
+        # A Grok Build subagent runs as its own session and fires the whole
+        # lifecycle under its own id, marked with `subagentType`. The parent's
+        # SubagentStart/SubagentStop already record it; registering it would
+        # invent a top-level session per subagent.
+        return None
 
     def event(name: str, *, content: str | None = None, **attributes: Any) -> NormalizedEvent:
         return NormalizedEvent(
@@ -105,7 +148,8 @@ def normalize_hook_payload(harness: str, payload: dict) -> NormalizedEvent | Non
         source = str(_first(payload, "source", "how_session_started", "reason") or "startup")
         # resume/compact/fork all continue an existing line of work; only
         # startup and clear open a genuinely new context.
-        if source in ("resume", "compact", "fork"):
+        # Grok Build: "load" = a resumed session, "new" = a fresh one.
+        if source in ("resume", "compact", "fork", "load"):
             return event("context.restored", source=source)
         return event("context.started", source=source)
 
@@ -114,7 +158,7 @@ def normalize_hook_payload(harness: str, payload: dict) -> NormalizedEvent | Non
         return event("input.received", content=str(content))
 
     if original in ("PostToolUse", "PostToolUseFailure"):
-        tool_name = str(payload.get("tool_name") or "")
+        tool_name = str(_first(payload, "tool_name", "toolName") or "")
         if _is_memory_tool(tool_name):
             return None  # recursion guard
         if original == "PostToolUse":
@@ -124,27 +168,34 @@ def normalize_hook_payload(harness: str, payload: dict) -> NormalizedEvent | Non
         return event("tool.finished", tool_name=tool_name, ok=False, error=error)
 
     if original == "PreCompact":
-        trigger = str(_first(payload, "compaction_trigger", "trigger", "reason") or "auto")
+        trigger = str(_first(payload, "compaction_trigger", "trigger", "reason", "source") or "auto")
         return event("context.compacting", trigger=trigger)
 
     if original == "PostCompact":
-        trigger = str(_first(payload, "compaction_trigger", "trigger", "reason") or "auto")
+        trigger = str(_first(payload, "compaction_trigger", "trigger", "reason", "source") or "auto")
         return event("context.compacted", trigger=trigger)
 
     if original == "Stop":
-        message = payload.get("last_assistant_message")
+        if harness == "grok-build" and payload.get("reason") in _SESSION_CLOSING_STOP_REASONS:
+            return None  # not a turn: SessionEnd closes the context
+        message = _first(payload, "last_assistant_message", "lastAssistantMessage")
         return event("turn.finished", content=str(message) if message else None,
                      stop_reason=payload.get("stop_reason"))
 
     if original == "SubagentStart":
-        return event("context.child_started", agent_type=payload.get("agent_type"))
+        return event("context.child_started",
+                     agent_type=_first(payload, "agent_type", "subagentType"))
 
     if original == "SubagentStop":
-        message = payload.get("last_assistant_message")
+        if payload.get("phase") == "gate":
+            # Grok Build fires SubagentStop twice: a `gate` phase that may
+            # still continue the child, then `observe` once it is done.
+            return None
+        message = _first(payload, "last_assistant_message", "lastAssistantMessage")
         return event(
             "context.child_finished",
             content=str(message) if message else None,
-            agent_type=payload.get("agent_type"),
+            agent_type=_first(payload, "agent_type", "subagentType"),
         )
 
     if original == "SessionEnd":
@@ -194,9 +245,11 @@ def event_idempotency_key(event: NormalizedEvent) -> str:
 
 
 def harness_output(harness: str, original_event: str, context: str) -> dict:
-    """The harness's stdout shape for injected context. Claude Code and
-    Codex share `hookSpecificOutput.additionalContext` (both verified
-    against their references; Claude Code live-verified 2026-09-15)."""
+    """The harness's stdout shape for injected context. Claude Code, Codex
+    and Grok Build share `hookSpecificOutput.additionalContext` (Claude
+    Code live-verified 2026-09-15). Grok Build honours it only on tool
+    events (Pre/PostToolUse[Failure]) and Stop — see
+    DEFERRED_CONTEXT_HARNESSES."""
     if harness not in HARNESSES:
         raise ValueError(f"unknown harness '{harness}'")
     return {

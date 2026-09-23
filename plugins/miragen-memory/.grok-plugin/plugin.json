@@ -1,0 +1,21 @@
+{
+  "name": "miragen-memory",
+  "version": "0.2.0",
+  "author": {
+    "name": "ieepirzy",
+    "url": "https://github.com/ieepirzy"
+  },
+  "homepage": "https://github.com/ieepirzy/miragen/tree/main/plugins/miragen-memory",
+  "repository": "https://github.com/ieepirzy/miragen",
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "loimi",
+    "miragen",
+    "hooks",
+    "mcp"
+  ],
+  "description": "miragen memory bridge for Grok Build: memory_* and store_* tools via MCP, bound to this session. Lifecycle hooks are installed separately (`python3 -m miragen_hook install grok-build`).",
+  "hooks": "./hooks/grok-plugin-none.json",
+  "mcpServers": "./grok.mcp.json"
+}

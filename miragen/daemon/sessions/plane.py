@@ -73,6 +73,7 @@ class PlaneStats:
     retrievals: int = 0
     retrieval_failures: int = 0
     injections: int = 0
+    deferred_injections: int = 0
     prompt_recalls: int = 0
     captures: int = 0
     capture_failures: int = 0
@@ -780,8 +781,7 @@ class SessionPlane:
         else:
             self.stats.note_loimi(True)
         self._outage_announced.discard(session.key)
-        self.stats.injections += 1
-        session.counters.injections += 1
+        self._count_injection(session, envelope)
         detail = "; ".join(part for part in (scope_detail, packet.degraded) if part) or None
         status = self._status_line(packet, project_scope=lifecycle.spec.scopes.default_write)
         return f"{self._session_header(session)}\n{packet.text}\n{status}", detail
@@ -857,9 +857,15 @@ class SessionPlane:
             self.stats.retrieval_failures += 1
             self.stats.note_loimi(False, status)
         if section:
-            self.stats.injections += 1
-            session.counters.injections += 1
+            self._count_injection(session, envelope)
         return section, status
+
+    def _count_injection(self, session: ExternalSession, envelope: EventEnvelope) -> None:
+        self.stats.injections += 1
+        session.counters.injections += 1
+        if envelope.client.context_delivery == "deferred":
+            self.stats.deferred_injections += 1
+            session.counters.deferred_injections += 1
 
     # ── capture (background, ordered per session) ─────────────────────────────
 
