@@ -81,8 +81,10 @@ def _lines(*messages) -> bytes:
     return b"".join(json.dumps(m).encode() + b"\n" for m in messages)
 
 
-def test_the_vendored_proxy_speaks_both_answer_shapes(bridge, tmp_path):
-    """Run exactly as the plugin manifests do: by file path, from the plugin."""
+@pytest.mark.parametrize("root", [ROOT, PLUGIN], ids=["package", "vendored"])
+def test_the_proxy_speaks_both_answer_shapes(bridge, tmp_path, root):
+    """Run exactly as the harness configs do: by file path (the daemon's
+    adapter copy is the package; the plugin manifests run the vendored one)."""
     url, seen = bridge
     token = tmp_path / "tok"
     token.write_text("s3cret\n")
@@ -93,7 +95,7 @@ def test_the_vendored_proxy_speaks_both_answer_shapes(bridge, tmp_path):
         {"jsonrpc": "2.0", "id": 2, "method": "fail"},
     )
     ran = subprocess.run(
-        [sys.executable, str(PLUGIN / "miragen_hook" / "__main__.py"), "mcp-proxy", "--harness",
+        [sys.executable, str(root / "miragen_hook" / "__main__.py"), "mcp-proxy", "--harness",
          "grok-build", "--daemon", url, "--token-file", str(token), "--no-setup"],
         input=stdin, capture_output=True, timeout=30, check=False, cwd=tmp_path,
         env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "GROK_SESSION_ID": "g-42"},

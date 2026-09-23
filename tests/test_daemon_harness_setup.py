@@ -84,14 +84,17 @@ class TestService:
         again = service.run_once()
         assert again["codex"]["current"] and service.runs == 2
 
-    def test_one_harness_failing_never_stops_the_other(self, tmp_path):
+    @pytest.mark.parametrize("broken", ["codex", "grok-build"])
+    def test_one_harness_failing_never_stops_the_other(self, tmp_path, broken):
         (tmp_path / ".codex").mkdir()
-        (tmp_path / ".codex" / "hooks.json").write_text("{broken")
-        (tmp_path / ".grok").mkdir()
+        (tmp_path / ".grok" / "hooks").mkdir(parents=True)
+        bad = {"codex": tmp_path / ".codex" / "hooks.json",
+               "grok-build": tmp_path / ".grok" / "hooks" / "miragen.json"}
+        bad[broken].write_text("{broken")
         status = _service(tmp_path).run_once()
-        assert status["codex"]["current"] is False and "not valid JSON" in status["codex"]["last_error"]
-        assert status["grok-build"]["current"] is True
-        assert (tmp_path / ".grok" / "hooks" / "miragen.json").exists()
+        other = "grok-build" if broken == "codex" else "codex"
+        assert status[broken]["current"] is False and "not valid JSON" in status[broken]["last_error"]
+        assert status[other]["current"] is True and status[other]["last_error"] is None
 
     def test_disabled_does_nothing(self, tmp_path):
         (tmp_path / ".codex").mkdir()
