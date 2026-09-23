@@ -74,6 +74,24 @@ class ClaudeCodeError(RuntimeError):
     """The call did not produce a valid structured result. Never 'empty'."""
 
 
+class ClaudeCodeLimited(ClaudeCodeError):
+    """The subscription's usage limit (or an API rate limit) refused the
+    call. Transient by nature: retry later, never treat as 'nothing'."""
+
+
+_LIMIT_MARKERS = ("usage limit", "session limit", "rate limit", "rate_limit", "hit your limit")
+
+
+def _result_text(stdout: str) -> str:
+    """Claude Code prints its JSON result even when it exits non-zero; the
+    `result` field is the human-readable reason (e.g. the usage limit)."""
+    try:
+        data = json.loads(stdout)
+    except ValueError:
+        return ""
+    return str(data.get("result") or "") if isinstance(data, dict) else ""
+
+
 def is_claude_code_model(model: str | None) -> bool:
     return bool(model) and model.startswith(PREFIX)
 
@@ -120,9 +138,10 @@ def command(binary: str, model: str, instructions: str, schema: dict) -> list[st
 def parse_result[M: BaseModel](
     stdout: str, returncode: int, stderr: str, output_type: type[M]
 ) -> M:
-    detail = (stderr or stdout or "").strip()[-400:]
+    detail = (_result_text(stdout) or stderr or stdout or "").strip()[-400:]
     if returncode != 0:
-        raise ClaudeCodeError(f"claude exited {returncode}: {detail}")
+        error = ClaudeCodeLimited if _is_limit(detail) else ClaudeCodeError
+        raise error(f"claude exited {returncode}: {detail}")
     try:
         data = json.loads(stdout)
     except ValueError as exc:
@@ -130,7 +149,9 @@ def parse_result[M: BaseModel](
     if not isinstance(data, dict):
         raise ClaudeCodeError(f"claude output is not an object: {detail}")
     if data.get("is_error") or data.get("subtype") not in (None, "success"):
-        raise ClaudeCodeError(
+        reason = str(data.get("result") or "")
+        error = ClaudeCodeLimited if _is_limit(reason) else ClaudeCodeError
+        raise error(
             f"claude reported an error ({data.get('subtype')}): "
             f"{str(data.get('result') or '')[:400]}"
         )
@@ -156,6 +177,11 @@ async def _reap(proc: asyncio.subprocess.Process) -> None:
         await asyncio.shield(proc.wait())
     except asyncio.CancelledError:
         pass
+
+
+def _is_limit(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _LIMIT_MARKERS)
 
 
 class ClaudeCodeRunner:

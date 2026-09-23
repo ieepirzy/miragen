@@ -56,6 +56,11 @@ FAKE = textwrap.dedent(
     if mode == "exit":
         print("rate limited", file=sys.stderr)
         sys.exit(1)
+    if mode == "limit":
+        print(json.dumps({{"type": "result", "subtype": "success", "is_error": True,
+                          "result": "You've hit your session limit · resets 9:30pm",
+                          "stats": {{"killed": {{"parent": 0}}}}}}))
+        sys.exit(1)
     out = {{"type": "result", "subtype": "success", "is_error": False,
            "structured_output": json.loads(os.environ.get("FAKE_OUTPUT", "{{}}"))}}
     if mode == "is_error":
@@ -267,3 +272,11 @@ def test_worker_backs_off_only_while_every_job_fails():
     assert next_backoff(30, failed, interval=30, ceiling=900) == 60
     assert next_backoff(600, failed, interval=30, ceiling=900) == 900
     assert next_backoff(900, failed + [{"status": "done"}], interval=30, ceiling=900) == 0
+
+
+def test_a_usage_limit_says_so(fake, monkeypatch):
+    from miragen.memory.claude_code import ClaudeCodeLimited
+
+    monkeypatch.setenv("FAKE_MODE", "limit")
+    with pytest.raises(ClaudeCodeLimited, match="session limit"):
+        run(ClaudeCodeRunner("claude-code:haiku").run("i", "p", Echo))
