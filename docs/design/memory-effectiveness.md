@@ -11,6 +11,22 @@ Owner: Mira (leads testing). Decided by Ilari 2026-09-23: **the VPS bridge
 (`10.8.0.4:8420` / `memory.muutto365.fi`) is the single memory store.** Local
 miragend is not the driver.
 
+## 0. Implementation status (2026-09-23)
+
+Built, reviewed and green in CI, **not merged or deployed** (merge and deploy wait for Ilari):
+
+| Piece | PR | Notes |
+| --- | --- | --- |
+| MiraDesign Stop continuation off `stop_hook_active` | miradesign#24 | Prerequisite for P1a |
+| P1.0 runner `claude-code:<model>` + worker lease/backoff/backlog cutoff/self-provisioned principal | #117 | |
+| P2 sticky project re-resolution | #118 | |
+| P2 asynchronous recall + retrieval judgment log | #126 | Stacked on #118 |
+| P1a pushy end-of-work nudge | #128 | Stacked on #126 |
+| Deploy prerequisites (Claude Code in the image, worker grants) | #129 | |
+| Compose: bridge token, worker service | Muutto365/movingfirm-agents#43 | Deploy **only after** the miragen image contains all of the above |
+
+Deferred, with issues: #116 redaction, #119 pinning, #120 async recall for HTTP hooks, #121 learned adapter, #122 `MEMORY.md` import, #123 judgment log into Loimi, #124 Codex/Grok parity, #125 run namespace after a switch, #130 poison-job retry cap. The P1.1 eval is running; its results gate turning the worker on.
+
 ## 1. Why this exists
 
 Ilari suspected memory "isn't doing much, and agents aren't acking it". A
