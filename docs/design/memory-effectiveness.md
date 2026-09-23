@@ -101,21 +101,42 @@ claude -p <input> --model haiku --output-format json --json-schema <schema> \
   --strict-mcp-config --mcp-config <empty> --no-session-persistence
 ```
 run from an empty working directory with `MIRAGEN_WORKER=1`.
-- **Isolation, measured:** debug log `Registered 0 hooks from 2 plugins`;
-  1,180 input tokens (so no CLAUDE.md, auto-memory or tool schemas); the model
-  did not know it was "Mira". `structured_output` came back schema-valid in 6/6
-  calls.
-- **Latency, measured:** 2.5–2.8 s wall per call (1.3–1.6 s API), 3.4–4.0 s
-  with a longer prompt. This matters only for the selector, which sits in
-  `UserPromptSubmit` (see P2).
+- **Isolation, measured with a control:** the isolated call's debug log shows
+  `Registered 0 hooks from 2 plugins`. The same command without
+  `--setting-sources ""` shows `Registered 15 hooks from 8 plugins`, with the
+  same rollout flag off in both. So the isolation comes from the flag, not
+  the rollout state. The isolated call also used only 1,180 input tokens, so
+  no CLAUDE.md, auto-memory or tool schemas were loaded, and the model did
+  not know it was "Mira".
+- **Structured output, measured:** schema-valid in 6/6 toy-schema calls, and
+  in one call with the real `ExtractionResult` schema (`$defs`, enums,
+  nullable fields) on a realistic episode. That call proposed 3 memories, all
+  with exact-substring quotes, and skipped both the joke and the
+  hypothetical. It did file a stated preference (squash-merge) as an
+  `observation`, not a `claim`. That kind of quality question is what the
+  P1.1 eval is for.
+- **Latency, measured:** 2.5–2.8 s wall for a trivial call (1.3–1.6 s API),
+  3.4–4.0 s with a longer prompt, and **17.9 s** for the real extraction call.
+  Extraction is background work, so that's fine there. The selector sits in
+  `UserPromptSubmit`, so its latency has to be measured on real selector
+  input (P2, open question 7D).
+- **Errors never look like "nothing":** the subscription shares its rate
+  limit with Ilari's interactive use, so calls will fail sometimes. A
+  non-zero exit, `is_error`, or a missing `structured_output` raises. It is
+  never read as an empty selection or as "nothing durable". For the
+  selector, that means §17.7's degraded path, and the status line says so.
+  For extraction, the episode stays unprocessed and is retried through the
+  job lease. Otherwise a rate-limited hour would lose its episodes for good.
 - **`--bare` is unusable:** it never reads OAuth ("Anthropic auth is strictly
   `ANTHROPIC_API_KEY`"), so it can't use the subscription. Isolation comes
   from the flags above instead.
 - **Recursion guard, required:** a worker call must never be captured as a
   harness session, or every memory call spawns a session that spawns an
   episode that spawns extraction. The flags already keep plugin hooks out.
-  `miragen_hook` also exits immediately when `MIRAGEN_WORKER=1`, as a second
-  guard, with a test for both.
+  `miragen_hook` also exits immediately when `MIRAGEN_WORKER=1`, with a test
+  for both. That env guard is the **primary** defence, because the flags'
+  behaviour belongs to Claude Code and can change between releases. The flag
+  test above stays in the runner's live check so a regression shows up.
 - **Credential boundary:** the runner shells out to the `claude` binary, and
   only that. The subscription OAuth token is never lifted into PydanticAI or
   raw API calls; that would stop being Claude Code usage. On a headless host
@@ -165,10 +186,13 @@ go through Loimi admission, so nothing mints authority.
     `stop_hook_active` is false (`harness/ingest.py`). A memory block sets
     that flag on the next Stop, which would silence MiraDesign's "someone is
     waiting" continuation. So neither hook decides from the shared flag. Each
-    keeps its own per-session "last blocked" state (miradesign#23 tracks
-    MiraDesign's side). Whether Claude Code runs two blocking Stop hooks in
-    parallel and merges their reasons is not verified. The design must work
-    either way, and §5 tests both hooks together.
+    keeps its own per-session "last blocked" state. **Prerequisite:** a
+    small MiraDesign PR, split out of miradesign#23, that stops keying its
+    continuation on `stop_hook_active`. Until that lands, §5 item 8 fails by
+    construction, so P1a ships after it. Whether Claude Code runs two
+    blocking Stop hooks in parallel and merges their reasons is not
+    verified. The design must work either way, and §5 tests both hooks
+    together.
   - *Build:* three pieces that don't exist yet: Stop-block output in
     `miragen_hook` (today it only emits `additionalContext`), per-session
     nudge state in miragend, and bridge-side counting of `memory_*` calls per
@@ -210,9 +234,20 @@ there's no model-free "interim" recall.
      session to;
   2. the repository of the **current** cwd, re-resolved on every event
      (Claude Code's hook `cwd` follows the agent's `cd`);
-  3. no project (`~`, or another workspace root): profile scope only.
-  The **write** scope follows the same resolution at write time, so a memory
-  learned inside miragen lands in miragen's scope.
+  3. no project: profile scope only. That covers `$HOME` itself, detected
+     explicitly (it is a git repo, and today it resolves locally to
+     `dir:ilari`), plus local cwds that match the existing workspace-root
+     heuristic, which today only applies to remote sessions.
+  - *Sticky, like MiraDesign:* a binding is only replaced by a *new*
+    resolution. `cd ~` after working in miragen keeps miragen; it does not
+    fall back to tier 3.
+  - *Writes:* the **write** scope follows the resolution at write time, so a
+    memory learned inside miragen lands in miragen's scope.
+  - *Multi-repo sessions:* a session that touched miragen and miradesign
+    still files one episode. It goes to the scope bound at filing time, and
+    lists every project the session was bound to in its attributes. The
+    extractor then assigns each proposal to one of those scopes, or to
+    profile scope when a proposal spans them.
 - *Session start, per tier:* tier 1/2 query from project, repo, branch and
   working-state goal, plus the previous session's last prompt. Tier 3 has no
   meaningful query at start: inject only the required lane (profile-scope
@@ -258,8 +293,15 @@ there's no model-free "interim" recall.
   - selected or not, with the selector's reason (teacher labels: a
     non-selected candidate is a hard negative);
   - the model and the embedding-space identity (null for now).
-  A second, weaker label joins later from P4 use signals: whether an
-  injected id was cited, read, corrected or ignored. Requirements:
+  How much of this is autonomous:
+  - The selector's teacher labels are fully autonomous. That is the main
+    dataset.
+  - The use signal is only partly observable. Hooks carry only the **last**
+    assistant message, so a `[mem:…]` citation mid-turn is invisible without
+    reading the transcript, which is out of scope (§8). What *can* be seen:
+    `memory_read` and `memory_correct` calls, and citations in the last
+    message. Anything else counts as **absent**, never as a negative label.
+  Requirements:
   - a test that a selector call writes its rows;
   - a `judgments` count on `/health`, so an empty log is visible;
   - §17.8 erasure covers these rows, since they hold prompt text.
