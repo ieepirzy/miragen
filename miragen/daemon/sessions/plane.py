@@ -1086,8 +1086,9 @@ class SessionPlane:
             self.stats.write_count += 1
         scope = lifecycle.spec.scopes.default_write
         if episode.get("status") == "captured":
-            self.stats.episodes += 1
-            session.episodes_written.append(occurrence)
+            if not episode.get("already_filed"):
+                self.stats.episodes += 1
+                session.episodes_written.append(occurrence)
             self.stats.note_loimi(True)
             self.stats.note_outcome(True, scope)
         else:

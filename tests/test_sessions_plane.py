@@ -843,3 +843,4 @@ class TestEpisodeRefinalize:
         assert len(h.events("session_episode")) == 1
         assert h.plane.stats.capture_failures == failures
         assert "episode capture" not in (h.plane.stats.last_loimi_error or "")
+        assert h.plane.stats.episodes == 1 and session.episodes_written == ["end"]
