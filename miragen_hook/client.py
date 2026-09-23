@@ -42,6 +42,16 @@ from miragen_hook.normalize import (
 
 DEFAULT_DAEMON_URL = "http://127.0.0.1:8420"
 EVENTS_PATH = "/sessions/v1/events"
+CLAIM_PATH = "/sessions/v1/recall/claim"
+# Harnesses whose adapter keeps a recall-pending marker and claims background
+# recall results on PostToolUse (main thread) and Stop.
+ASYNC_RECALL_HARNESSES = ("claude-code",)
+ASYNC_RECALL_CAPABILITY = "async-recall"
+# A Stop waits this long for a selection still running (hooks.json gives the
+# Stop entry a longer timeout than this plus the capture POST).
+STOP_CLAIM_WAIT_S = 8.0
+# A marker older than this belongs to a turn long gone.
+RECALL_MARKER_TTL_S = 15 * 60
 HOOKS_PATH = "/sessions/v1/hooks"  # raw harness payloads (HTTP hooks, no adapter)
 
 # Where the daemon URL / token come from, first match wins. The plugin
@@ -220,6 +230,9 @@ def build_envelope(
             "context_delivery": (
                 "deferred" if harness in DEFERRED_CONTEXT_HARNESSES else "immediate"
             ),
+            "capabilities": (
+                [ASYNC_RECALL_CAPABILITY] if harness in ASYNC_RECALL_HARNESSES else []
+            ),
         },
         "sent_at": datetime.now(timezone.utc).isoformat(),  # noqa: UP017 — Python 3.10 floor
     }
@@ -231,12 +244,30 @@ def post_envelope(
 ) -> dict | None:
     """POST one envelope; the daemon's JSON answer, or None when it could
     not be reached / refused (logged to stderr, never raised)."""
-    data = json.dumps(envelope).encode()
+    return _post_json(EVENTS_PATH, envelope, daemon_url=daemon_url, token=token,
+                      timeout=timeout, opener=opener)
+
+
+def claim_recall(
+    harness: str, session_id: str, seq: int, *, wait: float, daemon_url: str,
+    token: str | None, opener=None,
+) -> dict | None:
+    """Claim a pending background recall (None when unreachable)."""
+    return _post_json(
+        CLAIM_PATH, {"harness": harness, "session_id": session_id, "seq": seq, "wait": wait},
+        daemon_url=daemon_url, token=token, timeout=wait + 3.0, opener=opener,
+    )
+
+
+def _post_json(
+    path: str, body: dict, *, daemon_url: str, token: str | None, timeout: float, opener=None,
+) -> dict | None:
+    data = json.dumps(body).encode()
     headers = {"Content-Type": "application/json", "User-Agent": ADAPTER_VERSION}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(
-        daemon_url.rstrip("/") + EVENTS_PATH, data=data, headers=headers, method="POST"
+        daemon_url.rstrip("/") + path, data=data, headers=headers, method="POST"
     )
     open_fn = opener or urllib.request.urlopen
     try:
@@ -460,6 +491,61 @@ def discard_context(session_id: str, environ: dict | None = None) -> None:
     _pending_file(session_id, environ).unlink(missing_ok=True)
 
 
+# ── background recall marker (async-recall harnesses) ─────────────────────────
+
+
+def recall_marker_path(session_id: str, environ: dict | None = None) -> Path:
+    """Where "a recall for this session is pending" is remembered between
+    hooks. Only its existence is checked on the hot path (every tool call),
+    so a tool call without a pending recall never touches the network."""
+    name = hashlib.sha256(session_id.encode()).hexdigest()[:32]
+    return pending_dir(environ) / f"recall-{name}.json"
+
+
+def write_recall_marker(session_id: str, seq: int, environ: dict | None = None) -> None:
+    path = recall_marker_path(session_id, environ)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps({"seq": seq, "at": time.time()}))
+    except OSError as exc:
+        print(f"miragen-hook: could not keep the recall marker ({exc})", file=sys.stderr)
+
+
+def read_recall_marker(session_id: str, environ: dict | None = None) -> int | None:
+    path = recall_marker_path(session_id, environ)
+    try:
+        marker = json.loads(path.read_text())
+        if time.time() - float(marker.get("at", 0)) > RECALL_MARKER_TTL_S:
+            path.unlink(missing_ok=True)
+            return None
+        return int(marker["seq"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def clear_recall_marker(session_id: str, environ: dict | None = None) -> None:
+    recall_marker_path(session_id, environ).unlink(missing_ok=True)
+
+
+def _claim_output(event_name: str, answer: dict | None) -> tuple[str | None, bool]:
+    """(context to deliver, keep the marker?) for one claim answer."""
+    if answer is None:
+        return None, event_name != "Stop"   # unreachable: retry after the next tool
+    state = answer.get("state")
+    if state == "pending":
+        return None, event_name != "Stop"   # a turn that ends without it forgets it
+    context = answer.get("context") if state in ("ready", "failed") else None
+    return (str(context) if context else None), False
+
+
+STOP_RECALL_PREAMBLE = (
+    "[memory] The background recall for your last request finished while you were "
+    "wrapping up. If a memory below changes your answer, follow up; otherwise just finish."
+)
+
+
 def foreign_entry_under_grok(harness: str, environ: dict | None = None) -> bool:
     """Grok Build also runs the hook entries it finds in Claude Code's
     settings files and plugins (compat is on by default) — a
@@ -486,16 +572,51 @@ def run(
         return None
     deferred = harness in DEFERRED_CONTEXT_HARNESSES
     event_name = payload.get("hook_event_name") or ""
+    session_id = _session_id_of(payload)
     delivered = None
     if deferred and event_name in _DELIVERY_EVENTS:
-        session_id = _session_id_of(payload)
         delivered = take_context(session_id, environ) if session_id else None
 
     output = _forward(harness, payload, daemon_url=daemon_url, token=token,
                       environ=environ, opener=opener, pid=pid, deferred=deferred)
     if delivered:
         return harness_output(harness, event_name, delivered)
+    if harness in ASYNC_RECALL_HARNESSES and session_id:
+        recalled = _deliver_recall(harness, event_name, payload, session_id,
+                                   daemon_url=daemon_url, token=token, environ=environ,
+                                   opener=opener)
+        if recalled is not None:
+            return recalled
     return output
+
+
+def _deliver_recall(
+    harness: str, event_name: str, payload: dict, session_id: str, *,
+    daemon_url: str, token: str | None, environ: dict | None, opener,
+) -> dict | None:
+    """Background recall delivery: after a main-thread tool result (no
+    wait) or at Stop (bounded wait, block only for something to show)."""
+    if event_name in ("SessionEnd", "PreCompact"):
+        clear_recall_marker(session_id, environ)
+        return None
+    if event_name not in ("PostToolUse", "Stop"):
+        return None
+    if event_name == "PostToolUse" and (payload.get("agent_id") or payload.get("agentId")):
+        return None  # a subagent's tool result: not the conversation that asked
+    seq = read_recall_marker(session_id, environ)
+    if seq is None:
+        return None
+    wait = STOP_CLAIM_WAIT_S if event_name == "Stop" else 0.0
+    answer = claim_recall(harness, session_id, seq, wait=wait, daemon_url=daemon_url,
+                          token=token, opener=opener)
+    context, keep = _claim_output(event_name, answer)
+    if not keep:
+        clear_recall_marker(session_id, environ)
+    if not context:
+        return None
+    if event_name == "Stop":
+        return {"decision": "block", "reason": f"{STOP_RECALL_PREAMBLE}\n{context}"}
+    return harness_output(harness, event_name, context)
 
 
 def _forward(
@@ -516,6 +637,13 @@ def _forward(
     )
     if not answer:
         return None
+    if event.name == "input.received" and harness in ASYNC_RECALL_HARNESSES:
+        # A new prompt supersedes any earlier pending recall, delivered or not.
+        pending = answer.get("recall_pending")
+        if isinstance(pending, int) and not isinstance(pending, bool):
+            write_recall_marker(event.session_id, pending, environ)
+        else:
+            clear_recall_marker(event.session_id, environ)
     context = answer.get("context")
     if context and event.name in CONTEXT_BEARING:
         if deferred:

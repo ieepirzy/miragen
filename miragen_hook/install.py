@@ -39,9 +39,13 @@ CLAUDE_CODE_EVENTS = (
     ("SessionStart", 15),
     ("UserPromptSubmit", 15),
     ("PostToolUseFailure", 5),
+    # Every tool call: exits on a local marker check unless a background
+    # recall is pending (then one no-wait claim).
+    ("PostToolUse", 10),
     ("PreCompact", 5),
     ("PostCompact", 5),
-    ("Stop", 5),
+    # Capture POST (2 s) + a bounded wait for a still-running recall (8 s).
+    ("Stop", 20),
     ("SubagentStart", 5),
     ("SubagentStop", 5),
     ("SessionEnd", 3),

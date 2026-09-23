@@ -454,3 +454,140 @@ class TestCaptureKeys:
         assert event_idempotency_key(a) == event_idempotency_key(again)
         assert captured_content(a) == captured_content(again)
         assert "end_turn" in captured_content(a)
+
+
+# ── background recall: marker, claim, delivery ───────────────────────────────
+
+
+def _router(routes: dict):
+    """An opener answering by path: {"/sessions/v1/events": {...}, ".../claim": {...}}."""
+    calls = []
+
+    def opener(request, timeout):
+        calls.append((request, timeout))
+        for path, body in routes.items():
+            if request.full_url.endswith(path):
+                return _FakeResponse(json.dumps(body).encode())
+        raise AssertionError(f"unexpected request {request.full_url}")
+
+    opener.calls = calls
+    return opener
+
+
+class TestBackgroundRecall:
+    EVENTS = "/sessions/v1/events"
+    CLAIM = "/sessions/v1/recall/claim"
+
+    @pytest.fixture
+    def env(self, tmp_path):
+        return {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+
+    def _run(self, payload, opener, env):
+        return run("claude-code", {**LIVE, **payload}, daemon_url="http://127.0.0.1:1",
+                   token=None, opener=opener, pid=1, environ=env)
+
+    def _claims(self, opener):
+        return [json.loads(r.data) | {"timeout": t} for r, t in opener.calls
+                if r.full_url.endswith(self.CLAIM)]
+
+    def test_the_envelope_advertises_the_capability_for_claude_code_only(self, env):
+        from miragen_hook.client import build_envelope
+        from miragen_hook.normalize import normalize_hook_payload
+
+        payload = {**LIVE, "hook_event_name": "UserPromptSubmit", "prompt": "hi"}
+        for harness, caps in (("claude-code", ["async-recall"]), ("codex", [])):
+            event = normalize_hook_payload(harness, payload)
+            envelope = build_envelope(harness, payload, event, environ=env, pid=1)
+            assert envelope["client"]["capabilities"] == caps
+
+    def test_a_pending_recall_is_delivered_after_the_next_main_thread_tool(self, env):
+        from miragen_hook.client import read_recall_marker
+
+        prompt = _router({self.EVENTS: {"context": "NOTICE", "recall_pending": 3}})
+        out = self._run({"hook_event_name": "UserPromptSubmit", "prompt": "q"}, prompt, env)
+        assert "NOTICE" in json.dumps(out)
+        assert read_recall_marker(LIVE["session_id"], env) == 3
+
+        still = _router({self.CLAIM: {"state": "pending"}})
+        tool = {"hook_event_name": "PostToolUse", "tool_name": "Bash"}
+        assert self._run(tool, still, env) is None
+        assert self._claims(still) == [{"harness": "claude-code", "session_id": LIVE["session_id"],
+                                        "seq": 3, "wait": 0.0, "timeout": 3.0}]
+        assert read_recall_marker(LIVE["session_id"], env) == 3, "pending: keep waiting"
+
+        ready = _router({self.CLAIM: {"state": "ready", "context": "RECALLED"}})
+        assert self._run(tool, ready, env) == harness_output("claude-code", "PostToolUse", "RECALLED")
+        assert read_recall_marker(LIVE["session_id"], env) is None
+
+    def test_no_marker_means_no_request_at_all(self, env):
+        silent = _router({})
+        assert self._run({"hook_event_name": "PostToolUse", "tool_name": "Bash"}, silent, env) is None
+        assert silent.calls == []
+
+    def test_a_subagents_tool_result_never_claims(self, env):
+        from miragen_hook.client import write_recall_marker
+
+        write_recall_marker(LIVE["session_id"], 1, env)
+        silent = _router({})
+        payload = {"hook_event_name": "PostToolUse", "tool_name": "Bash",
+                   "agent_id": "a1", "agent_type": "general-purpose"}
+        assert self._run(payload, silent, env) is None
+        assert silent.calls == []
+
+    def test_stop_waits_briefly_and_blocks_only_for_something_to_show(self, env):
+        from miragen_hook.client import STOP_CLAIM_WAIT_S, read_recall_marker, write_recall_marker
+
+        write_recall_marker(LIVE["session_id"], 2, env)
+        ready = _router({self.EVENTS: {}, self.CLAIM: {"state": "ready", "context": "RECALLED"}})
+        out = self._run({"hook_event_name": "Stop", "last_assistant_message": "done"}, ready, env)
+        assert out["decision"] == "block" and "RECALLED" in out["reason"]
+        assert self._claims(ready)[0]["wait"] == STOP_CLAIM_WAIT_S
+        assert read_recall_marker(LIVE["session_id"], env) is None
+
+        write_recall_marker(LIVE["session_id"], 3, env)
+        empty = _router({self.EVENTS: {}, self.CLAIM: {"state": "pending"}})
+        assert self._run({"hook_event_name": "Stop"}, empty, env) is None
+        assert read_recall_marker(LIVE["session_id"], env) is None, "a finished turn forgets it"
+
+    def test_a_new_prompt_without_recall_clears_an_old_marker(self, env):
+        from miragen_hook.client import read_recall_marker, write_recall_marker
+
+        write_recall_marker(LIVE["session_id"], 1, env)
+        self._run({"hook_event_name": "UserPromptSubmit", "prompt": "q"},
+                  _router({self.EVENTS: {"context": None}}), env)
+        assert read_recall_marker(LIVE["session_id"], env) is None
+
+    def test_session_end_clears_the_marker(self, env):
+        from miragen_hook.client import read_recall_marker, write_recall_marker
+
+        write_recall_marker(LIVE["session_id"], 1, env)
+        self._run({"hook_event_name": "SessionEnd", "reason": "clear"},
+                  _router({self.EVENTS: {}}), env)
+        assert read_recall_marker(LIVE["session_id"], env) is None
+
+    def test_the_fast_path_uses_the_same_marker_path(self, tmp_path):
+        """`python -m miragen_hook claude-code` exits before importing the
+        adapter when no marker exists; with one it must fall through."""
+        import os
+        import subprocess
+        from pathlib import Path
+
+        from miragen_hook.client import recall_marker_path, write_recall_marker
+
+        env = {**os.environ, "XDG_STATE_HOME": str(tmp_path), "CLAUDE_PLUGIN_DATA": "",
+               "MIRAGEND_URL": "http://127.0.0.1:9", "PYTHONPATH": str(Path.cwd())}
+        env.pop("CLAUDE_PLUGIN_DATA")
+        payload = json.dumps({**LIVE, "hook_event_name": "PostToolUse", "tool_name": "Bash"})
+
+        def invoke():
+            return subprocess.run([sys.executable, "-m", "miragen_hook", "claude-code"],
+                                  input=payload, env=env, capture_output=True, text=True,
+                                  timeout=20)
+
+        quiet = invoke()
+        assert quiet.returncode == 0 and quiet.stdout == "" and quiet.stderr == ""
+        marker_env = {"XDG_STATE_HOME": str(tmp_path)}
+        write_recall_marker(LIVE["session_id"], 1, marker_env)
+        assert recall_marker_path(LIVE["session_id"], marker_env).exists()
+        loud = invoke()
+        assert loud.returncode == 0 and "unreachable" in loud.stderr, "fell through to a claim"

@@ -25,12 +25,14 @@ from pathlib import Path
 from typing import Any
 
 from miragen.daemon.sessions.config import SessionsConfig
+from miragen.daemon.sessions.judgments import JudgmentLog
 from miragen.daemon.sessions.models import (
     ChildAgent,
     EventEnvelope,
     ExternalSession,
     ProjectIdentity,
     now_iso,
+    session_key,
 )
 from miragen.daemon.sessions.projects import (
     ScopeAssignment,
@@ -45,7 +47,7 @@ from miragen.daemon.sessions.projects import (
 from miragen.daemon.sessions.registry import EventJournal, SessionRegistry, pid_alive
 from miragen.daemon.sessions.store import StoreAPIError, StoreClient, StoreUnavailable
 from miragen.memory.client import MemoryAPIError, MemoryClient, MemoryUnavailable
-from miragen.memory.lifecycle import MemoryLifecycle
+from miragen.memory.lifecycle import MemoryLifecycle, RecallCandidates, RecallSelection
 from miragen.models import MemoryRecallSpec, MemoryScopesSpec, MemorySpec
 from miragen_hook.normalize import CAPTURED, CONTEXT_OPENING, NormalizedEvent
 
@@ -110,6 +112,12 @@ class PlaneStats:
     adopted_by_name: int = 0
     remote_sessions: int = 0
     project_switches: int = 0
+    async_recalls_started: int = 0
+    async_recalls_delivered: int = 0
+    async_recalls_empty: int = 0
+    async_recalls_dropped: int = 0
+    async_recall_failures: int = 0
+    recall_wait_timeouts: int = 0
     raw_hooks_shadowed: int = 0
     late_opens: int = 0
     empty_sessions: int = 0
@@ -171,6 +179,32 @@ class HandleResult:
     state: str
     context: str | None = None
     detail: str | None = None
+    # A background recall was started for this prompt: the adapter keeps a
+    # marker with this sequence number and claims the result later.
+    recall_pending: int | None = None
+
+
+ASYNC_RECALL_CAPABILITY = "async-recall"
+# The longest any claim may hold its HTTP request open.
+MAX_CLAIM_WAIT_S = 15.0
+
+
+@dataclass
+class RecallJob:
+    """One prompt's background recall. Superseded by the next prompt,
+    dropped at compaction/end; delivered at most once (the claim IS the
+    delivery)."""
+
+    seq: int
+    key: str
+    scope: str
+    trigger: str
+    candidates: RecallCandidates
+    lifecycle: MemoryLifecycle
+    task: asyncio.Task | None = None
+    selection: RecallSelection | None = None
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    delivered: str | None = None
 
 
 ClientFactory = Callable[[MemorySpec], MemoryClient]
@@ -222,6 +256,14 @@ class SessionPlane:
         self._provisioned: set[str] = set()
         self._unprovisionable: dict[str, str] = {}
         self._tasks: set[asyncio.Task] = set()
+        self._recalls: dict[str, RecallJob] = {}
+        self._recall_seq: dict[str, int] = {}
+        self._recall_failure_announced: set[str] = set()
+        self.judgments = JudgmentLog(
+            self.state_dir / "judgments",
+            retention_days=config.recall.judgment_retention_days,
+            max_bytes=config.recall.judgment_max_mb * 1024 * 1024,
+        )
         self._sweeper: asyncio.Task | None = None
         self.principal_source: str | None = None
         self.shared_scopes_ready: dict[str, str] = {}
@@ -424,6 +466,7 @@ class SessionPlane:
         event = envelope.event
         context: str | None = None
         detail: str | None = None
+        recall_pending: int | None = None
         async with self._lock(session.key):
             if event.name in CONTEXT_OPENING:
                 context, detail = await self._open_context(session, envelope)
@@ -445,7 +488,8 @@ class SessionPlane:
                     self.stats.late_opens += 1
                     session.reopen_pending = False
                     context, detail = await self._open_context(session, envelope)
-                recalled, recall_detail = await self._prompt_recall(session, envelope)
+                recalled, recall_detail, recall_pending = await self._prompt_recall(
+                    session, envelope)
                 if recalled:
                     context = f"{context}\n{recalled}" if context else recalled
                 detail = "; ".join(part for part in (detail, recall_detail) if part) or None
@@ -456,6 +500,9 @@ class SessionPlane:
                 session.counters.tool_failures += 1
                 self._journal_and_capture(session, envelope)
             elif event.name == "context.compacting":
+                # A result prepared for the pre-compaction context must not
+                # land in the compacted one.
+                self._drop_recall(session.key)
                 session.counters.compactions += 1
                 self.journal.append(envelope)
                 self._spawn(self._capture_then_finalize(
@@ -477,10 +524,14 @@ class SessionPlane:
                     child.finished_at = now_iso()
                 self._journal_and_capture(session, envelope)
             elif event.name == "context.closed":
+                self._drop_recall(session.key)
+                self._recall_seq.pop(session.key, None)
+                self._recall_failure_announced.discard(session.key)
                 session.end(str(event.attributes.get("reason") or "session_end"))
                 self.journal.append(envelope)
                 self._spawn(self._capture_then_finalize(session, envelope, occurrence="end"))
-        return HandleResult(key=session.key, state=session.state, context=context, detail=detail)
+        return HandleResult(key=session.key, state=session.state, context=context, detail=detail,
+                            recall_pending=recall_pending)
 
     # ── project + scopes ─────────────────────────────────────────────────────
 
@@ -878,14 +929,21 @@ class SessionPlane:
 
     async def _prompt_recall(
         self, session: ExternalSession, envelope: EventEnvelope,
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, int | None]:
+        """(context, detail, pending recall sequence). Async-capable
+        adapters get the search now and the selection later; everyone else
+        waits for the selector inside the hook, as before."""
         recall = self.config.recall
         prompt = envelope.event.content or ""
         if not recall.on_prompt or self.selector is None or len(prompt) < recall.min_prompt_chars:
-            return None, None
+            # The previous prompt's result must not surface in this turn.
+            self._drop_recall(session.key)
+            return None, None, None
         lifecycle, reason = await self._lifecycle_for(session)
         if lifecycle is None:
-            return None, reason
+            return None, reason, None
+        if recall.delivery == "async" and ASYNC_RECALL_CAPABILITY in envelope.client.capabilities:
+            return await self._start_async_recall(session, envelope, lifecycle, prompt)
         started = time.monotonic()
         try:
             section, status = await asyncio.wait_for(
@@ -897,7 +955,7 @@ class SessionPlane:
             )
         except asyncio.TimeoutError:
             self.stats.timeouts += 1
-            return None, "prompt recall timed out"
+            return None, "prompt recall timed out", None
         finally:
             self.stats.retrieval_ms_total += (time.monotonic() - started) * 1000
             self.stats.retrieval_count += 1
@@ -907,7 +965,132 @@ class SessionPlane:
             self.stats.note_loimi(False, status)
         if section:
             self._count_injection(session, envelope)
-        return section, status
+        return section, status, None
+
+    # ── asynchronous recall: search now, select in the background ────────────
+
+    async def _start_async_recall(
+        self, session: ExternalSession, envelope: EventEnvelope,
+        lifecycle: MemoryLifecycle, prompt: str,
+    ) -> tuple[str | None, str | None, int | None]:
+        self._drop_recall(session.key)
+        started = time.monotonic()
+        try:
+            candidates = await asyncio.wait_for(
+                lifecycle.recall_candidates(
+                    instance=session.project.slug if session.project else None,
+                    prompt_hint=prompt,
+                ),
+                timeout=self.config.recall.search_timeout_seconds,
+            )
+        except TimeoutError:
+            self.stats.timeouts += 1
+            return None, "recall search timed out", None
+        finally:
+            self.stats.retrieval_ms_total += (time.monotonic() - started) * 1000
+            self.stats.retrieval_count += 1
+        self.stats.prompt_recalls += 1
+        if candidates.status.startswith("degraded"):
+            self.stats.retrieval_failures += 1
+            self.stats.note_loimi(False, candidates.status)
+            return None, candidates.status, None
+        if candidates.status != "ok":
+            return None, candidates.status, None  # nothing to select from: no notice
+        seq = self._recall_seq.get(session.key, 0) + 1
+        self._recall_seq[session.key] = seq
+        job = RecallJob(
+            seq=seq, key=session.key, scope=lifecycle.spec.scopes.default_write,
+            trigger=f"hook:{envelope.event.original_event.lower()}:async",
+            candidates=candidates, lifecycle=lifecycle,
+        )
+        self._recalls[session.key] = job
+        job.task = self._spawn(self._select_in_background(job))
+        self.stats.async_recalls_started += 1
+        count = len(candidates.cards)
+        notice = (
+            f"[memory] recall for this prompt is running in the background ({count} "
+            f"candidate{'s' if count != 1 else ''} being checked for relevance). Anything "
+            "relevant arrives after one of your next tool results, or before you finish. "
+            "Keep working: don't poll, and don't run memory_recall for the same thing."
+        )
+        return notice, "recall pending", seq
+
+    async def _select_in_background(self, job: RecallJob) -> None:
+        try:
+            selection = await job.lifecycle.recall_select(job.candidates)
+        except asyncio.CancelledError:
+            job.selection = RecallSelection("cancelled")
+            job.done.set()
+            raise
+        except Exception as exc:  # noqa: BLE001 — recall_select already degrades; belt and braces
+            selection = RecallSelection(f"degraded: {exc}")
+        job.selection = selection
+        job.done.set()
+        if selection.status.startswith("degraded"):
+            self.stats.retrieval_failures += 1
+            self.stats.async_recall_failures += 1
+            return
+        self.judgments.record(
+            session=job.key, scope=job.scope, recall_id=f"{job.key}#{job.seq}",
+            query=job.candidates.query, cards=job.candidates.cards,
+            selected=selection.selected, status=selection.status,
+            model=self.config.recall.model,
+        )
+
+    def _drop_recall(self, key: str) -> None:
+        job = self._recalls.pop(key, None)
+        if job is None:
+            return
+        if job.task is not None and not job.task.done():
+            job.task.cancel()  # the runner reaps its claude child on cancel
+        if job.delivered is None:
+            self.stats.async_recalls_dropped += 1
+
+    async def claim_recall(
+        self, harness: str, session_id: str, seq: int, *, wait: float = 0.0,
+    ) -> dict[str, Any]:
+        """The adapter's claim for a pending recall. Atomic: the first claim
+        that finds the result delivers it (and only then is it counted and
+        manifested); every later one is told "delivered". Never holds the
+        session lock — a Stop waiting here must not stall captures."""
+        key = session_key(harness, session_id)
+        job = self._recalls.get(key)
+        if job is None or job.seq != seq:
+            return {"state": "stale"}
+        if not job.done.is_set() and wait > 0:
+            try:
+                await asyncio.wait_for(asyncio.shield(job.done.wait()),
+                                       timeout=min(wait, MAX_CLAIM_WAIT_S))
+            except TimeoutError:
+                self.stats.recall_wait_timeouts += 1
+            if self._recalls.get(key) is not job:
+                return {"state": "stale"}
+        if not job.done.is_set():
+            return {"state": "pending"}
+        if job.delivered is not None:
+            return {"state": "delivered"}
+        selection = job.selection or RecallSelection("none_selected")
+        if selection.status == "ok" and selection.section:
+            job.delivered = "context"
+            await job.lifecycle.record_recall_manifest(
+                job.candidates, selection, run_id=key, trigger=job.trigger)
+            self.stats.injections += 1
+            session = self.registry.get(key)
+            if session is not None:
+                session.counters.injections += 1
+            self.stats.async_recalls_delivered += 1
+            self.judgments.mark_delivered(recall_id=f"{key}#{job.seq}", session=key,
+                                          state="context")
+            return {"state": "ready", "context": selection.section}
+        job.delivered = "empty"
+        self.stats.async_recalls_empty += 1
+        if selection.status.startswith("degraded") and key not in self._recall_failure_announced:
+            self._recall_failure_announced.add(key)
+            return {"state": "failed", "context": (
+                "[memory] background recall failed for this prompt: memories may exist that "
+                "were not checked. Use memory_recall if you need one. (Said once per session.)"
+            )}
+        return {"state": "empty"}
 
     def _count_injection(self, session: ExternalSession, envelope: EventEnvelope) -> None:
         self.stats.injections += 1
@@ -1315,7 +1498,10 @@ class SessionPlane:
                 "enabled": self.config.recall.enabled,
                 "selector_configured": self.selector is not None,
                 "on_prompt": self.config.recall.on_prompt,
+                "delivery": self.config.recall.delivery,
+                "pending": len(self._recalls),
             },
+            "judgments": self.judgments.describe(),
             "scopes": {
                 "policy": self.config.scopes.provision,
                 "provisioned": sorted(self._provisioned),
