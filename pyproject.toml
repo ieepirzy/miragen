@@ -80,7 +80,10 @@ codex = [
 # Claude Code executor backend (claude-agent-sdk is the official Anthropic
 # package; the spawn backend needs no extra at all).
 claude-code = [
-    "claude-agent-sdk>=0.1.0",
+    # >=0.2.159: the verified floor for what the recall selector relies on
+    # (bundled native CLI — no Node in the image —, output_format structured
+    # output, thinking config). Checked live against 0.2.159 / CLI 2.1.281.
+    "claude-agent-sdk>=0.2.159",
 ]
 # Kimi Code executor backend (kimi-agent-sdk wraps the Kimi Code / kimi-cli
 # runtime; subscription OAuth lives under KIMI_CODE_HOME — see

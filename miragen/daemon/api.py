@@ -540,11 +540,7 @@ def _build_session_plane(config_path: str):  # pragma: no cover - deployment wir
     from miragen.daemon.sessions.config import load_sessions_config
 
     config = load_sessions_config(config_path)
-    selector = None
-    if config.recall.enabled and config.recall.model:
-        from miragen.memory.selection import build_model_selector
-
-        selector = build_model_selector(config.recall.model)
+    selector = build_recall_selector(config.recall)
     telemetry = None
     otlp_endpoint = os.getenv("MIRAGEN_OTLP_ENDPOINT")
     if otlp_endpoint:
@@ -557,11 +553,26 @@ def _build_session_plane(config_path: str):  # pragma: no cover - deployment wir
             token=os.getenv("MIRAGEN_OTLP_TOKEN"), auth_header=os.getenv("MIRAGEN_OTLP_AUTH"),
         )
     plane = SessionPlane(config, selector=selector, telemetry=telemetry)
+    recall = f"on ({selector.backend})" if selector else "off"
     logger.info(
         f"session plane enabled: principal={config.principal} state={plane.state_dir} "
-        f"recall={'on' if selector else 'off'} provision={config.scopes.provision}"
+        f"recall={recall} provision={config.scopes.provision}"
     )
     return plane
+
+
+def build_recall_selector(recall):
+    """sessions.yaml `recall` → the selector, or None when the lane is off
+    or no model is configured. Nothing heavy is imported here: pydantic-ai
+    or claude-agent-sdk load on the first selection."""
+    if not (recall.enabled and recall.model):
+        return None
+    from miragen.memory.selection import build_model_selector
+
+    return build_model_selector(
+        recall.model, base_url=recall.base_url, api_key_env=recall.api_key_env,
+        timeout_s=recall.timeout_s,
+    )
 
 
 def _build_harness_setup(sessions: SessionPlane | None):

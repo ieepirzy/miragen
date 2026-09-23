@@ -126,7 +126,9 @@ the harness's output shape; `miragen-hook install claude-code --http
   principal and its policy. Multi-tenant bridges are a different design.
 - Codex has no HTTP hooks; it uses the adapter (plugin or `install codex`).
 - The extraction worker and a recall selector model are deployment
-  choices, not part of this record.
+  choices, not part of this record (the selector backends —
+  `claude-code:<model>` on the subscription, or a pydantic-ai model with an
+  optional `base_url` — are documented in external-sessions.md).
 - **No secret redaction of captured prompts (decided 2026-09-16).** Prompts
   and turn ends are captured verbatim; a token pasted into a prompt lands in
   the project's memory scope. Pattern lists for secrets are brittle and

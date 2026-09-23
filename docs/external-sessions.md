@@ -62,6 +62,7 @@ Docker socket. Environment:
 | `LOIMI_OPERATOR_TOKEN` (`_FILE`) | Loimi's store bearer: provisions the principal and scopes, and is the artifact store credential unless `LOIMI_STORE_TOKEN` is set |
 | `LOIMI_MEMORY_TOKEN` | optional — an operator-minted principal token; unset lets the daemon mint its own |
 | `MCP_BASE_URL`, `MCP_CLIENT_ID`, `MCP_CLIENT_SECRET`, `MCP_AUTO_APPROVE` | all together or none: origo OAuth on `/mcp` for claude.ai custom connectors |
+| `CLAUDE_CODE_OAUTH_TOKEN` (`_FILE`) | only with `recall.model: claude-code:<model>`: the subscription token from `claude setup-token` (see "Prompt-time recall") |
 
 `GET /health` → `sessions.principal_source` (`environment` / `state_dir` /
 `created` / `minted` / `missing`), `sessions.loimi.shared_scopes`,
@@ -302,7 +303,9 @@ for automatic per-project scopes, the operator credential.
    URL), created on first sight when `LOIMI_OPERATOR_TOKEN` is available.
    Explicit `projects:` bindings override the template (two repositories
    sharing one project scope, a project that may also read a shared
-   platform scope). Set `recall.model` to enable prompt-time recall.
+   platform scope). Set `recall.model` to enable prompt-time recall
+   (`claude-code:haiku` uses your local Claude Code login; see
+   "Prompt-time recall: the selector").
 
 3. **Start the daemon** as a user service (no Docker needed —
    `MIRAGEND_LIFECYCLE=off` in the unit):
@@ -337,6 +340,48 @@ for automatic per-project scopes, the operator credential.
    ```bash
    curl -s "http://127.0.0.1:8420/sessions/v1/sessions?active=true" | jq
    ```
+
+## Prompt-time recall: the selector
+
+The optional recall lane runs on each new user prompt (`recall.on_prompt`,
+prompts of `min_prompt_chars`+): a bounded search for candidates, then ONE
+selector call that returns zero or more record ids, each with a reason.
+Every id is re-resolved against canonical state before anything is injected;
+a selector failure (error, invalid output, timeout) injects nothing optional
+and the lane reports `degraded: selector: …`. The lane is off until
+`recall.model` names a selector. Two backends:
+
+| `recall.model` | Backend | Credentials |
+|---|---|---|
+| `claude-code:<model>` (e.g. `claude-code:haiku`) | headless Claude Code through `claude-agent-sdk` (the `claude-code` extra; the `miragend` image includes it, CLI bundled — no Node) | `CLAUDE_CODE_OAUTH_TOKEN` (subscription token from `claude setup-token`), else `~/.claude` credentials, else a metered `ANTHROPIC_API_KEY` — the executor backend's order ([design/subscription-homes.md](design/subscription-homes.md)) |
+| any pydantic-ai model string (`deepseek:deepseek-chat`, `openai:gpt-4.1-mini`, …) | pydantic-ai, unchanged | the provider's own env var (`DEEPSEEK_API_KEY`, …) |
+| the same, plus `recall.base_url` | pydantic-ai against an OpenAI- or Anthropic-compatible endpoint (a local model server, a proxy); `model` must be `openai:`, `openai-chat:`, `openai-responses:` or `anthropic:<name>` (`anthropic:` needs `pydantic-ai-slim[anthropic]`, not installed by default) | `recall.api_key_env`: the env var NAME (or `<NAME>_FILE`) holding the endpoint key. Unset = a keyless endpoint; the provider's own `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` is never sent to a custom `base_url` |
+
+```yaml
+recall:
+  enabled: true
+  model: claude-code:haiku     # or "openai:qwen2.5-7b-instruct" + base_url
+  # base_url: http://127.0.0.1:8081/v1
+  # api_key_env: SELECTOR_API_KEY
+  timeout_s: 6                 # hard bound per selector call
+```
+
+The claude-code call is one bounded, tool-less turn: no built-in tools, no
+MCP servers, `max_turns: 1`, no user/project/local settings (so no hooks,
+plugins or CLAUDE.md), no session transcript, an empty neutral working
+directory, thinking disabled, and the SDK's JSON-schema structured output
+validated into the selection (strict JSON of the result text is the only
+fallback). The daemon warns at startup when the SDK is missing or no
+credential is visible. **Latency**: each selection spawns the bundled CLI;
+measured on a desktop, 1.6–2.0 s per call end to end (≈0.3 s spawn to first
+message, ≈1.4 s model time with Haiku), i.e. roughly that much added to every
+prompt that is not a cache hit. `timeout_s` (default 6 s) bounds it below the
+plane's 8 s prompt-recall bound, so a slow model degrades the lane instead of
+stalling the hook (the hook client gives up at 15 s).
+
+`/health` → `sessions.recall` names `selector_backend` (`claude-code` /
+`pydantic-ai`), `selector_model`, whether a `selector_base_url` is set
+(never the URL) and `selector_timeout_s`.
 
 ## Observability
 

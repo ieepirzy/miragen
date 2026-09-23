@@ -136,6 +136,45 @@ class SessionsRecall(MemoryRecallSpec):
                     "(one selector call per new prompt; cache hits are free).",
     )
     min_prompt_chars: int = Field(default=20, ge=0)
+    # Selector backend knobs. They live here, not on the profile-level
+    # MemoryRecallSpec: adding fields there changes the agent-profile schema
+    # (extra=forbid), which older runtimes would reject — a profile-contract
+    # bump for a daemon-only need. `claude-code:<model>` in `model` works on
+    # both paths because the selector builder parses it.
+    base_url: Optional[str] = Field(
+        default=None, min_length=1,
+        description=(
+            "Point a pydantic-ai selector model at an OpenAI- or Anthropic-"
+            "compatible endpoint (a local model server, a proxy). `model` must "
+            "then be openai:<name>, openai-chat:<name>, openai-responses:<name> "
+            "or anthropic:<name>. Not valid with claude-code:<model>."
+        ),
+    )
+    api_key_env: Optional[str] = Field(
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
+        description=(
+            "Env var NAME holding the base_url endpoint's key (or <NAME>_FILE) — "
+            "never the value. Unset = a keyless endpoint; the provider's own "
+            "OPENAI_API_KEY/ANTHROPIC_API_KEY is never sent to a custom base_url."
+        ),
+    )
+    timeout_s: float = Field(
+        default=6.0, gt=0, le=60,
+        description=(
+            "Hard bound on one selector call. A slower selection is a selector "
+            "failure (nothing optional injected), not a stalled hook; keep it "
+            "under the plane's 8 s prompt-recall bound."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _selector_config(self) -> "SessionsRecall":
+        from miragen.memory.selection import validate_selector_config
+
+        validate_selector_config(self.model, self.base_url)
+        if self.api_key_env and not self.base_url:
+            raise ValueError("recall.api_key_env applies only with recall.base_url")
+        return self
 
 
 class Housekeeping(_Model):

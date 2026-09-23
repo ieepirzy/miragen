@@ -1250,6 +1250,17 @@ class SessionPlane:
             "recall": {
                 "enabled": self.config.recall.enabled,
                 "selector_configured": self.selector is not None,
+                # Backend label + model string only: base_url (a hostname)
+                # and credentials never reach this unguarded endpoint.
+                "selector_backend": (
+                    getattr(self.selector, "backend", "custom") if self.selector else None
+                ),
+                "selector_model": getattr(self.selector, "model", None) if self.selector else None,
+                "selector_base_url": (
+                    bool(getattr(self.selector, "base_url_configured", False))
+                    if self.selector else False
+                ),
+                "selector_timeout_s": self.config.recall.timeout_s,
                 "on_prompt": self.config.recall.on_prompt,
             },
             "scopes": {

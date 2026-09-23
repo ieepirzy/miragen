@@ -20,7 +20,11 @@ COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr
 
 COPY . /build/
 
-RUN pip install --no-cache-dir "/build[daemon]" \
+# claude-code: the recall selector's `claude-code:<model>` backend (headless
+# Claude on the subscription via CLAUDE_CODE_OAUTH_TOKEN). The wheel bundles
+# the native Claude Code CLI (~230 MB), so no Node install is needed.
+
+RUN pip install --no-cache-dir "/build[daemon,claude-code]" \
     && apt-get update && apt-get install -y --no-install-recommends gosu \
     && rm -rf /var/lib/apt/lists/* \
     && adduser --disabled-password --gecos "" miragend

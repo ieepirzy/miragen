@@ -71,7 +71,14 @@ recall:
   enabled: true
   # The zero-or-more relevance selector (one structured-output model call
   # per new prompt/state; cache hits are free). Unset = optional lane off.
-  model: null            # e.g. "deepseek:deepseek-chat"
+  #   claude-code:haiku        headless Claude Code on the subscription
+  #                            (CLAUDE_CODE_OAUTH_TOKEN, else ~/.claude login)
+  #   deepseek:deepseek-chat   any pydantic-ai model string (its own key env)
+  #   openai:<name> + base_url an OpenAI-compatible endpoint (local server/proxy)
+  model: null
+  # base_url: http://127.0.0.1:8081/v1   # pydantic-ai models only
+  # api_key_env: SELECTOR_API_KEY        # env var NAME (or NAME_FILE); unset = keyless
+  timeout_s: 6           # hard bound per selector call (failure = inject nothing)
   on_prompt: true
   min_prompt_chars: 20
   max_candidates: 20
