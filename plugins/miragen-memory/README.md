@@ -1,4 +1,4 @@
-# miragen-memory (Claude Code + Grok Build plugin)
+# miragen-memory (Claude Code, Codex and Grok Build plugin)
 
 Joins every Claude Code session — on your machine **and in cloud sessions** —
 to the miragen memory bridge: a hosted `miragend` in front of Loimi's memory
@@ -36,33 +36,51 @@ plugin options are not available there.
 
 The hook adapter (`miragen_hook/` in this plugin, a vendored copy of the
 repository package) is **stdlib-only Python 3**; nothing is installed on the
-machine. Every hook fails open within its timeout.
+machine. Every hook fails open within its t## Codex and Grok Build: the local daemon sets them up
 
-## Grok Build
+On a machine that runs AI harnesses, the local `miragend` writes the Codex
+and Grok Build setup itself — no per-machine step, no trust prompt — once
+its `sessions.yaml` names where sessions report:
 
-Grok Build (xAI's `grok`, ≥ 1.0) loads Claude Code plugins itself: once this
-plugin is enabled in `~/.claude/settings.json`, `grok` reads its
-`.grok-plugin/plugin.json` (Claude Code ignores that directory) and starts the
-bridge MCP server from `grok.mcp.json`:
-`${MIRAGEND_URL:-https://memory.muutto365.fi}/mcp`, the bearer from
-`MIRAGEND_TOKEN` (`bearer_token_env_var`: sent only when set) and
-`X-Harness-Session: grok-build:{{session_id}}`. Grok never shows the model the
-session header, so the bridge binds omitted `project`/`session` arguments to
-the session named on the connection (only a session it already knows).
-
-**Hooks need one install step.** Grok 1.0.41 builds a session's hooks from
-hook *files* only and merges plugin hooks only after a plugin reload
-(`/reload-plugins`) — so plugin hooks never see SessionStart. Install the
-lifecycle hooks as a file instead, from wherever the plugin lives:
-
-```shell
-PYTHONPATH=<plugin dir> python3 -m miragen_hook install grok-build [--daemon URL]
-# writes ~/.grok/hooks/miragen.json; re-run to refresh, --uninstall to remove
+```yaml
+harness_setup:
+  url: https://memory.muutto365.fi
+  token_file: ~/.config/miragend/bridge.token   # 0600
 ```
 
-The Grok manifest points at an explicitly empty hooks file, so the two never
-both fire. Point it at a stable directory (a directory-source marketplace
-clone), not a versioned plugin-cache path that an update deletes.
+- **Grok Build**: `$GROK_HOME/hooks/miragen.json` (every lifecycle event,
+  harness `grok-build`). Grok 1.0.41 builds a session's hooks from hook
+  *files* only (plugin hooks load only after `/reload-plugins`), so the Grok
+  manifest points at an explicitly empty hooks file and the two never both
+  fire.
+- **Codex**: native entries in `$CODEX_HOME/hooks.json` (harness `codex`),
+  their `trusted_hash` in `config.toml` (`codex exec` silently skips
+  untrusted hooks), and `[mcp_servers.miragen-bridge]` — which replaces a
+  hand-made entry of that name, e.g. one from `codex mcp add`.
+
+Details, the exact files and `/health` status:
+[docs/external-sessions.md](../../docs/external-sessions.md). By hand (a
+machine without a daemon, or debugging):
+
+```shell
+PYTHONPATH=<plugin dir> python3 -m miragen_hook setup grok-build --daemon URL [--token-file F]
+PYTHONPATH=<plugin dir> python3 -m miragen_hook setup codex      --daemon URL [--token-file F]
+# --remove undoes it
+```
+
+**MCP tools under Codex and Grok** run as a stdio proxy from this plugin
+(`miragen_hook/__main__.py mcp-proxy`), so they reach the same daemon with
+the same token as the hooks: `--daemon`/`--token-file` → the daemon's
+`<home>/miragen-adapter/setup.json` → `MIRAGEND_URL` / `MIRAGEND_TOKEN` →
+the `daemon_url` saved for this plugin in Claude Code → the manifest
+default. Under Grok the proxy binds the connection to the session
+(`X-Harness-Session: grok-build:<id>`; Grok never shows the model the session
+header, so omitted `project`/`session` arguments mean this session), and on
+a machine without a daemon it writes the Grok hook file itself — hooks then
+start with the *next* session. Codex installs the plugin with `codex plugin
+marketplace add ieepirzy/miragen && codex plugin add miragen-memory@miragen`;
+its `.codex-plugin/plugin.json` declares an empty hooks file (the daemon's
+native hooks are the Codex path) and the proxy.
 
 Grok **discards** SessionStart/UserPromptSubmit hook output. The start block
 and prompt recall are queued (0600, under `~/.local/state/miragen-hook/`) and
@@ -70,21 +88,11 @@ handed to the model with the **first tool result** that follows, exactly
 once. A turn that uses no tool gets none: its prompt context waits for the
 next tool result and is replaced by the next prompt's, a new start replaces
 everything, and anything older than 12 h is dropped — the MCP tools are the
-fallback.
+fallback. Codex shows SessionStart/UserPromptSubmit context directly; it is
+capped (in bytes) under Codex's spill limit. Codex reports no tool failures
+to hooks, so none are captured there.
 
-Grok has **no plugin options**: nothing reaches it from `/plugin install
---config`. Installed from the plugin dir without `--daemon` or `MIRAGEND_URL` (either
-is written into the entry), the hooks resolve the daemon per event:
-`MIRAGEND_URL` → the `daemon_url` you saved for this plugin in Claude Code →
-the manifest default. The bearer comes only from the environment — export
-`MIRAGEND_TOKEN` (and `MIRAGEND_URL` for a non-default bridge; the MCP config
-reads only the environment) in the shell that starts `grok`; Claude Code's
-`settings.json` `env` does not reach Grok. Without the token Grok tries the
-bridge's OAuth flow, which the hosted bridge's private client registration
-refuses — so export it.
-
-Codex benefits from the same resolution order: it also loads the plugin
-without exporting `CLAUDE_PLUGIN_OPTION_*`.
+ION_*`.
 
 ## Cloud sessions
 

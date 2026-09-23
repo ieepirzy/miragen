@@ -1,7 +1,7 @@
 # External sessions: Claude Code, Codex and Grok Build on the memory substrate
 
 `miragend` can run on a developer machine as the **local memory-participation
-daemon**: every ordinary `claude` or `codex` process joins the same memory
+daemon**: every ordinary `claude`, `codex` or `grok` process joins the same memory
 substrate MiraGen-owned agents use, without a wrapper command and without
 MiraGen spawning it. Design record: [docs/design/external-sessions.md](design/external-sessions.md).
 
@@ -110,19 +110,70 @@ MIRAGEND_URL=https://memory.example miragen-hook install claude-code --http \
 The harness POSTs raw payloads to `/sessions/v1/hooks/claude-code` with
 `Authorization: Bearer $MIRAGEND_TOKEN` from its own environment.
 
+### Codex and Grok Build: the daemon sets them up
+
+Harnesses may be started by mirarun with nobody present, so nothing here
+needs a per-machine step or a trust prompt. Every machine that runs an AI
+harness runs a local `miragend`, and **the daemon writes the harness setup**
+(`miragen_hook/harness_setup.py`, run by `miragen/daemon/harness_setup.py`)
+at startup and every `interval_s` (default 10 min):
+
+```yaml
+# sessions.yaml of the LOCAL daemon
+harness_setup:
+  url: https://memory.muutto365.fi        # where harness sessions report (the hosted bridge)
+  token_file: ~/.config/miragend/bridge.token   # 0600, that bridge's bearer
+  # enabled: true | false   (default: on when url is set and not in a container)
+  # interval_s: 600
+```
+
+(or `MIRAGEND_HARNESS_SETUP_URL` / `_TOKEN_FILE` / `_INTERVAL_S`, and
+`MIRAGEND_HARNESS_SETUP=off`). There is no default URL — the feature stays
+off, and `/health` says why, rather than pointing sessions at a daemon
+nobody chose. The hosted daemon (a container) never runs it unless
+`enabled: true`. Each harness is skipped while its home does not exist: the
+homes come from the daemon's own environment (`GROK_HOME`, `CODEX_HOME`,
+default `~/.grok`, `~/.codex`), so **a systemd unit must carry a relocated
+home** (`Environment=CODEX_HOME=…`). What it writes, and only that:
+
+| Harness | Files | Notes |
+|---|---|---|
+| both | `<home>/miragen-adapter/<digest>/miragen_hook/` | a stable copy of the stdlib adapter; a superseded copy is deleted a day after it stopped being referenced (running sessions keep their command line) |
+| both | `<home>/miragen-adapter/setup.json` | the URL + token file baked below; the plugin's MCP proxy reads it so tools reach the daemon the hooks reach |
+| Grok Build | `$GROK_HOME/hooks/miragen.json` | every event, `python3 <copy>/miragen_hook/__main__.py grok-build --daemon URL --token-file PATH` (hook files load in every Grok mode with no trust step) |
+| Codex | our groups in `$CODEX_HOME/hooks.json` | harness `codex` explicit; user groups untouched and kept in place |
+| Codex | `[hooks.state."<key>"] trusted_hash` in `config.toml` | for exactly our entries, computed as Codex does (`hook_hash`); `codex exec` silently skips untrusted hooks |
+| Codex | `[mcp_servers.miragen-bridge]` in `config.toml` | the stdio proxy with `--daemon`/`--token-file` in its args (Codex clears the MCP environment); `default_tools_approval_mode = "approve"` (`codex exec` refuses tools that need approval) |
+
+TOML is edited table by table and re-parsed; an edit that would change
+anything outside our tables (our key defined inline or dotted, say) is
+refused and reported on `/health` instead of written. A second run with
+nothing to change writes nothing. `GET /health` → `harness_setup`: enabled,
+reason, url, and per harness installed / current / last_changed /
+last_error. By hand (debug, or a machine without a daemon):
+`miragen-hook setup {grok-build,codex} --daemon URL [--token-file F] [--home DIR] [--remove]`.
+
+**MCP tools** come from the plugin, as `miragen-hook mcp-proxy`: stdio
+JSON-RPC ↔ Streamable HTTP `POST <url>/mcp`, resolving URL and token like
+the hooks (`--daemon`/`--token-file` → the daemon's `setup.json` →
+`MIRAGEND_URL`/`MIRAGEND_TOKEN` → the option saved in Claude Code → the
+manifest default). Under Grok it names the session on the connection
+(`X-Harness-Session: grok-build:$GROK_SESSION_ID`), and where no daemon
+manages the Grok hooks it writes them itself (effective from the next
+session; never over a daemon's). Codex gets no session header — the model
+passes `session`.
+
 ### Join from Grok Build
 
 Grok Build ≥ 1.0 loads the Claude Code plugin when it is enabled in
-`~/.claude/settings.json`; `.grok-plugin/plugin.json` gives it a Grok-only MCP
-config and an empty hooks file. The lifecycle hooks (harness `grok-build`,
-session key `grok-build:<sessionId>`) are a hook FILE,
-`PYTHONPATH=<plugin dir> python3 -m miragen_hook install grok-build` →
-`~/.grok/hooks/miragen.json` (from a checkout or the console script, pass
-`--daemon` — there is no manifest default to fall back on),
-because Grok 1.0.41 registers plugin hooks only after a plugin reload, never
-at session start (source: `spawn.rs` builds the session registry with
+`~/.claude/settings.json`; `.grok-plugin/plugin.json` gives it the MCP proxy
+and an empty hooks file. The lifecycle hooks (harness `grok-build`, session
+key `grok-build:<sessionId>`) are the hook FILE the daemon writes, because
+Grok 1.0.41 registers plugin hooks only after a plugin reload, never at
+session start (source: `spawn.rs` builds the session registry with
 `discover_hooks`, plugin hooks arrive only via `apply_plugin_registry_snapshot`;
-confirmed live). Contract facts, read from the xai-org/grok-build source at 1.0.41
+confirmed live). `miragen-hook install grok-build` remains as a manual
+fallback. Contract facts, read from the xai-org/grok-build source at 1.0.41
 (2026-09-23), that shaped the adapter:
 
 | Fact | Consequence |
@@ -143,6 +194,34 @@ and this daemon over in-memory Loimi fakes: every lifecycle event arrived as
 the first tool result exactly once, `memory_checkpoint` without `project`
 landed in the session's project scope, and the hooks found the daemon via
 the saved Claude option with no `MIRAGEND_URL`.
+
+### Join from Codex
+
+Codex 0.156 (source-read and live-verified 2026-09-23): the daemon's native
+hooks and MCP entry (above) are the path. The plugin (`codex plugin
+marketplace add ieepirzy/miragen && codex plugin add miragen-memory@miragen`)
+is optional: its `.codex-plugin/plugin.json` wins over `.claude-plugin` and
+declares an **empty** hooks file (the Claude `hooks/hooks.json` fallback
+labelled every Codex event `claude-code`, and untrusted plugin hooks never
+run under `codex exec`) plus the MCP proxy (`cwd: "."`, `env_vars` for
+`MIRAGEND_URL`/`MIRAGEND_TOKEN`/`CODEX_HOME`); the daemon's
+`[mcp_servers.miragen-bridge]` shadows it where both exist.
+
+| Fact | Consequence |
+|---|---|
+| non-managed hooks run only when `[hooks.state."<file>:<event>:<group>:<handler>"].trusted_hash` matches; `codex exec` skips others silently | the daemon writes the hash for our entries (pinned by a test against hashes Codex itself accepted; a flipped byte live-verified to drop exactly that hook) |
+| SessionStart / UserPromptSubmit `additionalContext` reaches the model as a developer message; above ~2,500 tokens (bytes/4) it is spilled to a file and previewed | our entries set `additionalContextLimit: 6000`; the adapter caps Codex context below that in UTF-8 bytes, head kept |
+| no PostToolUseFailure event; PostToolUse on a failed command carries only the output text (no exit code) | tool failures are **not captured** under Codex |
+| no Notification event, no `CODEX_*` marker env | harness named explicitly in every entry |
+| plugin MCP: no variable expansion, `headers` ignored, a cleared environment | the stdio proxy, told where to look by arguments or `env_vars` |
+| `codex exec` runs with approval policy `never` | the bridge's MCP tools are `approve`d up front |
+
+Live (2026-09-23, codex-cli 0.156.1, a scripted Responses-API stub, this
+daemon on a scratch port over in-memory Loimi, network-isolated): with no
+bypass flag, every event arrived as `codex`, the start block reached the
+model, `bridge_status` ran through the proxy from the daemon-written entry,
+from the plugin entry alone, and with both installed (one set of events,
+the daemon's server winning).
 
 ### Join from claude.ai / any MCP client
 
@@ -190,23 +269,24 @@ for automatic per-project scopes, the operator credential.
    curl -s http://127.0.0.1:8420/health | jq .sessions
    ```
 
-4. **Install the hooks once, globally**:
+4. **Claude Code: install the plugin** (above) or the hooks once:
 
    ```bash
    miragen-hook install claude-code --daemon http://127.0.0.1:8420
-   miragen-hook install codex       --daemon http://127.0.0.1:8420
    ```
+
+   **Codex and Grok Build need nothing**: set `harness_setup.url` (and
+   `token_file` when the bridge is guarded) in `sessions.yaml` and the
+   daemon writes and keeps their hooks, trust and MCP entries current (see
+   "Codex and Grok Build: the daemon sets them up"). If `~/.codex` or
+   `~/.grok` live elsewhere, put `CODEX_HOME` / `GROK_HOME` into the unit's
+   environment.
 
    The local daemon is bound to loopback and runs unauthenticated by
    default (the same "rely on network isolation" mode the containerised
    daemon uses on `miragen-net`). To guard it anyway, set
-   `MIRAGEND_TOKEN_FILE` in `miragend.env` and pass the same file to
-   `miragen-hook install … --token-file <path>`.
-
-   This merges owned entries into `~/.claude/settings.json` and
-   `~/.codex/hooks.json` (user entries untouched; re-running refreshes;
-   `--uninstall` removes). Codex's `hooks` feature is stable in
-   codex-cli 0.153 — no flag needed.
+   `MIRAGEND_TOKEN_FILE` in `miragend.env` and name the same file as
+   `harness_setup.token_file` / `--token-file`.
 
 5. **Use it**: `cd` into any repository and run `claude` or `codex`. Check
    participation with:
@@ -256,9 +336,8 @@ A session's memory is scoped by the daemon, never by the session:
 - No model-authored summaries in the daemon; extraction into claims is
   the existing `miragen memory-worker`'s job (`session_episode` events are
   eligible, `harness:*` trail is not).
-- Codex was not live-probed on 2026-09-15 (usage limit); its field
-  spellings follow the reference verified for PR #88 and the normalizer
-  accepts every documented variant.
+- Codex tool failures: Codex has no PostToolUseFailure event and its
+  PostToolUse carries no exit code, so failed commands are not captured.
 - Memory MCP tools for external sessions (`memory_remember` etc.) are not
   wired; the guide tells the model so. The `/mcp/memory` mount of a
   MiraGen agent remains the explicit interface.

@@ -82,3 +82,14 @@ housekeeping:
   retention_hours: 24          # keep ended sessions listed this long
   stale_after_minutes: 180     # a pid-less session silent this long is finalized
   sweep_interval_seconds: 60
+
+# Codex + Grok Build on THIS machine: the daemon writes their hooks, Codex
+# hook trust and the bridge MCP entry into ~/.codex and ~/.grok (or
+# CODEX_HOME / GROK_HOME from this unit's environment), at startup and every
+# interval_s. Off until `url` is set — the bridge harness sessions report to
+# (the hosted one), never guessed. Status: GET /health → harness_setup.
+harness_setup:
+  url: null                    # e.g. https://memory.muutto365.fi
+  token_file: null             # e.g. ~/.config/miragend/bridge.token (0600)
+  # enabled: true              # default: on when url is set, off in a container
+  # interval_s: 600

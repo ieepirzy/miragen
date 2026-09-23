@@ -20,6 +20,10 @@ Environment=MIRAGEND_SESSIONS_CONFIG=%h/.config/miragend/sessions.yaml
 Environment=MIRAGEND_HOST=127.0.0.1
 Environment=MIRAGEND_PORT=8420
 Environment=MIRAGEND_STATE_DIR=%h/.local/state/miragend
+# harness_setup writes into ~/.codex and ~/.grok; if those homes live
+# elsewhere the daemon must see the same variables the harnesses do:
+#Environment=CODEX_HOME=%h/.codex
+#Environment=GROK_HOME=%h/.grok
 # The console script from the venv/uv tool env where `miragen` is installed
 # — edit to match: `which miragend` after `uv tool install miragen` or
 # `pipx install miragen`.
