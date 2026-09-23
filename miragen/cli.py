@@ -313,7 +313,14 @@ def memory_hook(harness: str) -> None:
               help="Jobs claimed per sweep.")
 @click.option("--embed-url", envvar="MIRAGEN_MEMORY_EMBED_URL", default=None,
               help="Embed endpoint (POST /embed); enables index-job backfill.")
-def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None) -> None:
+@click.option("--lease", "lease_seconds", default=120, show_default=True,
+              help="Job lease in seconds. Jobs in a sweep run one after another, so keep "
+                   "it above limit × the slowest extraction (a claude-code: extraction "
+                   "plus its checks can take a minute).")
+@click.option("--max-backoff", default=900, show_default=True,
+              help="Upper bound (seconds) of the pause after sweeps where every job failed.")
+def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None,
+                  lease_seconds: int, max_backoff: int) -> None:
     """The bounded extraction worker (memory pass PR 3, §17.5): claims
     consolidate jobs through /memory/v1 as its own maintain-capable
     principal and proposes extracted memories through the same admission
@@ -353,10 +360,11 @@ def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None) 
     check = build_model_checker(model)
     embed = build_http_embedder(embed_url) if embed_url else None
 
+    backoff = 0
     while True:
         results = asyncio.run(
             run_worker_once(client, extract=extract, check=check, embed=embed,
-                            limit=limit)
+                            limit=limit, lease_seconds=lease_seconds)
         )
         for result in results:
             click.echo(
@@ -368,7 +376,18 @@ def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None) 
             )
         if once:
             break
-        _time.sleep(interval)
+        backoff = next_backoff(backoff, results, interval=interval, ceiling=max_backoff)
+        _time.sleep(backoff or interval)
+
+
+def next_backoff(current: int, results: list[dict], *, interval: int, ceiling: int) -> int:
+    """Failed jobs go straight back to pending (Loimi has no retry delay), so
+    a model outage — a subscription rate limit above all — would otherwise
+    re-run every job each sweep. A sweep where every job failed doubles the
+    pause (from `interval`, up to `ceiling`); any success resets it."""
+    if not results or any(r.get("status") != "failed" for r in results):
+        return 0
+    return min(ceiling, max(interval, current * 2))
 
 
 @cli.command(name="memory-conformance")

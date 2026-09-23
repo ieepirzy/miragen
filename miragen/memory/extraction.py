@@ -142,7 +142,22 @@ Your verdict gates admission wording only; it cannot verify external truth.
 
 
 def build_model_extractor(model: str) -> ExtractFn:
-    """The production extractor: one bounded structured-output call."""
+    """The production extractor: one bounded structured-output call —
+    through headless Claude Code for `claude-code:<model>`, PydanticAI
+    otherwise."""
+    from miragen.memory.claude_code import ClaudeCodeRunner, is_claude_code_model
+
+    if is_claude_code_model(model):
+        runner = ClaudeCodeRunner(model)
+
+        async def extract_cc(content: str, source_kind: str) -> ExtractionResult:
+            return await runner.run(
+                EXTRACTION_INSTRUCTIONS, f"[source kind: {source_kind}]\n{content}",
+                ExtractionResult,
+            )
+
+        return extract_cc
+
     from pydantic_ai import Agent
 
     agent = Agent(model=model, instructions=EXTRACTION_INSTRUCTIONS,
@@ -158,6 +173,19 @@ def build_model_extractor(model: str) -> ExtractFn:
 
 
 def build_model_checker(model: str) -> CheckFn:
+    from miragen.memory.claude_code import ClaudeCodeRunner, is_claude_code_model
+
+    if is_claude_code_model(model):
+        runner = ClaudeCodeRunner(model)
+
+        async def check_cc(statement: str, quote: str) -> SupportCheck:
+            return await runner.run(
+                CHECKER_INSTRUCTIONS, f"Statement: {statement}\nSupporting quote: {quote}",
+                SupportCheck,
+            )
+
+        return check_cc
+
     from pydantic_ai import Agent
 
     agent = Agent(model=model, instructions=CHECKER_INSTRUCTIONS,

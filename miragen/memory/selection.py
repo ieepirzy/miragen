@@ -58,6 +58,18 @@ never rewrite or summarize the memories themselves.
 
 
 def build_model_selector(model: str) -> SelectFn:
+    from miragen.memory.claude_code import ClaudeCodeRunner, is_claude_code_model
+
+    if is_claude_code_model(model):
+        runner = ClaudeCodeRunner(model)
+
+        async def select_cc(request: str, cards: list[dict]) -> SelectionResult:
+            return await runner.run(
+                SELECTOR_INSTRUCTIONS, render_selector_input(request, cards), SelectionResult,
+            )
+
+        return select_cc
+
     # Lazy construction: pydantic-ai validates provider credentials at
     # Agent construction, and the selector may be built at boot on
     # profiles (executor tier) whose model key only matters if the lane
