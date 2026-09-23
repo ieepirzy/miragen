@@ -150,7 +150,7 @@ class HarnessSetup(_Model):
     startup and every `interval_s`. The URL is where harness sessions should
     report — the hosted bridge, not necessarily this daemon. Environment
     overrides: MIRAGEND_HARNESS_SETUP (on/off), MIRAGEND_HARNESS_SETUP_URL,
-    MIRAGEND_HARNESS_SETUP_TOKEN_FILE, MIRAGEND_HARNESS_SETUP_INTERVAL_S."""
+    MIRAGEND_HARNESS_SETUP_TOKEN_PATH, MIRAGEND_HARNESS_SETUP_INTERVAL_S."""
 
     enabled: bool | None = Field(
         default=None,

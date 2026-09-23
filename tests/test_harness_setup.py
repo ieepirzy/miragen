@@ -182,6 +182,34 @@ class TestEnsureCodex:
         assert f"{home}/hooks.json:stop:1:0" in state
         assert f"{home}/hooks.json:stop:0:0" not in state  # would now name the USER's hook
 
+    def test_a_group_after_ours_keeps_its_index_and_trust(self, tmp_path):
+        """Codex keys trust by group index: our group is replaced IN PLACE,
+        never moved behind a later one (a user's, or another daemon's that
+        edits the same file) — that would untrust it, and two setups that
+        each re-append would ping-pong forever."""
+        home = _codex_home(tmp_path)
+        hs.ensure_codex(home, url="https://m.example")
+        hooks = json.loads((home / "hooks.json").read_text())
+        foreign = {"hooks": [{"type": "command", "command": "python3 /x/miradesign_hook/__main__.py codex"}]}
+        hooks["hooks"]["Stop"].append(foreign)
+        (home / "hooks.json").write_text(json.dumps(hooks, indent=2) + "\n")
+        before = (home / "hooks.json").read_text()
+        assert hs.ensure_codex(home, url="https://m.example")["changed"] == []
+        assert (home / "hooks.json").read_text() == before
+        hs.ensure_codex(home, url="https://other.example")  # an update rewrites our entry only
+        stop = json.loads((home / "hooks.json").read_text())["hooks"]["Stop"]
+        assert stop[1] == foreign and "https://other.example" in stop[0]["hooks"][0]["command"]
+        state = tomllib.loads((home / "config.toml").read_text())["hooks"]["state"]
+        assert f"{home}/hooks.json:stop:0:0" in state and f"{home}/hooks.json:stop:1:0" not in state
+
+    def test_owned_duplicates_collapse_into_the_first(self, tmp_path):
+        legacy = {"hooks": [{"type": "command", "command": "miragen-hook codex --daemon http://old"}]}
+        user = {"hooks": [{"type": "command", "command": "user-stop"}]}
+        home = _codex_home(tmp_path, hooks={"hooks": {"Stop": [legacy, user, legacy]}})
+        hs.ensure_codex(home, url="https://m.example")
+        stop = json.loads((home / "hooks.json").read_text())["hooks"]["Stop"]
+        assert len(stop) == 2 and stop[1] == user and "miragen-adapter" in stop[0]["hooks"][0]["command"]
+
     def test_a_users_disable_is_kept(self, tmp_path):
         home = _codex_home(tmp_path)
         hs.ensure_codex(home, url="https://m.example")

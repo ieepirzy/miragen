@@ -274,21 +274,35 @@ def _load_hooks_json(path: Path) -> dict:
 
 
 def merge_owned_groups(data: dict, entries: dict[str, dict]) -> dict:
-    """`data` with every group we own removed (from every event, so an
-    event we stopped using is cleaned too) and one group per `entries`
-    event appended LAST — user groups keep their positions (and so their
-    Codex trust keys)."""
+    """`data` with our group for each `entries` event replaced IN PLACE (or
+    appended when the event has none), further owned duplicates and owned
+    groups of events we no longer use removed, everything else untouched.
+    In place matters: Codex keys hook trust by group index, so moving our
+    group behind a later one (a user's, another daemon's) would silently
+    untrust that one — and two setups each re-appending would ping-pong."""
     merged = json.loads(json.dumps(data))
     hooks = merged.setdefault("hooks", {})
     for event in list(hooks):
         groups = hooks[event] if isinstance(hooks[event], list) else []
-        kept = [g for g in groups if not (isinstance(g, dict) and _group_is_owned(g))]
+        replacement = entries.get(event)
+        kept: list = []
+        placed = False
+        for group in groups:
+            if isinstance(group, dict) and _group_is_owned(group):
+                if replacement is not None and not placed:
+                    kept.append({"hooks": [replacement]})
+                    placed = True
+                continue
+            kept.append(group)
+        if replacement is not None and not placed:
+            kept.append({"hooks": [replacement]})
         if kept:
             hooks[event] = kept
         else:
             del hooks[event]
     for event, entry in entries.items():
-        hooks.setdefault(event, []).append({"hooks": [entry]})
+        if event not in hooks:
+            hooks[event] = [{"hooks": [entry]}]
     if not hooks:
         del merged["hooks"]
     return merged

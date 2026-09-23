@@ -46,6 +46,8 @@ class ResolvedHarnessSetup:
     interval_s: int
 
 
+# Not `…_TOKEN_FILE`: main() resolves every `*_FILE` variable into its
+# plain counterpart (the secret-file convention) before this is read.
 def resolve_harness_setup(
     config: HarnessSetupConfig | None, environ: dict | None = None,
     *, in_container: Callable[[], bool] = _in_container,
@@ -53,7 +55,7 @@ def resolve_harness_setup(
     env = os.environ if environ is None else environ
     config = config or HarnessSetupConfig()
     url = env.get("MIRAGEND_HARNESS_SETUP_URL") or config.url
-    token_file = env.get("MIRAGEND_HARNESS_SETUP_TOKEN_FILE") or (
+    token_file = env.get("MIRAGEND_HARNESS_SETUP_TOKEN_PATH") or (
         str(Path(config.token_file).expanduser()) if config.token_file else None
     )
     interval = int(env.get("MIRAGEND_HARNESS_SETUP_INTERVAL_S") or config.interval_s)

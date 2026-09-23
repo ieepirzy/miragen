@@ -127,7 +127,7 @@ harness_setup:
   # interval_s: 600
 ```
 
-(or `MIRAGEND_HARNESS_SETUP_URL` / `_TOKEN_FILE` / `_INTERVAL_S`, and
+(or `MIRAGEND_HARNESS_SETUP_URL` / `_TOKEN_PATH` / `_INTERVAL_S`, and
 `MIRAGEND_HARNESS_SETUP=off`). There is no default URL — the feature stays
 off, and `/health` says why, rather than pointing sessions at a daemon
 nobody chose. The hosted daemon (a container) never runs it unless

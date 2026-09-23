@@ -34,13 +34,26 @@ class TestGate:
         assert resolved.token_file.endswith("/t") and "~" not in resolved.token_file
 
     def test_environment_overrides(self):
-        env = {"MIRAGEND_HARNESS_SETUP_URL": "https://env.example", "MIRAGEND_HARNESS_SETUP_TOKEN_FILE": "/s/t",
+        env = {"MIRAGEND_HARNESS_SETUP_URL": "https://env.example", "MIRAGEND_HARNESS_SETUP_TOKEN_PATH": "/s/t",
                "MIRAGEND_HARNESS_SETUP_INTERVAL_S": "120"}
         resolved = resolve_harness_setup(HarnessSetup(url="https://file.example"), env, in_container=_no_container)
         assert (resolved.url, resolved.token_file, resolved.interval_s) == ("https://env.example", "/s/t", 120)
         off = resolve_harness_setup(HarnessSetup(url="https://m.example"), {"MIRAGEND_HARNESS_SETUP": "off"},
                                     in_container=_no_container)
         assert off.enabled is False
+
+    def test_the_token_path_survives_the_secret_file_loader(self, tmp_path):
+        """main() runs load_file_secrets first, which turns every *_FILE
+        variable into its plain name and deletes it — the override must not
+        be one of those."""
+        from miragen.daemon.sessions.config import load_file_secrets
+        token = tmp_path / "bridge.token"
+        token.write_text("t0k")
+        env = {"MIRAGEND_HARNESS_SETUP_URL": "https://m.example",
+               "MIRAGEND_HARNESS_SETUP_TOKEN_PATH": str(token)}
+        load_file_secrets(env)
+        resolved = resolve_harness_setup(HarnessSetup(), env, in_container=_no_container)
+        assert resolved.token_file == str(token)
 
     def test_a_container_is_the_hosted_daemon_unless_told_otherwise(self):
         hosted = resolve_harness_setup(HarnessSetup(url="https://m.example"), {}, in_container=lambda: True)
