@@ -635,6 +635,10 @@ def _forward(
         envelope, daemon_url=daemon_url, token=token,
         timeout=timeout_for(event), opener=opener,
     )
+    if not answer and event.name == "input.received" and harness in ASYNC_RECALL_HARNESSES:
+        # A new prompt supersedes any pending recall even when the daemon
+        # cannot be reached: an old result must never land in this turn.
+        clear_recall_marker(event.session_id, environ)
     if not answer:
         return None
     if event.name == "input.received" and harness in ASYNC_RECALL_HARNESSES:

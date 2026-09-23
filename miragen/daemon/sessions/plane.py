@@ -941,6 +941,7 @@ class SessionPlane:
             return None, None, None
         lifecycle, reason = await self._lifecycle_for(session)
         if lifecycle is None:
+            self._drop_recall(session.key)
             return None, reason, None
         if recall.delivery == "async" and ASYNC_RECALL_CAPABILITY in envelope.client.capabilities:
             return await self._start_async_recall(session, envelope, lifecycle, prompt)
@@ -1072,8 +1073,10 @@ class SessionPlane:
         selection = job.selection or RecallSelection("none_selected")
         if selection.status == "ok" and selection.section:
             job.delivered = "context"
-            await job.lifecycle.record_recall_manifest(
-                job.candidates, selection, run_id=key, trigger=job.trigger)
+            # The answer must not wait on Loimi: a claim that outlived the
+            # adapter's timeout would be marked delivered yet never shown.
+            self._spawn(job.lifecycle.record_recall_manifest(
+                job.candidates, selection, run_id=key, trigger=job.trigger))
             self.stats.injections += 1
             session = self.registry.get(key)
             if session is not None:
@@ -1424,10 +1427,14 @@ class SessionPlane:
         for session in stale:
             self.stats.finalized_by_sweep += 1
             logger.info(f"[{session.key}] finalizing: {session.end_reason}")
+            self._drop_recall(session.key)
             self._spawn(self._locked(session, self._finalize(session, occurrence="end")))
         for key in pruned:
             self.journal.clear(key)
             self._locks.pop(key, None)
+            self._drop_recall(key)
+            self._recall_seq.pop(key, None)
+            self._recall_failure_announced.discard(key)
         if stale or pruned:
             self.registry.save()
         return len(stale)
@@ -1499,7 +1506,7 @@ class SessionPlane:
                 "selector_configured": self.selector is not None,
                 "on_prompt": self.config.recall.on_prompt,
                 "delivery": self.config.recall.delivery,
-                "pending": len(self._recalls),
+                "pending": sum(1 for job in self._recalls.values() if job.delivered is None),
             },
             "judgments": self.judgments.describe(),
             "scopes": {

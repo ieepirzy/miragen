@@ -37,7 +37,9 @@ class JudgmentLog:
         self.max_bytes = max_bytes
         self.written = 0
         self.failures = 0
+        self.capped = 0
         self._pruned_for: str | None = None
+        self._since_prune = 0
 
     def _file(self, day: str) -> Path:
         return self.directory / f"{_PREFIX}{day}.jsonl"
@@ -89,13 +91,20 @@ class JudgmentLog:
         try:
             self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             path = self._file(day)
+            if _size(path) >= self.max_bytes:
+                # One day alone filled the cap: drop rows, never the disk.
+                self.capped += 1
+                return
+            line = json.dumps(row, ensure_ascii=False) + "\n"
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             with os.fdopen(fd, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                handle.write(line)
             if count:
                 self.written += 1
-            if self._pruned_for != day:
+            self._since_prune += len(line)
+            if self._pruned_for != day or self._since_prune > self.max_bytes // 16:
                 self._pruned_for = day
+                self._since_prune = 0
                 self.prune()
         except OSError as exc:
             self.failures += 1
@@ -125,7 +134,8 @@ class JudgmentLog:
     def describe(self) -> dict[str, Any]:
         files = sorted(self.directory.glob(f"{_PREFIX}*.jsonl")) if self.directory.exists() else []
         return {
-            "written": self.written, "failures": self.failures, "files": len(files),
+            "written": self.written, "failures": self.failures, "capped": self.capped,
+            "files": len(files),
             "bytes": sum(_size(path) for path in files),
         }
 

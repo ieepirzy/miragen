@@ -591,3 +591,17 @@ class TestBackgroundRecall:
         assert recall_marker_path(LIVE["session_id"], marker_env).exists()
         loud = invoke()
         assert loud.returncode == 0 and "unreachable" in loud.stderr, "fell through to a claim"
+
+
+def test_an_unreachable_daemon_on_a_new_prompt_still_clears_the_old_marker(tmp_path):
+    from miragen_hook.client import read_recall_marker, write_recall_marker
+
+    env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+    write_recall_marker(LIVE["session_id"], 1, env)
+
+    def down(request, timeout):
+        raise urllib.error.URLError("connection refused")
+
+    run("claude-code", {**LIVE, "hook_event_name": "UserPromptSubmit", "prompt": "next"},
+        daemon_url="http://127.0.0.1:1", token=None, opener=down, pid=1, environ=env)
+    assert read_recall_marker(LIVE["session_id"], env) is None

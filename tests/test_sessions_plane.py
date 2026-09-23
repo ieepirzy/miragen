@@ -1024,6 +1024,7 @@ class TestAsyncRecall:
         assert "vault mounted" in ready["context"] and "lunch" not in ready["context"]
         assert await h.plane.claim_recall("claude-code", "s-1", 1, wait=0) == {"state": "delivered"}
         # Counted and manifested when DELIVERED, exactly once.
+        await h.drain()
         assert h.plane.stats.async_recalls_delivered == 1
         new = h.service.manifests[manifests_before:]
         assert len(new) == 1 and new[0]["policy"]["delivery"] == "async"
@@ -1117,3 +1118,36 @@ class TestAsyncRecall:
         assert answer.status_code == 200 and answer.json()["state"] == "ready"
         bad = client.post("/sessions/v1/recall/claim", json={"harness": "claude-code"})
         assert bad.status_code == 422
+
+
+class TestAsyncRecallReviewFixes:
+    async def test_the_claim_answers_before_the_manifest_is_written(self, tmp_path):
+        import asyncio
+
+        h = await _seeded(tmp_path, _vault_selector())
+        await h.send("UserPromptSubmit", prompt="why does the hel1 deploy fail on vault",
+                     client_extra=ASYNC)
+        lifecycle = h.plane._lifecycles[PROJECT_SCOPE]
+        slow = asyncio.Event()
+        original = lifecycle.record_recall_manifest
+
+        async def slow_manifest(*args, **kwargs):
+            await slow.wait()
+            return await original(*args, **kwargs)
+
+        lifecycle.record_recall_manifest = slow_manifest
+        ready = await asyncio.wait_for(h.plane.claim_recall("claude-code", "s-1", 1, wait=5), 2)
+        assert ready["state"] == "ready", "a slow Loimi must not hold the answer"
+        slow.set()
+        await h.drain()
+
+    async def test_a_swept_session_leaves_no_recall_behind(self, tmp_path):
+        from datetime import timedelta
+
+        h = await _seeded(tmp_path, _vault_selector())
+        await h.send("UserPromptSubmit", prompt="why does the hel1 deploy fail on vault",
+                     client_extra=ASYNC)
+        h.alive.clear()
+        await h.plane.sweep(now=datetime.now(timezone.utc) + timedelta(days=3))
+        assert "claude-code:s-1" not in h.plane._recalls
+        assert h.plane.describe()["recall"]["pending"] == 0

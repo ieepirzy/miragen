@@ -48,3 +48,12 @@ def test_a_write_failure_never_raises(tmp_path):
     log.record(session="s", scope="g", recall_id="s#1", query="q", cards=[], selected=[],
                status="ok", model=None)
     assert log.failures == 1 and log.written == 0
+
+
+def test_a_single_busy_day_cannot_exceed_the_cap(tmp_path):
+    log = JudgmentLog(tmp_path / "j", max_bytes=2000)
+    for i in range(50):
+        log.record(session="s", scope="g", recall_id=f"s#{i}", query="q" * 200, cards=[],
+                   selected=[], status="ok", model=None)
+    total = sum(p.stat().st_size for p in (tmp_path / "j").iterdir())
+    assert total < 2000 + 400 and log.capped > 0
