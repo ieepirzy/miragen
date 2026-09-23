@@ -49,6 +49,12 @@ from miragen.memory.lifecycle import MemoryLifecycle
 from miragen.models import MemoryRecallSpec, MemoryScopesSpec, MemorySpec
 from miragen_hook.normalize import CAPTURED, CONTEXT_OPENING, NormalizedEvent
 
+
+def _same_dir(a: str, b: str) -> bool:
+    """Path equality as the harness reported it (no filesystem access: the
+    paths usually belong to another host)."""
+    return a.rstrip("/") == b.rstrip("/")
+
 logger = logging.getLogger("miragend.sessions")
 
 # Daemon-side bounds UNDER the adapter's (client.py: 10 s for context).
@@ -103,6 +109,7 @@ class PlaneStats:
     # Startup provisioning + identity adoption.
     adopted_by_name: int = 0
     remote_sessions: int = 0
+    project_switches: int = 0
     raw_hooks_shadowed: int = 0
     late_opens: int = 0
     empty_sessions: int = 0
@@ -391,8 +398,7 @@ class SessionPlane:
         session, created = self.registry.upsert(envelope)
         if created:
             self.stats.sessions_registered += 1
-        if session.project is None:
-            await self._attach_project(session, envelope)
+        await self._attach_project(session, envelope)
 
         span_cm = None
         if self.telemetry is not None:
@@ -424,7 +430,13 @@ class SessionPlane:
             elif event.name == "input.received":
                 session.note_prompt(event.content)
                 self._journal_and_capture(session, envelope)
-                if session.counters.injections == 0:
+                if session.reopen_pending and session.counters.injections:
+                    # The agent cd'd into another repository: its working
+                    # state, status line and scope header are that
+                    # project's now, so the model gets them before recall.
+                    session.reopen_pending = False
+                    context, detail = await self._open_context(session, envelope)
+                elif session.counters.injections == 0:
                     # The session's start was never answered (a SessionStart
                     # hook that ran before its credentials existed — seen on
                     # cloud VMs — or a daemon that was down). The first prompt
@@ -482,7 +494,17 @@ class SessionPlane:
             self._known_by_name.setdefault(project.name.lower(), project)
 
     async def _attach_project(self, session: ExternalSession, envelope: EventEnvelope) -> None:
-        """Identity, in order of trust in what we can verify: the remote
+        """Bind (or re-bind) the session's project from where it is now.
+
+        Resolved on every event whose cwd/remote changed — sessions are
+        mostly launched from ~ and cd into repositories later, the rule
+        MiraDesign already follows. Sticky: a binding is only replaced by a
+        REPOSITORY (a remote-derived identity) other than the current one.
+        A provisional binding (`dir:`, `workspace:`, `path:`, the home
+        directory) is replaced as soon as a repository resolves; moving to
+        ~ or any non-repository directory never downgrades a binding.
+
+        Identity, in order of trust in what we can verify: the remote
         the adapter observed (works from any host), the daemon's own look
         at the directory (this host only), the directory name (anything
         else — optionally adopting a known project of that name)."""
@@ -491,6 +513,10 @@ class SessionPlane:
         local = self._client_is_local(envelope)
         if not local and not session.remote:
             session.remote = True
+        fingerprint = f"{cwd}\x00{client.project_remote or ''}"
+        if session.project is not None and session.resolved_from == fingerprint:
+            return
+        at_home = bool(cwd and client.home) and _same_dir(cwd, client.home)
         project: ProjectIdentity | None = None
         if client.project_remote:
             project = identity_from_remote(client.project_remote, root=cwd)
@@ -520,12 +546,24 @@ class SessionPlane:
                 self.stats.adopted_by_name += 1
         if project is None:
             return
+        session.resolved_from = fingerprint
+        current = session.project
+        is_repository = bool(project.remote) and not at_home
+        if current is not None and (not is_repository or project.id == current.id):
+            return  # sticky: only another repository replaces a binding
         self._remember_project(project)
         session.project = project
         assignment = self._assignment_for(project)
         session.scope = assignment.write
-        if session.remote:
-            self.stats.remote_sessions += 1
+        if project.id not in session.projects_seen:
+            session.projects_seen.append(project.id)
+        if current is None:
+            if session.remote:
+                self.stats.remote_sessions += 1
+            return
+        self.stats.project_switches += 1
+        session.reopen_pending = True
+        logger.info(f"[{session.key}] project {current.id} → {project.id} (cwd {cwd})")
 
     def _looks_like_workspace_root(self, cwd: str) -> bool:
         """A remote cwd that other known remote-derived projects sit
@@ -1076,6 +1114,9 @@ class SessionPlane:
                         "occurrence": occurrence,
                         "project": session.project.id if session.project else None,
                         "cwd": session.cwd,
+                        # Every project the session was bound to; the episode
+                        # is filed under the one bound at filing time.
+                        "projects": list(session.projects_seen),
                         "prompts": session.counters.prompts,
                         "turns": session.counters.turns,
                         "end_reason": session.end_reason,

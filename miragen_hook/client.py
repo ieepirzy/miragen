@@ -172,6 +172,7 @@ def build_envelope(
     harness: str, payload: dict, event: NormalizedEvent, *, environ: dict | None = None,
     pid: int | None = None, host: str | None = "", user: str | None = "",
     remote: bool | None = None, project_remote_url: str | None = "", cwd: str | None = "",
+    home: str | None = "",
 ) -> dict[str, Any]:
     """`host`/`user`/`project_remote_url`/`cwd` default to "observe them
     here" (the adapter runs on the harness's machine); pass None to leave a
@@ -192,6 +193,8 @@ def build_envelope(
         project_remote_url = project_remote(cwd)
     if remote is None:
         remote = env.get("CLAUDE_CODE_REMOTE") == "true"
+    if home == "":
+        home = env.get("HOME") or None
     return {
         "harness": harness,
         "session_id": event.session_id,
@@ -203,6 +206,8 @@ def build_envelope(
             "host": host,
             "remote": remote,
             "project_remote": project_remote_url,
+            # ~ is "no project yet", even when it is a git repository.
+            "home": home,
             "transcript_path": payload.get("transcript_path"),
             "project_dir": env.get("CLAUDE_PROJECT_DIR"),
             # A harness spawned by another agent can be told who spawned it;

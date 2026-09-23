@@ -844,3 +844,101 @@ class TestEpisodeRefinalize:
         assert h.plane.stats.capture_failures == failures
         assert "episode capture" not in (h.plane.stats.last_loimi_error or "")
         assert h.plane.stats.episodes == 1 and session.episodes_written == ["end"]
+
+
+# ── project re-resolution: launched from ~, cd'd into repositories ───────────
+
+HOME = "/home/ilari"
+
+
+class TestProjectReResolution:
+    """Sessions start in ~ and cd into repositories. The binding follows,
+    stickily: only a repository replaces it (MiraDesign's rule)."""
+
+    async def test_a_session_launched_from_home_binds_to_the_repo_it_moves_into(self, tmp_path):
+        h = Harness(tmp_path)
+        home = {"home": HOME}
+        await h.send("SessionStart", source="startup", cwd=HOME, client_extra=home)
+        session = h.plane.registry.get("claude-code:s-1")
+        assert session.project.id == f"path:{HOME}"
+        first_scope = session.scope
+
+        result = await h.send("UserPromptSubmit", prompt="fix the tests", cwd="/w/repo",
+                              client_extra=home)
+        assert session.project.id == REPO.id and session.scope == PROJECT_SCOPE != first_scope
+        assert session.projects_seen == [f"path:{HOME}", REPO.id]
+        assert h.plane.stats.project_switches == 1
+        # The model gets the new project's context on that very prompt.
+        assert result.context and f"scope={PROJECT_SCOPE}" in result.context
+        assert not session.reopen_pending
+
+        # Captures from now on land in the repository's scope.
+        await h.send("Stop", last_assistant_message="done", cwd="/w/repo", client_extra=home)
+        await h.drain()
+        assert any(e["scope_id"] == PROJECT_SCOPE for e in h.events("harness:"))
+
+    async def test_the_binding_is_sticky_when_the_agent_cds_back_home(self, tmp_path):
+        h = Harness(tmp_path)
+        home = {"home": HOME}
+        await h.send("SessionStart", source="startup", cwd="/w/repo", client_extra=home)
+        await h.send("UserPromptSubmit", prompt="look around", cwd=HOME, client_extra=home)
+        await h.send("UserPromptSubmit", prompt="and in /tmp", cwd="/tmp/x", client_extra=home)
+        session = h.plane.registry.get("claude-code:s-1")
+        assert session.project.id == REPO.id, "~ and non-repositories never downgrade"
+        assert h.plane.stats.project_switches == 0
+
+    async def test_moving_between_repositories_follows_the_latest(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", cwd="/w/repo")
+        await h.send("UserPromptSubmit", prompt="now the other one", cwd="/w/other")
+        session = h.plane.registry.get("claude-code:s-1")
+        assert session.project.id == OTHER.id
+        assert session.projects_seen == [REPO.id, OTHER.id]
+
+    async def test_home_is_never_a_repository_even_with_a_dotfiles_remote(self, tmp_path):
+        h = Harness(tmp_path)
+        home = {"home": HOME}
+        await h.send("SessionStart", source="startup", cwd="/w/repo", client_extra=home)
+        await h.send("UserPromptSubmit", prompt="edit my dotfiles", cwd=HOME,
+                     host="laptop", project_remote="git@github.com:ilari/dotfiles.git",
+                     client_extra=home)
+        assert h.plane.registry.get("claude-code:s-1").project.id == REPO.id
+
+    async def test_a_remote_session_rebinds_from_the_reported_remote(self, tmp_path):
+        h = Harness(tmp_path)
+        home = {"home": HOME}
+        await h.send("SessionStart", source="startup", cwd=HOME, host="laptop",
+                     client_extra=home)
+        session = h.plane.registry.get("claude-code:s-1")
+        assert session.project.id == "dir:ilari"
+        await h.send("UserPromptSubmit", prompt="go", cwd="/home/ilari/src/miragen",
+                     host="laptop", project_remote="https://github.com/ieepirzy/miragen.git",
+                     client_extra=home)
+        assert session.project.id == "github.com/ieepirzy/miragen"
+
+    async def test_the_episode_lists_every_project_it_touched(self, tmp_path):
+        h = Harness(tmp_path)
+        home = {"home": HOME}
+        await h.send("SessionStart", source="startup", cwd=HOME, client_extra=home)
+        await h.send("UserPromptSubmit", prompt="work in repo", cwd="/w/repo", client_extra=home)
+        await h.send("SessionEnd", reason="clear", cwd="/w/repo", client_extra=home)
+        await h.drain()
+        (episode,) = h.events("session_episode")
+        assert episode["scope_id"] == PROJECT_SCOPE
+        assert episode["attributes"]["projects"] == [f"path:{HOME}", REPO.id]
+
+    async def test_an_unchanged_cwd_is_not_re_resolved(self, tmp_path):
+        calls = []
+        h = Harness(tmp_path)
+        original = h.plane._resolve
+
+        def counting(cwd):
+            calls.append(cwd)
+            return original(cwd)
+
+        h.plane._resolve = counting
+        h.plane._projects.clear()
+        await h.send("SessionStart", source="startup")
+        for _ in range(3):
+            await h.send("UserPromptSubmit", prompt="again please")
+        assert calls == ["/w/repo"]

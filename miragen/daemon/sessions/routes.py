@@ -95,6 +95,7 @@ def register_session_routes(app: FastAPI, plane: SessionPlane, *, dependencies: 
             envelope = EventEnvelope.model_validate(build_envelope(
                 harness, payload, event, environ={}, pid=None, host=None, user=None,
                 remote=True, project_remote_url=None, cwd=payload.get("cwd") or None,
+                home=None,
             ))
         except ValidationError:
             # Counted (adapter/harness drift must show on /health) but an
