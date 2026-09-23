@@ -325,8 +325,15 @@ def memory_hook(harness: str) -> None:
               help="ISO timestamp: jobs for events received earlier are completed without "
                    "a model call. Every captured event queues a job, so a first deployment "
                    "would otherwise extract the whole history on the model's quota.")
+@click.option("--principal", envvar="MIRAGEN_WORKER_PRINCIPAL", default=None,
+              help="The worker's Loimi principal. With --token-file and LOIMI_OPERATOR_TOKEN, "
+                   "it is created (or a token minted) on first start and the token kept in "
+                   "the file; the bridge's scopes.worker_principal grants it per scope.")
+@click.option("--token-file", envvar="MIRAGEN_WORKER_TOKEN_FILE", default=None,
+              help="Where the worker's own principal token is kept (0600).")
 def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None,
-                  lease_seconds: int, max_backoff: int, skip_before: str | None) -> None:
+                  lease_seconds: int, max_backoff: int, skip_before: str | None,
+                  principal: str | None, token_file: str | None) -> None:
     """The bounded extraction worker (memory pass PR 3, §17.5): claims
     consolidate jobs through /memory/v1 as its own maintain-capable
     principal and proposes extracted memories through the same admission
@@ -360,6 +367,13 @@ def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None,
             "no extraction model: set memory.extraction.model (required on "
             "executor-tier profiles, which have no spec.model)"
         )
+
+    if principal and token_file:
+        try:
+            how = asyncio.run(ensure_worker_token(profile.memory, principal, Path(token_file)))
+        except Exception as exc:  # noqa: BLE001 — surfaced as a CLI error
+            raise click.ClickException(f"worker principal {principal}: {exc}") from exc
+        click.echo(f"worker principal {principal}: token {how}")
 
     client = MemoryClient(profile.memory)
     extract = build_model_extractor(model)
@@ -395,6 +409,45 @@ def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None,
             break
         backoff = next_backoff(backoff, results, interval=interval, ceiling=max_backoff)
         _time.sleep(backoff or interval)
+
+
+async def ensure_worker_token(
+    spec, principal: str, token_file: Path, *, environ: dict | None = None,
+    client_factory=None,
+) -> str:
+    """The worker's own principal token into `spec.credential_env`: already
+    set → kept; the token file → read; else created (or re-minted when the
+    principal exists) with the operator token, persisted 0600. Returns how."""
+    from miragen.memory import MemoryClient
+    from miragen.memory.client import MemoryAPIError
+
+    env = os.environ if environ is None else environ
+    if env.get(spec.credential_env):
+        return "from environment"
+    if token_file.exists():
+        env[spec.credential_env] = token_file.read_text().strip()
+        return "from file"
+    operator = env.get("LOIMI_OPERATOR_TOKEN")
+    if not operator:
+        raise RuntimeError("no token file yet and LOIMI_OPERATOR_TOKEN is not set")
+    factory = client_factory or (lambda token: MemoryClient(spec, token=token))
+    admin = factory(operator)
+    try:
+        created = await admin.admin_create_principal(
+            principal_id=principal, kind="agent",
+            description="miragen memory-worker (extraction; maintain on granted scopes)",
+        )
+        token, how = created["token"], "created"
+    except MemoryAPIError as exc:
+        if exc.status_code != 409:
+            raise
+        token, how = (await admin.admin_mint_token(principal_id=principal))["token"], "minted"
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(token + "\n")
+    env[spec.credential_env] = token
+    return how
 
 
 def next_backoff(current: int, results: list[dict], *, interval: int, ceiling: int) -> int:

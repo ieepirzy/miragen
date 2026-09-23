@@ -280,3 +280,37 @@ def test_a_usage_limit_says_so(fake, monkeypatch):
     monkeypatch.setenv("FAKE_MODE", "limit")
     with pytest.raises(ClaudeCodeLimited, match="session limit"):
         run(ClaudeCodeRunner("claude-code:haiku").run("i", "p", Echo))
+
+
+def test_the_worker_provisions_its_principal_once_and_keeps_the_token(tmp_path):
+    import stat as _stat
+
+    from miragen.cli import ensure_worker_token
+    from miragen.memory.client import MemoryClient
+    from miragen.memory.ephemeral import EphemeralMemoryService
+    from miragen.models import MemoryScopesSpec, MemorySpec
+
+    service = EphemeralMemoryService()
+    spec = MemorySpec(scopes=MemoryScopesSpec(read=[], propose=["x"], default_write="x"))
+    factory = lambda token: MemoryClient(  # noqa: E731
+        spec, transport=service.transport(), base_url="http://loimi.test", token=token)
+    token_file = tmp_path / "state" / "worker.token"
+    env = {"LOIMI_OPERATOR_TOKEN": service.operator_token}
+
+    assert run(ensure_worker_token(spec, "mira-worker", token_file, environ=env,
+                                   client_factory=factory)) == "created"
+    assert "mira-worker" in service.principals
+    assert _stat.S_IMODE(token_file.stat().st_mode) == 0o600
+    token = token_file.read_text().strip()
+    assert env[spec.credential_env] == token
+
+    again = {"LOIMI_OPERATOR_TOKEN": service.operator_token}
+    assert run(ensure_worker_token(spec, "mira-worker", token_file, environ=again,
+                                   client_factory=factory)) == "from file"
+    assert again[spec.credential_env] == token
+
+    token_file.unlink()
+    assert run(ensure_worker_token(spec, "mira-worker", token_file, environ={
+        "LOIMI_OPERATOR_TOKEN": service.operator_token}, client_factory=factory)) == "minted"
+    with pytest.raises(RuntimeError, match="LOIMI_OPERATOR_TOKEN"):
+        run(ensure_worker_token(spec, "w2", tmp_path / "none", environ={}, client_factory=factory))
