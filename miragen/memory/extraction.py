@@ -149,7 +149,10 @@ def build_model_extractor(model: str) -> ExtractFn:
     from miragen.memory.claude_code import ClaudeCodeRunner, is_claude_code_model
 
     if is_claude_code_model(model):
-        runner = ClaudeCodeRunner(model)
+        # Extraction p50 ≈ 30 s, tail > 90 s through the runner (P1.1 eval):
+        # 120 s timed real episodes out; a job that always times out would
+        # retry forever.
+        runner = ClaudeCodeRunner(model, timeout=300)
 
         async def extract_cc(content: str, source_kind: str) -> ExtractionResult:
             return await runner.run(
