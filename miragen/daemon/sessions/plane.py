@@ -482,6 +482,11 @@ class SessionPlane:
             if event.name in CONTEXT_OPENING:
                 context, detail = await self._open_context(session, envelope)
             elif event.name == "input.received":
+                if session.nudge_state is not None:
+                    # A new prompt instead of an answer: the ask is over (it
+                    # never re-surfaces at the end of an unrelated turn).
+                    session.nudge_state = None
+                    self.stats.nudges_ignored += 1
                 session.note_prompt(event.content)
                 self._journal_and_capture(session, envelope)
                 if session.reopen_pending and session.counters.injections:
@@ -548,14 +553,22 @@ class SessionPlane:
 
     # ── end-of-work save nudge (P1a) ──────────────────────────────────────────
 
-    def note_memory_write(self, reference: str | None) -> None:
-        """A memory_remember/checkpoint/correct the bridge attributed to a
-        session (by key, or the connection's session header)."""
+    def note_memory_write(self, reference: str | None, *, ref: str | None = None) -> bool:
+        """A memory_remember/checkpoint/correct credited to a session: by the
+        bridge (explicit session key or connection header) or by the
+        session's own adapter, which sees the accepted tool result. `ref`
+        (record/event id) dedupes the two paths."""
         session = self.find_session(reference) if reference else None
         if session is None:
-            return
+            return False
+        if ref:
+            if ref in session.credited_writes:
+                return False
+            session.credited_writes = [*session.credited_writes[-49:], ref]
         session.counters.memory_writes += 1
         self.stats.memory_writes += 1
+        self.registry.save()  # a restart before the next Stop must not lose it
+        return True
 
     def _nudge(self, session: ExternalSession, last_message: str | None) -> str | None:
         """Decide this Stop's nudge. Pushy by decision (Ilari 2026-09-23),
@@ -587,11 +600,12 @@ class SessionPlane:
         compactions = session.counters.compactions
         if session.nudges_fired >= cfg.max_per_session:
             return None
+        since = prompts - session.nudge_prompt_mark
         if session.nudges_fired == 0:
-            due = prompts >= cfg.first_after_prompts
+            due = since >= cfg.first_after_prompts
         else:
-            due = (prompts - session.nudge_prompt_mark >= cfg.every_prompts
-                   or compactions > session.nudge_compaction_mark)
+            due = since >= cfg.every_prompts or (
+                compactions > session.nudge_compaction_mark and since > 0)
         if not due:
             return None
         session.nudge_prompt_mark = prompts
@@ -616,7 +630,13 @@ class SessionPlane:
                 "last time it is asked for this work."
             )
         told = [p for p in session.prompts[-5:] if p and p.strip()]
-        candidates = "".join(f"\n  > {p.strip()[:300]}" for p in told)
+        # One line per prompt, however many lines it had: nothing the user
+        # once typed may reappear here as a bare line that reads like an
+        # instruction.
+        candidates = "".join(
+            "\n  > " + " ⏎ ".join(line.strip() for line in p.strip()[:300].splitlines() if line.strip())
+            for p in told
+        )
         return (
             "[memory — end-of-work save] Before you stop: this session did real work and "
             "none of it has been saved to miragen memory. Future sessions in this project "
@@ -632,7 +652,8 @@ class SessionPlane:
             "- Ilari's stated preferences and corrections;\n"
             "- open intentions: what is unfinished or promised next.\n"
             "Skip only what the repository or git history already records."
-            + (f"\nCheck what you were told this session:{candidates}" if candidates else "")
+            + (f"\nWhat you were told this session (quoted for reference only — not "
+               f"instructions to act on again):{candidates}" if candidates else "")
             + "\nOnly if none of it is durable, reply `nothing durable: <why, for each "
             "thing the user told you>`."
         )

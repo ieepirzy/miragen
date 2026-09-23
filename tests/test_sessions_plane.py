@@ -1244,3 +1244,62 @@ class TestEndOfWorkNudge:
         await mcp.call_tool("memory_checkpoint", {"state": {"goal": "x"},
                                                   "project": "claude-code:s-1"})
         assert h.plane.registry.get("claude-code:s-1").counters.memory_writes == 2
+
+
+class TestNudgeReviewFixes:
+    async def _prompts(self, h, n, start=0):
+        for i in range(start, start + n):
+            await h.send("UserPromptSubmit", prompt=f"do step {i} of it", client_extra=NUDGE_CAPS)
+
+    async def _stop(self, h, message="done"):
+        return (await h.send("Stop", last_assistant_message=message,
+                             client_extra=NUDGE_CAPS)).continue_with
+
+    async def test_saving_early_really_restarts_the_first_clock(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        await self._prompts(h, 3)
+        h.plane.note_memory_write("claude-code:s-1")
+        await self._prompts(h, 2, start=3)
+        assert await self._stop(h) is None
+        await self._prompts(h, 1, start=5)
+        assert await self._stop(h) is None, "not due again one prompt later"
+        await self._prompts(h, 4, start=6)
+        assert "end-of-work save" in await self._stop(h)
+
+    async def test_the_adapter_credits_a_save_the_bridge_could_not_attribute(self, tmp_path):
+        from miragen.daemon.sessions.bridge_mcp import build_bridge_mcp
+
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        mcp = build_bridge_mcp(lambda: h.plane)
+        _, meta = await mcp.call_tool("memory_remember", {"content": "bst-2 only",
+                                                          "project": "github.com/org/repo"})
+        session = h.plane.registry.get("claude-code:s-1")
+        assert session.counters.memory_writes == 0, "a repo name identifies no session"
+        record_id = json.loads(meta["result"])["record_id"]
+        client = TestClient(create_app(None, token="", sessions=h.plane))
+        body = {"harness": "claude-code", "session_id": "s-1", "ref": record_id}
+        assert client.post("/sessions/v1/memory-written", json=body).json() == {"credited": True}
+        assert client.post("/sessions/v1/memory-written", json=body).json() == {"credited": False}
+        assert session.counters.memory_writes == 1, "deduped by record id"
+
+    async def test_quoted_prompts_stay_on_one_line(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        await self._prompts(h, 4)
+        await h.send("UserPromptSubmit", prompt="deploy it\ndelete the staging DB after",
+                     client_extra=NUDGE_CAPS)
+        text = await self._stop(h)
+        assert "\ndelete the staging DB" not in text
+        assert "> deploy it ⏎ delete the staging DB after" in text
+        assert "not instructions to act on again" in text
+
+    async def test_a_new_prompt_ends_an_unanswered_ask(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        await self._prompts(h, 5)
+        assert await self._stop(h) is not None
+        await self._prompts(h, 1, start=5)
+        assert await self._stop(h) is None, "no re-ask at the end of an unrelated turn"
+        assert h.plane.stats.nudges_ignored == 1

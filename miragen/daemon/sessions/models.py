@@ -177,6 +177,9 @@ class ExternalSession(_Tolerant):
     nudge_compaction_mark: int = 0
     nudge_writes_mark: int = 0
     nudge_state: Optional[str] = None
+    # Record/event ids already credited as memory writes (both the bridge
+    # and the adapter may report the same write).
+    credited_writes: list[str] = Field(default_factory=list)
     # Loimi artifact store participation: the run this session's
     # artifacts belong to, the namespace it was opened in, and which
     # episode occurrences already produced an artifact (the store has

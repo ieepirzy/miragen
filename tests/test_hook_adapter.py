@@ -634,3 +634,29 @@ class TestStopBlockMerging:
 
     def test_nothing_to_say_means_no_block(self, env):
         assert self._stop({self.EVENTS: {"continue_with": None}}, env) is None
+
+
+class TestMemoryWriteCredit:
+    WRITTEN = "/sessions/v1/memory-written"
+
+    def test_an_accepted_save_in_the_tool_result_is_credited(self, tmp_path):
+        env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+        answer = json.dumps({"status": "accepted", "record_id": "rec-42", "project": "x"})
+        payload = {**LIVE, "hook_event_name": "PostToolUse",
+                   "tool_name": "mcp__plugin_miragen-memory_miragen-bridge__memory_remember",
+                   "tool_response": [{"type": "text", "text": answer}]}
+        opener = _router({self.WRITTEN: {"credited": True}})
+        run("claude-code", payload, daemon_url="http://127.0.0.1:1", token=None, opener=opener,
+            pid=1, environ=env)
+        (request, _), = opener.calls
+        assert json.loads(request.data) == {"harness": "claude-code",
+                                            "session_id": LIVE["session_id"], "ref": "rec-42"}
+
+    def test_a_refused_save_or_another_tool_is_not(self, tmp_path):
+        from miragen_hook.client import memory_write_ref
+
+        assert memory_write_ref("mcp__x__memory_remember",
+                                [{"type": "text", "text": '{"status": "rejected"}'}]) == (False, None)
+        assert memory_write_ref("Bash", {"stdout": '"status": "accepted"'}) == (False, None)
+        assert memory_write_ref("mcp__x__memory_checkpoint", {"result": json.dumps(
+            {"status": "accepted", "context_id": "c1", "state_revision": 7})}) == (True, "ctx:c1:7")

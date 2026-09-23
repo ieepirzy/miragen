@@ -43,6 +43,9 @@ from miragen_hook.normalize import (
 DEFAULT_DAEMON_URL = "http://127.0.0.1:8420"
 EVENTS_PATH = "/sessions/v1/events"
 CLAIM_PATH = "/sessions/v1/recall/claim"
+WRITTEN_PATH = "/sessions/v1/memory-written"
+# The bridge's write tools, as Claude Code names them (mcp__<server>__<tool>).
+MEMORY_WRITE_TOOLS = ("memory_remember", "memory_checkpoint", "memory_correct")
 # Harnesses whose adapter keeps a recall-pending marker and claims background
 # recall results on PostToolUse (main thread) and Stop.
 ASYNC_RECALL_HARNESSES = ("claude-code",)
@@ -589,6 +592,9 @@ def run(
         return harness_output(harness, event_name, delivered)
     if harness not in ASYNC_RECALL_HARNESSES or not session_id:
         return output
+    if event_name == "PostToolUse" and not (payload.get("agent_id") or payload.get("agentId")):
+        _credit_memory_write(harness, payload, session_id, daemon_url=daemon_url, token=token,
+                             opener=opener)
     recalled = _deliver_recall(harness, event_name, payload, session_id,
                                daemon_url=daemon_url, token=token, environ=environ,
                                opener=opener)
@@ -603,6 +609,38 @@ def run(
     if recalled:
         return harness_output(harness, event_name, recalled)
     return output
+
+
+def memory_write_ref(tool_name: str, tool_response: Any) -> tuple[bool, str | None]:
+    """(accepted?, dedupe ref) for a bridge write tool's result, read from
+    the text the harness hands the hook (the tool answers JSON)."""
+    if not str(tool_name).endswith(MEMORY_WRITE_TOOLS):
+        return False, None
+    text = json.dumps(tool_response).replace('\\"', '"')
+    if '"status": "accepted"' not in text and '"status":"accepted"' not in text:
+        return False, None
+    import re
+
+    record = re.search(r'"record_id":\s*"([^"]+)"', text)
+    if record:
+        return True, record.group(1)
+    context = re.search(r'"context_id":\s*"([^"]+)"', text)
+    revision = re.search(r'"state_revision":\s*(\d+)', text)
+    if context:
+        return True, f"ctx:{context.group(1)}:{revision.group(1) if revision else ''}"
+    return True, None
+
+
+def _credit_memory_write(
+    harness: str, payload: dict, session_id: str, *, daemon_url: str, token: str | None,
+    opener,
+) -> None:
+    """The agent saved something: tell the daemon, whatever the agent named
+    as the project (the end-of-work nudge counts on this)."""
+    accepted, ref = memory_write_ref(payload.get("tool_name") or "", payload.get("tool_response"))
+    if accepted:
+        _post_json(WRITTEN_PATH, {"harness": harness, "session_id": session_id, "ref": ref},
+                   daemon_url=daemon_url, token=token, timeout=TIMEOUT_CAPTURE_S, opener=opener)
 
 
 def _deliver_recall(

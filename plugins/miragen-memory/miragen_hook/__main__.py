@@ -41,6 +41,9 @@ def _fast_exit() -> bool:
     session_id = payload.get("session_id")
     if not session_id or payload.get("agent_id"):
         return True
+    if str(payload.get("tool_name") or "").endswith(
+            ("memory_remember", "memory_checkpoint", "memory_correct")):
+        return False  # a save to credit (client.MEMORY_WRITE_TOOLS)
     base = os.environ.get("GROK_PLUGIN_DATA") or os.environ.get("CLAUDE_PLUGIN_DATA")
     if base:
         directory = Path(base) / "pending"

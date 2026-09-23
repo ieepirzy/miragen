@@ -219,7 +219,8 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
             instance=identity.slug, run_id=session, content=content,
         )
         if result.get("status") == "accepted":
-            plane.note_memory_write(session or project or _connection_session(ctx))
+            plane.note_memory_write(session or _connection_session(ctx) or project,
+                                    ref=result.get("record_id"))
         return _dump({**result, "project": identity.id, "scope": write, "scope_detail": detail})
 
     @mcp.tool()
@@ -242,7 +243,8 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
             corrected_payload=correction, reason=reason,
         )
         if isinstance(result, dict) and result.get("status") == "accepted":
-            plane.note_memory_write(project or _connection_session(ctx))
+            plane.note_memory_write(_connection_session(ctx) or project,
+                                    ref=result.get("record_id") or result.get("revision_id"))
         return _dump(result)
 
     @mcp.tool()
@@ -260,7 +262,8 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
         plane, identity, lifecycle, write, _ = await _lifecycle(project or _connection_session(ctx))
         result = await lifecycle.checkpoint(instance=identity.slug, patch=state)
         if result.get("status") == "accepted":
-            plane.note_memory_write(project or _connection_session(ctx))
+            plane.note_memory_write(_connection_session(ctx) or project,
+                                    ref=f"ctx:{result.get('context_id')}:{result.get('state_revision')}")
         return _dump({**result, "project": identity.id, "scope": write})
 
     # ── artifact store ────────────────────────────────────────────────────────
