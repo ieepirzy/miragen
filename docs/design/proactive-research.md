@@ -2,8 +2,8 @@
 
 Status: **Foundations only**, 2026-09-23. No code has been written. This doc
 records where the capability would attach and what has to be true before each
-piece gets built. Tracking issues: research skill #TBD-SKILL, librarian
-experiment #TBD-EXP, optional integration #TBD-INT.
+piece gets built. Tracking issues: research skill #136, librarian
+experiment #137, optional integration #138.
 
 ## Goal
 
@@ -105,16 +105,16 @@ result on most turns.
 ## Roadmap
 
 1. **Foundations.** This doc and the issues. *Done.*
-2. **Research skill (#TBD-SKILL).** Independently useful; ship it.
+2. **Research skill (#136).** Independently useful; ship it.
 3. **Measure the skill in real sessions.** Use the transcript method from the
    #110 audit: how often it loads, and how often agents research when it would
    have mattered. If it doesn't trigger, fix its `description` first.
    **Gate:** steps 4–5 happen only if the skill, once it triggers reliably,
    still leaves consequential gaps unnoticed.
-4. **Librarian experiment (#TBD-EXP).** Offline, on a handful of real
+4. **Librarian experiment (#137).** Offline, on a handful of real
    scenarios. It answers one question: can a small model spot gaps worth
    researching from what the plane actually sees? *Contingent on step 3.*
-5. **Optional integration (#TBD-INT).** Wire it into the plane behind the
+5. **Optional integration (#138).** Wire it into the plane behind the
    toggle, then validate it against real workflows. *Contingent on step 4
    succeeding and on #126 being merged.*
 
@@ -131,7 +131,7 @@ It is a valid outcome to stop after step 3.
    - a hook payload enriched with new fields;
    - the transcript, which is local sessions only.
 
-   The experiment (#TBD-EXP) should test the first one before anything is
+   The experiment (#137) should test the first one before anything is
    added.
 2. **Does "base agent" include profile agents and the executor tier?** The
    default answer is no. Harness sessions get the skill. Profile agents, which
