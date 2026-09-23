@@ -262,9 +262,29 @@ there's no model-free "interim" recall.
   tentative. Otherwise this would reopen the §17.1 finding. It's consistent
   with §17.7 because the selector still decides relevance; only candidate
   generation is trivial.
-- *Latency:* the selector runs synchronously with a hard 4 s timeout. On
-  timeout, optional recall degrades to nothing for that prompt and the status
-  line says so. Trivial prompts ("yes", "merge it", under ~20 chars with no
+- *Asynchronous recall (decision 11).* The prompt hook never waits for the
+  selector. `UserPromptSubmit` answers at once with one line in the status
+  line: recall for this prompt is running in the background, results arrive
+  after a later tool result, don't poll and don't re-run `memory_recall` for
+  the same thing. The line is skipped when the scope has zero eligible
+  records. The daemon runs search and selection as a background task, keyed
+  to that prompt. Delivery:
+  - a new `PostToolUse` hook, gated on a local per-session "recall pending"
+    marker, so it exits without touching the network when nothing is
+    outstanding. When the result is ready, it goes out as `additionalContext`
+    on that tool result. Fetching it is the atomic delivery claim, so
+    injections are counted when **delivered**, not when prepared;
+  - if the turn ends first, the miragen Stop handler waits a short, bounded
+    time and blocks only for a **non-empty** selection. This is the same
+    handler, and the same per-session state, as the P1a nudge, so there is
+    one miragen Stop block at a time;
+  - a result is dropped when a newer prompt arrived, the context compacted,
+    or the session ended;
+  - HTTP-hook (cloud) sessions have no local marker, so they get no async
+    delivery in v1 (issue filed).
+  Selector latency (2.5–18 s through the runner) stops mattering to the
+  prompt path. Runner calls share a small concurrency cap, since each one is
+  a Node process on a memory-constrained VPS. Trivial prompts ("yes", "merge it", under ~20 chars with no
   new facet) skip the selector call. That decides *whether* recall runs, not
   what's relevant, so it doesn't bend §17.7's rule.
 - *Budget:* tighter than §17.7's 2,000-token ceiling: about 800 tokens or
@@ -433,7 +453,17 @@ Decided by Ilari, 2026-09-23 (design round, answering §9):
 7. **Stop-hook coexistence with MiraDesign is proven by a test** (§5 item 8),
    not argued.
 
-Still open:
+Decided by Ilari, 2026-09-23 (answers to A–D below):
+8. **A:** Claude Code auto-memory stays **on** for now (the baseline).
+9. **B:** "no redaction" still holds; deferred to #116.
+10. **C:** the runner lives on the **VPS**. Ilari accepts that blast radius:
+    the credential only spends his subscription's usage limits. This holds on
+    the condition that the `setup-token` credential gives no billing or
+    account control; see P1.0.
+11. **D:** recall is **asynchronous**: the agent is told it's running and
+    gets the result later, like an async API call (P2).
+
+Kept for the record:
 A. **`MEMORY.md` coexistence during the trial.** Claude Code's system prompt
    tells agents to write file memory, and that competes with the nudge.
    Options: (a) leave auto-memory on as the baseline and let P4 compare;
@@ -451,9 +481,8 @@ C. **Where the runner lives.** Either on the VPS next to the bridge (it needs
    extraction can queue, but per-prompt selection from cloud sessions would
    degrade while it's off. Recommendation: the VPS, if Ilari accepts the
    credential there.
-D. **Selector latency.** Is +2.5–4 s per non-trivial prompt acceptable? If
-   not, the selector runs asynchronously and the result is delivered at the
-   next Stop continuation instead of up front.
+D. **Selector latency.** Is +2.5–4 s per non-trivial prompt acceptable?
+   Answered by decision 11: recall doesn't block the prompt at all.
 
 ## 9. Handoff: design questions for a fresh session
 
