@@ -398,7 +398,11 @@ class TestHostedBridgeAdapter:
         assert read_token(str(f), env) == "filetoken"
 
     def test_http_install_for_a_repository(self, tmp_path):
-        from miragen_hook.install import CLAUDE_CODE_EVENTS, install_hooks, uninstall_hooks
+        from miragen_hook.install import (
+            CLAUDE_CODE_EVENTS,
+            install_hooks,
+            uninstall_hooks,
+        )
 
         settings = tmp_path / ".claude" / "settings.json"
         settings.parent.mkdir()
@@ -535,7 +539,11 @@ class TestBackgroundRecall:
         assert silent.calls == []
 
     def test_stop_waits_briefly_and_blocks_only_for_something_to_show(self, env):
-        from miragen_hook.client import STOP_CLAIM_WAIT_S, read_recall_marker, write_recall_marker
+        from miragen_hook.client import (
+            STOP_CLAIM_WAIT_S,
+            read_recall_marker,
+            write_recall_marker,
+        )
 
         write_recall_marker(LIVE["session_id"], 2, env)
         ready = _router({self.EVENTS: {}, self.CLAIM: {"state": "ready", "context": "RECALLED"}})
@@ -582,7 +590,7 @@ class TestBackgroundRecall:
         def invoke():
             return subprocess.run([sys.executable, "-m", "miragen_hook", "claude-code"],
                                   input=payload, env=env, capture_output=True, text=True,
-                                  timeout=20)
+                                  timeout=20, check=False)
 
         quiet = invoke()
         assert quiet.returncode == 0 and quiet.stdout == "" and quiet.stderr == ""
