@@ -373,11 +373,14 @@ directory, thinking disabled, and the SDK's JSON-schema structured output
 validated into the selection (strict JSON of the result text is the only
 fallback). The daemon warns at startup when the SDK is missing or no
 credential is visible. **Latency**: each selection spawns the bundled CLI;
-measured on a desktop, 1.6–2.0 s per call end to end (≈0.3 s spawn to first
-message, ≈1.4 s model time with Haiku), i.e. roughly that much added to every
-prompt that is not a cache hit. `timeout_s` (default 6 s) bounds it below the
-plane's 8 s prompt-recall bound, so a slow model degrades the lane instead of
-stalling the hook (the hook client gives up at 15 s).
+measured on a desktop (Haiku), 1.6–2.5 s per selection and 2.3–2.5 s for the
+whole `UserPromptSubmit` hook round trip (≈1.4 s of it is model time, the rest
+CLI spawn and init); a prompt answered from the selection cache costs ≈0.1 s.
+That is added to every prompt that is not a cache hit. `timeout_s` (default
+6 s) bounds the selection below the plane's 8 s prompt-recall bound and the
+adapter's 10 s context timeout, so a slow model degrades the lane instead of
+stalling the hook; the caller gets the failure at the deadline while the CLI
+is torn down in the background.
 
 `/health` → `sessions.recall` names `selector_backend` (`claude-code` /
 `pydantic-ai`), `selector_model`, whether a `selector_base_url` is set
