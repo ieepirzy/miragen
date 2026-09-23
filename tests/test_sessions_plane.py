@@ -704,3 +704,122 @@ class TestHttp:
         assert attrs["mira.run.trigger"] == "input.received"
         assert attrs["mira.project.id"] == "github.com/org/repo"
         assert "secret plan" not in json.dumps(attrs)
+
+
+class TestStatusLine:
+    """The opening context always ends with one `[memory status]` line, so
+    an agent never has to read meaning into silence (memory-effectiveness
+    P3)."""
+
+    async def test_recall_off_is_said_out_loud(self, tmp_path):
+        h = Harness(tmp_path)
+        result = await h.send("SessionStart", source="startup")
+        status = result.context.splitlines()[-1]
+        assert status.startswith("[memory status] automatic recall is OFF")
+        assert "memory_recall searches on demand" in status
+        assert status.endswith("capture ok")
+
+    async def test_recall_on_without_a_query_says_it_runs_per_prompt(self, tmp_path):
+        async def selector(request, cards):
+            return SelectionResult(selections=[])
+
+        h = Harness(tmp_path, selector=selector)
+        result = await h.send("SessionStart", source="startup")
+        assert "automatic recall on; it runs on each prompt of 5+ characters" in result.context.splitlines()[-1]
+
+    async def test_recent_capture_failures_are_announced(self, tmp_path):
+        h = Harness(tmp_path)
+        h.plane.stats.note_capture(True, PROJECT_SCOPE)
+        h.plane.stats.note_capture(False, PROJECT_SCOPE)
+        result = await h.send("SessionStart", source="startup")
+        assert "capture FAILING: 1 of 2 recent writes to this project" in result.context.splitlines()[-1]
+        snapshot = h.plane.stats.snapshot()
+        assert snapshot["recent_capture_failures"] == 1
+        assert "recent_captures" not in snapshot  # the deque never reaches /health
+
+    async def test_other_projects_and_old_failures_are_not_blamed(self, tmp_path):
+        import time as _time
+
+        from miragen.daemon.sessions import plane as plane_mod
+
+        h = Harness(tmp_path)
+        h.plane.stats.note_capture(False, "group:project.somewhere-else")
+        h.plane.stats.recent_captures.append(
+            (_time.monotonic() - plane_mod.RECENT_CAPTURE_SECONDS - 1, PROJECT_SCOPE, False))
+        result = await h.send("SessionStart", source="startup")
+        assert result.context.splitlines()[-1].endswith("capture ok")
+
+    async def test_failed_episodes_count_as_capture_failures(self, tmp_path):
+        h = Harness(tmp_path)
+        h.plane.stats.note_outcome(False, PROJECT_SCOPE)  # what a lost episode records
+        result = await h.send("SessionStart", source="startup")
+        assert "capture FAILING" in result.context.splitlines()[-1]
+
+    async def test_no_tools_means_no_tool_advice(self, tmp_path):
+        h = Harness(tmp_path)
+        h.plane.config.mcp.enabled = False
+        status = (await h.send("SessionStart", source="startup")).context.splitlines()[-1]
+        assert "automatic recall is OFF" in status and "memory_recall" not in status
+
+    async def test_recall_only_at_open_is_not_claimed_per_prompt(self, tmp_path):
+        async def selector(request, cards):
+            return SelectionResult(selections=[])
+
+        h = Harness(tmp_path, selector=selector)
+        h.plane.config.recall.on_prompt = False
+        status = (await h.send("SessionStart", source="startup")).context.splitlines()[-1]
+        assert "only at session open" in status and "each prompt" not in status
+
+    async def test_retrieval_timeout_is_announced_once_not_every_prompt(self, tmp_path, monkeypatch):
+        import asyncio as _asyncio
+
+        from miragen.daemon.sessions import plane as plane_mod
+        from miragen.memory.lifecycle import MemoryLifecycle
+
+        async def hang(self, **kwargs):
+            await _asyncio.sleep(1)
+
+        monkeypatch.setattr(plane_mod, "RETRIEVAL_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(MemoryLifecycle, "prepare_context", hang)
+        h = Harness(tmp_path)
+        first = await h.send("SessionStart", source="startup")
+        assert first.context.startswith("[memory status] memory UNAVAILABLE for this session (retrieval timed out)")
+        again = await h.send("UserPromptSubmit", prompt="still slow?", prompt_id="p-1")
+        assert again.context is None  # the late-open retry stays quiet
+
+    async def test_injected_memories_are_counted_and_citation_asked(self, tmp_path):
+        from miragen.memory.lifecycle import MemoryPacket
+
+        h = Harness(tmp_path)
+        packet = MemoryPacket(text="", optional_status="ok", items=[
+            {"kind": "working_state"}, {"revision_id": "r1"}, {"revision_id": "r2"}])
+        line = h.plane._status_line(packet, project_scope="group:project.x")
+        assert "2 memories in group:project.x injected above — cite the ids" in line
+
+
+def test_only_rendered_recall_entries_are_tracked():
+    """Entries past the optional budget are not in the text, so they must
+    not be in the manifest or counted for citation either."""
+    from miragen.memory.selection import fit_optional_entries, render_optional_section
+
+    entries = [{"record_id": f"rec-{i}aaaaaa", "type": "claim", "text": "x" * 60 + "\nline two",
+                "reason": "r"} for i in range(5)]
+    fitted = fit_optional_entries(entries, 250)
+    section = render_optional_section(entries, 250)
+    assert 0 < len(fitted) < len(entries)
+    assert all(e["record_id"][:8] in section for e in fitted)
+    assert not any(e["record_id"][:8] in section for e in entries[len(fitted):])
+
+
+@pytest.mark.parametrize("status,degraded,expected", [
+    ("empty", None, "searched in group:project.x: nothing stored matches yet"),
+    ("none_selected", None, "searched in group:project.x: nothing relevant to this"),
+    ("degraded: selector: boom", None, "recall DEGRADED"),
+    (None, "prepare: unreachable", "recall DEGRADED"),
+])
+def test_status_line_recall_states(tmp_path, status, degraded, expected):
+    from miragen.memory.lifecycle import MemoryPacket
+
+    h = Harness(tmp_path)
+    packet = MemoryPacket(text="", optional_status=status, degraded=degraded)
+    assert expected in h.plane._status_line(packet, project_scope="group:project.x")

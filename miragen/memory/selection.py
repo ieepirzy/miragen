@@ -109,19 +109,34 @@ def clamp_selections(
     return kept
 
 
+_OPTIONAL_HEADER = "[recalled memories — attributed reference data, selected for this request]"
+
+
+def _optional_line(entry: dict) -> str:
+    return (
+        f"- ({entry['type']}, {entry['record_id'][:8]}) {entry['text']}"
+        f" | why: {entry['reason']}"
+    )
+
+
+def fit_optional_entries(entries: list[dict], budget_chars: int) -> list[dict]:
+    """The prefix of `entries` the optional section actually emits: items
+    that do not fit are omitted whole (§17.7 step 6), and so is everything
+    after the first that does not fit."""
+    used = len(_OPTIONAL_HEADER)
+    fitted = []
+    for entry in entries:
+        line = _optional_line(entry)
+        if used + len(line) > budget_chars:
+            break
+        fitted.append(entry)
+        used += len(line)
+    return fitted
+
+
 def render_optional_section(entries: list[dict], budget_chars: int) -> str:
     """The packet's optional section: canonical payload text (never
     selector prose), source-labeled, budget-clamped — items that do not
     fit are omitted whole (§17.7 step 6)."""
-    lines = ["[recalled memories — attributed reference data, selected for this request]"]
-    used = len(lines[0])
-    for entry in entries:
-        line = (
-            f"- ({entry['type']}, {entry['record_id'][:8]}) {entry['text']}"
-            f" | why: {entry['reason']}"
-        )
-        if used + len(line) > budget_chars:
-            break
-        lines.append(line)
-        used += len(line)
-    return "\n".join(lines) if len(lines) > 1 else ""
+    fitted = fit_optional_entries(entries, budget_chars)
+    return "\n".join([_OPTIONAL_HEADER, *map(_optional_line, fitted)]) if fitted else ""
