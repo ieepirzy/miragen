@@ -192,9 +192,10 @@ Postgres, Loimi's authenticated API and Miragen's source/recall/check/worker cod
 
 ## Rollout and limitations
 
-Apply Loimi migration **0011_memory_grounding** through its normal migration
-runner before running the changed memory service. Then update Miragen. There
-are no new dependencies or daemon configuration keys. Existing principals keep
+Loimi automatically applies **0011_memory_grounding** during normal startup,
+before accepting requests. No manual migration step is needed. When rolling
+out these changes, update Loimi before Miragen. There are no new dependencies
+or daemon configuration keys. Existing principals keep
 their capabilities: grounding creation needs `read`/`propose`, checks need
 `read`/`propose`/`maintain`, consolidation needs
 `read`/`propose`/`maintain`/`resolve`. A backend
