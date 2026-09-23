@@ -71,3 +71,25 @@ def test_manifests_and_mcp_config():
     [entry] = marketplace["plugins"]
     assert entry["name"] == "miragen-memory" and entry["source"] == "./plugins/miragen-memory"
     assert (PLUGIN / "skills" / "memory-bridge" / "SKILL.md").read_text().startswith("---\ndescription:")
+
+
+def test_codex_manifest():
+    """Codex prefers .codex-plugin over .claude-plugin, and its `hooks` /
+    `mcpServers` REPLACE hooks/hooks.json and .mcp.json: an explicitly
+    empty hooks file (the daemon writes the trusted native hooks; the Claude
+    file would label every Codex event claude-code) and the stdio proxy
+    (Codex plugin MCP has no variable expansion and a cleared environment,
+    so the variables it may read are named)."""
+    claude = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())
+    grok = json.loads((PLUGIN / ".grok-plugin" / "plugin.json").read_text())
+    codex = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text())
+    assert codex["name"] == claude["name"] == grok["name"]
+    assert codex["version"] == claude["version"] == grok["version"]
+    assert "userConfig" not in codex
+    assert json.loads((PLUGIN / codex["hooks"]).read_text())["hooks"] == {}
+    server = json.loads((PLUGIN / codex["mcpServers"]).read_text())["mcpServers"]["miragen-bridge"]
+    assert server["cwd"] == "." and server["command"] == "python3"
+    assert server["args"] == ["./miragen_hook/__main__.py", "mcp-proxy", "--harness", "codex"]
+    assert (PLUGIN / server["args"][0]).is_file()
+    assert set(server["env_vars"]) == {"MIRAGEND_URL", "MIRAGEND_TOKEN", "CODEX_HOME"}
+    assert "${" not in json.dumps(server)  # never expanded by Codex

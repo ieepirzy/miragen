@@ -512,17 +512,20 @@ class TestGrokInstallAndPlugin:
         claude = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())
         assert result.stdout.strip() == claude["userConfig"]["daemon_url"]["default"], result.stderr
 
-    def test_grok_mcp_config_uses_only_what_grok_expands(self):
+    def test_grok_mcp_config_is_the_stdio_proxy(self):
+        """Grok expands only the plugin-root tokens and env vars in MCP
+        configs, never Claude's options: the proxy resolves URL + token with
+        the hooks' own chain (daemon setup record → MIRAGEND_URL/TOKEN →
+        saved Claude option → manifest default) and names the session from
+        GROK_SESSION_ID — tools and hooks cannot reach different daemons."""
         manifest = json.loads((PLUGIN / ".grok-plugin" / "plugin.json").read_text())
         text = (PLUGIN / manifest["mcpServers"]).read_text()
         assert "user_config" not in text  # never expanded by Grok
         server = json.loads(text)["mcpServers"]["miragen-bridge"]
-        assert server["url"].startswith("${MIRAGEND_URL:-https://")  # default, never an empty URL
-        assert server["headers"]["X-Harness-Session"] == "grok-build:{{session_id}}"
-        # Grok adds Authorization only when the variable is set; a literal
-        # `Bearer ${MIRAGEND_TOKEN:-}` header would suppress OAuth when unset.
-        assert server["bearer_token_env_var"] == "MIRAGEND_TOKEN"
-        assert "Authorization" not in server["headers"]
+        assert server == {"command": "python3",
+                          "args": ["${GROK_PLUGIN_ROOT}/miragen_hook/__main__.py", "mcp-proxy",
+                                   "--harness", "grok-build"]}
+        assert (PLUGIN / "miragen_hook" / "__main__.py").is_file()
 
 
 # ── bridge MCP: the session named by the connection ──────────────────────────

@@ -1,6 +1,6 @@
 {
   "name": "miragen-memory",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Join this Claude Code session to the miragen memory bridge: context injected at start, prompts/outcomes captured, episodes filed as Loimi artifacts, memory_* and store_* tools via MCP.",
   "author": {
     "name": "ieepirzy",
