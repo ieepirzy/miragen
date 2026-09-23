@@ -25,7 +25,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -72,7 +72,24 @@ _HARNESS_PROCESS_MARKERS = {
 
 # Grok Build honours additionalContext on tool results up to 10,000 chars.
 DEFERRED_CONTEXT_CAP = 10_000
+# Codex spills additionalContext above its per-hook token limit (bytes/4) to
+# a file, showing the model only a head/tail preview. The daemon-written
+# entries raise the limit to 6,000 tokens (harness_setup); the context is
+# capped in UTF-8 BYTES below that, keeping the head (the session header
+# with store_run=… and the guide lead).
+CODEX_CONTEXT_CAP_BYTES = 6_000 * 4 - 200
+_TRUNCATION_NOTE = "\n[miragen-hook: context truncated here ({} more bytes) — memory_read / memory_recall for the rest]"
 _DELIVERY_EVENTS = ("PostToolUse", "PostToolUseFailure")
+
+
+def cap_context_bytes(text: str, limit: int) -> str:
+    """`text` within `limit` UTF-8 bytes, head kept, with a note of the cut."""
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return text
+    note_room = len(_TRUNCATION_NOTE.format(len(raw)).encode("utf-8"))
+    head = raw[:max(0, limit - note_room)].decode("utf-8", "ignore")
+    return head + _TRUNCATION_NOTE.format(len(raw) - len(head.encode("utf-8")))
 
 
 def timeout_for(event: NormalizedEvent) -> float:
@@ -199,7 +216,7 @@ def build_envelope(
                 "deferred" if harness in DEFERRED_CONTEXT_HARNESSES else "immediate"
             ),
         },
-        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "sent_at": datetime.now(UTC).isoformat(),
     }
 
 
@@ -235,12 +252,17 @@ def post_envelope(
 
 
 def read_token(token_file: str | None, environ: dict | None = None) -> str | None:
+    """--token-file (a 0600 file the daemon's harness setup names) → the
+    environment. A named file that is missing or empty falls through: the
+    environment may still carry the bearer."""
     env = os.environ if environ is None else environ
     if token_file:
         try:
-            return Path(token_file).read_text().strip() or None
+            token = Path(token_file).read_text().strip()
         except OSError:
-            return None
+            token = ""
+        if token:
+            return token
     for name in TOKEN_ENV_VARS:
         if env.get(name):
             return env[name]
@@ -495,8 +517,31 @@ def _forward(
             stash_context(event.session_id, context, environ,
                           origin="SessionStart" if event.name in CONTEXT_OPENING else "UserPromptSubmit")
             return None
+        if harness == "codex":
+            context = cap_context_bytes(context, CODEX_CONTEXT_CAP_BYTES)
         return harness_output(harness, event.original_event, context)
     return None
+
+
+def _setup_command(args) -> int:
+    from miragen_hook import harness_setup
+
+    ensure = {"grok-build": harness_setup.ensure_grok, "codex": harness_setup.ensure_codex}
+    remove = {"grok-build": harness_setup.remove_grok, "codex": harness_setup.remove_codex}
+    try:
+        if args.remove:
+            status = remove[args.harness](args.home)
+        else:
+            if not args.daemon:
+                print("miragen-hook: setup needs --daemon URL (where the sessions should report)",
+                      file=sys.stderr)
+                return 2
+            status = ensure[args.harness](args.home, url=args.daemon, token_file=args.token_file)
+    except harness_setup.SetupError as exc:
+        print(f"miragen-hook: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(status, indent=2))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -522,11 +567,30 @@ def main(argv: list[str] | None = None) -> int:
              "join too. The bearer is read from $MIRAGEND_TOKEN where the harness runs.",
     )
 
+    setup = sub.add_parser(
+        "setup", help="write/refresh (or --remove) the daemon-managed Grok/Codex setup by hand "
+                      "(miragend does this itself; manual/debug fallback)")
+    setup.add_argument("harness", choices=("grok-build", "codex"))
+    setup.add_argument("--daemon", default=None, help="URL the harness sessions report to")
+    setup.add_argument("--token-file", default=None)
+    setup.add_argument("--home", default=None, help="GROK_HOME / CODEX_HOME (default: env, ~/.grok, ~/.codex)")
+    setup.add_argument("--remove", action="store_true")
+
+    from miragen_hook.mcp_proxy import add_parser as add_proxy_parser
+    add_proxy_parser(sub)
+
     args_list = list(sys.argv[1:] if argv is None else argv)
     # `miragen-hook claude-code` is the hook command line: default subcommand.
     if args_list and args_list[0] in HARNESSES:
         args_list = ["forward", *args_list]
     args = parser.parse_args(args_list)
+
+    if args.command == "mcp-proxy":
+        from miragen_hook import mcp_proxy
+        return mcp_proxy.main(args)
+
+    if args.command == "setup":
+        return _setup_command(args)
 
     daemon_url = resolve_daemon_url(args.daemon)
 
