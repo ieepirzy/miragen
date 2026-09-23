@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -44,6 +45,9 @@ class ResolvedHarnessSetup:
     url: str | None
     token_file: str | None
     interval_s: int
+    # Explicitly disabled: undo what THIS daemon wrote (a setup record with
+    # managed_by=miragend), so hooks and proxies stop following it.
+    remove: bool = False
 
 
 # Not `…_TOKEN_FILE`: main() resolves every `*_FILE` variable into its
@@ -58,12 +62,19 @@ def resolve_harness_setup(
     token_file = env.get("MIRAGEND_HARNESS_SETUP_TOKEN_PATH") or (
         str(Path(config.token_file).expanduser()) if config.token_file else None
     )
-    interval = int(env.get("MIRAGEND_HARNESS_SETUP_INTERVAL_S") or config.interval_s)
+    raw_interval = env.get("MIRAGEND_HARNESS_SETUP_INTERVAL_S")
+    try:
+        interval = int(raw_interval) if raw_interval else config.interval_s
+    except ValueError:
+        logger.warning(f"MIRAGEND_HARNESS_SETUP_INTERVAL_S={raw_interval!r} is not a number; "
+                       f"using {config.interval_s}s")
+        interval = config.interval_s
     switch = (env.get("MIRAGEND_HARNESS_SETUP") or "").strip().lower()
     explicit = False if switch in _FALSE else True if switch in _TRUE else config.enabled
 
     if explicit is False:
-        return ResolvedHarnessSetup(False, "disabled by configuration", url, token_file, interval)
+        return ResolvedHarnessSetup(False, "disabled by configuration (daemon-written setup removed)",
+                                    url, token_file, interval, remove=True)
     if not url:
         return ResolvedHarnessSetup(
             False, "no harness_setup.url (or MIRAGEND_HARNESS_SETUP_URL): nothing to point "
@@ -98,22 +109,63 @@ class HarnessSetupService:
     at startup and every interval."""
 
     def __init__(self, resolved: ResolvedHarnessSetup, environ: dict | None = None,
-                 *, ensure: dict[str, Callable[..., dict]] | None = None):
+                 *, ensure: dict[str, Callable[..., dict]] | None = None,
+                 remove: dict[str, Callable[..., dict]] | None = None):
         from miragen_hook import harness_setup
 
         self.resolved = resolved
         self.environ = dict(os.environ if environ is None else environ)
+        # The adapter is snapshotted ONCE, now: a local miragend often runs
+        # editable from a live checkout that other sessions switch branches
+        # in — that must not reach the harness homes within an interval.
+        self._source = None
+        if resolved.enabled and ensure is None:
+            self._snapshot_dir = tempfile.TemporaryDirectory(prefix="miragend-adapter-")
+            self._source = harness_setup.snapshot_adapter(Path(self._snapshot_dir.name))
         self._ensure = ensure or {
             "grok-build": lambda: harness_setup.ensure_grok(
                 harness_setup.grok_home(self.environ), url=self.resolved.url,
-                token_file=self.resolved.token_file, environ=self.environ),
+                token_file=self.resolved.token_file, environ=self.environ, source=self._source),
             "codex": lambda: harness_setup.ensure_codex(
                 harness_setup.codex_home(self.environ), url=self.resolved.url,
-                token_file=self.resolved.token_file, environ=self.environ),
+                token_file=self.resolved.token_file, environ=self.environ, source=self._source),
         }
+        homes = {"grok-build": lambda: harness_setup.grok_home(self.environ),
+                 "codex": lambda: harness_setup.codex_home(self.environ)}
+        removers = {"grok-build": harness_setup.remove_grok, "codex": harness_setup.remove_codex}
+
+        def _remover(name):
+            def run() -> dict:
+                home = homes[name]()
+                record = harness_setup.read_setup_record(home)
+                if record.get("managed_by") != harness_setup.MANAGED_BY_DAEMON:
+                    return {"changed": []}  # not ours (absent, or the plugin's fallback)
+                return removers[name](home)
+            return run
+
+        self._remove = remove or {name: _remover(name) for name in self._ensure}
         self.status = {name: HarnessStatus() for name in self._ensure}
         self.runs = 0
         self._task: asyncio.Task | None = None
+
+    def remove_once(self) -> dict[str, dict]:
+        """Undo this daemon's setup (explicitly disabled)."""
+        for name, remove in self._remove.items():
+            status = self.status[name]
+            status.last_run_at = time.time()
+            try:
+                result = remove()
+            except Exception as exc:  # noqa: BLE001
+                status.last_error = f"{type(exc).__name__}: {exc}"
+                logger.warning(f"harness setup removal ({name}): {status.last_error}")
+                continue
+            status.current = False
+            status.last_error = None
+            if result.get("changed"):
+                status.last_changed = list(result["changed"])
+                status.last_changed_at = status.last_run_at
+                logger.info(f"harness setup ({name}): removed {', '.join(result['changed'])}")
+        return self.describe()["harnesses"]
 
     def run_once(self) -> dict[str, dict]:
         if not self.resolved.enabled:
@@ -152,6 +204,9 @@ class HarnessSetupService:
     async def start(self) -> None:
         if not self.resolved.enabled:
             logger.info(f"harness setup off: {self.resolved.reason}")
+            if self.resolved.remove:
+                self._task = asyncio.create_task(asyncio.to_thread(self.remove_once),
+                                                 name="miragend-harness-setup-remove")
             return
         logger.info(f"harness setup on: sessions report to {self.resolved.url} "
                     f"(token file: {self.resolved.token_file or 'none'}), every "

@@ -204,3 +204,61 @@ class TestTokenAndCap:
                   opener=lambda req, timeout: R(json.dumps({"context": big}).encode()))
         context = out["hookSpecificOutput"]["additionalContext"]
         assert (len(context.encode()) <= CODEX_CONTEXT_CAP_BYTES) is capped
+
+
+
+class TestRedirects:
+    @staticmethod
+    def _redirecting(location, seen):
+        from email.message import Message
+
+        def opener(request, timeout):
+            seen.append((request.full_url, request.get_header("Authorization")))
+            if len(seen) == 1:
+                headers = Message()
+                headers["Location"] = location
+                raise urllib.error.HTTPError(request.full_url, 307, "moved", headers, io.BytesIO(b""))
+
+            class R(io.BytesIO):
+                headers = {"Content-Type": "application/json"}  # noqa: RUF012
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+            return R(b'{"jsonrpc":"2.0","id":1,"result":{}}')
+        return opener
+
+    def test_same_origin_redirect_is_followed(self):
+        seen, out = [], io.StringIO()
+        proxy = mcp_proxy.Proxy("https://m.example", "tok", out=out,
+                                opener=self._redirecting("/mcp/", seen))
+        proxy.forward({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        assert seen[1] == ("https://m.example/mcp/", "Bearer tok")
+        assert json.loads(out.getvalue())["result"] == {}
+
+    @pytest.mark.parametrize("location", ["https://evil.example/mcp", "http://m.example/mcp",
+                                          "https://m.example:8443/mcp"])
+    def test_the_bearer_never_follows_to_another_origin(self, location):
+        seen, out = [], io.StringIO()
+        proxy = mcp_proxy.Proxy("https://m.example", "tok", out=out,
+                                opener=self._redirecting(location, seen))
+        proxy.forward({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        assert len(seen) == 1 and "307" in json.loads(out.getvalue())["error"]["message"]
+
+
+
+def test_old_grok_degrades_to_no_session_header(capsys):
+    assert mcp_proxy.harness_session("grok-build", {}) is None
+    assert "1.0.41" in capsys.readouterr().err
+
+
+def test_a_cli_record_is_authoritative_too(tmp_path):
+    home = tmp_path / ".grok"
+    home.mkdir()
+    hs.ensure_grok(home, url="https://cli.example", managed_by=hs.MANAGED_BY_CLI)
+    env = {"GROK_HOME": str(home), "MIRAGEND_URL": "https://env.example"}
+    assert mcp_proxy.resolve("grok-build", None, None, env)[0] == "https://cli.example"
+    mcp_proxy._secondary_grok_setup("https://plugin.example", None, env)
+    assert hs.read_setup_record(home)["url"] == "https://cli.example"

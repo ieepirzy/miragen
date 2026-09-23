@@ -147,7 +147,41 @@ home** (`Environment=CODEX_HOME=…`). What it writes, and only that:
 
 TOML is edited table by table and re-parsed; an edit that would change
 anything outside our tables (our key defined inline or dotted, say) is
-refused and reported on `/health` instead of written. A second run with
+refused and reported on `/health` instead of written. What a user adds to
+our server table (`enabled = false`, `env`, timeouts, a per-tool
+`[mcp_servers.miragen-bridge.tools.<tool>] approval_mode` narrowing our
+blanket approve) is carried over, as is `enabled` on our trust keys.
+config.toml (the trust) is written before hooks.json, so a failed write
+never leaves untrusted hooks. A UTF-8 BOM is kept; files that are symlinks
+(dotfile managers) are written through — the link stays, its target
+changes. Every edit holds an exclusive lock on
+`<home>/.mira-harness-setup.lock`, shared with MiraDesign's setup, and our
+hook groups are replaced in place (Codex keys trust by group position).
+Still refused: our tables defined inline or as dotted keys, and a line
+looking like one of our table headers inside a multi-line string. A
+superseded adapter copy is deleted 24 h after it stopped being referenced;
+a session running longer than that loses its hooks (fail-open) until
+restarted. Disabling explicitly (`enabled: false` or
+`MIRAGEND_HARNESS_SETUP=off`) removes what this daemon wrote (only where its
+`setup.json` says `managed_by: miragend`); an unset URL leaves things as
+they are. Python: the hooks, the MCP proxy and the Grok setup need ≥ 3.10;
+the Codex setup ≥ 3.11 (tomllib) and reports an error otherwise.
+
+More rules: our handler inside a user's hook group (next to theirs, under
+their matcher) is replaced or removed alone — the group keeps its shape,
+and only our handler is trusted. The daemon installs from a snapshot of the
+adapter taken at its start (a local miragend often runs editable from a
+live checkout; a branch switch there does not reach the homes), and every
+copy is verified against its digest before it is published. A setup record
+written by `miragen-hook setup` (`managed_by: cli`) is authoritative like
+the daemon's (`miragend`); the proxy's fallback record (`plugin`) is not.
+**Grok Build ≥ 1.0.41 is required**: 0.2.114 gives stdio MCP servers
+neither `GROK_SESSION_ID` nor `GROK_PLUGIN_ROOT`, so the plugin's MCP entry
+does not start and, started by hand, the proxy sends no session header (it
+logs this once). `default_tools_approval_mode = "approve"` is pending
+Ilari's decision and lives in one constant
+(`harness_setup.CODEX_TOOLS_APPROVAL_MODE`, mirrored in the plugin's
+`codex.mcp.json`). A second run with
 nothing to change writes nothing. `GET /health` → `harness_setup`: enabled,
 reason, url, and per harness installed / current / last_changed /
 last_error. By hand (debug, or a machine without a daemon):

@@ -35,8 +35,11 @@ in the environment — which is how a cloud environment supplies them when
 plugin options are not available there.
 
 The hook adapter (`miragen_hook/` in this plugin, a vendored copy of the
-repository package) is **stdlib-only Python 3**; nothing is installed on the
-machine. Every hook fails open within its t## Codex and Grok Build: the local daemon sets them up
+repository package) is **stdlib-only Python ≥ 3.10** (the Codex setup
+alone needs 3.11); nothing is installed on the machine. Every hook fails open within its t## Codex and Grok Build: the local daemon sets them up
+
+Requires Grok Build ≥ 1.0.41 (older builds pass stdio MCP servers no
+`GROK_SESSION_ID` / `GROK_PLUGIN_ROOT`) and codex-cli ≥ 0.156.
 
 On a machine that runs AI harnesses, the local `miragend` writes the Codex
 and Grok Build setup itself — no per-machine step, no trust prompt — once

@@ -25,7 +25,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -216,7 +216,7 @@ def build_envelope(
                 "deferred" if harness in DEFERRED_CONTEXT_HARNESSES else "immediate"
             ),
         },
-        "sent_at": datetime.now(UTC).isoformat(),
+        "sent_at": datetime.now(timezone.utc).isoformat(),  # noqa: UP017 — Python 3.10 floor
     }
 
 
@@ -536,7 +536,8 @@ def _setup_command(args) -> int:
                 print("miragen-hook: setup needs --daemon URL (where the sessions should report)",
                       file=sys.stderr)
                 return 2
-            status = ensure[args.harness](args.home, url=args.daemon, token_file=args.token_file)
+            status = ensure[args.harness](args.home, url=args.daemon, token_file=args.token_file,
+                                          managed_by=harness_setup.MANAGED_BY_CLI)
     except harness_setup.SetupError as exc:
         print(f"miragen-hook: {exc}", file=sys.stderr)
         return 2

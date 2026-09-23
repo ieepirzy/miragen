@@ -30,6 +30,7 @@ import os
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from typing import Any
@@ -42,23 +43,34 @@ SESSION_HEADER = "X-Harness-Session"
 _ACCEPT = "application/json, text/event-stream"
 
 
+def _origin(url: str) -> tuple[str, str, int | None]:
+    parts = urllib.parse.urlsplit(url)
+    port = parts.port or {"http": 80, "https": 443}.get(parts.scheme)
+    return parts.scheme, (parts.hostname or "").lower(), port
+
+
 def _log(message: str) -> None:
     print(f"miragen-hook mcp-proxy: {message}", file=sys.stderr, flush=True)
 
 
 def harness_session(harness: str | None, environ: dict | None = None) -> str | None:
     env = os.environ if environ is None else environ
-    if harness == "grok-build" and env.get("GROK_SESSION_ID"):
-        return f"grok-build:{env['GROK_SESSION_ID']}"
+    if harness == "grok-build":
+        if env.get("GROK_SESSION_ID"):
+            return f"grok-build:{env['GROK_SESSION_ID']}"
+        # Grok < 1.0.41 (0.2.114, verified) passes its stdio MCP servers no
+        # GROK_SESSION_ID: the tools still work, unbound to the session.
+        _log("no GROK_SESSION_ID in the environment (Grok Build < 1.0.41?): tool calls are "
+             "not bound to this session — omitted project/session mean the default project")
     return None
 
 
 def managed_record(harness: str | None, environ: dict | None = None) -> dict:
-    """The daemon's setup record for this harness, if a DAEMON wrote it (a
+    """The setup record for this harness, if the daemon or `setup` CLI wrote it (a
     record the plugin path wrote only mirrors this chain — honouring it
     would pin a URL the environment has since changed)."""
     from miragen_hook.harness_setup import (
-        MANAGED_BY_DAEMON,
+        AUTHORITATIVE,
         codex_home,
         grok_home,
         read_setup_record,
@@ -70,7 +82,7 @@ def managed_record(harness: str | None, environ: dict | None = None) -> dict:
         record = read_setup_record(codex_home(environ))
     else:
         return {}
-    return record if record.get("managed_by") == MANAGED_BY_DAEMON and record.get("url") else {}
+    return record if record.get("managed_by") in AUTHORITATIVE and record.get("url") else {}
 
 
 def resolve(harness: str | None, daemon: str | None, token_file: str | None,
@@ -140,7 +152,12 @@ class Proxy:
         except urllib.error.HTTPError as exc:
             location = exc.headers.get("Location") if exc.headers else None
             if exc.code in (307, 308) and location and hops < 2:
-                return self._post(data, urllib.request.urljoin(request.full_url, location), hops + 1)
+                target = urllib.request.urljoin(request.full_url, location)
+                # Same origin only: the bearer must never follow a redirect
+                # to another host (or a scheme/port downgrade).
+                if _origin(target) == _origin(self.endpoint):
+                    return self._post(data, target, hops + 1)
+                _log(f"refusing a redirect to another origin ({_origin(target)})")
             raise
 
     def forward(self, message: Any) -> None:
@@ -260,7 +277,7 @@ def _secondary_grok_setup(url: str, token_file: str | None, environ: dict | None
     """No daemon manages this machine's Grok hooks: write them from here
     (they take effect from the next session). Never over a daemon's setup."""
     from miragen_hook.harness_setup import (
-        MANAGED_BY_DAEMON,
+        AUTHORITATIVE,
         MANAGED_BY_PLUGIN,
         ensure_grok,
         grok_home,
@@ -268,7 +285,7 @@ def _secondary_grok_setup(url: str, token_file: str | None, environ: dict | None
     )
 
     home = grok_home(environ)
-    if read_setup_record(home).get("managed_by") == MANAGED_BY_DAEMON:
+    if read_setup_record(home).get("managed_by") in AUTHORITATIVE:
         return
     try:
         status = ensure_grok(home, url=url, token_file=token_file, managed_by=MANAGED_BY_PLUGIN,

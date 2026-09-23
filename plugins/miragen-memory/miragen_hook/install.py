@@ -176,7 +176,7 @@ def http_hook_entry(harness: str, *, daemon_url: str, timeout: int) -> dict:
 def install_hook_entries(
     path: Path, command: str | None, events: tuple[tuple[str, int], ...],
     *, status_message: str = "miragen memory", http_daemon_url: str | None = None,
-    harness: str | None = None,
+    harness: str | None = None, context_limit: int | None = None,
 ) -> Path:
     existing = _read_config(path)
     hooks = existing.setdefault("hooks", {})
@@ -194,6 +194,9 @@ def install_hook_entries(
                 "timeout": timeout,
                 "statusMessage": status_message,
             }
+            if context_limit and event_name in ("SessionStart", "UserPromptSubmit"):
+                # Codex spills larger context to a file (see harness_setup).
+                entry["additionalContextLimit"] = context_limit
         groups.append({"hooks": [entry]})
         hooks[event_name] = groups
     _write_config(path, existing)
@@ -233,7 +236,11 @@ def install_hooks(
             path, None, events, http_daemon_url=daemon_url, harness=harness,
         )
     command = hook_command(harness, daemon_url=daemon_url, token_file=token_file)
-    return install_hook_entries(path, command, events)
+    # Codex: the same raised spill limit the daemon-written entries carry
+    # (6,000 tokens; the adapter caps Codex context below it). This path
+    # writes no trust — `miragen-hook setup codex` does.
+    return install_hook_entries(path, command, events,
+                                context_limit=6_000 if harness == "codex" else None)
 
 
 def uninstall_hooks(harness: str, *, settings_path: Path | None = None) -> Path:

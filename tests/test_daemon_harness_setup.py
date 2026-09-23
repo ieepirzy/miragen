@@ -140,3 +140,55 @@ class TestService:
         service = _build_harness_setup(harness.plane)
         assert service.resolved.url == "https://env.example"
         assert _build_harness_setup(None) is None
+
+
+
+def test_a_bad_interval_falls_back_instead_of_crashing():
+    resolved = resolve_harness_setup(HarnessSetup(url="https://m.example", interval_s=300),
+                                     {"MIRAGEND_HARNESS_SETUP_INTERVAL_S": "ten"}, in_container=_no_container)
+    assert resolved.enabled and resolved.interval_s == 300
+
+
+def test_disabling_removes_what_this_daemon_wrote(tmp_path):
+    from miragen_hook import harness_setup as hs
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".grok").mkdir()
+    _service(tmp_path).run_once()
+    # a Grok home the PLUGIN manages (fallback path) is not the daemon's to remove
+    hs.ensure_grok(tmp_path / ".grok", url="https://m.example", managed_by=hs.MANAGED_BY_PLUGIN)
+    environ = {"HOME": str(tmp_path), "GROK_HOME": str(tmp_path / ".grok"),
+               "CODEX_HOME": str(tmp_path / ".codex"), "MIRAGEND_HARNESS_SETUP": "off"}
+    resolved = resolve_harness_setup(HarnessSetup(url="https://m.example"), environ, in_container=_no_container)
+    assert resolved.enabled is False and resolved.remove is True
+    HarnessSetupService(resolved, environ).remove_once()
+    assert not (tmp_path / ".codex" / "miragen-adapter").exists()
+    assert "miragen-bridge" not in (tmp_path / ".codex" / "config.toml").read_text()
+    assert json.loads((tmp_path / ".codex" / "hooks.json").read_text()) == {}
+    assert (tmp_path / ".grok" / "hooks" / "miragen.json").exists()  # the plugin's: kept
+    # no URL is not a disable: nothing is removed
+    assert resolve_harness_setup(HarnessSetup(), {}, in_container=_no_container).remove is False
+
+
+def test_disabled_at_startup_runs_the_removal(tmp_path):
+    (tmp_path / ".codex").mkdir()
+    _service(tmp_path).run_once()
+    environ = {"HOME": str(tmp_path), "CODEX_HOME": str(tmp_path / ".codex"),
+               "GROK_HOME": str(tmp_path / ".grok")}
+    resolved = resolve_harness_setup(HarnessSetup(url="https://m.example", enabled=False), environ,
+                                     in_container=_no_container)
+    harness = Harness(tmp_path / "plane")
+    app = create_app(None, sessions=harness.plane, harness_setup=HarnessSetupService(resolved, environ))
+    with TestClient(app):
+        for _ in range(100):
+            if not (tmp_path / ".codex" / "miragen-adapter").exists():
+                break
+            time.sleep(0.02)
+    assert not (tmp_path / ".codex" / "miragen-adapter").exists()
+
+
+
+def test_the_service_snapshots_the_adapter_at_start(tmp_path):
+    from miragen_hook import harness_setup as hs
+    service = _service(tmp_path)
+    assert service._source is not None and service._source != hs.adapter_source()
+    assert hs.adapter_digest(service._source) == hs.adapter_digest()

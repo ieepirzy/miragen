@@ -23,22 +23,32 @@ one. Every write is atomic and touches only what this module owns:
   baked, read by the plugin's MCP proxy so tools reach the daemon the hooks
   reach.
 
-Stdlib only (the adapter's contract): TOML is read with tomllib and edited
-as text, table by table, then re-parsed — a result that changes anything
-but our own tables is refused rather than written.
+Stdlib only (the adapter's contract). Python ≥ 3.10 for the hooks, the MCP
+proxy and the Grok setup; the Codex setup reads TOML with tomllib (3.11+,
+imported lazily — without it ensure_codex raises SetupError and nothing
+else is affected). TOML is edited as text, table by table, then re-parsed —
+a result that changes anything but our own tables is refused rather than
+written. Files that are symlinks (dotfile managers) are written THROUGH:
+the link stays, its target changes.
+
+Cross-writer safety: every read-modify-write holds an exclusive flock on
+`<home>/.mira-harness-setup.lock` — the same file the MiraDesign adapter's
+setup locks, so the two daemons never interleave edits of one hooks.json or
+config.toml.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
 import shutil
 import tempfile
 import time
-import tomllib
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -52,7 +62,16 @@ MCP_SERVER_NAME = "miragen-bridge"
 STATUS_MESSAGE = "miragen memory"
 MANAGED_COMMENT = "# managed by miragen harness setup"
 MANAGED_BY_DAEMON = "miragend"
-MANAGED_BY_PLUGIN = "plugin"
+MANAGED_BY_CLI = "cli"          # `miragen-hook setup`: authoritative like the daemon's
+MANAGED_BY_PLUGIN = "plugin"    # the proxy's fallback: only mirrors the resolution chain
+AUTHORITATIVE = frozenset({MANAGED_BY_DAEMON, MANAGED_BY_CLI})
+
+# ── PENDING ILARI'S DECISION: the ONE place the Codex tool approval is set
+# (mirrored by hand in plugins/miragen-memory/codex.mcp.json). `codex exec`
+# runs with approval policy `never` and refuses any MCP tool that needs
+# approval ("MCP tool call requires approval, but approval policy is never",
+# found live), so without "approve" the bridge tools do not work headless.
+CODEX_TOOLS_APPROVAL_MODE = "approve"
 
 # A superseded adapter copy is deleted this long after it stopped being
 # referenced (a session started before the switch keeps its command line).
@@ -82,6 +101,35 @@ _CODEX_DEFAULT_TIMEOUT_S = 600
 
 class SetupError(RuntimeError):
     """A file this setup must edit is not in a state it may edit."""
+
+
+LOCK_FILE = ".mira-harness-setup.lock"  # shared with the MiraDesign adapter: keep the name
+
+
+@contextmanager
+def harness_lock(home: Path):
+    """Exclusive advisory lock for one harness home (blocking; the other
+    writer's critical section is milliseconds). No fcntl (Windows): no lock."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover
+        yield
+        return
+    fd = os.open(home / LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing releases the lock
+
+
+def _tomllib():
+    try:
+        import tomllib
+    except ImportError:  # Python 3.10
+        raise SetupError("the Codex setup needs Python >= 3.11 (tomllib); the hooks and the "
+                         "MCP proxy do not") from None
+    return tomllib
 
 
 # ── homes / installation ─────────────────────────────────────────────────────
@@ -169,11 +217,30 @@ def adapter_digest(package: Path | None = None) -> str:
     return digest.hexdigest()[:16]
 
 
-def ensure_adapter_copy(home: Path, changed: list[str]) -> Path:
+def snapshot_adapter(dest: Path) -> Path:
+    """Copy the running adapter package to `dest/miragen_hook` ONCE and
+    return that package dir: the daemon installs from this snapshot, so a
+    `git checkout` in an editable install's live checkout never propagates
+    into the harness homes (and the digest always names what is copied)."""
+    source = adapter_source()
+    for _ in range(3):
+        digest = adapter_digest(source)
+        package = dest / PACKAGE
+        shutil.rmtree(package, ignore_errors=True)
+        package.mkdir(parents=True)
+        for path in _package_files(source):
+            shutil.copy2(path, package / path.name)
+        if adapter_digest(package) == digest:
+            return package
+    raise SetupError(f"{source} kept changing while it was snapshotted")
+
+
+def ensure_adapter_copy(home: Path, changed: list[str], source: Path | None = None) -> Path:
     """`<home>/miragen-adapter/<digest>` holding a `miragen_hook` package:
     created once per adapter version by an atomic directory rename, then
-    only read. Returns the copy's root (what goes on sys.path)."""
-    source = adapter_source()
+    only read. Returns the copy's root (what goes on sys.path). The copy is
+    verified against the digest before it is published."""
+    source = source or adapter_source()
     digest = adapter_digest(source)
     base = home / ADAPTER_DIR
     target = base / digest
@@ -186,6 +253,8 @@ def ensure_adapter_copy(home: Path, changed: list[str]) -> Path:
         (staging / PACKAGE).mkdir()
         for path in _package_files(source):
             shutil.copy2(path, staging / PACKAGE / path.name)
+        if adapter_digest(staging / PACKAGE) != digest:
+            raise SetupError(f"{source} changed while it was copied — retrying next run")
         if target.exists():  # a broken/partial copy: replace it
             shutil.rmtree(target)
         os.rename(staging, target)
@@ -273,13 +342,20 @@ def _load_hooks_json(path: Path) -> dict:
     return data
 
 
+def handler_is_owned(handler: Any) -> bool:
+    return isinstance(handler, dict) and _group_is_owned({"hooks": [handler]})
+
+
 def merge_owned_groups(data: dict, entries: dict[str, dict]) -> dict:
-    """`data` with our group for each `entries` event replaced IN PLACE (or
-    appended when the event has none), further owned duplicates and owned
-    groups of events we no longer use removed, everything else untouched.
-    In place matters: Codex keys hook trust by group index, so moving our
-    group behind a later one (a user's, another daemon's) would silently
-    untrust that one — and two setups each re-appending would ping-pong."""
+    """`data` with our handler for each `entries` event replaced IN PLACE (or
+    appended as a group of its own when the event has none), further owned
+    duplicates and our handlers of events we no longer use removed,
+    everything else untouched. In place matters: Codex keys hook trust by
+    group AND handler index, so moving our group behind a later one (a
+    user's, another daemon's) would silently untrust that one — and two
+    setups each re-appending would ping-pong. A user group that holds our
+    handler next to theirs (or under a matcher) keeps its shape: only our
+    handler inside it is replaced or removed."""
     merged = json.loads(json.dumps(data))
     hooks = merged.setdefault("hooks", {})
     for event in list(hooks):
@@ -288,12 +364,19 @@ def merge_owned_groups(data: dict, entries: dict[str, dict]) -> dict:
         kept: list = []
         placed = False
         for group in groups:
-            if isinstance(group, dict) and _group_is_owned(group):
-                if replacement is not None and not placed:
-                    kept.append({"hooks": [replacement]})
-                    placed = True
+            handlers = group.get("hooks") if isinstance(group, dict) else None
+            if not isinstance(handlers, list) or not any(handler_is_owned(h) for h in handlers):
+                kept.append(group)
                 continue
-            kept.append(group)
+            new_handlers = []
+            for handler in handlers:
+                if not handler_is_owned(handler):
+                    new_handlers.append(handler)
+                elif replacement is not None and not placed:
+                    new_handlers.append(replacement)
+                    placed = True
+            if new_handlers:
+                kept.append({**group, "hooks": new_handlers})
         if replacement is not None and not placed:
             kept.append({"hooks": [replacement]})
         if kept:
@@ -333,10 +416,11 @@ def grok_hook_entries(copy_root: Path, *, url: str, token_file: str | None) -> d
 
 def ensure_grok(
     home: Path | str | None = None, *, url: str, token_file: str | None = None,
-    managed_by: str = MANAGED_BY_DAEMON, environ: dict | None = None,
+    managed_by: str = MANAGED_BY_DAEMON, environ: dict | None = None, source: Path | None = None,
 ) -> dict[str, Any]:
     """Grok Build: the hook file + adapter copy + setup record. A no-op
-    (installed=False) when `$GROK_HOME` does not exist."""
+    (installed=False) when `$GROK_HOME` does not exist. `source`: the
+    adapter package to install (the daemon's start-time snapshot)."""
     home = Path(home) if home is not None else grok_home(environ)
     status: dict[str, Any] = {"harness": "grok-build", "home": str(home),
                               "installed": home.is_dir(), "binary": _binary("grok", environ),
@@ -346,14 +430,16 @@ def ensure_grok(
     if not url:
         raise SetupError("no URL to point the Grok hooks at")
     changed: list[str] = status["changed"]
-    copy_root = ensure_adapter_copy(home, changed)
-    _check_no_dollar(str(copy_root), url, token_file)
-    hook_file = home / "hooks" / f"{NAME}.json"
-    current = _load_hooks_json(hook_file)
-    merged = merge_owned_groups(current, grok_hook_entries(copy_root, url=url, token_file=token_file))
-    _write_hooks_json(hook_file, current, merged, changed)
-    _write_if_changed(home / ADAPTER_DIR / SETUP_FILE, _setup_record(url, token_file, managed_by), changed)
-    status["pruned"] = prune_adapter_copies(home, copy_root)
+    with harness_lock(home):
+        copy_root = ensure_adapter_copy(home, changed, source)
+        _check_no_dollar(str(copy_root), url, token_file)
+        hook_file = home / "hooks" / f"{NAME}.json"
+        current = _load_hooks_json(hook_file)
+        merged = merge_owned_groups(current, grok_hook_entries(copy_root, url=url, token_file=token_file))
+        _write_hooks_json(hook_file, current, merged, changed)
+        _write_if_changed(home / ADAPTER_DIR / SETUP_FILE, _setup_record(url, token_file, managed_by),
+                          changed)
+        status["pruned"] = prune_adapter_copies(home, copy_root)
     status["current"] = True
     status["hook_file"] = str(hook_file)
     return status
@@ -362,18 +448,21 @@ def ensure_grok(
 def remove_grok(home: Path | str | None = None, *, environ: dict | None = None) -> dict[str, Any]:
     home = Path(home) if home is not None else grok_home(environ)
     changed: list[str] = []
-    hook_file = home / "hooks" / f"{NAME}.json"
-    if hook_file.exists():
-        current = _load_hooks_json(hook_file)
-        merged = merge_owned_groups(current, {})
-        if merged:
-            _write_hooks_json(hook_file, current, merged, changed)
-        else:
-            hook_file.unlink()
-            changed.append(str(hook_file))
-    if (home / ADAPTER_DIR).is_dir():
-        shutil.rmtree(home / ADAPTER_DIR)
-        changed.append(str(home / ADAPTER_DIR))
+    if not home.is_dir():
+        return {"harness": "grok-build", "home": str(home), "changed": changed}
+    with harness_lock(home):
+        hook_file = home / "hooks" / f"{NAME}.json"
+        if hook_file.exists():
+            current = _load_hooks_json(hook_file)
+            merged = merge_owned_groups(current, {})
+            if merged:
+                _write_hooks_json(hook_file, current, merged, changed)
+            else:
+                hook_file.unlink()
+                changed.append(str(hook_file))
+        if (home / ADAPTER_DIR).is_dir():
+            shutil.rmtree(home / ADAPTER_DIR)
+            changed.append(str(home / ADAPTER_DIR))
     return {"harness": "grok-build", "home": str(home), "changed": changed}
 
 
@@ -391,7 +480,7 @@ def codex_hook_hash(event: str, entry: dict, matcher: str | None = None) -> str:
     canonical (sorted-key, compact) JSON of the normalized identity
     `{event_name, matcher?, hooks: [handler]}`, where the handler has its
     timeout normalized (SessionEnd clamped to 1–3 s, others default 600),
-    `async` always present, `commandWindows`/`statusMessage` only when set,
+    `async` always present, `statusMessage` only when set (never `commandWindows`),
     and `additionalContextLimit` only on the events that honour it and only
     when it differs from the 2,500-token default."""
     handler: dict[str, Any] = {
@@ -400,8 +489,8 @@ def codex_hook_hash(event: str, entry: dict, matcher: str | None = None) -> str:
         "timeout": _codex_normalized_timeout(event, entry.get("timeout")),
         "async": bool(entry.get("async", False)),
     }
-    if entry.get("commandWindows") is not None:
-        handler["commandWindows"] = entry["commandWindows"]
+    # commandWindows is NOT part of the identity: Codex hashes the normalized
+    # handler with command_windows = None (discovery.rs).
     if entry.get("statusMessage") is not None:
         handler["statusMessage"] = entry["statusMessage"]
     limit = entry.get("additionalContextLimit")
@@ -436,11 +525,11 @@ def codex_trust_states(home: Path, merged: dict) -> dict[str, str]:
         if event not in _CODEX_EVENT_LABELS or not isinstance(groups, list):
             continue
         for group_index, group in enumerate(groups):
-            if not (isinstance(group, dict) and _group_is_owned(group)):
+            if not isinstance(group, dict):
                 continue
             for handler_index, entry in enumerate(group.get("hooks") or []):
-                if not isinstance(entry, dict) or entry.get("type") != "command":
-                    continue
+                if not handler_is_owned(entry) or entry.get("type") != "command":
+                    continue  # a user's handler, even in a group with ours: never trusted by us
                 digest = codex_hook_hash(event, entry, group.get("matcher"))
                 for spelling in codex_hooks_json_spellings(home):
                     states[codex_hook_key(spelling, event, group_index, handler_index)] = digest
@@ -450,11 +539,27 @@ def codex_trust_states(home: Path, merged: dict) -> dict[str, str]:
 # ── Codex: config.toml, edited table by table ────────────────────────────────
 
 
-_HEADER = re.compile(r"^\s*\[\[?\s*(?P<key>[^\]]*?)\s*\]\]?\s*(?P<comment>#.*)?$")
+# Quoted key parts may contain ']' and '#'.
+_HEADER = re.compile(
+    r"""^\s*\[\[?\s*(?P<key>(?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\]"'#])+?)\s*\]\]?\s*(?P<comment>#.*)?$"""
+)
+_TOML_ESCAPES = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\t": "\\t", "\n": "\\n",
+                 "\f": "\\f", "\r": "\\r"}
 
 
 def _toml_string(value: str) -> str:
-    return json.dumps(value).replace("\x7f", "\\u007f")
+    """A TOML basic string: quote, backslash and control characters escaped,
+    everything else (non-BMP too) written as UTF-8 — never JSON's
+    surrogate-pair escapes, which TOML rejects."""
+    out = []
+    for ch in value:
+        if ch in _TOML_ESCAPES:
+            out.append(_TOML_ESCAPES[ch])
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
 
 
 def _parse_key(raw: str) -> list[str] | None:
@@ -518,6 +623,23 @@ def _blocks(text: str) -> list[tuple[list[str] | None, bool, list[str]]]:
     return blocks
 
 
+def _trailing_comments(lines: list[str]) -> list[str]:
+    """The comment lines at the end of a block (blank lines between them
+    kept): they introduce the NEXT table — a user's `# ---- projects ----`
+    placed after one of our tables must survive our table's rewrite."""
+    tail: list[str] = []
+    for line in reversed(lines[1:]):
+        stripped = line.strip()
+        if stripped.startswith("#") or not stripped:
+            tail.append(line)
+        else:
+            break
+    tail.reverse()
+    while tail and not tail[0].strip():
+        tail.pop(0)
+    return tail
+
+
 def _is_ours(key: list[str] | None, marked: bool, state_keys: set[str]) -> bool:
     if not key:
         return False
@@ -557,56 +679,105 @@ def _owned_values(parsed: dict, state_keys: set[str]) -> dict:
     }
 
 
+def desired_server(parsed: dict, server: dict | None) -> dict | None:
+    """Our server table as it should be: our fields over whatever the user
+    added to the same table (`enabled = false`, `[….tools.<t>] approval_mode`
+    narrowing our blanket approve, env, timeouts…) — the user's additions
+    are carried over, never reverted on the next interval."""
+    if server is None:
+        return None
+    existing = _owned_values(parsed, set())["server"]
+    merged = {k: v for k, v in existing.items() if k not in server} if isinstance(existing, dict) else {}
+    merged.update(server)
+    return json.loads(json.dumps(merged, default=str))
+
+
+def _split_bom(text: str) -> tuple[str, str]:
+    return ("﻿", text[1:]) if text.startswith("﻿") else ("", text)
+
+
 def render_codex_config(
     text: str | None, *, server: dict | None, trust: dict[str, str],
 ) -> str:
     """`text` with our tables replaced: the MCP server table (None removes
-    it) and one `[hooks.state."<key>"]` per `trust` entry (stale marked
-    ones removed). A user's `enabled` on one of our keys is carried over.
-    Raises SetupError instead of returning anything that changes a byte of
-    meaning outside our tables."""
-    text = text or ""
+    it; the user's own additions to it are kept) and one
+    `[hooks.state."<key>"]` per `trust` entry (stale marked ones removed). A
+    user's `enabled` on one of our keys is carried over. Raises SetupError
+    instead of returning anything that changes a byte of meaning outside our
+    tables."""
+    toml = _tomllib()
+    bom, text = _split_bom(text or "")
     try:
-        before = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
+        before = toml.loads(text)
+    except toml.TOMLDecodeError as exc:
         raise SetupError(f"config.toml is not valid TOML ({exc}) — not touching it") from None
     state_keys = set(trust)
     blocks = _blocks(text)
     marked = {b[0][2] for b in blocks if b[0] and b[1] and len(b[0]) == 3 and b[0][:2] == ["hooks", "state"]}
     prior_state = ((before.get("hooks") or {}).get("state") or {}) if isinstance(before.get("hooks"), dict) else {}
+    wanted_server = desired_server(before, server)
 
-    kept = "".join("".join(lines) for key, is_marked, lines in blocks
-                   if not _is_ours(key, is_marked, state_keys))
-    kept = kept.rstrip("\n")
-    out: list[str] = [kept + "\n"] if kept else []
-    if server is not None:
-        out.append(f"\n[mcp_servers.{MCP_SERVER_NAME}]  {MANAGED_COMMENT}\n")
-        for field, value in server.items():
-            out.append(f"{field} = {_toml_value(value)}\n")
+    server_block: list[str] = []
+    if wanted_server is not None:
+        server_block.append(f"[mcp_servers.{MCP_SERVER_NAME}]  {MANAGED_COMMENT}\n")
+        for field, value in wanted_server.items():
+            server_block.append(f"{_toml_key(field)} = {_toml_value(value)}\n")
+        server_block.append("\n")
+    state_block: list[str] = []
     for key in sorted(trust):
-        out.append(f"\n[hooks.state.{_toml_string(key)}]  {MANAGED_COMMENT}\n")
-        out.append(f"trusted_hash = {_toml_string(trust[key])}\n")
+        state_block.append(f"[hooks.state.{_toml_string(key)}]  {MANAGED_COMMENT}\n")
+        state_block.append(f"trusted_hash = {_toml_string(trust[key])}\n")
         previous = prior_state.get(key) if isinstance(prior_state, dict) else None
         if isinstance(previous, dict) and isinstance(previous.get("enabled"), bool):
-            out.append(f"enabled = {'true' if previous['enabled'] else 'false'}\n")
-    rendered = "".join(out).lstrip("\n")
+            state_block.append(f"enabled = {'true' if previous['enabled'] else 'false'}\n")
+        state_block.append("\n")
+
+    # Our tables are rewritten WHERE THEY WERE (first occurrence), new ones
+    # go to the end; comments that close one of our blocks introduce the
+    # next table and stay with it.
+    parts: list[str] = []
+    server_placed = state_placed = False
+    for key, is_marked, lines in blocks:
+        if _is_ours(key, is_marked, state_keys):
+            is_server = key[:2] == ["mcp_servers", MCP_SERVER_NAME]
+            if is_server and not server_placed:
+                parts.extend(server_block)
+                server_placed = True
+            elif not is_server and not state_placed:
+                parts.extend(state_block)
+                state_placed = True
+            parts.extend(_trailing_comments(lines))
+        else:
+            if lines and parts and not parts[-1].endswith("\n"):
+                parts[-1] += "\n"
+            parts.extend(lines)
+    tail = ([] if server_placed else server_block) + ([] if state_placed else state_block)
+    body = "".join(parts).rstrip("\r\n")
+    rendered = (body + "\n\n" if body else "") + "".join(tail)
+    rendered = rendered.rstrip("\n") + "\n" if rendered.strip() else ""
 
     try:
-        after = tomllib.loads(rendered)
-    except tomllib.TOMLDecodeError as exc:
+        after = toml.loads(rendered)
+    except toml.TOMLDecodeError as exc:
         raise SetupError(f"config.toml: our tables could not be placed ({exc}); "
                          f"is '{MCP_SERVER_NAME}' or hooks.state defined inline/dotted?") from None
     if _strip_owned(before, state_keys, marked) != _strip_owned(after, state_keys, marked):
         raise SetupError("config.toml: editing our tables would change other settings "
                          "(our keys defined inline or as dotted keys?) — not touching it")
     owned = _owned_values(after, state_keys)
-    expected_server = json.loads(json.dumps(server)) if server is not None else None
-    if owned["server"] != expected_server or any(
+    if json.loads(json.dumps(owned["server"], default=str)) != wanted_server or any(
         (owned["state"][k] or {}).get("trusted_hash") != trust[k] for k in state_keys
     ):
         raise SetupError("config.toml: our settings did not take effect as written "
                          "(defined a second time elsewhere?) — not touching it")
-    return rendered
+    return bom + rendered
+
+
+_BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _toml_key(key: str) -> str:
+    return key if _BARE_KEY.match(key) else _toml_string(key)
 
 
 def _toml_value(value: Any) -> str:
@@ -614,29 +785,37 @@ def _toml_value(value: Any) -> str:
         return "true" if value else "false"
     if isinstance(value, int):
         return str(value)
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "nan"
+        if value in (float("inf"), float("-inf")):
+            return "inf" if value > 0 else "-inf"
+        return repr(value)
     if isinstance(value, str):
         return _toml_string(value)
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(v) for v in value) + "]"
     if isinstance(value, dict):
-        return "{ " + ", ".join(f"{_toml_string(k)} = {_toml_value(v)}" for k, v in value.items()) + " }"
-    raise TypeError(f"cannot write {type(value).__name__} to TOML")
+        return "{ " + ", ".join(f"{_toml_key(k)} = {_toml_value(v)}" for k, v in value.items()) + " }"
+    raise SetupError(f"cannot write a {type(value).__name__} back into config.toml")
 
 
 def _config_is_current(text: str | None, server: dict | None, trust: dict[str, str]) -> bool:
     """Semantically current (our values as desired, no stale marked state):
     the periodic run must then be a pure read — Codex writes this file too."""
+    toml = _tomllib()
+    _, body = _split_bom(text or "")
     try:
-        parsed = tomllib.loads(text or "")
-    except tomllib.TOMLDecodeError:
+        parsed = toml.loads(body)
+    except toml.TOMLDecodeError:
         return False
-    marked = {b[0][2] for b in _blocks(text or "")
+    marked = {b[0][2] for b in _blocks(body)
               if b[0] and b[1] and len(b[0]) == 3 and b[0][:2] == ["hooks", "state"]}
     if marked - set(trust):
         return False
     owned = _owned_values(parsed, set(trust))
-    expected_server = json.loads(json.dumps(server)) if server is not None else None
-    return owned["server"] == expected_server and all(
+    current_server = json.loads(json.dumps(owned["server"], default=str)) if owned["server"] is not None else None
+    return current_server == desired_server(parsed, server) and all(
         (owned["state"][k] or {}).get("trusted_hash") == trust[k] for k in trust
     )
 
@@ -666,13 +845,14 @@ def codex_mcp_server(copy_root: Path, *, url: str, token_file: str | None) -> di
     # `codex exec` runs with approval policy `never`, under which a tool that
     # needs approval is refused outright ("MCP tool call requires approval,
     # but approval policy is never" — found live): the bridge's own tools are
-    # approved up front, like its hooks are trusted.
-    return {"command": "python3", "args": args, "default_tools_approval_mode": "approve"}
+    # approved up front, like its hooks are trusted. A user's per-tool
+    # `[mcp_servers.miragen-bridge.tools.<t>] approval_mode` still narrows it.
+    return {"command": "python3", "args": args, "default_tools_approval_mode": CODEX_TOOLS_APPROVAL_MODE}
 
 
 def ensure_codex(
     home: Path | str | None = None, *, url: str, token_file: str | None = None,
-    environ: dict | None = None,
+    environ: dict | None = None, source: Path | None = None, managed_by: str = MANAGED_BY_DAEMON,
 ) -> dict[str, Any]:
     """Codex: native hooks (harness `codex`), their trust, and the bridge
     MCP server as the stdio proxy. A no-op when `$CODEX_HOME` does not exist."""
@@ -683,27 +863,29 @@ def ensure_codex(
         return status
     if not url:
         raise SetupError("no URL to point the Codex hooks at")
+    _tomllib()  # before anything is written: no hooks without their trust
     changed: list[str] = status["changed"]
-    copy_root = ensure_adapter_copy(home, changed)
-    hooks_path = home / "hooks.json"
-    current = _load_hooks_json(hooks_path)
-    merged = merge_owned_groups(current, codex_hook_entries(copy_root, url=url, token_file=token_file))
-    trust = codex_trust_states(home, merged)
-    server = codex_mcp_server(copy_root, url=url, token_file=token_file)
-    config_path = home / "config.toml"
-    config_text = _read_text(config_path)
-    # Validate the TOML edit BEFORE touching hooks.json: hooks without their
-    # trust would be silently skipped by `codex exec`.
-    rendered = None
-    if not _config_is_current(config_text, server, trust):
-        rendered = render_codex_config(config_text, server=server, trust=trust)
-    _write_hooks_json(hooks_path, current, merged, changed)
-    if rendered is not None and rendered != config_text:
-        _atomic_write(config_path, rendered, default_mode=0o600)
-        changed.append(str(config_path))
-    _write_if_changed(home / ADAPTER_DIR / SETUP_FILE,
-                      _setup_record(url, token_file, MANAGED_BY_DAEMON), changed)
-    status["pruned"] = prune_adapter_copies(home, copy_root)
+    with harness_lock(home):
+        copy_root = ensure_adapter_copy(home, changed, source)
+        hooks_path = home / "hooks.json"
+        current = _load_hooks_json(hooks_path)
+        merged = merge_owned_groups(current, codex_hook_entries(copy_root, url=url, token_file=token_file))
+        trust = codex_trust_states(home, merged)
+        server = codex_mcp_server(copy_root, url=url, token_file=token_file)
+        config_path = home / "config.toml"
+        config_text = _read_text(config_path)
+        # config.toml (the trust) FIRST: if it cannot be written (refused,
+        # read-only target), hooks.json stays as it was — new hooks without
+        # their trust would be skipped by `codex exec` and prompt in the TUI.
+        if not _config_is_current(config_text, server, trust):
+            rendered = render_codex_config(config_text, server=server, trust=trust)
+            if rendered != config_text:
+                _atomic_write(config_path, rendered, default_mode=0o600)
+                changed.append(str(config_path))
+        _write_hooks_json(hooks_path, current, merged, changed)
+        _write_if_changed(home / ADAPTER_DIR / SETUP_FILE,
+                          _setup_record(url, token_file, managed_by), changed)
+        status["pruned"] = prune_adapter_copies(home, copy_root)
     status["current"] = True
     status["trusted_hooks"] = len(trust)
     return status
@@ -712,18 +894,21 @@ def ensure_codex(
 def remove_codex(home: Path | str | None = None, *, environ: dict | None = None) -> dict[str, Any]:
     home = Path(home) if home is not None else codex_home(environ)
     changed: list[str] = []
-    hooks_path = home / "hooks.json"
-    if hooks_path.exists():
-        current = _load_hooks_json(hooks_path)
-        _write_hooks_json(hooks_path, current, merge_owned_groups(current, {}), changed)
-    config_path = home / "config.toml"
-    text = _read_text(config_path)
-    if text is not None:
-        rendered = render_codex_config(text, server=None, trust={})
-        if rendered != text:
-            _atomic_write(config_path, rendered)
-            changed.append(str(config_path))
-    if (home / ADAPTER_DIR).is_dir():
-        shutil.rmtree(home / ADAPTER_DIR)
-        changed.append(str(home / ADAPTER_DIR))
+    if not home.is_dir():
+        return {"harness": "codex", "home": str(home), "changed": changed}
+    with harness_lock(home):
+        hooks_path = home / "hooks.json"
+        if hooks_path.exists():
+            current = _load_hooks_json(hooks_path)
+            _write_hooks_json(hooks_path, current, merge_owned_groups(current, {}), changed)
+        config_path = home / "config.toml"
+        text = _read_text(config_path)
+        if text is not None:
+            rendered = render_codex_config(text, server=None, trust={})
+            if rendered != text:
+                _atomic_write(config_path, rendered)
+                changed.append(str(config_path))
+        if (home / ADAPTER_DIR).is_dir():
+            shutil.rmtree(home / ADAPTER_DIR)
+            changed.append(str(home / ADAPTER_DIR))
     return {"harness": "codex", "home": str(home), "changed": changed}

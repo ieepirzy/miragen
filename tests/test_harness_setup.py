@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -93,6 +94,8 @@ def _user_hooks() -> dict:
 def _strip(parsed: dict) -> dict:
     parsed = json.loads(json.dumps(parsed))
     parsed.get("mcp_servers", {}).pop("miragen-bridge", None)
+    if parsed.get("mcp_servers") == {}:
+        parsed.pop("mcp_servers")
     parsed.pop("hooks", None)
     return parsed
 
@@ -360,7 +363,8 @@ class TestEnsureGrok:
         (checkout / "client.py").write_text("raise SystemExit('SHADOWED')\n")
         payload = json.dumps({"hook_event_name": "PostToolUse", "session_id": "s", "tool_name": "Bash"})
         ran = subprocess.run(["sh", "-c", command], input=payload, capture_output=True, text=True,
-                             cwd=checkout.parent, env={"PATH": os.environ["PATH"], "PYTHONPATH": str(checkout.parent)},
+                             cwd=checkout.parent, env={"PATH": os.environ["PATH"], "PYTHONPATH": str(checkout.parent),
+                                                               "HOME": str(tmp_path)},
                              timeout=20, check=False)
         assert (ran.returncode, ran.stdout) == (0, ""), ran.stderr
         assert "SHADOWED" not in ran.stderr
@@ -415,3 +419,175 @@ def test_setup_cli(tmp_path):
                           "--remove"], capture_output=True, text=True, timeout=30, check=False,
                          cwd=Path(__file__).resolve().parents[1])
     assert ran.returncode == 0 and "miragen-bridge" not in (home / "config.toml").read_text()
+
+
+
+# ── review fixes: ordering, user additions, locking, TOML edges ──────────────
+
+
+def test_trust_is_written_before_the_hooks(tmp_path):
+    """config.toml whose target cannot be written (a dotfile symlink into a
+    read-only directory): hooks.json must stay untouched — new hooks without
+    their trust would be skipped by codex exec and prompt in the TUI."""
+    home = _codex_home(tmp_path, config=None, hooks=_user_hooks())
+    locked = tmp_path / "ro"
+    locked.mkdir()
+    (locked / "config.toml").write_text(USER_CONFIG)
+    (home / "config.toml").symlink_to(locked / "config.toml")
+    locked.chmod(0o555)
+    try:
+        before = (home / "hooks.json").read_text()
+        with pytest.raises(OSError):
+            hs.ensure_codex(home, url="https://m.example")
+        assert (home / "hooks.json").read_text() == before
+    finally:
+        locked.chmod(0o755)
+
+
+def test_user_additions_to_our_server_table_are_kept(tmp_path):
+    config = (USER_CONFIG + '\n[mcp_servers.miragen-bridge]\ncommand = "old"\nenabled = false\n'
+              'startup_timeout_sec = 30\n\n[mcp_servers.miragen-bridge.env]\nFOO = "1"\n\n'
+              '[mcp_servers.miragen-bridge.tools.store_put_artifact]\napproval_mode = "prompt"\n')
+    home = _codex_home(tmp_path, config=config)
+    hs.ensure_codex(home, url="https://m.example")
+    server = tomllib.loads((home / "config.toml").read_text())["mcp_servers"]["miragen-bridge"]
+    assert server["enabled"] is False and server["startup_timeout_sec"] == 30
+    assert server["env"] == {"FOO": "1"}
+    assert server["tools"]["store_put_artifact"]["approval_mode"] == "prompt"  # narrows our approve
+    assert server["command"] == "python3" and server["default_tools_approval_mode"] == "approve"
+    again = hs.ensure_codex(home, url="https://m.example")
+    assert again["changed"] == []  # not reverted every interval
+
+
+def test_setup_waits_for_the_shared_lock(tmp_path):
+    import fcntl
+    import threading
+    home = _codex_home(tmp_path)
+    fd = os.open(home / ".mira-harness-setup.lock", os.O_RDWR | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    done = threading.Event()
+    worker = threading.Thread(target=lambda: (hs.ensure_codex(home, url="https://m.example"), done.set()))
+    worker.start()
+    try:
+        assert not done.wait(0.4)  # blocked by the other writer (the MiraDesign setup)
+        assert not (home / "hooks.json").exists()
+    finally:
+        os.close(fd)
+    worker.join(10)
+    assert done.is_set() and (home / "hooks.json").exists()
+    assert hs.LOCK_FILE == ".mira-harness-setup.lock"  # the name both adapters share
+
+
+def test_command_windows_is_not_hashed():
+    entry = {"type": "command", "command": "x", "timeout": 5}
+    assert hs.codex_hook_hash("Stop", dict(entry, commandWindows="y.cmd")) == hs.codex_hook_hash("Stop", entry)
+
+
+@pytest.mark.parametrize("config", [
+    "﻿" + USER_CONFIG,
+    USER_CONFIG + '\n[projects."/home/a]b"]\ntrust_level = "trusted"\n',
+    USER_CONFIG.replace("\n", "\r\n"),
+    'model = "x"',
+])
+def test_toml_edges_are_edited_not_refused(tmp_path, config):
+    home = _codex_home(tmp_path, config=config)
+    hs.ensure_codex(home, url="https://m.example")
+    text = (home / "config.toml").read_text()
+    assert text.startswith("﻿") == config.startswith("﻿")
+    parsed = tomllib.loads(text.lstrip("﻿"))
+    assert _strip(parsed) == _strip(tomllib.loads(config.lstrip("﻿")))
+    assert hs.ensure_codex(home, url="https://z.example")["current"]  # and again, with a change
+
+
+def test_a_bracket_key_after_our_table_is_not_swallowed(tmp_path):
+    home = _codex_home(tmp_path)
+    hs.ensure_codex(home, url="https://m.example")
+    with (home / "config.toml").open("a") as f:
+        f.write('\n[projects."/home/a]b"]\ntrust_level = "trusted"\n')
+    hs.ensure_codex(home, url="https://other.example")  # must not be refused
+    assert tomllib.loads((home / "config.toml").read_text())["projects"]["/home/a]b"]["trust_level"] == "trusted"
+
+
+def test_a_comment_after_our_table_survives(tmp_path):
+    home = _codex_home(tmp_path)
+    hs.ensure_codex(home, url="https://m.example")
+    with (home / "config.toml").open("a") as f:
+        f.write('\n# ---- my projects ----\n[projects."/w/new"]\ntrust_level = "trusted"\n')
+    hs.ensure_codex(home, url="https://other.example")
+    text = (home / "config.toml").read_text()
+    assert '# ---- my projects ----\n[projects."/w/new"]' in text
+
+
+def test_toml_strings_are_toml_not_json():
+    for value in ("emoji \U0001F600 path", 'q"uote\\back', "tab\tnl\n", "del\x7f"):
+        assert tomllib.loads(f"k = {hs._toml_string(value)}")["k"] == value
+
+
+def test_codex_install_carries_the_context_limit(tmp_path):
+    from miragen_hook.install import install_hooks
+    path = install_hooks("codex", daemon_url="http://d", token_file=None, settings_path=tmp_path / "h.json")
+    hooks = json.loads(path.read_text())["hooks"]
+    assert hooks["SessionStart"][0]["hooks"][0]["additionalContextLimit"] == hs.CODEX_CONTEXT_TOKEN_LIMIT
+    assert "additionalContextLimit" not in hooks["Stop"][0]["hooks"][0]
+
+
+
+def test_a_mixed_user_group_keeps_its_shape(tmp_path):
+    """Our handler inside a user's group (next to theirs, under their
+    matcher): only our handler is replaced; only it is trusted."""
+    mixed = {"matcher": "startup", "hooks": [
+        {"type": "command", "command": "user-start"},
+        {"type": "command", "command": "miragen-hook codex --daemon http://old"}]}
+    home = _codex_home(tmp_path, hooks={"hooks": {"SessionStart": [mixed]}})
+    hs.ensure_codex(home, url="https://m.example")
+    group = json.loads((home / "hooks.json").read_text())["hooks"]["SessionStart"]
+    assert len(group) == 1 and group[0]["matcher"] == "startup"
+    assert group[0]["hooks"][0] == {"type": "command", "command": "user-start"}
+    assert "miragen-adapter" in group[0]["hooks"][1]["command"]
+    state = tomllib.loads((home / "config.toml").read_text())["hooks"]["state"]
+    ours = f"{home}/hooks.json:session_start:0:1"
+    assert state[ours]["trusted_hash"] == hs.codex_hook_hash("SessionStart", group[0]["hooks"][1], "startup")
+    assert f"{home}/hooks.json:session_start:0:0" not in state
+    hs.remove_codex(home)
+    group = json.loads((home / "hooks.json").read_text())["hooks"]["SessionStart"]
+    assert group == [{"matcher": "startup", "hooks": [{"type": "command", "command": "user-start"}]}]
+
+
+def test_our_table_is_rewritten_where_it_stands(tmp_path):
+    config = ('model = "x"\n\n[mcp_servers.miragen-bridge]\ncommand = "old"\n\n'
+              '# my projects\n[projects."/a"]\ntrust_level = "trusted"\n')
+    home = _codex_home(tmp_path, config=config)
+    hs.ensure_codex(home, url="https://m.example")
+    text = (home / "config.toml").read_text()
+    assert text.index("[mcp_servers.miragen-bridge]") < text.index("# my projects\n[projects.\"/a\"]")
+
+
+def test_the_daemon_installs_from_its_start_time_snapshot(tmp_path, monkeypatch):
+    """A branch switch in the live checkout after start never reaches the homes."""
+    live = tmp_path / "live" / "miragen_hook"
+    shutil.copytree(hs.adapter_source(), live, ignore=shutil.ignore_patterns("__pycache__"))
+    monkeypatch.setattr(hs, "adapter_source", lambda: live)
+    snap = hs.snapshot_adapter(tmp_path / "snap")
+    (live / "client.py").write_text("# someone checked out another branch\n")
+    home = tmp_path / ".grok"
+    home.mkdir()
+    hs.ensure_grok(home, url="https://m.example", source=snap)
+    copy = next((home / "miragen-adapter").glob("[0-9a-f]*"))
+    assert (copy / "miragen_hook" / "client.py").read_bytes() == (snap / "client.py").read_bytes()
+    assert copy.name == hs.adapter_digest(copy / "miragen_hook")  # digest names the content
+
+
+def test_a_source_changing_mid_copy_is_not_published(tmp_path, monkeypatch):
+    src = tmp_path / "src" / "miragen_hook"
+    shutil.copytree(hs.adapter_source(), src, ignore=shutil.ignore_patterns("__pycache__"))
+    real_copy = shutil.copy2
+
+    def racing_copy(a, b, *args, **kw):
+        result = real_copy(a, b, *args, **kw)
+        if Path(a).name == "client.py":
+            Path(b).write_text("# changed underneath\n")
+        return result
+    monkeypatch.setattr(hs.shutil, "copy2", racing_copy)
+    with pytest.raises(hs.SetupError, match="changed while it was copied"):
+        hs.ensure_adapter_copy(tmp_path / "home", [], src)
+    assert not [p for p in (tmp_path / "home" / "miragen-adapter").iterdir() if not p.name.startswith(".")]
