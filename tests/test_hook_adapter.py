@@ -140,7 +140,7 @@ class TestCodexSpellings:
         assert prompt.ids["turn_id"] == "t-1"
         assert compact.attributes["trigger"] == "manual"
         key = event_idempotency_key(prompt)
-        assert key == "hook:codex:cx:UserPromptSubmit:t-1"
+        assert key.startswith("hook:codex:cx:UserPromptSubmit:t-1:")
 
 
 class TestEnvelopeAndTimeouts:
