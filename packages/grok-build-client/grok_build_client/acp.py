@@ -116,7 +116,11 @@ class AcpSession:
             if isinstance(m, dict)
         }
         # Prefer cached subscription token; fall back to API key auth method id.
-        if os.environ.get("XAI_API_KEY") and "xai.api_key" in methods:
+        # Read the child's effective env, not ours: a caller that stripped
+        # XAI_API_KEY from `env` (subscription-only) must not be switched to
+        # the metered API-key method because the parent still has it set.
+        effective_env = self.env if self.env is not None else os.environ
+        if effective_env.get("XAI_API_KEY") and "xai.api_key" in methods:
             method_id = "xai.api_key"
         elif "cached_token" in methods:
             method_id = "cached_token"

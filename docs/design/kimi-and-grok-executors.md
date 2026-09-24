@@ -207,6 +207,91 @@ Mirror `codex-login`: operator runs once against the shared volume. Exact
 headless OAuth mechanism (`grok login`, device-code if available, browser
 print) verified at implementation time against the installed CLI.
 
+### Phase C — locked-down headless Grok (tool allowlist + hermetic home)
+
+For a persistent agent that must reason with Grok but act **only** through
+an explicit set of MCP servers (no shell, files, web or subagents), with the
+boundary enforced by grok's own permission/policy layers rather than by the
+prompt. Verified against grok 1.0.41 (`~/.grok/docs/user-guide/`
+05, 07, 09, 10, 14, 16, 22, 26 and `grok inspect`).
+
+```yaml
+executor:
+  executor: grok-build
+  instructions: "You are Mira. Act only through the tools you are given."
+  grok_home: /agent/grok-home-mira      # dedicated: hermetic owns this home
+  grok_auth: subscription               # XAI_API_KEY never reaches grok
+  grok_hermetic: true                   # miragen owns config.toml + requirements.toml
+  mcp_servers:
+    - name: loimi
+      url: https://memory.example/mcp
+      bearer_token_env: LOIMI_TOKEN     # per-run secret or container env; never on disk
+  web_search: false                     # -> --disable-web-search
+  grok_tools: [search_tool, use_tool]   # --tools: the MCP dispatchers only
+  grok_disallowed_tools: [Agent]        # --disallowed-tools: no subagents
+  grok_permission_mode: dontAsk         # --permission-mode (replaces --always-approve)
+  grok_allow:                           # --allow, one per permitted MCP tool
+    - MCPTool(loimi__memory_recall)
+    - MCPTool(loimi__memory_remember)
+  grok_deny: [Bash, Read, Edit, Write, Grep, WebFetch, WebSearch]
+  grok_max_turns: 12                    # --max-turns
+```
+
+What each layer does, and why none of them is enough alone:
+
+| Layer | Mechanism | Gap it closes |
+|---|---|---|
+| `grok_tools` | `--tools` built-in allowlist | Removes shell/file/web tools from the model's toolset. `search_tool`/`use_tool` are "always-on MCP meta-tools" (14-headless-mode.md) |
+| `grok_disallowed_tools: [Agent]` + hermetic `subagents.enabled = false` | tool removal + pinned policy | Subagents would otherwise inherit the parent's MCP servers |
+| `grok_permission_mode: dontAsk` + `grok_allow` | deny everything not pre-approved | **Not an allowlist on its own:** grok auto-approves `read_file`, `grep`, `list_dir`, `web_search`, `todo_write` and skills in every mode (22-permissions-and-safety.md), hence `grok_tools` + `grok_deny` |
+| `grok_deny` | deny rules win over everything, including always-approve | Belt and braces for the read-only auto-approvals |
+| `grok_hermetic` config.toml | compat cells off, subagents/memory/managed MCPs/remote managed config/leader/trace upload off; ONLY the spec's `[mcp_servers.*]`, `Authorization = "Bearer ${ENV}"` | Grok merges MCP/skills/rules/agents/hooks from `~/.claude.json`, `~/.claude/`, `~/.cursor/` by default |
+| `grok_hermetic` requirements.toml | `allow_managed_mcp_servers_only`, exact-URL `[[allowed_mcp_servers]]`, `enable_all_project_mcp_servers = false`, `allow_managed_hooks_only`, and the same switches as policy | A workspace `.mcp.json` or `.grok/config.toml` still adds servers (compat cells do not cover them); policy keys in `config.toml` are **ignored** — only `requirements.toml` enforces them |
+| isolated `HOME` (`<grok_home>/hermetic-home`) | grok process env | Compat cells do **not** stop Claude *plugins* (`~/.claude/plugins`: skills, command hooks, stdio MCP servers) or `~/.agents/skills` |
+| GROK_* scrub | grok process env keeps only `GROK_HOME` (plus `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`CURSOR_CONFIG_DIR` dropped) | `GROK_CLAUDE_MCPS_ENABLED=true` overrides even a `requirements.toml` compat cell (cells are not `pin` keys); `GROK_CONFIG`/`GROK_CONFIG_PATH` are config overlays |
+| `grok_auth: subscription` | `XAI_API_KEY`/`GROK_CODE_XAI_API_KEY` removed from the grok env (headless and ACP) | Grok's auth precedence falls back to the metered key silently when the session token is missing/expired |
+
+`grok inspect --json` with the rendered home (real `$HOME` full of Claude
+plugins, a workspace `.mcp.json` and `.grok/config.toml`, and
+`GROK_CLAUDE_MCPS_ENABLED=true` in the env) reported: 0 skills, 0 hooks,
+0 plugins, 0 project instructions; MCP servers = the declared one, with the
+workspace servers `disabledReason: not in allowedMcpServers`;
+`mcpManagedServersOnly: enforced`; `nonManagedHooks` and
+`projectMcpServers` enforced off. Without the isolated HOME the same
+compat-off config still loaded 43 skills, 5 plugins, 3 plugin hooks and 3
+plugin MCP servers.
+
+Ownership rules (`miragen/executor/grok_hermetic.py`):
+
+- `config.toml` and `requirements.toml` are rewritten atomically
+  (tmp + `os.replace`) at **every** start; grok itself appends state to
+  `config.toml` at runtime, so ownership is a marker file
+  (`.miragen-hermetic-owner`), not a TOML comment.
+- Everything else in GROK_HOME (`auth.json`, `sessions/`, `logs/`) is
+  never touched.
+- A home owned by another agent, or a `requirements.toml` miragen did not
+  write (possibly an organisation's synced policy), makes `prepare()` fail
+  loudly. A pre-existing `config.toml` is kept once as
+  `config.toml.pre-hermetic` and restored when `grok_hermetic` is turned
+  off (which also removes the policy file and marker).
+- `grok_hermetic` requires a dedicated `grok_home`: its policy pins clamp
+  every grok process using that home. Log in once into that home with
+  `miragen grok-login --grok-home <it>`.
+
+Validation (profiles fail loudly on dead config): every new field is
+grok-build only; all but `grok_auth` require `grok_transport: headless`;
+headless `mcp_servers` now require `grok_hermetic: true` (still rejected
+without it — no silent drop); hermetic `bearer_token_env` must be a plain
+env var name and server URLs must be literal (they are the allowlist
+entries); `web_search: true` with a `grok_tools` list that omits
+`web_search`/`web_fetch` is rejected.
+
+Not covered here (see the live-probe notes in the PR): whether
+`use_tool`'s file-backed argument forms (`tool_input_file`, `{"file": …}`,
+07-mcp-servers.md) let the model read local files into an allowed MCP call;
+and retention — grok keeps full transcripts under
+`$GROK_HOME/sessions/` (the `storage.cleanup_ttl_days` key prunes them).
+
 ### Optional MIT package (`grok-build-sdk` working name)
 
 Scope if extracted:
