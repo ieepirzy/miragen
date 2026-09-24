@@ -532,6 +532,28 @@ BRIDGE_DEFAULT_REDIRECT_URIS = (
 # ---------------------------------------------------------------------------
 
 
+def build_recall_selector(recall):
+    """sessions.yaml `recall` → the selector, or None when the lane is off or
+    no model is configured. Nothing heavy is imported: pydantic-ai loads on
+    the first selection, and `claude-code:` only checks that the CLI and a
+    subscription credential are visible (a warning — the lane fails closed)."""
+    if not (recall.enabled and recall.model):
+        return None
+    from miragen.memory.selection import build_model_selector, selector_backend
+
+    if selector_backend(recall.model) == "claude-code":
+        from miragen.memory.claude_code import unavailable_reason
+
+        reason = unavailable_reason()
+        if reason:
+            logger.warning(f"recall.model {recall.model}: {reason}; every selection "
+                           "will fail and optional recall will inject nothing")
+    return build_model_selector(
+        recall.model, base_url=recall.base_url, api_key_env=recall.api_key_env,
+        timeout_s=recall.timeout_s,
+    )
+
+
 def _build_session_plane(config_path: str):  # pragma: no cover - deployment wiring
     """The external-session plane from MIRAGEND_SESSIONS_CONFIG: secrets
     via the *_FILE loader, the recall selector only when a model is
@@ -540,11 +562,7 @@ def _build_session_plane(config_path: str):  # pragma: no cover - deployment wir
     from miragen.daemon.sessions.config import load_sessions_config
 
     config = load_sessions_config(config_path)
-    selector = None
-    if config.recall.enabled and config.recall.model:
-        from miragen.memory.selection import build_model_selector
-
-        selector = build_model_selector(config.recall.model)
+    selector = build_recall_selector(config.recall)
     telemetry = None
     otlp_endpoint = os.getenv("MIRAGEN_OTLP_ENDPOINT")
     if otlp_endpoint:
@@ -559,7 +577,8 @@ def _build_session_plane(config_path: str):  # pragma: no cover - deployment wir
     plane = SessionPlane(config, selector=selector, telemetry=telemetry)
     logger.info(
         f"session plane enabled: principal={config.principal} state={plane.state_dir} "
-        f"recall={'on' if selector else 'off'} provision={config.scopes.provision}"
+        f"recall={f'on ({selector.backend})' if selector else 'off'} "
+        f"provision={config.scopes.provision}"
     )
     return plane
 
