@@ -1323,6 +1323,7 @@ async def lifespan(app: FastAPI):
             runtime_tools=_runtime_extra_tools(),
             registered_tools=registered_tools(),
             bind_context=_bind_run_context,
+            system_guidance=_speak_guidance,
         )
         _gateway_mount.inner = _gateway.asgi
         logger.info(

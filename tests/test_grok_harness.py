@@ -322,3 +322,12 @@ async def test_concurrent_turns_on_different_instances_both_succeed(env):
     a, b = await asyncio.gather(h.run(turn("one", instance="a", run_id="ra")),
                                 h.run(turn("two", instance="b", run_id="rb")))
     assert a.output == "echo: one\n" and b.output == "echo: two\n"
+
+
+async def test_voice_guidance_is_part_of_the_session_rules(env):
+    base = env.harness()
+    h = GrokHarness(profile(), env.gateway, base.settings, system_guidance="Tags: [laugh]")
+    env.harnesses.append(h)
+    res = await h.run(turn("HISTORY", instance="voice"))
+    assert "You are Mira." in res.output
+    assert "## Speaking aloud" in res.output and "Tags: [laugh]" in res.output

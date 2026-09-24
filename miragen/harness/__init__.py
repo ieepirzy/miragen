@@ -46,6 +46,7 @@ def build_model_harness(
     registered_tools: dict | None = None,
     bind_context=None,
     gateway_url: str | None = None,
+    system_guidance: str | None = None,
 ):
     """A long-lived non-PydanticAI harness for this profile, plus the tool
     gateway it acts through: (harness, gateway)."""
@@ -57,5 +58,6 @@ def build_model_harness(
         gateway = ToolGateway(profile, runtime_tools=runtime_tools,
                               registered_tools=registered_tools, bind_context=bind_context)
         url = gateway_url or f"http://127.0.0.1:{os.environ.get('PORT', '8000')}/mcp/gateway/"
-        return GrokHarness(profile, gateway, GrokSettings.from_env(gateway_url=url)), gateway
+        return GrokHarness(profile, gateway, GrokSettings.from_env(gateway_url=url),
+                           system_guidance=system_guidance), gateway
     raise ValueError(f"harness '{name}' is not available in this build")

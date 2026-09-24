@@ -161,6 +161,7 @@ class GrokHarness:
         settings: GrokSettings,
         *,
         session_factory: Callable[..., AcpSession] | None = None,
+        system_guidance: str | None = None,
     ):
         if profile.spec is None:
             raise GrokHarnessError("the grok-build harness runs base-tier (spec:) profiles")
@@ -168,7 +169,12 @@ class GrokHarness:
         self.gateway = gateway
         self.settings = settings
         self.model = parse_harness_model(profile.spec.model)[1] or None
-        self.instructions = profile.spec.instructions or ""
+        # System instructions = identity + stable profile-level guidance
+        # (the voice renderer's 'Speaking aloud' section). Part of the
+        # session's rules, so a change forks the session (decision 7).
+        from miragen.voice import with_voice_guidance
+
+        self.instructions = with_voice_guidance(profile.spec.instructions or "", system_guidance)
         self._session_factory = session_factory or AcpSession
         self._agents: dict[str, _Agent] = {}
         self._spawn_lock = asyncio.Lock()
