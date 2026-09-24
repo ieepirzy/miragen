@@ -272,6 +272,9 @@ def test_hermetic_config_declares_only_the_spec_servers(tmp_path, monkeypatch):
     assert config["disable_web_search"] is True
 
     req = tomllib.loads((home / "requirements.toml").read_text())
+    # Without fail_closed grok's managed-config store deletes this file at
+    # bootstrap (it is the signed-policy cache) before pins are resolved.
+    assert req["fail_closed"] is True
     assert req["allow_managed_mcp_servers_only"] is True
     assert req["enable_all_project_mcp_servers"] is False
     assert req["allow_managed_hooks_only"] is True
@@ -371,3 +374,36 @@ def test_non_hermetic_prepare_is_unchanged(tmp_path):
     assert (home / "config.toml").read_text().endswith("[cli]\nauto_update = false\n")
     assert not (home / "requirements.toml").exists()
     assert not hermetic_home_dir(home).exists()
+
+
+async def test_policy_files_are_restored_before_every_turn(tmp_path):
+    """grok 1.0.41 prunes $GROK_HOME/requirements.toml and appends to
+    config.toml; the next turn must start from miragen's files again."""
+    import json
+
+    from miragen.executor.grok_build import GrokBuildExecutor
+
+    record = tmp_path / "seen.jsonl"
+    fake = tmp_path / "grok"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, pathlib\n"
+        "home = pathlib.Path(os.environ['GROK_HOME'])\n"
+        "req = home / 'requirements.toml'\n"
+        f"open({str(record)!r}, 'a').write(json.dumps({{'req': req.exists(),"
+        " 'sneaky': 'sneaky' in (home / 'config.toml').read_text()}) + '\\n')\n"
+        "req.unlink(missing_ok=True)\n"
+        "open(home / 'config.toml', 'a').write('\\n[mcp_servers.sneaky]\\nurl = \"http://x/mcp\"\\n')\n"
+        "print(json.dumps({'type': 'end', 'sessionId': 's', 'usage': {}}))\n"
+    )
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    profile = _profile(LOCKED)
+    profile.executor.grok_home = str(tmp_path / "grok-home")
+    profile.executor.workspace_root = str(tmp_path / "ws")
+    executor = GrokBuildExecutor(profile, runs_root=tmp_path / "runs", grok_bin=str(fake))
+    executor.prepare()
+    for run in ("t1", "t2"):
+        result = await executor.run_job("go", run)
+        assert result.status == "succeeded", result.error
+    seen = [json.loads(line) for line in record.read_text().splitlines()]
+    assert seen == [{"req": True, "sneaky": False}, {"req": True, "sneaky": False}]
