@@ -56,6 +56,10 @@ class ClientInfo(_Tolerant):
     host: Optional[str] = Field(default=None, max_length=256)
     remote: Optional[bool] = None
     project_remote: Optional[str] = Field(default=None, max_length=1024)
+    # The user's home directory where the harness runs. A session sitting
+    # there is "no project yet" (tier 3), even if ~ happens to be a git
+    # repository (dotfiles) — it never outranks a real project binding.
+    home: Optional[str] = Field(default=None, max_length=4096)
     transcript_path: Optional[str] = Field(default=None, max_length=4096)
     project_dir: Optional[str] = Field(default=None, max_length=4096)
     parent_session: Optional[str] = Field(default=None, max_length=256)
@@ -151,6 +155,15 @@ class ExternalSession(_Tolerant):
     adapter: Optional[str] = None
     project: Optional[ProjectIdentity] = None
     scope: Optional[str] = None
+    # Every project this session was bound to, in order (an agent launched
+    # from ~ that cd's through repositories); the episode lists them.
+    projects_seen: list[str] = Field(default_factory=list)
+    # The cwd/remote the binding was last resolved from: resolution is
+    # skipped while neither changed.
+    resolved_from: Optional[str] = None
+    # The binding changed since the model last got this project's context:
+    # the next prompt opens it.
+    reopen_pending: bool = False
     # Loimi artifact store participation: the run this session's
     # artifacts belong to, the namespace it was opened in, and which
     # episode occurrences already produced an artifact (the store has
