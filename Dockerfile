@@ -43,8 +43,14 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
     "/build[codex,claude-code]"
 
+# State directories are created here, owned by agentuser: a named volume
+# mounted on a path that doesn't exist in the image comes up root-owned and
+# unwritable for agentuser (runs, histories, grok/codex homes all failed).
+# Docker copies the image directory's ownership into a fresh named volume.
 RUN adduser --disabled-password --gecos "" agentuser \
-    && chown agentuser /agent
+    && mkdir -p /agent/runs /agent/workspaces /agent/histories /agent/schedules \
+       /agent/memory /agent/grok-home /agent/codex-home /agent/kimi-home \
+    && chown -R agentuser /agent
 
 USER agentuser
 
