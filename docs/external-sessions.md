@@ -352,9 +352,9 @@ candidates, if any, apply (§17.7). `recall.model` in `sessions.yaml` picks it:
 `recall.timeout_s` bounds one selector call (unset: the `claude-code` runner's
 own default); a timed-out or failed selection injects nothing optional. For
 `claude-code:` the daemon warns at startup when the `claude` binary or a
-subscription credential is missing. The published `miragend` image ships the
-Claude Code CLI (pin with `--build-arg CLAUDE_CODE_VERSION=<x.y.z>`); in a
-container, pass `CLAUDE_CODE_OAUTH_TOKEN` through the environment. Each
+subscription credential is missing. In a container, the image must carry the
+Claude Code CLI and `CLAUDE_CODE_OAUTH_TOKEN` must be passed through the
+environment. Each
 uncached prompt spawns one `claude` process (about 2–3 s with Haiku), capped
 by `MIRAGEN_CLAUDE_CODE_CONCURRENCY` (default 2).
 
