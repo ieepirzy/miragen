@@ -37,6 +37,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
@@ -102,20 +103,52 @@ class _Agent:
     ephemeral: bool
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_used: float = field(default_factory=time.monotonic)
+    # Turns that hold this agent (reserved under the spawn lock, before the
+    # turn takes `lock`): eviction and the reaper never touch a reserved agent.
+    reserved: int = 0
+
+    @property
+    def busy(self) -> bool:
+        return self.reserved > 0 or self.lock.locked()
 
 
 def instructions_hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
+_GATEWAY_TOOL = re.compile(rf"^{GATEWAY_SERVER}__[A-Za-z0-9_.-]+$")
+# Fields that name the tool being called — never its (model-written) input.
+_IDENTITY_FIELDS = ("toolName", "tool_name", "name", "title")
+_DISPATCH_SERVER = ("server", "server_name", "serverName", "mcp_server")
+_DISPATCH_TOOL = ("tool", "tool_name", "toolName", "name")
+
+
 def is_gateway_tool_call(params: dict[str, Any]) -> bool:
     """Does a permission request concern a gateway tool?
 
-    MCP tools reach grok as ``<server>__<tool>`` through its use_tool
-    dispatcher. Anything that doesn't name a gateway tool — a built-in that
-    somehow survived the agent profile, another MCP server — is refused."""
-    blob = json.dumps(params.get("toolCall") or params, default=str)
-    return f'"{GATEWAY_SERVER}__' in blob or f"{GATEWAY_SERVER}__" in blob
+    Only the call's *identity* is examined: a tool-name field that is
+    exactly ``gateway__<tool>``, or a use_tool/search_tool dispatch whose
+    target server is exactly ``gateway``. Arguments are never searched —
+    they are model-written, and a built-in whose input merely mentions a
+    gateway tool must still be refused.
+
+    This layer only sees tools that ask permission. Grok auto-runs some
+    read-only built-ins without asking, so removing built-ins through the
+    agent profile remains the primary barrier; the gateway is the last."""
+    call = params.get("toolCall")
+    if not isinstance(call, dict):
+        return False
+    names = [call.get(k) for k in _IDENTITY_FIELDS if isinstance(call.get(k), str)]
+    if any(_GATEWAY_TOOL.fullmatch(n) for n in names):
+        return True
+    raw = call.get("rawInput")
+    if any(n in DISPATCHERS for n in names) and isinstance(raw, dict):
+        server = next((raw[k] for k in _DISPATCH_SERVER if isinstance(raw.get(k), str)), None)
+        tool = next((raw[k] for k in _DISPATCH_TOOL if isinstance(raw.get(k), str)), None)
+        if server is not None:
+            return server == GATEWAY_SERVER and bool(tool)
+        return bool(tool and _GATEWAY_TOOL.fullmatch(tool))
+    return False
 
 
 class GrokHarness:
@@ -246,6 +279,7 @@ class GrokHarness:
         async with self._spawn_lock:
             agent = self._agents.get(instance)
             if agent is not None and agent.acp.alive:
+                agent.reserved += 1
                 return agent
             if agent is not None:  # died since last turn: resume via session/load
                 self._agents.pop(instance, None)
@@ -253,12 +287,13 @@ class GrokHarness:
                     await agent.acp.close()
             await self._evict_for_capacity()
             agent = await self._spawn(instance, ephemeral=ephemeral)
+            agent.reserved += 1
             self._agents[instance] = agent
             self._ensure_reaper()
             return agent
 
     async def _evict_for_capacity(self) -> None:
-        idle = sorted((a for a in self._agents.values() if not a.lock.locked()),
+        idle = sorted((a for a in self._agents.values() if not a.busy),
                       key=lambda a: a.last_used)
         while len(self._agents) >= self.settings.max_processes and idle:
             await self._drop(idle.pop(0).instance)
@@ -278,7 +313,7 @@ class GrokHarness:
             await asyncio.sleep(min(60.0, max(1.0, self.settings.idle_s / 4)))
             now = time.monotonic()
             for agent in list(self._agents.values()):
-                if not agent.lock.locked() and now - agent.last_used > self.settings.idle_s:
+                if not agent.busy and now - agent.last_used > self.settings.idle_s:
                     logger.info("grok harness: stopping idle process for %s", agent.instance)
                     async with self._spawn_lock:
                         await self._drop(agent.instance)
@@ -332,6 +367,7 @@ class GrokHarness:
                     calls = list(log.calls)
                 agent.last_used = time.monotonic()
         finally:
+            agent.reserved -= 1
             if ephemeral:
                 await self._drop(instance)
         if not agent.acp.alive and not ephemeral:

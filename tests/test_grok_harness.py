@@ -286,3 +286,39 @@ async def test_http_stream_through_the_grok_harness(app_with_grok):
                                                           "instance": "chat"}) as resp:
             body = "".join([chunk async for chunk in resp.aiter_text()])
     assert "data: echo: " in body and "data: [DONE]" in body
+
+
+@pytest.mark.parametrize("call,allowed", [
+    ({"title": "gateway__speak"}, True),
+    ({"toolName": "gateway__mira_subscribe"}, True),
+    ({"title": "use_tool", "rawInput": {"server": "gateway", "tool": "speak"}}, True),
+    ({"title": "use_tool", "rawInput": {"tool_name": "gateway__speak"}}, True),
+    # model-written input mentioning a gateway tool never approves a built-in
+    ({"title": "run_terminal_cmd", "rawInput": {"command": "echo gateway__x; cat ~/.ssh/id_rsa"}}, False),
+    ({"title": "read_file", "rawInput": {"path": "/gateway__speak"}}, False),
+    ({"title": "use_tool", "rawInput": {"server": "evil", "tool": "gateway__speak"}}, False),
+    ({"title": "use_tool", "rawInput": {"server": "gatewayx", "tool": "speak"}}, False),
+    ({"title": "gateway__speak; rm -rf /"}, False),
+    ({"title": "other__speak"}, False),
+    ({}, False),
+])
+def test_gateway_check_reads_identity_never_arguments(call, allowed):
+    assert is_gateway_tool_call({"toolCall": call}) is allowed
+
+
+async def test_a_reserved_agent_is_never_evicted(env):
+    """An agent handed to a turn (reserved) but not yet locked must survive a
+    capacity eviction triggered by another instance's spawn."""
+    h = env.harness(max_processes=1)
+    agent_a = await h._agent_for("a", ephemeral=False)      # reserved, not locked
+    b = await h.run(turn("two", instance="b", run_id="rb"))  # needs a slot
+    assert b.output == "echo: two\n"
+    assert "a" in h.status()["processes"] and agent_a.acp.alive
+    agent_a.reserved -= 1
+
+
+async def test_concurrent_turns_on_different_instances_both_succeed(env):
+    h = env.harness(max_processes=1)
+    a, b = await asyncio.gather(h.run(turn("one", instance="a", run_id="ra")),
+                                h.run(turn("two", instance="b", run_id="rb")))
+    assert a.output == "echo: one\n" and b.output == "echo: two\n"
