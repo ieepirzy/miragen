@@ -41,6 +41,31 @@ _EXT_BY_CONTENT_TYPE = {
 _REQUEST_TIMEOUT_S = 60.0
 
 
+def load_speak_guidance(spec: VoiceSpec, profile_path: str | None) -> str | None:
+    """The renderer guidance text for the speak tool, or None. A configured
+    file that can't be read is a boot failure, never a silently plainer tool."""
+    if not spec.instructions_file:
+        return None
+    from pathlib import Path
+
+    path = Path(spec.instructions_file)
+    if not path.is_absolute() and profile_path:
+        path = Path(profile_path).resolve().parent / path
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError(f"voice.instructions_file {path} is not readable: {exc}") from exc
+    if not text:
+        raise ValueError(f"voice.instructions_file {path} is empty")
+    return text
+
+
+def with_speak_guidance(doc: str, guidance: str | None) -> str:
+    if not guidance:
+        return doc
+    return f"{doc.rstrip()}\n\nHow the speech renderer reads your text:\n{guidance}"
+
+
 class VoiceError(Exception):
     """The provider refused or failed a speak call; the message is what the
     agent (or operator) sees, and says what to fix."""

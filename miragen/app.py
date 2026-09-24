@@ -95,7 +95,9 @@ from miragen.runtime_tools.scheduling import (
 )
 from miragen.memory.tools import build_memory_tools
 from miragen.memory_mcp import build_memory_mcp
-from miragen.voice import SpeechAudio, VoiceBackend, build_voice_backend
+from miragen.voice import (
+    SpeechAudio, VoiceBackend, build_voice_backend, load_speak_guidance, with_speak_guidance,
+)
 from miragen.voice_mcp import build_voice_mcp
 
 logger = logging.getLogger(__name__)
@@ -109,6 +111,8 @@ _limits: UsageLimits | None = None
 # profiles whose spec.model names one. None for pydantic-ai profiles: their
 # harness wraps the _agent/_limits globals above (see _model_harness).
 _harness: Harness | None = None
+# voice.instructions_file contents: renderer guidance on the speak tool.
+_speak_guidance: str | None = None
 _scheduler: AsyncIOScheduler = AsyncIOScheduler()
 _run_store: RunStore | None = None
 _executor: "ExecutorBackend | None" = None
@@ -415,7 +419,7 @@ def _record_audio_artifacts(run_id: str | None) -> None:
         logger.warning("Failed to annotate audio artifacts", exc_info=True)
 
 
-def _make_speak_tool(backend: "VoiceBackend") -> Callable:
+def _make_speak_tool(backend: "VoiceBackend", guidance: str | None = None) -> Callable:
     async def speak(text: str, voice: str | None = None) -> str:
         """Speak text aloud through this agent's configured voice provider.
 
@@ -431,13 +435,14 @@ def _make_speak_tool(backend: "VoiceBackend") -> Callable:
             return f"Audio synthesized and stored at {saved}."
         return "Audio synthesized (no run to store it against; discarded)."
 
+    speak.__doc__ = with_speak_guidance(speak.__doc__ or "", guidance)
     return speak
 
 
 def _voice_extra_tools() -> list[Callable] | None:
     """The runtime tools a `voice:` profile grants — what build_agent
     receives as extra_tools (both the startup agent and per-run rebuilds)."""
-    return [_make_speak_tool(_voice)] if _voice is not None else None
+    return [_make_speak_tool(_voice, _speak_guidance)] if _voice is not None else None
 
 
 def _build_memory_lifecycle(profile: AgentProfile) -> "MemoryLifecycle | None":
@@ -1231,7 +1236,7 @@ def _load_file_secrets() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _profile, _agent, _limits, _harness, _run_store, _executor, _schedule_store, \
+    global _profile, _agent, _limits, _harness, _speak_guidance, _run_store, _executor, _schedule_store, \
         _publication_store, _telemetry, _voice, _memory, _scheduling
 
     _load_file_secrets()
@@ -1275,6 +1280,9 @@ async def lifespan(app: FastAPI):
         build_voice_backend(_profile.voice, _profile.name)
         if _profile.voice is not None
         else None
+    )
+    _speak_guidance = (
+        load_speak_guidance(_profile.voice, profile_path) if _profile.voice is not None else None
     )
     if _voice is not None:
         logger.info(f"Voice enabled (provider: {_profile.voice.provider})")
@@ -1351,7 +1359,8 @@ async def lifespan(app: FastAPI):
     # window in which an immediate startup trigger fires ahead of `yield`.
     ask_human_mcp = build_ask_human_mcp(lambda: (_run_store, _executor))
     _ask_human_guard.inner = ask_human_mcp.streamable_http_app()
-    voice_mcp = build_voice_mcp(lambda: (_voice, _resolve_and_store_audio))
+    voice_mcp = build_voice_mcp(lambda: (_voice, _resolve_and_store_audio),
+                                speak_guidance=_speak_guidance)
     _voice_mcp_guard.inner = voice_mcp.streamable_http_app()
     memory_mcp = build_memory_mcp(lambda: (_memory, _run_store))
     _memory_mcp_guard.inner = memory_mcp.streamable_http_app()
