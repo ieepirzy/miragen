@@ -60,10 +60,13 @@ def load_speak_guidance(spec: VoiceSpec, profile_path: str | None) -> str | None
     return text
 
 
-def with_speak_guidance(doc: str, guidance: str | None) -> str:
+def with_voice_guidance(instructions: str, guidance: str | None) -> str:
+    """The agent's system instructions with the renderer guidance appended
+    (decision recorded in docs/design/harnesses.md): identity text first,
+    then how the speech renderer reads what the agent says aloud."""
     if not guidance:
-        return doc
-    return f"{doc.rstrip()}\n\nHow the speech renderer reads your text:\n{guidance}"
+        return instructions
+    return f"{instructions.rstrip()}\n\n## Speaking aloud\n\n{guidance}"
 
 
 class VoiceError(Exception):

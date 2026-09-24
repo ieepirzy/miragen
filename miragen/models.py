@@ -451,10 +451,9 @@ class VoiceSpec(_ProfileModel):
         min_length=1,
         description=(
             "Renderer guidance (e.g. a TTS engine's supported tags and language "
-            "handling) appended to the speak tool's description. It reaches the "
-            "model exactly where it decides what to say aloud, and stays out of "
-            "the agent's identity/system prompt. A relative path resolves "
-            "against the profile file's directory."
+            "handling), kept in its own file and appended to the agent's system "
+            "instructions under 'Speaking aloud' (base tier, every harness). A "
+            "relative path resolves against the profile file's directory."
         ),
     )
 

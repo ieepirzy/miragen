@@ -26,12 +26,12 @@ from collections.abc import Callable
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from miragen.voice import SpeechAudio, VoiceBackend, VoiceError, with_speak_guidance
+from miragen.voice import SpeechAudio, VoiceBackend, VoiceError
 
 logger = logging.getLogger("miragen.voice_mcp")
 
 
-def build_voice_mcp(get_state, *, speak_guidance: str | None = None) -> FastMCP:
+def build_voice_mcp(get_state) -> FastMCP:
     """Build the FastMCP server. `get_state` is a zero-arg callable returning
     (voice_backend | None, store_audio) — read per call so the server mounted
     at import time sees the state the lifespan (or a test) wired later.
@@ -52,6 +52,7 @@ def build_voice_mcp(get_state, *, speak_guidance: str | None = None) -> FastMCP:
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
+    @mcp.tool()
     async def speak(text: str, voice: str | None = None, run_id: str | None = None) -> str:
         """Speak `text` aloud through this agent's configured voice provider.
 
@@ -80,6 +81,4 @@ def build_voice_mcp(get_state, *, speak_guidance: str | None = None) -> FastMCP:
             "against — pass run_id if you need the file kept."
         )
 
-    speak.__doc__ = with_speak_guidance(speak.__doc__ or "", speak_guidance)
-    mcp.tool()(speak)
     return mcp

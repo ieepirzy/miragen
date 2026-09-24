@@ -117,6 +117,7 @@ def build_agent(
     secret_env: dict[str, str] | None = None,
     extra_tools: list[Callable] | None = None,
     extra_instructions: str | None = None,
+    system_guidance: str | None = None,
 ) -> tuple[Agent, UsageLimits | None]:
     """
     Construct a live PydanticAI Agent from a validated AgentProfile.
@@ -178,6 +179,13 @@ def build_agent(
     # this is what makes a per-run memory packet transient (§17.3): it is
     # regenerated each run and never persisted into a saved conversation.
     instructions = profile.spec.instructions
+    if system_guidance:
+        # Stable, profile-level additions to the system prompt (the voice
+        # renderer guidance): part of who the agent is, unlike the per-run
+        # memory packet below.
+        from miragen.voice import with_voice_guidance
+
+        instructions = with_voice_guidance(instructions, system_guidance)
     if extra_instructions:
         instructions = f"{instructions}\n\n{extra_instructions}"
 

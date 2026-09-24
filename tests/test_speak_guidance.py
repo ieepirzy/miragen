@@ -1,13 +1,13 @@
-"""voice.instructions_file: renderer guidance rides the speak tool, not the
-system prompt."""
+"""voice.instructions_file: renderer guidance kept in its own file and
+appended to the agent's system instructions (every base-tier harness)."""
 
 from __future__ import annotations
 
 import pytest
 
-from miragen.models import VoiceSpec
-from miragen.voice import load_speak_guidance, with_speak_guidance
-from miragen.voice_mcp import build_voice_mcp
+from miragen.factory import build_agent
+from miragen.models import AgentProfile, VoiceSpec
+from miragen.voice import load_speak_guidance, with_voice_guidance
 
 
 def test_guidance_loaded_relative_to_profile(tmp_path):
@@ -28,10 +28,15 @@ def test_missing_or_empty_guidance_fails_boot(tmp_path, content):
 
 def test_no_file_no_guidance():
     assert load_speak_guidance(VoiceSpec(provider="http", url="http://t"), None) is None
-    assert with_speak_guidance("Say it.", None) == "Say it."
+    assert with_voice_guidance("You are Mira.", None) == "You are Mira."
 
 
-async def test_voice_mcp_speak_description_carries_guidance():
-    mcp = build_voice_mcp(lambda: (None, None), speak_guidance="Tags: [laugh]")
-    tool = next(t for t in await mcp.list_tools() if t.name == "speak")
-    assert "Tags: [laugh]" in tool.description and "speak" in tool.name
+def test_guidance_is_appended_to_the_system_instructions():
+    assert with_voice_guidance("You are Mira.\n", "Tags: [laugh]") == \
+        "You are Mira.\n\n## Speaking aloud\n\nTags: [laugh]"
+    profile = AgentProfile.model_validate({
+        "name": "t", "mode": "interactive", "triggers": [{"type": "http"}],
+        "spec": {"model": "test", "instructions": "You are Mira."}})
+    agent, _ = build_agent(profile, system_guidance="Tags: [laugh]", extra_instructions="MEM")
+    text = "\n".join(str(i) for i in agent._instructions)
+    assert text.index("You are Mira.") < text.index("## Speaking aloud") < text.index("MEM")
