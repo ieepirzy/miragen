@@ -39,6 +39,10 @@ from miragen.edf import (
 )
 from miragen.executor import ExecutorBackend, ExecutorResult, RepositoryCheckout, build_executor
 from miragen.factory import build_agent, registered_handlers
+from miragen.harness import (
+    PYDANTIC_AI, Harness, HarnessTurn, PydanticAIHarness, build_model_harness, profile_harness,
+    pydantic_ai_model,
+)
 from miragen.load import load_profile
 from miragen.profile_contract import SUPPORTED_PROFILE_CONTRACTS
 from miragen.models import (
@@ -70,7 +74,6 @@ from miragen.publication import (
 from miragen.runs import (
     AmbiguousRunIdError,
     RunStore,
-    extract_run_details,
     reserved_tokens_in_flight,
     run_retention_from_env,
     simplify_history_messages,
@@ -102,6 +105,10 @@ logger = logging.getLogger(__name__)
 _profile: AgentProfile | None = None
 _agent: Agent | None = None
 _limits: UsageLimits | None = None
+# A long-lived non-PydanticAI harness (e.g. Grok Build) for base-tier
+# profiles whose spec.model names one. None for pydantic-ai profiles: their
+# harness wraps the _agent/_limits globals above (see _model_harness).
+_harness: Harness | None = None
 _scheduler: AsyncIOScheduler = AsyncIOScheduler()
 _run_store: RunStore | None = None
 _executor: "ExecutorBackend | None" = None
@@ -278,6 +285,35 @@ def _save_history_messages(instance: str, messages: list, run_id: str | None) ->
     _append_history_sidecar(instance, run_id, len(messages))
 
 
+def _model_ready() -> bool:
+    """A base-tier harness is available for turns."""
+    return _harness is not None or _agent is not None
+
+
+def _model_harness() -> Harness:
+    """The harness running this profile's base-tier turns.
+
+    A dedicated harness (Grok Build, …) is long-lived and owns its own
+    state. The PydanticAI harness is a thin wrapper around the startup
+    agent, rebuilt on each call so it always sees the current `_agent`."""
+    if _harness is not None:
+        return _harness
+    assert _agent is not None, "Agent not initialized"
+    return PydanticAIHarness(
+        _agent,
+        _limits,
+        build_run_agent=lambda secret_env, extra_instructions: build_agent(
+            _profile,
+            telemetry=_telemetry,
+            secret_env=secret_env,
+            extra_tools=_runtime_extra_tools(),
+            extra_instructions=extra_instructions,
+        ),
+        load_history=lambda instance: _cap_history(_load_history_messages(instance)),
+        save_history=_save_history_messages,
+    )
+
+
 def _sidecar_message_count(instance: str, run_id: str) -> int | None:
     """
     message_count recorded in the instance's sidecar the last time `run_id`
@@ -430,7 +466,9 @@ def _build_memory_lifecycle(profile: AgentProfile) -> "MemoryLifecycle | None":
         selector_model = (
             profile.memory.recall.model
             or profile.memory.extraction.model
-            or (profile.spec.model if profile.spec else None)
+            # A harness model (grok-build:…) is not a PydanticAI model the
+            # selector could call: such profiles name memory.recall.model.
+            or pydantic_ai_model(profile)
         )
         if selector_model:
             from miragen.memory.selection import build_model_selector
@@ -535,7 +573,7 @@ async def run_agent(
             prompt, record, repositories=repositories, mcp_secret_env=mcp_secret_env
         )
 
-    assert _agent is not None, "Agent not initialized"
+    assert _model_ready(), "Agent not initialized"
 
     # Same rule as use_history above, in the other direction. Workspace
     # checkout is executor-tier machinery that the model tier does not have
@@ -566,23 +604,16 @@ async def run_agent(
             prompt_hint=prompt,
         )
 
-    agent, limits = (_agent, _limits)
-    if mcp_secret_env or memory_packet is not None:
-        agent, limits = build_agent(
-            _profile,
-            telemetry=_telemetry,
-            secret_env=mcp_secret_env,
-            extra_tools=_runtime_extra_tools(),
-            extra_instructions=memory_packet.text if memory_packet else None,
-        )
-
     history_instance = instance or DEFAULT_INSTANCE
-    history = None
-    if use_history:
-        try:
-            history = _cap_history(_load_history_messages(history_instance)) or None
-        except Exception:
-            logger.warning("Failed to load history, starting fresh")
+    turn = HarnessTurn(
+        prompt=prompt,
+        instance=history_instance,
+        use_history=use_history,
+        run_id=record.run_id if record is not None else None,
+        secret_env=mcp_secret_env or None,
+        extra_instructions=memory_packet.text if memory_packet is not None else None,
+    )
+    harness = _model_harness()
 
     run_ctx = (
         _telemetry.run_span(
@@ -598,13 +629,12 @@ async def run_agent(
     instance_token = _current_instance.set(instance)
     try:
         with run_ctx as run_span:
-            result = await agent.run(prompt, usage_limits=limits, message_history=history)
-            if run_span is not None:
-                pai_usage = result.usage
-                if pai_usage.input_tokens:
-                    run_span.set_attribute("gen_ai.usage.input_tokens", pai_usage.input_tokens)
-                if pai_usage.output_tokens:
-                    run_span.set_attribute("gen_ai.usage.output_tokens", pai_usage.output_tokens)
+            result = await harness.run(turn)
+            if run_span is not None and result.usage is not None:
+                if result.usage.input_tokens:
+                    run_span.set_attribute("gen_ai.usage.input_tokens", result.usage.input_tokens)
+                if result.usage.output_tokens:
+                    run_span.set_attribute("gen_ai.usage.output_tokens", result.usage.output_tokens)
     except Exception as e:
         if record is not None and _run_store is not None:
             _run_store.finish(record, status="failed", error=str(e))
@@ -620,17 +650,10 @@ async def run_agent(
         _current_run_id.reset(run_id_token)
         _current_instance.reset(instance_token)
 
-    if use_history:
-        try:
-            messages = result.all_messages()
-            _save_history_messages(history_instance, messages, record.run_id if record else None)
-        except Exception:
-            logger.warning("Failed to save history")
-
-    output = str(result.output)
+    output = result.output
 
     if record is not None and _run_store is not None:
-        usage, tool_calls = extract_run_details(result)
+        usage, tool_calls = result.usage, result.tool_calls
         _run_store.finish(
             record,
             status="succeeded",
@@ -1208,7 +1231,7 @@ def _load_file_secrets() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _profile, _agent, _limits, _run_store, _executor, _schedule_store, \
+    global _profile, _agent, _limits, _harness, _run_store, _executor, _schedule_store, \
         _publication_store, _telemetry, _voice, _memory, _scheduling
 
     _load_file_secrets()
@@ -1263,6 +1286,11 @@ async def lifespan(app: FastAPI):
         _executor.set_memory(_memory)
         _executor.prepare()
         logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode (executor tier: {_profile.executor.executor})")
+    elif profile_harness(_profile) != PYDANTIC_AI:
+        _harness = build_model_harness(_profile, runs_root=_run_store.root)
+        logger.info(
+            f"Agent '{_profile.name}' built in {_profile.mode} mode (harness: {_harness.name})"
+        )
     else:
         _agent, _limits = build_agent(
             _profile, telemetry=_telemetry, extra_tools=_runtime_extra_tools()
@@ -1347,6 +1375,11 @@ async def lifespan(app: FastAPI):
 
     _scheduler.shutdown(wait=False)
     logger.info("Scheduler stopped")
+    if _harness is not None:
+        # Long-lived harnesses hold processes (e.g. one grok agent per
+        # instance); stop them with the container.
+        await _harness.aclose()
+        _harness = None
 
     if _telemetry is not None:
         _telemetry.shutdown()
@@ -1644,7 +1677,7 @@ async def run(request: RunRequest):
     HTTP trigger endpoint. Available for interactive and hybrid agents,
     and for manually triggering autonomous agents outside their cron schedule.
     """
-    if _agent is None and _executor is None:
+    if not _model_ready() and _executor is None:
         raise HTTPException(status_code=503, detail="Agent not ready")
     _reject_executor_use_history(request)
     _raise_if_daily_budget_exceeded()
@@ -1684,7 +1717,7 @@ async def run_async(request: RunRequest):
     Non-blocking variant of /run: starts the run in the background and returns
     immediately with a run_id. Poll GET /runs/{run_id} for the outcome.
     """
-    if _agent is None and _executor is None:
+    if not _model_ready() and _executor is None:
         raise HTTPException(status_code=503, detail="Agent not ready")
     if _run_store is None or _profile is None:
         raise HTTPException(status_code=503, detail="Run store not ready")
@@ -2205,7 +2238,7 @@ async def launch_executor_run(request: ExecutorLaunchRequest, response: Response
     # name is executor-era and kept for compatibility; what it actually means
     # is "durable, idempotent, provenance-carrying launch", which is not
     # tier-specific. A profile with neither backend cannot run at all.
-    if _executor is None and _agent is None:
+    if _executor is None and not _model_ready():
         raise HTTPException(
             status_code=400,
             detail="this agent has no backend configured; /executor-runs requires "
@@ -2652,7 +2685,7 @@ async def run_stream(request: RunRequest):
             status_code=400,
             detail="executor-backed agents do not stream text; poll GET /runs/{run_id}/events instead",
         )
-    if _agent is None:
+    if not _model_ready():
         raise HTTPException(status_code=503, detail="Agent not ready")
 
     instance = request.effective_instance()
@@ -2663,13 +2696,6 @@ async def run_stream(request: RunRequest):
     try:
         prompt = _apply_trigger_prompt(request.prompt)
         history_instance = instance or DEFAULT_INSTANCE
-
-        history = None
-        if request.use_history:
-            try:
-                history = _cap_history(_load_history_messages(history_instance)) or None
-            except Exception:
-                logger.warning("Failed to load history for stream, starting fresh")
 
         record = (
             _run_store.start(
@@ -2683,7 +2709,7 @@ async def run_stream(request: RunRequest):
             else None
         )
 
-        stream_agent, stream_limits = _agent, _limits
+        memory_packet = None
         if _memory is not None:
             memory_packet = await _memory.prepare_context(
                 instance=instance,
@@ -2691,12 +2717,14 @@ async def run_stream(request: RunRequest):
                 trigger="http",
                 prompt_hint=prompt,
             )
-            stream_agent, stream_limits = build_agent(
-                _profile,
-                telemetry=_telemetry,
-                extra_tools=_runtime_extra_tools(),
-                extra_instructions=memory_packet.text,
-            )
+        turn = HarnessTurn(
+            prompt=prompt,
+            instance=history_instance,
+            use_history=request.use_history,
+            run_id=record.run_id if record is not None else None,
+            extra_instructions=memory_packet.text if memory_packet is not None else None,
+        )
+        harness = _model_harness()
     except Exception:
         release()
         raise
@@ -2719,18 +2747,11 @@ async def run_stream(request: RunRequest):
         try:
           with run_ctx as run_span:
             try:
-                async with stream_agent.run_stream(prompt, usage_limits=stream_limits, message_history=history) as stream:
-                    async for chunk in stream.stream_text(delta=True):
+                async with harness.stream(turn) as stream:
+                    async for chunk in stream:
                         chunks.append(chunk)
                         yield f"data: {chunk}\n\n"
-                    if request.use_history:
-                        try:
-                            messages = stream.all_messages()
-                            _save_history_messages(
-                                history_instance, messages, record.run_id if record else None
-                            )
-                        except Exception:
-                            logger.warning("Failed to save history after stream")
+                    stream_result = stream.result
             except Exception as e:
                 if record is not None and _run_store is not None:
                     _run_store.finish(record, status="failed", error=str(e), output="".join(chunks) or None)
@@ -2742,10 +2763,7 @@ async def run_stream(request: RunRequest):
                         )
                 raise
             if record is not None and _run_store is not None:
-                try:
-                    usage, tool_calls = extract_run_details(stream)
-                except Exception:
-                    usage, tool_calls = None, []
+                usage, tool_calls = stream_result.usage, stream_result.tool_calls
                 _run_store.finish(
                     record,
                     status="succeeded",
