@@ -7,8 +7,8 @@ the §9 design round (decisions 3–7); **nothing gets built until Ilari
 approves.**
 Revised after an agent fact-check against main: P1b already exists (undeployed),
 and P2 follows §17.7's mandatory selector.
-Owner: Mira (leads testing). Decided by Ilari 2026-09-23: **the VPS bridge
-(`10.8.0.4:8420` / `memory.muutto365.fi`) is the single memory store.** Local
+Owner: Mira (leads testing). Decided by Ilari 2026-09-23: **the hosted bridge
+is the single memory store.** Local
 miragend is not the driver.
 
 ## 0. Implementation status (2026-09-23)
@@ -23,7 +23,7 @@ Built, reviewed and green in CI, **not merged or deployed** (merge and deploy wa
 | P2 asynchronous recall + retrieval judgment log | #126 | Stacked on #118 |
 | P1a pushy end-of-work nudge | #128 | Stacked on #126 |
 | Deploy prerequisites (Claude Code in the image, worker grants) | #129 | |
-| Compose: bridge token, worker service | Muutto365/movingfirm-agents#43 | Deploy **only after** the miragen image contains all of the above |
+| Compose: bridge token, worker service | deployment repo (private) | Deploy **only after** the miragen image contains all of the above |
 
 Deferred, with issues: #116 redaction, #119 pinning, #120 async recall for HTTP hooks, #121 learned adapter, #122 `MEMORY.md` import, #123 judgment log into Loimi, #124 Codex/Grok parity, #125 run namespace after a switch, #130 poison-job retry cap, #133 other agents' messages recorded as the user's.
 
@@ -71,7 +71,7 @@ the only way in that actually runs is the agent voluntarily calling
 
 ### 2.3 Retrieval is off by construction
 - Per-prompt recall needs `recall.model` in `MIRAGEND_SESSIONS_CONFIG`
-  (`BRIDGE_RECALL_MODEL` in the agent-stack). It's unset on both daemons, so
+  (`BRIDGE_RECALL_MODEL` in the deployment stack). It's unset on both daemons, so
   `SessionPlane(selector=None)`. That's by design: §17.7 of the architecture
   pass makes the relevance selector mandatory ("No rank threshold or top-k
   list alone means 'relevant enough'").
@@ -112,7 +112,7 @@ Each item is one PR with a live check against the VPS, not only a suite.
 `claude -p` invocation. No API key, no per-token bill. The code already has
 the seam: `ExtractFn`, `CheckFn` and `SelectFn` are plain async callables, so
 the runner is a fourth implementation next to the PydanticAI ones, not a
-rewrite. Verified 2026-09-23 on Dakiaim (Claude Code 2.1.280):
+rewrite. Verified 2026-09-23 on the operator's desktop (Claude Code 2.1.280):
 ```
 claude -p <input> --model haiku --output-format json --json-schema <schema> \
   --system-prompt <instructions> --tools "" --setting-sources "" \
@@ -233,7 +233,7 @@ go through Loimi admission, so nothing mints authority.
     This reuses the grounded branch's consolidation instead of building a
     second one.
   - *Situation field:* each proposal also carries a short `situation` ("while
-    redeploying agent-stack on the VPS"). This is the store side of task
+    redeploying the bridge stack on the VPS"). This is the store side of task
     vectors (P2). It changes `ProposedMemory` (`extra="forbid"`) and the
     record payload. Before building, check it doesn't touch the grounding
     contract this doc promises to leave alone (§1).
@@ -311,7 +311,7 @@ there's no model-free "interim" recall.
 - *Budget:* tighter than §17.7's 2,000-token ceiling: about 800 tokens or
   4 cards per prompt, and never an id already injected in this session.
 - *Dense retrieval: deferred.* §17.2 already fixes bge-m3 at 1024 dims.
-  Deploying it is movingfirm-agents#29 and waits until scopes outgrow the
+  Deploying it is tracked in the deployment repo and waits until scopes outgrow the
   whole-scope path.
 - *Task vectors* (Ilari's term; origin miradb #600/#231/#225): a multi-facet
   **situation** representation (domain, activity, entities, outcome, a
@@ -423,7 +423,7 @@ Run it after each of P0–P3, so each PR shows what it moved.
   - **PreCompact/PostCompact** repeated within one prompt behave the same way.
 - UserPromptSubmit (once per prompt) and PostToolUseFailure (`tool_use_id`) are
   safe.
-- VPS evidence: `agent-stack-miragend-bridge-1` (`ghcr.io/ieepirzy/miragend:latest`)
+- VPS evidence: the bridge container (`ghcr.io/ieepirzy/miragend:latest`)
   logs `POST /memory/v1/events 409` → `memory degraded: hook capture: memory API 409`
   roughly every 32 s during long agentic sessions. Only hook events fail.
   Episodes and artifacts don't.
@@ -497,8 +497,8 @@ B. **Prompt capture + secrets.** Distilling session episodes (P1b) mines
    still holds once content gets *promoted*, not just stored.
 C. **Where the runner lives.** Either on the VPS next to the bridge (it needs
    the `claude` CLI in the image and a `setup-token` credential there; that
-   puts a personal subscription credential on the company VPS), or on
-   Dakiaim, where Claude Code is already logged in. Dakiaim is off at times:
+   puts a personal subscription credential on the shared VPS), or on
+   the operator's desktop, where Claude Code is already logged in. The desktop is off at times:
    extraction can queue, but per-prompt selection from cloud sessions would
    degrade while it's off. Recommendation: the VPS, if Ilari accepts the
    credential there.
@@ -523,7 +523,7 @@ PR #110 comments).
   `query_embedding` in a locked 1024-dim projection space (pgvector,
   migrations 0004/0005/0010; `service.py` search). **No embedding server is
   deployed**, so production recall is lexical-only. Tracked in
-  Muutto365/movingfirm-agents#29 (embed server + Loimi worker) and
+  the deployment repo's embed-server + Loimi-worker item and
   miragen#109 (memory worker: extraction, projection embeddings, predicate
   registry).
 - The write path exists but never runs: `miragen memory-worker` extracts from
@@ -531,8 +531,8 @@ PR #110 comments).
   propose zero). It skips per-turn `harness:*` events by design. It isn't
   deployed and has no model.
 - The selector (§17.7) is mandatory for automatic recall. Nothing injects
-  until `BRIDGE_RECALL_MODEL` is set (agent-stack env, declared in compose).
-  movingfirm-agents#28 tracks it.
+  until `BRIDGE_RECALL_MODEL` is set (bridge stack env, declared in compose).
+  The deployment repo tracks it.
 - Episodes are built from what hooks carry (prompts, last assistant messages,
   failures, children). There's no transcript reading.
 - The status line (P3) now tells agents the recall mode on every open, so the
