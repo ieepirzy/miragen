@@ -70,6 +70,15 @@ class ScopePolicy(_Model):
         description="Scope to use when a project scope cannot be provisioned "
                     "(auto without an operator token). None = degrade.",
     )
+    worker_principal: Optional[str] = Field(
+        default=None,
+        description=(
+            "The extraction worker's Loimi principal (`miragen memory-worker`). "
+            "Every project scope this daemon provisions is also granted to it "
+            "with read/propose/maintain, so the worker can claim that scope's "
+            "consolidate jobs. Unset: no worker grants."
+        ),
+    )
     adopt_by_name: bool = Field(
         default=True,
         description=(
@@ -151,6 +160,37 @@ class SessionsRecall(MemoryRecallSpec):
     )
     judgment_retention_days: int = Field(default=30, ge=1)
     judgment_max_mb: int = Field(default=64, ge=1)
+    # Selector endpoint knobs. Daemon-only on purpose: adding fields to the
+    # profile-level MemoryRecallSpec (extra=forbid) would change the agent-
+    # profile schema and need a profile-contract bump.
+    base_url: Optional[str] = Field(
+        default=None, min_length=1,
+        description="Point a pydantic-ai selector model at an OpenAI- or "
+                    "Anthropic-compatible endpoint (a local model server, a "
+                    "proxy). `model` must then be openai:, openai-chat:, "
+                    "openai-responses: or anthropic:<name>; not valid with "
+                    "claude-code:<model>.",
+    )
+    api_key_env: Optional[str] = Field(
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
+        description="NAME of the env var (or <NAME>_FILE) holding the base_url "
+                    "endpoint's key, never the value. Unset = a keyless endpoint; "
+                    "the provider's own OPENAI_API_KEY/ANTHROPIC_API_KEY is never "
+                    "sent to a custom base_url.",
+    )
+    timeout_s: Optional[float] = Field(
+        default=None, gt=0, le=600,
+        description="Bound on one selector call. Unset = the claude-code "
+                    "runner's own default; the plane's recall bound applies "
+                    "either way.",
+    )
+
+    @model_validator(mode="after")
+    def _selector_config(self) -> "SessionsRecall":
+        from miragen.memory.selection import validate_selector_config
+
+        validate_selector_config(self.model, self.base_url, self.api_key_env)
+        return self
 
 
 class SessionsNudge(_Model):

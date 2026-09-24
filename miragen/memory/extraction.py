@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -142,7 +143,25 @@ Your verdict gates admission wording only; it cannot verify external truth.
 
 
 def build_model_extractor(model: str) -> ExtractFn:
-    """The production extractor: one bounded structured-output call."""
+    """The production extractor: one bounded structured-output call —
+    through headless Claude Code for `claude-code:<model>`, PydanticAI
+    otherwise."""
+    from miragen.memory.claude_code import ClaudeCodeRunner, is_claude_code_model
+
+    if is_claude_code_model(model):
+        # Extraction p50 ≈ 30 s, tail > 90 s through the runner (P1.1 eval):
+        # 120 s timed real episodes out; a job that always times out would
+        # retry forever.
+        runner = ClaudeCodeRunner(model, timeout=300)
+
+        async def extract_cc(content: str, source_kind: str) -> ExtractionResult:
+            return await runner.run(
+                EXTRACTION_INSTRUCTIONS, f"[source kind: {source_kind}]\n{content}",
+                ExtractionResult,
+            )
+
+        return extract_cc
+
     from pydantic_ai import Agent
 
     agent = Agent(model=model, instructions=EXTRACTION_INSTRUCTIONS,
@@ -158,6 +177,19 @@ def build_model_extractor(model: str) -> ExtractFn:
 
 
 def build_model_checker(model: str) -> CheckFn:
+    from miragen.memory.claude_code import ClaudeCodeRunner, is_claude_code_model
+
+    if is_claude_code_model(model):
+        runner = ClaudeCodeRunner(model)
+
+        async def check_cc(statement: str, quote: str) -> SupportCheck:
+            return await runner.run(
+                CHECKER_INSTRUCTIONS, f"Statement: {statement}\nSupporting quote: {quote}",
+                SupportCheck,
+            )
+
+        return check_cc
+
     from pydantic_ai import Agent
 
     agent = Agent(model=model, instructions=CHECKER_INSTRUCTIONS,
@@ -261,6 +293,7 @@ async def run_worker_once(
     embed: EmbedFn | None = None,
     limit: int = 5,
     lease_seconds: int = 120,
+    skip_before: datetime | None = None,
 ) -> list[dict]:
     """One worker sweep: claim consolidate jobs in this principal's
     jurisdiction, process, complete — or fail-for-retry on error. Model
@@ -282,6 +315,13 @@ async def run_worker_once(
                 summary = await _process_index_job(client, job, embed)
             else:
                 event = await client.get_event(job["payload"]["event_id"])
+                if skip_before is not None and _received(event) < skip_before:
+                    # Backlog from before this deployment's cutoff: completed
+                    # without a model call (each is a paid/limited call).
+                    await client.complete_job(job["id"])
+                    results.append({"job_id": job["id"], "status": "skipped_backlog",
+                                    "event_id": event.get("id")})
+                    continue
                 summary = await process_event(client, event, extract=extract, check=check)
             await client.complete_job(job["id"])
             results.append(summary | {"job_id": job["id"], "status": "done"})
@@ -293,6 +333,17 @@ async def run_worker_once(
                 pass  # lease expiry re-queues it regardless
             results.append({"job_id": job["id"], "status": "failed", "error": str(exc)})
     return results
+
+
+def _received(event: dict) -> datetime:
+    """When the store received the event (occurred_at when that is all
+    there is); unknown → the epoch, i.e. treated as backlog."""
+    value = event.get("received_at") or event.get("occurred_at")
+    try:
+        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=UTC)
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
 
 
 async def _process_index_job(client: MemoryClient, job: dict, embed: EmbedFn) -> dict:
