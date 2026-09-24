@@ -132,7 +132,8 @@ def test_child_env_never_mutates_the_parent():
     parent = {"ANTHROPIC_API_KEY": "k", "PATH": "/bin"}
     child = child_env(parent)
     assert parent == {"ANTHROPIC_API_KEY": "k", "PATH": "/bin"}
-    assert child == {"PATH": "/bin", "MIRAGEN_WORKER": "1"}
+    assert child == {"PATH": "/bin", "MIRAGEN_WORKER": "1",
+                     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
 
 
 @pytest.mark.parametrize("mode", ["exit", "is_error", "missing", "garbage"])

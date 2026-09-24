@@ -36,6 +36,7 @@ import json
 import os
 import shutil
 import tempfile
+from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
 
@@ -118,7 +119,35 @@ def child_env(environ: dict[str, str] | None = None) -> dict[str, str]:
     for key in SCRUBBED_ENV:
         env.pop(key, None)
     env[WORKER_ENV] = "1"
+    # Skips the CLI's nonessential startup traffic: ~0.5 s per spawn, and
+    # every selector call is a spawn.
+    env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
     return env
+
+
+def unavailable_reason(
+    binary: str | None = None, environ: dict[str, str] | None = None,
+    home: Path | None = None,
+) -> str | None:
+    """Why a `claude-code:` model cannot run on this host, or None.
+
+    Startup honesty only (the call itself fails loudly anyway): the binary
+    must be on PATH (or MIRAGEN_CLAUDE_BIN), and a SUBSCRIPTION credential
+    must be visible — CLAUDE_CODE_OAUTH_TOKEN or an OAuth login under
+    ~/.claude. API keys don't count: child_env() scrubs them."""
+    env = os.environ if environ is None else environ
+    name = binary or env.get("MIRAGEN_CLAUDE_BIN") or "claude"
+    if shutil.which(name) is None and not Path(name).is_file():
+        return f"the `{name}` binary is not on PATH"
+    if env.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return None
+    config_dir = Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else (
+        (home or Path.home()) / ".claude"
+    )
+    if (config_dir / ".credentials.json").is_file():
+        return None
+    return ("no subscription credential: set CLAUDE_CODE_OAUTH_TOKEN "
+            "(`claude setup-token`) or log in under ~/.claude")
 
 
 def command(binary: str, model: str, instructions: str, schema: dict) -> list[str]:

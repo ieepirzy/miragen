@@ -71,7 +71,12 @@ recall:
   enabled: true
   # The zero-or-more relevance selector (one structured-output model call
   # per new prompt/state; cache hits are free). Unset = optional lane off.
-  model: null            # e.g. "deepseek:deepseek-chat"
+  model: null            # "claude-code:haiku" (subscription) or a pydantic-ai
+                         # model string, e.g. "deepseek:deepseek-chat"
+  # base_url: http://127.0.0.1:11434/v1   # openai:/openai-chat:/openai-responses:/
+  #                                       # anthropic: models only
+  # api_key_env: SELECTOR_KEY             # env var NAME (or SELECTOR_KEY_FILE)
+  # timeout_s: 30                         # per selector call; unset = runner default
   on_prompt: true
   min_prompt_chars: 20
   max_candidates: 20

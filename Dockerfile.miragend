@@ -25,6 +25,22 @@ RUN pip install --no-cache-dir "/build[daemon]" \
     && rm -rf /var/lib/apt/lists/* \
     && adduser --disabled-password --gecos "" miragend
 
+# Claude Code CLI for `claude-code:<model>` memory calls (selector, extractor,
+# checker) on the operator's subscription (CLAUDE_CODE_OAUTH_TOKEN from
+# `claude setup-token`). The native installer verifies the release checksum;
+# the binary is self-contained (no Node). Pin with --build-arg
+# CLAUDE_CODE_VERSION=<x.y.z>; updates come from rebuilding, never at runtime.
+ARG CLAUDE_CODE_VERSION=stable
+RUN set -e \
+    && apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh \
+    && bash /tmp/claude-install.sh "${CLAUDE_CODE_VERSION}" \
+    && cp -L /root/.local/bin/claude /usr/local/bin/claude \
+    && rm -rf /tmp/claude-install.sh /root/.local /root/.claude /root/.claude.json \
+    && rm -rf /var/lib/apt/lists/* \
+    && claude --version
+ENV DISABLE_AUTOUPDATER=1
+
 COPY entrypoint.miragend.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
