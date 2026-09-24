@@ -96,6 +96,9 @@ async def test_history_loaded_and_saved_only_with_use_history():
     assert agent.run.call_args.kwargs["message_history"] == ["m"]
 
 
-def test_unknown_harness_refuses_to_build(tmp_path):
-    with pytest.raises(ValueError, match="grok-build"):
-        build_model_harness(profile("grok-build:grok-4.6"), runs_root=tmp_path)
+def test_grok_build_prefix_builds_a_grok_harness_with_its_gateway(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIRAGEN_GROK_HOME", str(tmp_path / "grok-home"))
+    monkeypatch.setenv("MIRAGEN_GROK_WORKDIRS", str(tmp_path / "work"))
+    harness, gateway = build_model_harness(profile("grok-build:grok-4.6"), runs_root=tmp_path)
+    assert harness.name == "grok-build" and harness.gateway is gateway
+    assert harness.model == "grok-4.6"
