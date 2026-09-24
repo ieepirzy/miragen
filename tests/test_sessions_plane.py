@@ -975,6 +975,184 @@ class TestProjectReResolution:
         assert h.plane.registry.get("claude-code:s-1").project.id == REPO.id
 
 
+# ── asynchronous recall: search now, select in the background ────────────────
+
+ASYNC = {"capabilities": ["async-recall"]}
+
+
+async def _seeded(tmp_path, selector, **kwargs):
+    h = Harness(tmp_path, selector=selector, **kwargs)
+    await h.send("SessionStart", source="startup", client_extra=ASYNC)
+    lifecycle = h.plane._lifecycles[PROJECT_SCOPE]
+    await lifecycle.remember(instance=REPO.slug, run_id="seed",
+                             content="the hel1 deploy needs the vault mounted first")
+    await lifecycle.remember(instance=REPO.slug, run_id="seed2", content="lunch was good")
+    return h
+
+
+def _vault_selector(calls=None, gate=None):
+    async def selector(request, cards):
+        if calls is not None:
+            calls.append(request)
+        if gate is not None:
+            await gate.wait()
+        return SelectionResult(selections=[
+            Selection(record_id=c["record_id"], reason="same vault mount")
+            for c in cards if "vault" in c["payload"]["text"]
+        ])
+    return selector
+
+
+class TestAsyncRecall:
+    async def test_the_prompt_gets_a_notice_and_the_claim_gets_the_memory(self, tmp_path):
+        import asyncio
+
+        gate = asyncio.Event()
+        h = await _seeded(tmp_path, _vault_selector(gate=gate))
+        manifests_before = len(h.service.manifests)
+        result = await h.send("UserPromptSubmit", prompt="why does the hel1 deploy fail on vault",
+                              prompt_id="p-1", client_extra=ASYNC)
+        assert result.recall_pending == 1
+        assert "running in the background" in result.context
+        assert "vault mounted" not in result.context, "the prompt never waits for the selector"
+
+        pending = await h.plane.claim_recall("claude-code", "s-1", 1, wait=0)
+        assert pending == {"state": "pending"}
+        gate.set()
+        ready = await h.plane.claim_recall("claude-code", "s-1", 1, wait=5)
+        assert ready["state"] == "ready"
+        assert "vault mounted" in ready["context"] and "lunch" not in ready["context"]
+        assert await h.plane.claim_recall("claude-code", "s-1", 1, wait=0) == {"state": "delivered"}
+        # Counted and manifested when DELIVERED, exactly once.
+        await h.drain()
+        assert h.plane.stats.async_recalls_delivered == 1
+        new = h.service.manifests[manifests_before:]
+        assert len(new) == 1 and new[0]["policy"]["delivery"] == "async"
+
+    async def test_nothing_stored_means_no_notice_and_nothing_pending(self, tmp_path):
+        h = Harness(tmp_path, selector=_vault_selector())
+        await h.send("SessionStart", source="startup", client_extra=ASYNC)
+        result = await h.send("UserPromptSubmit", prompt="why does the hel1 deploy fail",
+                              client_extra=ASYNC)
+        assert result.recall_pending is None
+        assert result.context is None or "background" not in result.context
+        assert h.plane.stats.async_recalls_started == 0
+
+    async def test_a_new_prompt_supersedes_and_cancels_the_old_selection(self, tmp_path):
+        import asyncio
+
+        gate = asyncio.Event()
+        calls = []
+        h = await _seeded(tmp_path, _vault_selector(calls, gate=gate))
+        first = await h.send("UserPromptSubmit", prompt="vault question one here",
+                             client_extra=ASYNC)
+        await asyncio.sleep(0)
+        old_task = h.plane._recalls["claude-code:s-1"].task
+        second = await h.send("UserPromptSubmit", prompt="vault question two here",
+                              client_extra=ASYNC)
+        assert (first.recall_pending, second.recall_pending) == (1, 2)
+        await asyncio.sleep(0)
+        assert old_task.cancelled()
+        assert await h.plane.claim_recall("claude-code", "s-1", 1, wait=0) == {"state": "stale"}
+        gate.set()
+        assert (await h.plane.claim_recall("claude-code", "s-1", 2, wait=5))["state"] == "ready"
+        assert h.plane.stats.async_recalls_dropped == 1
+
+    async def test_compaction_and_session_end_drop_the_pending_result(self, tmp_path):
+        h = await _seeded(tmp_path, _vault_selector())
+        await h.send("UserPromptSubmit", prompt="vault question for compaction",
+                     client_extra=ASYNC)
+        await h.send("PreCompact", trigger="auto", client_extra=ASYNC)
+        assert await h.plane.claim_recall("claude-code", "s-1", 1, wait=1) == {"state": "stale"}
+        await h.send("UserPromptSubmit", prompt="vault question before the end",
+                     client_extra=ASYNC)
+        await h.send("SessionEnd", reason="clear", client_extra=ASYNC)
+        assert await h.plane.claim_recall("claude-code", "s-1", 2, wait=1) == {"state": "stale"}
+
+    async def test_a_failed_selection_is_said_once_and_never_reads_as_nothing(self, tmp_path):
+        async def broken(request, cards):
+            raise RuntimeError("claude exited 1: rate limited")
+
+        h = await _seeded(tmp_path, broken)
+        await h.send("UserPromptSubmit", prompt="vault question number one", client_extra=ASYNC)
+        failed = await h.plane.claim_recall("claude-code", "s-1", 1, wait=5)
+        assert failed["state"] == "failed" and "recall failed" in failed["context"]
+        await h.send("UserPromptSubmit", prompt="vault question number two", client_extra=ASYNC)
+        assert await h.plane.claim_recall("claude-code", "s-1", 2, wait=5) == {"state": "empty"}
+        assert h.plane.stats.async_recall_failures == 2
+        assert h.plane.judgments.written == 0, "a failed call is not a label"
+
+    async def test_every_selection_leaves_a_judgment_row(self, tmp_path):
+        import json as _json
+        import stat as _stat
+
+        h = await _seeded(tmp_path, _vault_selector())
+        await h.send("UserPromptSubmit", prompt="why does the hel1 deploy fail on vault, was lunch good",
+                     client_extra=ASYNC)
+        await h.plane.claim_recall("claude-code", "s-1", 1, wait=5)
+        (log,) = (h.state_dir / "judgments").glob("judgments-*.jsonl")
+        assert _stat.S_IMODE(log.stat().st_mode) == 0o600, "it holds prompt text"
+        rows = [_json.loads(line) for line in log.read_text().splitlines()]
+        judged, delivery = rows
+        assert judged["query"].endswith("why does the hel1 deploy fail on vault, was lunch good")
+        labels = {c["text"]: (c["selected"], c["reason"]) for c in judged["candidates"]}
+        assert labels["the hel1 deploy needs the vault mounted first"] == (True, "same vault mount")
+        assert labels["lunch was good"] == (False, None), "a non-pick is a hard negative"
+        assert delivery == {**delivery, "recall_id": judged["recall_id"], "delivery": "context"}
+        assert h.plane.describe()["judgments"]["written"] == 1
+
+    async def test_adapters_without_the_capability_keep_the_sync_path(self, tmp_path):
+        h = await _seeded(tmp_path, _vault_selector())
+        result = await h.send("UserPromptSubmit", prompt="why does the hel1 deploy fail on vault")
+        assert result.recall_pending is None
+        assert "vault mounted" in result.context
+
+    async def test_the_claim_route_answers_the_adapter(self, tmp_path):
+        h = await _seeded(tmp_path, _vault_selector())
+        await h.send("UserPromptSubmit", prompt="why does the hel1 deploy fail on vault",
+                     client_extra=ASYNC)
+        await h.drain()
+        client = TestClient(create_app(None, token="", sessions=h.plane))
+        answer = client.post("/sessions/v1/recall/claim",
+                             json={"harness": "claude-code", "session_id": "s-1", "seq": 1})
+        assert answer.status_code == 200 and answer.json()["state"] == "ready"
+        bad = client.post("/sessions/v1/recall/claim", json={"harness": "claude-code"})
+        assert bad.status_code == 422
+
+
+class TestAsyncRecallReviewFixes:
+    async def test_the_claim_answers_before_the_manifest_is_written(self, tmp_path):
+        import asyncio
+
+        h = await _seeded(tmp_path, _vault_selector())
+        await h.send("UserPromptSubmit", prompt="why does the hel1 deploy fail on vault",
+                     client_extra=ASYNC)
+        lifecycle = h.plane._lifecycles[PROJECT_SCOPE]
+        slow = asyncio.Event()
+        original = lifecycle.record_recall_manifest
+
+        async def slow_manifest(*args, **kwargs):
+            await slow.wait()
+            return await original(*args, **kwargs)
+
+        lifecycle.record_recall_manifest = slow_manifest
+        ready = await asyncio.wait_for(h.plane.claim_recall("claude-code", "s-1", 1, wait=5), 2)
+        assert ready["state"] == "ready", "a slow Loimi must not hold the answer"
+        slow.set()
+        await h.drain()
+
+    async def test_a_swept_session_leaves_no_recall_behind(self, tmp_path):
+        from datetime import timedelta
+
+        h = await _seeded(tmp_path, _vault_selector())
+        await h.send("UserPromptSubmit", prompt="why does the hel1 deploy fail on vault",
+                     client_extra=ASYNC)
+        h.alive.clear()
+        await h.plane.sweep(now=datetime.now(timezone.utc) + timedelta(days=3))
+        assert "claude-code:s-1" not in h.plane._recalls
+        assert h.plane.describe()["recall"]["pending"] == 0
+
+
 class TestWorkerGrants:
     def _config(self, worker):
         return SessionsConfig(

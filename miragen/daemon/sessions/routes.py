@@ -53,8 +53,25 @@ def register_session_routes(app: FastAPI, plane: SessionPlane, *, dependencies: 
             "state": result.state,
             "context": result.context,
             "detail": result.detail,
+            "recall_pending": result.recall_pending,
             "accepted": True,
         })
+
+    @app.post("/sessions/v1/recall/claim", dependencies=dependencies)
+    async def claim_recall(request: Request) -> JSONResponse:
+        """A pending background recall, claimed by the adapter after a tool
+        result (wait 0) or at Stop (bounded wait). The first claim that
+        finds a result delivers it; the answer says which state it is in."""
+        try:
+            body = await request.json()
+            harness = str(body["harness"])
+            session_id = str(body["session_id"])
+            seq = int(body["seq"])
+            wait = max(0.0, min(float(body.get("wait") or 0.0), 15.0))
+        except (ValueError, KeyError, TypeError) as exc:
+            return JSONResponse(status_code=422,
+                                content={"detail": str(exc)[:500], "code": "malformed_claim"})
+        return JSONResponse(await plane.claim_recall(harness, session_id, seq, wait=wait))
 
     @app.post("/sessions/v1/hooks/{harness}", dependencies=dependencies)
     async def post_raw_hook(harness: str, request: Request) -> JSONResponse:

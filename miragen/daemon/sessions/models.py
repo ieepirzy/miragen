@@ -60,6 +60,9 @@ class ClientInfo(_Tolerant):
     # there is "no project yet" (tier 3), even if ~ happens to be a git
     # repository (dotfiles) — it never outranks a real project binding.
     home: Optional[str] = Field(default=None, max_length=4096)
+    # What this adapter can do beyond the baseline, e.g. "async-recall": it
+    # keeps a recall-pending marker and claims results on later hooks.
+    capabilities: list[str] = Field(default_factory=list, max_length=16)
     transcript_path: Optional[str] = Field(default=None, max_length=4096)
     project_dir: Optional[str] = Field(default=None, max_length=4096)
     parent_session: Optional[str] = Field(default=None, max_length=256)

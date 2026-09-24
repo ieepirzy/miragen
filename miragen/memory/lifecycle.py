@@ -63,6 +63,32 @@ class MemoryPacket:
     optional_status: str | None = None
 
 
+@dataclass
+class RecallCandidates:
+    """Phase 1 of an asynchronous prompt recall (§17.7 steps 1-3): the
+    bounded search. Cheap and synchronous; `status` is "ok" only when there
+    are cards for the selector."""
+
+    status: str
+    instance: str = DEFAULT_INSTANCE
+    query: str = ""
+    cards: list[dict[str, Any]] = field(default_factory=list)
+    context: dict[str, Any] | None = None
+
+
+@dataclass
+class RecallSelection:
+    """Phase 2 (§17.7 steps 4-6): the selector's picks, re-rendered from
+    canonical state. `selected` is what the selector returned (clamped), in
+    order, with reasons — for the judgment log; `items` is what the section
+    actually emits — for the manifest, written only when delivered."""
+
+    status: str
+    section: str | None = None
+    items: list[dict[str, Any]] = field(default_factory=list)
+    selected: list[tuple[str, str]] = field(default_factory=list)
+
+
 class MemoryLifecycle:
     def __init__(
         self,
@@ -223,11 +249,7 @@ class MemoryLifecycle:
         zero-or-more selector, canonical re-render, budgeted injection.
         Failure NEVER falls back to stuffing neighbors — required state
         stands alone and the degradation is explicit in the manifest."""
-        from miragen.memory.selection import (
-            clamp_selections,
-            fit_optional_entries,
-            render_optional_section,
-        )
+        from miragen.memory.selection import clamp_selections
 
         if not self.spec.recall.enabled:
             return "disabled"
@@ -266,42 +288,11 @@ class MemoryLifecycle:
             if not selected:
                 return "none_selected"
 
-            # Canonical re-render (§17.7 step 5): fetch each selected id
-            # fresh — the selector chose, canonical state speaks.
-            entries = []
-            for record_id, reason in selected:
-                record = await self.client.get_record(record_id)
-                if (
-                    record.get("admission") != "accepted"
-                    or not record.get("roots_valid", False)
-                    or record.get("revision") is None
-                ):
-                    continue
-                payload = record["revision"]["payload"]
-                text = str(payload.get("text") or payload.get("value") or payload)[:500]
-                entries.append({
-                    "record_id": record_id,
-                    "revision_id": record["revision"]["id"],
-                    "type": record["type"],
-                    "text": text,
-                    "reason": reason,
-                })
-            section = render_optional_section(
-                entries, self.spec.recall.max_optional_chars
-            )
+            section, items = await self._render_selected(selected)
             if not section:
                 return "none_selected"
             packet.text = f"{packet.text}\n{section}"
-            # The renderer emits a prefix of `entries` and stops at the first
-            # that does not fit; only those are injected — the manifest and
-            # the "cite these ids" status line must not name the rest.
-            emitted = fit_optional_entries(entries, self.spec.recall.max_optional_chars)
-            packet.items.extend({
-                "kind": "recalled",
-                "record_id": entry["record_id"],
-                "revision_id": entry["revision_id"],
-                "reason": entry["reason"],
-            } for entry in emitted)
+            packet.items.extend(items)
             return "ok"
         except (MemoryUnavailable, MemoryAPIError) as exc:
             self._degrade(f"optional recall: {exc}")
@@ -317,6 +308,139 @@ class MemoryLifecycle:
                 "memories were not injected]"
             )
             return f"degraded: selector: {exc}"
+
+    async def _render_selected(
+        self, selected: list[tuple[str, str]],
+    ) -> tuple[str | None, list[dict[str, Any]]]:
+        """Canonical re-render (§17.7 step 5): fetch each selected id fresh —
+        the selector chose, canonical state speaks. Returns the rendered
+        section and the items it actually emits (the renderer stops at the
+        first entry that does not fit; the manifest and the "cite these ids"
+        status line must not name the rest)."""
+        from miragen.memory.selection import (
+            fit_optional_entries,
+            render_optional_section,
+        )
+
+        entries = []
+        for record_id, reason in selected:
+            record = await self.client.get_record(record_id)
+            if (
+                record.get("admission") != "accepted"
+                or not record.get("roots_valid", False)
+                or record.get("revision") is None
+            ):
+                continue
+            payload = record["revision"]["payload"]
+            text = str(payload.get("text") or payload.get("value") or payload)[:500]
+            entries.append({
+                "record_id": record_id,
+                "revision_id": record["revision"]["id"],
+                "type": record["type"],
+                "text": text,
+                "reason": reason,
+            })
+        section = render_optional_section(entries, self.spec.recall.max_optional_chars)
+        if not section:
+            return None, []
+        emitted = fit_optional_entries(entries, self.spec.recall.max_optional_chars)
+        return section, [{
+            "kind": "recalled",
+            "record_id": entry["record_id"],
+            "revision_id": entry["revision_id"],
+            "reason": entry["reason"],
+        } for entry in emitted]
+
+    # ── asynchronous prompt recall: search now, select in the background ──
+
+    async def recall_candidates(
+        self, *, instance: str | None, prompt_hint: str,
+    ) -> RecallCandidates:
+        """Phase 1: the bounded search, nothing more. Zero cards means there
+        is nothing to select from — no background work, no notice."""
+        effective_instance = instance or DEFAULT_INSTANCE
+        if not self.spec.recall.enabled:
+            return RecallCandidates("disabled", effective_instance)
+        if self.selector is None:
+            return RecallCandidates("unconfigured", effective_instance)
+        try:
+            context = await self._ensure_context(effective_instance)
+            state = context.get("state") or {}
+            goal = state.get("goal") if isinstance(state.get("goal"), str) else None
+            query = " ".join(part for part in (goal, prompt_hint) if part)[:2000].strip()
+            if not query:
+                return RecallCandidates("no_query", effective_instance, context=context)
+            found = await self.client.search_memory({
+                "scope_ids": self.spec.scopes.read,
+                "query_text": query,
+                "limit": self.spec.recall.max_candidates,
+            })
+        except MemoryUnavailable as exc:
+            return RecallCandidates(f"degraded: {self._degrade(f'recall: {exc}')}",
+                                    effective_instance)
+        except MemoryAPIError as exc:
+            return RecallCandidates(f"degraded: {self._degrade(f'recall refused: {exc}')}",
+                                    effective_instance)
+        cards = list(found.get("items") or [])
+        return RecallCandidates(
+            "ok" if cards else "empty", effective_instance, query, cards, context,
+        )
+
+    async def recall_select(self, candidates: RecallCandidates) -> RecallSelection:
+        """Phase 2, off the prompt path: the selector over the cards, then
+        the canonical re-render. Selector failure never falls back to the
+        nearest neighbours (§17.7): the status says degraded, nothing is
+        injected."""
+        from miragen.memory.selection import clamp_selections
+
+        if self.selector is None or not candidates.cards:
+            return RecallSelection("none_selected")
+        try:
+            result = await self.selector(candidates.query, candidates.cards)
+        except Exception as exc:  # noqa: BLE001 — any selector failure degrades
+            return RecallSelection(f"degraded: selector: {self._degrade(f'relevance selection: {exc}')}")
+        kept = clamp_selections(result, candidates.cards, self.spec.recall.max_selected)
+        selected = [(sel.record_id, sel.reason) for sel in kept]
+        if not selected:
+            return RecallSelection("none_selected")
+        try:
+            section, items = await self._render_selected(selected)
+        except (MemoryUnavailable, MemoryAPIError) as exc:
+            return RecallSelection(f"degraded: {self._degrade(f'optional recall: {exc}')}",
+                                   selected=selected)
+        if not section:
+            return RecallSelection("none_selected", selected=selected)
+        return RecallSelection("ok", section, items, selected)
+
+    async def record_recall_manifest(
+        self, candidates: RecallCandidates, selection: RecallSelection, *,
+        run_id: str | None, trigger: str,
+    ) -> None:
+        """The manifest of what was ACTUALLY injected — called when the
+        result is delivered, never when it was merely prepared."""
+        if not selection.items or candidates.context is None:
+            return
+        try:
+            await self.client.create_manifest({
+                "scope_id": self.spec.scopes.default_write,
+                "context_id": candidates.context["id"],
+                "run_ref": run_id,
+                "items": [
+                    {"revision_id": item["revision_id"], "reason": item["reason"]}
+                    for item in selection.items if item.get("revision_id")
+                ],
+                "policy": {
+                    "guidance_version": GUIDANCE_VERSION,
+                    "trigger": trigger,
+                    "lane": "optional",
+                    "delivery": "async",
+                    "state_revision": candidates.context["state_revision"],
+                    "optional_status": selection.status,
+                },
+                "degraded": None,
+            })
+        except (MemoryUnavailable, MemoryAPIError) as exc:
+            logger.warning(f"[{self.profile_name}] manifest write failed: {exc}")
 
     async def recall_section(
         self, *, instance: str | None, prompt_hint: str, run_id: str | None = None,

@@ -145,6 +145,21 @@ class SessionsRecall(MemoryRecallSpec):
                     "(one selector call per new prompt; cache hits are free).",
     )
     min_prompt_chars: int = Field(default=20, ge=0)
+    delivery: Literal["async", "sync"] = Field(
+        default="async",
+        description="async: search on the prompt, select in the background, deliver after a "
+                    "later tool result or at Stop (adapters that advertise `async-recall`); "
+                    "sync: select inside the prompt hook. Adapters without the capability "
+                    "always get sync.",
+    )
+    search_timeout_seconds: float = Field(default=4.0, gt=0)
+    stop_wait_seconds: float = Field(
+        default=8.0, ge=0, le=15,
+        description="How long a Stop may wait for a still-running selection before the "
+                    "turn ends without it (the adapter's Stop hook timeout must exceed it).",
+    )
+    judgment_retention_days: int = Field(default=30, ge=1)
+    judgment_max_mb: int = Field(default=64, ge=1)
     # Selector endpoint knobs. Daemon-only on purpose: adding fields to the
     # profile-level MemoryRecallSpec (extra=forbid) would change the agent-
     # profile schema and need a profile-contract bump.
