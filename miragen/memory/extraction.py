@@ -315,14 +315,16 @@ async def run_worker_once(
                 summary = await _process_index_job(client, job, embed)
             else:
                 event = await client.get_event(job["payload"]["event_id"])
+                context = event_context(event)
                 if skip_before is not None and _received(event) < skip_before:
                     # Backlog from before this deployment's cutoff: completed
                     # without a model call (each is a paid/limited call).
                     await client.complete_job(job["id"])
                     results.append({"job_id": job["id"], "status": "skipped_backlog",
-                                    "event_id": event.get("id")})
+                                    "event_id": event.get("id")} | context)
                     continue
                 summary = await process_event(client, event, extract=extract, check=check)
+                summary |= context
             await client.complete_job(job["id"])
             results.append(summary | {"job_id": job["id"], "status": "done"})
         except Exception as exc:  # noqa: BLE001 — worker isolation per job
@@ -333,6 +335,18 @@ async def run_worker_once(
                 pass  # lease expiry re-queues it regardless
             results.append({"job_id": job["id"], "status": "failed", "error": str(exc)})
     return results
+
+
+def event_context(event: dict) -> dict:
+    """What a log line needs to place a job: when its event was received,
+    what kind of source it came from, and which scope it belongs to."""
+    received = _received(event)
+    return {
+        "event_at": (None if received == datetime.min.replace(tzinfo=UTC)
+                     else received.isoformat().replace("+00:00", "Z")),
+        "source_kind": (event.get("source") or {}).get("kind"),
+        "scope_id": event.get("scope_id"),
+    }
 
 
 def _received(event: dict) -> datetime:

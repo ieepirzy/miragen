@@ -265,6 +265,12 @@ class TestWorker:
         assert by_id == {old_job["id"]: "skipped_backlog", new_job["id"]: "done"}
         assert calls == ["the deploy failed on step 3"]
         assert old_job["status"] == "done", "completed, so it never comes back"
+        # Every result carries what a log line needs to place the job.
+        placed = {r["job_id"]: (r["event_at"], r["source_kind"], r["scope_id"]) for r in results}
+        assert placed == {
+            old_job["id"]: ("2026-09-01T00:00:00Z", "user_message", "profile:test-agent"),
+            new_job["id"]: ("2026-09-24T00:00:00Z", "user_message", "profile:test-agent"),
+        }
 
     async def test_unreachable_store_claims_nothing_quietly(self, client, service):
         service.fail_with = __import__("httpx").ConnectError("refused")
