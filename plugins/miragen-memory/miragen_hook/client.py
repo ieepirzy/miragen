@@ -471,6 +471,17 @@ def foreign_entry_under_grok(harness: str, environ: dict | None = None) -> bool:
     return bool(env.get("GROK_HOOK_EVENT")) and harness != "grok-build"
 
 
+def is_memory_worker(environ: dict | None = None) -> bool:
+    """A `claude -p` that miragen itself started for a memory model call
+    (miragen/memory/claude_code.py sets MIRAGEN_WORKER=1). Capturing it
+    would file every memory call as a session → an episode → another
+    extraction call: an unbounded loop. Its flags already keep plugin hooks
+    out; this is the guard that does not depend on Claude Code's flag
+    semantics staying the same."""
+    env = os.environ if environ is None else environ
+    return bool(env.get("MIRAGEN_WORKER"))
+
+
 def _session_id_of(payload: dict) -> str | None:
     value = payload.get("session_id") or payload.get("sessionId")
     return str(value) if value else None
@@ -482,6 +493,8 @@ def run(
 ) -> dict | None:
     """The whole adapter, testable: returns the harness stdout JSON (or
     None when nothing is to be printed)."""
+    if is_memory_worker(environ):
+        return None
     if foreign_entry_under_grok(harness, environ):
         return None
     deferred = harness in DEFERRED_CONTEXT_HARNESSES
