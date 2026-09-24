@@ -246,7 +246,7 @@ What each layer does, and why none of them is enough alone:
 | `grok_permission_mode: dontAsk` + `grok_allow` | deny everything not pre-approved | **Not an allowlist on its own:** grok auto-approves `read_file`, `grep`, `list_dir`, `web_search`, `todo_write` and skills in every mode (22-permissions-and-safety.md), hence `grok_tools` + `grok_deny` |
 | `grok_deny` | deny rules win over everything, including always-approve | Belt and braces for the read-only auto-approvals |
 | `grok_hermetic` config.toml | compat cells off, subagents/memory/managed MCPs/remote managed config/leader/trace upload off; ONLY the spec's `[mcp_servers.*]`, `Authorization = "Bearer ${ENV}"` | Grok merges MCP/skills/rules/agents/hooks from `~/.claude.json`, `~/.claude/`, `~/.cursor/` by default |
-| `grok_hermetic` requirements.toml | `allow_managed_mcp_servers_only`, exact-URL `[[allowed_mcp_servers]]`, `enable_all_project_mcp_servers = false`, `allow_managed_hooks_only`, and the same switches as policy | A workspace `.mcp.json` or `.grok/config.toml` still adds servers (compat cells do not cover them); policy keys in `config.toml` are **ignored** — only `requirements.toml` enforces them |
+| `grok_hermetic` requirements.toml | `fail_closed = true`, `allow_managed_mcp_servers_only`, exact-URL `[[allowed_mcp_servers]]`, `enable_all_project_mcp_servers = false`, `allow_managed_hooks_only`, and the same switches as policy | A workspace `.mcp.json` or `.grok/config.toml` still adds servers (compat cells do not cover them); policy keys in `config.toml` are **ignored**, and only `requirements.toml` enforces them |
 | isolated `HOME` (`<grok_home>/hermetic-home`) | grok process env | Compat cells do **not** stop Claude *plugins* (`~/.claude/plugins`: skills, command hooks, stdio MCP servers) or `~/.agents/skills` |
 | GROK_* scrub | grok process env keeps only `GROK_HOME` (plus `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`CURSOR_CONFIG_DIR` dropped) | `GROK_CLAUDE_MCPS_ENABLED=true` overrides even a `requirements.toml` compat cell (cells are not `pin` keys); `GROK_CONFIG`/`GROK_CONFIG_PATH` are config overlays |
 | `grok_auth: subscription` | `XAI_API_KEY`/`GROK_CODE_XAI_API_KEY` removed from the grok env (headless and ACP) | Grok's auth precedence falls back to the metered key silently when the session token is missing/expired |
@@ -261,11 +261,29 @@ workspace servers `disabledReason: not in allowedMcpServers`;
 compat-off config still loaded 43 skills, 5 plugins, 3 plugin hooks and 3
 plugin MCP servers.
 
+`$GROK_HOME/requirements.toml` is grok's **signed managed-policy cache**
+(26-config-reference.md). A headless run with debug logging showed that
+grok's managed-config store deletes an unsigned file at bootstrap ("removed
+managed config file") when no team principal serves one. That happens before
+the config pins are resolved: the MCP allowlist still applied to that one
+run, but the pins did not, and every later run had no policy at all. With
+`fail_closed = true` the log says "keeping fail_closed managed policy on
+disk; no team principal present to own a clear", followed by "deployment
+requirements enforced". A server not on the list is logged as `MCP server
+blocked by managed settings policy … not in allowedMcpServers`. All of this
+was observed without auth. Whether a **signed-in** subscription account's
+online managed-config sync keeps the file, or refuses to start because it is
+unsigned, has **not been verified yet**. The live probe must check it.
+Separately, headless grok already skips workspace `.mcp.json` servers in an
+untrusted folder ("folder untrusted: skipping repo-local (project-scoped) MCP
+server"). A stdio `.mcp.json` server in the workspace was not launched.
+
 Ownership rules (`miragen/executor/grok_hermetic.py`):
 
 - `config.toml` and `requirements.toml` are rewritten atomically
-  (tmp + `os.replace`) at **every** start; grok itself appends state to
-  `config.toml` at runtime, so ownership is a marker file
+  (tmp + `os.replace`) at start **and before every headless turn**,
+  because grok appends state to `config.toml` at runtime and may prune
+  `requirements.toml`. Ownership is recorded in a marker file
   (`.miragen-hermetic-owner`), not a TOML comment.
 - Everything else in GROK_HOME (`auth.json`, `sessions/`, `logs/`) is
   never touched.

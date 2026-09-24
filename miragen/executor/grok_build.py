@@ -28,6 +28,7 @@ from miragen.executor.base import ExecutorBackend
 from miragen.executor.grok_hermetic import (
     hermetic_home_dir,
     hermetic_owner,
+    refresh_hermetic_files,
     release_hermetic_home,
     write_hermetic_home,
 )
@@ -343,6 +344,9 @@ class GrokBuildExecutor(ExecutorBackend):
 
     async def _headless_session(self, prompt: str, options: dict[str, Any]) -> AsyncIterator[Any]:
         from grok_build_client import HeadlessSession
+
+        if self.spec.grok_hermetic:
+            refresh_hermetic_files(Path(self.spec.grok_home), self.profile.name, self.spec)
 
         session = HeadlessSession(
             prompt=prompt,
