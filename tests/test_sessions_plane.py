@@ -973,3 +973,47 @@ class TestProjectReResolution:
         await h.send("UserPromptSubmit", prompt="look at my notes", cwd=f"{HOME}/Documents",
                      client_extra=home)
         assert h.plane.registry.get("claude-code:s-1").project.id == REPO.id
+
+
+class TestWorkerGrants:
+    def _config(self, worker):
+        return SessionsConfig(
+            principal=PRINCIPAL,
+            scopes=ScopePolicy(shared_read=[SHARED], provision="auto", worker_principal=worker),
+            recall=SessionsRecall(enabled=False),
+        )
+
+    async def test_a_provisioned_project_scope_is_granted_to_the_worker(self, tmp_path):
+        h = Harness(tmp_path, config=self._config("mira-worker"))
+        h.service.principals["mira-worker"] = {"kind": "agent"}
+        await h.send("SessionStart", source="startup")
+        for verb in ("read", "propose", "maintain"):
+            assert ("mira-worker", PROJECT_SCOPE, verb) in h.service.grants
+        assert ("mira-worker", PROJECT_SCOPE, "resolve") not in h.service.grants
+        assert h.plane.stats.worker_grants == 1
+
+    async def test_a_missing_worker_principal_never_costs_the_session_its_scope(self, tmp_path):
+        h = Harness(tmp_path, config=self._config("mira-worker"))
+        result = await h.send("SessionStart", source="startup")
+        assert f"scope={PROJECT_SCOPE}" in result.context
+        assert "MEMORY DEGRADED" not in result.context
+        assert h.plane.stats.worker_grant_failures == 1
+
+    async def test_no_worker_configured_means_no_grant(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup")
+        assert not any(p == "mira-worker" for p, _, _ in h.service.grants)
+
+
+async def test_a_failed_worker_grant_is_retried_when_the_scope_is_used_again(tmp_path):
+    config = SessionsConfig(
+        principal=PRINCIPAL,
+        scopes=ScopePolicy(shared_read=[SHARED], provision="auto", worker_principal="mira-worker"),
+        recall=SessionsRecall(enabled=False),
+    )
+    h = Harness(tmp_path, config=config)
+    await h.send("SessionStart", source="startup")
+    assert ("mira-worker", PROJECT_SCOPE, "maintain") not in h.service.grants
+    h.service.principals["mira-worker"] = {"kind": "agent"}  # the worker started later
+    await h.send("SessionStart", source="startup", session="s-2", pid=4243)
+    assert ("mira-worker", PROJECT_SCOPE, "maintain") in h.service.grants
