@@ -218,6 +218,9 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
         result = await lifecycle.remember(
             instance=identity.slug, run_id=session, content=content,
         )
+        if result.get("status") == "accepted":
+            plane.note_memory_write(session or _connection_session(ctx) or project,
+                                    ref=result.get("record_id"))
         return _dump({**result, "project": identity.id, "scope": write, "scope_detail": detail})
 
     @mcp.tool()
@@ -234,11 +237,15 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
             reason: Why — quote the user's correction when relaying one.
             project: Repository remote/name or session key.
         """
-        _, identity, lifecycle, _, _ = await _lifecycle(project or _connection_session(ctx))
-        return _dump(await lifecycle.correct(
+        plane, identity, lifecycle, _, _ = await _lifecycle(project or _connection_session(ctx))
+        result = await lifecycle.correct(
             instance=identity.slug, run_id=None, record_id=record_id,
             corrected_payload=correction, reason=reason,
-        ))
+        )
+        if isinstance(result, dict) and result.get("status") == "accepted":
+            plane.note_memory_write(_connection_session(ctx) or project,
+                                    ref=result.get("record_id") or result.get("revision_id"))
+        return _dump(result)
 
     @mcp.tool()
     async def memory_checkpoint(
@@ -252,8 +259,11 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
             state: Fields to merge, e.g. {"goal": ..., "pending_actions": [...]}.
             project: Repository remote/name or session key; omit for the default project.
         """
-        _, identity, lifecycle, write, _ = await _lifecycle(project or _connection_session(ctx))
+        plane, identity, lifecycle, write, _ = await _lifecycle(project or _connection_session(ctx))
         result = await lifecycle.checkpoint(instance=identity.slug, patch=state)
+        if result.get("status") == "accepted":
+            plane.note_memory_write(_connection_session(ctx) or project,
+                                    ref=f"ctx:{result.get('context_id')}:{result.get('state_revision')}")
         return _dump({**result, "project": identity.id, "scope": write})
 
     # ── artifact store ────────────────────────────────────────────────────────

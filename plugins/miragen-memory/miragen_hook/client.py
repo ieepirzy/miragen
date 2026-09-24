@@ -43,10 +43,16 @@ from miragen_hook.normalize import (
 DEFAULT_DAEMON_URL = "http://127.0.0.1:8420"
 EVENTS_PATH = "/sessions/v1/events"
 CLAIM_PATH = "/sessions/v1/recall/claim"
+WRITTEN_PATH = "/sessions/v1/memory-written"
+# The bridge's write tools, as Claude Code names them (mcp__<server>__<tool>).
+MEMORY_WRITE_TOOLS = ("memory_remember", "memory_checkpoint", "memory_correct")
 # Harnesses whose adapter keeps a recall-pending marker and claims background
 # recall results on PostToolUse (main thread) and Stop.
 ASYNC_RECALL_HARNESSES = ("claude-code",)
 ASYNC_RECALL_CAPABILITY = "async-recall"
+# The adapter turns the daemon's `continue_with` at Stop into a block (the
+# end-of-work save nudge), merged with any late recall into ONE block.
+STOP_CONTINUE_CAPABILITY = "stop-continue"
 # A Stop waits this long for a selection still running (hooks.json gives the
 # Stop entry a longer timeout than this plus the capture POST).
 STOP_CLAIM_WAIT_S = 8.0
@@ -231,7 +237,8 @@ def build_envelope(
                 "deferred" if harness in DEFERRED_CONTEXT_HARNESSES else "immediate"
             ),
             "capabilities": (
-                [ASYNC_RECALL_CAPABILITY] if harness in ASYNC_RECALL_HARNESSES else []
+                [ASYNC_RECALL_CAPABILITY, STOP_CONTINUE_CAPABILITY]
+                if harness in ASYNC_RECALL_HARNESSES else []
             ),
         },
         "sent_at": datetime.now(timezone.utc).isoformat(),  # noqa: UP017 — Python 3.10 floor
@@ -542,7 +549,7 @@ def _claim_output(event_name: str, answer: dict | None) -> tuple[str | None, boo
 
 STOP_RECALL_PREAMBLE = (
     "[memory] The background recall for your last request finished while you were "
-    "wrapping up. If a memory below changes your answer, follow up; otherwise just finish."
+    "wrapping up. If a memory below changes your answer, follow up on it."
 )
 
 
@@ -590,25 +597,71 @@ def run(
     if deferred and event_name in _DELIVERY_EVENTS:
         delivered = take_context(session_id, environ) if session_id else None
 
+    answer: dict = {}
     output = _forward(harness, payload, daemon_url=daemon_url, token=token,
-                      environ=environ, opener=opener, pid=pid, deferred=deferred)
+                      environ=environ, opener=opener, pid=pid, deferred=deferred,
+                      answer_out=answer)
     if delivered:
         return harness_output(harness, event_name, delivered)
-    if harness in ASYNC_RECALL_HARNESSES and session_id:
-        recalled = _deliver_recall(harness, event_name, payload, session_id,
-                                   daemon_url=daemon_url, token=token, environ=environ,
-                                   opener=opener)
-        if recalled is not None:
-            return recalled
+    if harness not in ASYNC_RECALL_HARNESSES or not session_id:
+        return output
+    if event_name == "PostToolUse" and not (payload.get("agent_id") or payload.get("agentId")):
+        _credit_memory_write(harness, payload, session_id, daemon_url=daemon_url, token=token,
+                             opener=opener)
+    recalled = _deliver_recall(harness, event_name, payload, session_id,
+                               daemon_url=daemon_url, token=token, environ=environ,
+                               opener=opener)
+    if event_name == "Stop":
+        # One miragen Stop block at a time: a late recall first, then the
+        # end-of-work save nudge.
+        nudge = answer.get("continue_with")
+        parts = [f"{STOP_RECALL_PREAMBLE}\n{recalled}" if recalled else None,
+                 str(nudge) if nudge else None]
+        reason = "\n\n".join(part for part in parts if part)
+        return {"decision": "block", "reason": reason} if reason else output
+    if recalled:
+        return harness_output(harness, event_name, recalled)
     return output
+
+
+def memory_write_ref(tool_name: str, tool_response: Any) -> tuple[bool, str | None]:
+    """(accepted?, dedupe ref) for a bridge write tool's result, read from
+    the text the harness hands the hook (the tool answers JSON)."""
+    if not str(tool_name).endswith(MEMORY_WRITE_TOOLS):
+        return False, None
+    text = json.dumps(tool_response).replace('\\"', '"')
+    if '"status": "accepted"' not in text and '"status":"accepted"' not in text:
+        return False, None
+    import re
+
+    record = re.search(r'"record_id":\s*"([^"]+)"', text)
+    if record:
+        return True, record.group(1)
+    context = re.search(r'"context_id":\s*"([^"]+)"', text)
+    revision = re.search(r'"state_revision":\s*(\d+)', text)
+    if context:
+        return True, f"ctx:{context.group(1)}:{revision.group(1) if revision else ''}"
+    return True, None
+
+
+def _credit_memory_write(
+    harness: str, payload: dict, session_id: str, *, daemon_url: str, token: str | None,
+    opener,
+) -> None:
+    """The agent saved something: tell the daemon, whatever the agent named
+    as the project (the end-of-work nudge counts on this)."""
+    accepted, ref = memory_write_ref(payload.get("tool_name") or "", payload.get("tool_response"))
+    if accepted:
+        _post_json(WRITTEN_PATH, {"harness": harness, "session_id": session_id, "ref": ref},
+                   daemon_url=daemon_url, token=token, timeout=TIMEOUT_CAPTURE_S, opener=opener)
 
 
 def _deliver_recall(
     harness: str, event_name: str, payload: dict, session_id: str, *,
     daemon_url: str, token: str | None, environ: dict | None, opener,
-) -> dict | None:
-    """Background recall delivery: after a main-thread tool result (no
-    wait) or at Stop (bounded wait, block only for something to show)."""
+) -> str | None:
+    """Background recall delivery: the context to show after a main-thread
+    tool result (no wait) or at Stop (bounded wait), or None."""
     if event_name in ("SessionEnd", "PreCompact"):
         clear_recall_marker(session_id, environ)
         return None
@@ -625,16 +678,13 @@ def _deliver_recall(
     context, keep = _claim_output(event_name, answer)
     if not keep:
         clear_recall_marker(session_id, environ)
-    if not context:
-        return None
-    if event_name == "Stop":
-        return {"decision": "block", "reason": f"{STOP_RECALL_PREAMBLE}\n{context}"}
-    return harness_output(harness, event_name, context)
+    return context
 
 
 def _forward(
     harness: str, payload: dict, *, daemon_url: str, token: str | None,
     environ: dict | None, opener, pid: int | None, deferred: bool,
+    answer_out: dict | None = None,
 ) -> dict | None:
     event = normalize_hook_payload(harness, payload)
     if event is None or event.session_id is None:
@@ -654,6 +704,8 @@ def _forward(
         clear_recall_marker(event.session_id, environ)
     if not answer:
         return None
+    if answer_out is not None:
+        answer_out.update(answer)
     if event.name == "input.received" and harness in ASYNC_RECALL_HARNESSES:
         # A new prompt supersedes any earlier pending recall, delivered or not.
         pending = answer.get("recall_pending")

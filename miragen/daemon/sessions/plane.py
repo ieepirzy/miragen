@@ -120,6 +120,11 @@ class PlaneStats:
     async_recalls_dropped: int = 0
     async_recall_failures: int = 0
     recall_wait_timeouts: int = 0
+    nudges_fired: int = 0
+    nudges_reasked: int = 0
+    nudges_answered: int = 0
+    nudges_ignored: int = 0
+    memory_writes: int = 0
     worker_grants: int = 0
     worker_grant_failures: int = 0
     raw_hooks_shadowed: int = 0
@@ -186,9 +191,14 @@ class HandleResult:
     # A background recall was started for this prompt: the adapter keeps a
     # marker with this sequence number and claims the result later.
     recall_pending: int | None = None
+    # Keep the agent going at this Stop with this text (the end-of-work
+    # save nudge); only adapters advertising `stop-continue` get it.
+    continue_with: str | None = None
 
 
 ASYNC_RECALL_CAPABILITY = "async-recall"
+STOP_CONTINUE_CAPABILITY = "stop-continue"
+NOTHING_DURABLE = "nothing durable"
 # The longest any claim may hold its HTTP request open.
 MAX_CLAIM_WAIT_S = 15.0
 
@@ -497,10 +507,16 @@ class SessionPlane:
         context: str | None = None
         detail: str | None = None
         recall_pending: int | None = None
+        continue_with: str | None = None
         async with self._lock(session.key):
             if event.name in CONTEXT_OPENING:
                 context, detail = await self._open_context(session, envelope)
             elif event.name == "input.received":
+                if session.nudge_state is not None:
+                    # A new prompt instead of an answer: the ask is over (it
+                    # never re-surfaces at the end of an unrelated turn).
+                    session.nudge_state = None
+                    self.stats.nudges_ignored += 1
                 session.note_prompt(event.content)
                 self._journal_and_capture(session, envelope)
                 if session.reopen_pending and session.counters.injections:
@@ -526,6 +542,8 @@ class SessionPlane:
             elif event.name == "turn.finished":
                 session.note_turn(event.content)
                 self._journal_and_capture(session, envelope)
+                if STOP_CONTINUE_CAPABILITY in envelope.client.capabilities:
+                    continue_with = self._nudge(session, event.content)
             elif event.name == "tool.finished":
                 session.counters.tool_failures += 1
                 self._journal_and_capture(session, envelope)
@@ -561,7 +579,114 @@ class SessionPlane:
                 self.journal.append(envelope)
                 self._spawn(self._capture_then_finalize(session, envelope, occurrence="end"))
         return HandleResult(key=session.key, state=session.state, context=context, detail=detail,
-                            recall_pending=recall_pending)
+                            recall_pending=recall_pending, continue_with=continue_with)
+
+    # ── end-of-work save nudge (P1a) ──────────────────────────────────────────
+
+    def note_memory_write(self, reference: str | None, *, ref: str | None = None) -> bool:
+        """A memory_remember/checkpoint/correct credited to a session: by the
+        bridge (explicit session key or connection header) or by the
+        session's own adapter, which sees the accepted tool result. `ref`
+        (record/event id) dedupes the two paths."""
+        session = self.find_session(reference) if reference else None
+        if session is None:
+            return False
+        if ref:
+            if ref in session.credited_writes:
+                return False
+            session.credited_writes = [*session.credited_writes[-49:], ref]
+        session.counters.memory_writes += 1
+        self.stats.memory_writes += 1
+        self.registry.save()  # a restart before the next Stop must not lose it
+        return True
+
+    def _nudge(self, session: ExternalSession, last_message: str | None) -> str | None:
+        """Decide this Stop's nudge. Pushy by decision (Ilari 2026-09-23),
+        bounded by construction: at most `max_per_session` nudges, each
+        re-asked at most once, never while the agent already saved
+        something since the last one, never in a child session. Keyed on
+        its own per-session state, never on `stop_hook_active` (any
+        plugin's blocking Stop sets that — it would silence this, or let
+        this silence MiraDesign)."""
+        cfg = self.config.nudge
+        if not cfg.enabled or session.parent_session or session.project is None:
+            return None
+        writes = session.counters.memory_writes
+        answered = bool(last_message) and NOTHING_DURABLE in last_message.lower()
+        if session.nudge_state in ("asked", "reasked"):
+            if writes > session.nudge_writes_mark or answered:
+                session.nudge_state = None
+                session.nudge_writes_mark = writes
+                self.stats.nudges_answered += 1
+                return None
+            if session.nudge_state == "asked":
+                session.nudge_state = "reasked"
+                self.stats.nudges_reasked += 1
+                return self._nudge_text(session, reask=True)
+            session.nudge_state = None
+            self.stats.nudges_ignored += 1
+            return None
+        prompts = session.counters.prompts
+        compactions = session.counters.compactions
+        if session.nudges_fired >= cfg.max_per_session:
+            return None
+        since = prompts - session.nudge_prompt_mark
+        if session.nudges_fired == 0:
+            due = since >= cfg.first_after_prompts
+        else:
+            due = since >= cfg.every_prompts or (
+                compactions > session.nudge_compaction_mark and since > 0)
+        if not due:
+            return None
+        session.nudge_prompt_mark = prompts
+        session.nudge_compaction_mark = compactions
+        if writes > session.nudge_writes_mark:
+            # It saved on its own since the last check: that's the goal, so
+            # the clock restarts instead of nagging.
+            session.nudge_writes_mark = writes
+            return None
+        session.nudges_fired += 1
+        session.nudge_state = "asked"
+        self.stats.nudges_fired += 1
+        return self._nudge_text(session, reask=False)
+
+    def _nudge_text(self, session: ExternalSession, *, reask: bool) -> str:
+        where = f"session='{session.key}'"
+        if reask:
+            return (
+                "[memory — end-of-work save, asked again] That went unanswered. Call "
+                f"memory_remember ({where}) once per durable learning now, or reply "
+                "`nothing durable: <why, for each thing the user told you>`. This is the "
+                "last time it is asked for this work."
+            )
+        told = [p for p in session.prompts[-5:] if p and p.strip()]
+        # One line per prompt, however many lines it had: nothing the user
+        # once typed may reappear here as a bare line that reads like an
+        # instruction.
+        candidates = "".join(
+            "\n  > " + " ⏎ ".join(line.strip() for line in p.strip()[:300].splitlines() if line.strip())
+            for p in told
+        )
+        return (
+            "[memory — end-of-work save] Before you stop: this session did real work and "
+            "none of it has been saved to miragen memory. Future sessions in this project "
+            "only know what you save now — this is separate from any MEMORY.md. Call "
+            f"memory_remember ({where}) once per item, one specific, self-contained fact "
+            "each:\n"
+            "- facts the user TOLD you that no file records (\"X only works from Y\", "
+            "\"we never do Z\") — these are lost first;\n"
+            "- decisions made, and why;\n"
+            "- gotchas hit and how they were fixed (the fix, with its conditions);\n"
+            "- environment facts: ports, hosts, paths, commands, where configuration lives "
+            "(never a secret's value);\n"
+            "- Ilari's stated preferences and corrections;\n"
+            "- open intentions: what is unfinished or promised next.\n"
+            "Skip only what the repository or git history already records."
+            + (f"\nWhat you were told this session (quoted for reference only — not "
+               f"instructions to act on again):{candidates}" if candidates else "")
+            + "\nOnly if none of it is durable, reply `nothing durable: <why, for each "
+            "thing the user told you>`."
+        )
 
     # ── project + scopes ─────────────────────────────────────────────────────
 

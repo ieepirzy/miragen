@@ -398,7 +398,11 @@ class TestHostedBridgeAdapter:
         assert read_token(str(f), env) == "filetoken"
 
     def test_http_install_for_a_repository(self, tmp_path):
-        from miragen_hook.install import CLAUDE_CODE_EVENTS, install_hooks, uninstall_hooks
+        from miragen_hook.install import (
+            CLAUDE_CODE_EVENTS,
+            install_hooks,
+            uninstall_hooks,
+        )
 
         settings = tmp_path / ".claude" / "settings.json"
         settings.parent.mkdir()
@@ -495,7 +499,7 @@ class TestBackgroundRecall:
         from miragen_hook.normalize import normalize_hook_payload
 
         payload = {**LIVE, "hook_event_name": "UserPromptSubmit", "prompt": "hi"}
-        for harness, caps in (("claude-code", ["async-recall"]), ("codex", [])):
+        for harness, caps in (("claude-code", ["async-recall", "stop-continue"]), ("codex", [])):
             event = normalize_hook_payload(harness, payload)
             envelope = build_envelope(harness, payload, event, environ=env, pid=1)
             assert envelope["client"]["capabilities"] == caps
@@ -535,7 +539,11 @@ class TestBackgroundRecall:
         assert silent.calls == []
 
     def test_stop_waits_briefly_and_blocks_only_for_something_to_show(self, env):
-        from miragen_hook.client import STOP_CLAIM_WAIT_S, read_recall_marker, write_recall_marker
+        from miragen_hook.client import (
+            STOP_CLAIM_WAIT_S,
+            read_recall_marker,
+            write_recall_marker,
+        )
 
         write_recall_marker(LIVE["session_id"], 2, env)
         ready = _router({self.EVENTS: {}, self.CLAIM: {"state": "ready", "context": "RECALLED"}})
@@ -582,7 +590,7 @@ class TestBackgroundRecall:
         def invoke():
             return subprocess.run([sys.executable, "-m", "miragen_hook", "claude-code"],
                                   input=payload, env=env, capture_output=True, text=True,
-                                  timeout=20)
+                                  timeout=20, check=False)
 
         quiet = invoke()
         assert quiet.returncode == 0 and quiet.stdout == "" and quiet.stderr == ""
@@ -605,3 +613,58 @@ def test_an_unreachable_daemon_on_a_new_prompt_still_clears_the_old_marker(tmp_p
     run("claude-code", {**LIVE, "hook_event_name": "UserPromptSubmit", "prompt": "next"},
         daemon_url="http://127.0.0.1:1", token=None, opener=down, pid=1, environ=env)
     assert read_recall_marker(LIVE["session_id"], env) is None
+
+class TestStopBlockMerging:
+    EVENTS = "/sessions/v1/events"
+    CLAIM = "/sessions/v1/recall/claim"
+
+    @pytest.fixture
+    def env(self, tmp_path):
+        return {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+
+    def _stop(self, routes, env):
+        return run("claude-code", {**LIVE, "hook_event_name": "Stop", "last_assistant_message": "x"},
+                   daemon_url="http://127.0.0.1:1", token=None, opener=_router(routes), pid=1,
+                   environ=env)
+
+    def test_the_nudge_alone_blocks(self, env):
+        out = self._stop({self.EVENTS: {"continue_with": "SAVE-NUDGE"}}, env)
+        assert out == {"decision": "block", "reason": "SAVE-NUDGE"}
+
+    def test_a_late_recall_and_the_nudge_share_one_block(self, env):
+        from miragen_hook.client import write_recall_marker
+
+        write_recall_marker(LIVE["session_id"], 1, env)
+        out = self._stop({self.EVENTS: {"continue_with": "SAVE-NUDGE"},
+                          self.CLAIM: {"state": "ready", "context": "RECALLED"}}, env)
+        assert out["decision"] == "block"
+        assert out["reason"].index("RECALLED") < out["reason"].index("SAVE-NUDGE")
+
+    def test_nothing_to_say_means_no_block(self, env):
+        assert self._stop({self.EVENTS: {"continue_with": None}}, env) is None
+
+
+class TestMemoryWriteCredit:
+    WRITTEN = "/sessions/v1/memory-written"
+
+    def test_an_accepted_save_in_the_tool_result_is_credited(self, tmp_path):
+        env = {"XDG_STATE_HOME": str(tmp_path), "HOME": str(tmp_path)}
+        answer = json.dumps({"status": "accepted", "record_id": "rec-42", "project": "x"})
+        payload = {**LIVE, "hook_event_name": "PostToolUse",
+                   "tool_name": "mcp__plugin_miragen-memory_miragen-bridge__memory_remember",
+                   "tool_response": [{"type": "text", "text": answer}]}
+        opener = _router({self.WRITTEN: {"credited": True}})
+        run("claude-code", payload, daemon_url="http://127.0.0.1:1", token=None, opener=opener,
+            pid=1, environ=env)
+        (request, _), = opener.calls
+        assert json.loads(request.data) == {"harness": "claude-code",
+                                            "session_id": LIVE["session_id"], "ref": "rec-42"}
+
+    def test_a_refused_save_or_another_tool_is_not(self, tmp_path):
+        from miragen_hook.client import memory_write_ref
+
+        assert memory_write_ref("mcp__x__memory_remember",
+                                [{"type": "text", "text": '{"status": "rejected"}'}]) == (False, None)
+        assert memory_write_ref("Bash", {"stdout": '"status": "accepted"'}) == (False, None)
+        assert memory_write_ref("mcp__x__memory_checkpoint", {"result": json.dumps(
+            {"status": "accepted", "context_id": "c1", "state_revision": 7})}) == (True, "ctx:c1:7")

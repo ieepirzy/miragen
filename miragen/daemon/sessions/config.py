@@ -193,6 +193,17 @@ class SessionsRecall(MemoryRecallSpec):
         return self
 
 
+class SessionsNudge(_Model):
+    """The pushy end-of-work save (docs/design/memory-effectiveness.md P1a):
+    a Stop continuation asking the agent to memory_remember what a future
+    session would need — or to say `nothing durable`."""
+
+    enabled: bool = True
+    first_after_prompts: int = Field(default=5, ge=1)
+    every_prompts: int = Field(default=15, ge=1)
+    max_per_session: int = Field(default=3, ge=0)
+
+
 class Housekeeping(_Model):
     retention_hours: int = Field(default=24, ge=1)
     stale_after_minutes: int = Field(default=180, ge=1)
@@ -245,6 +256,7 @@ class SessionsConfig(_Model):
     scopes: ScopePolicy = Field(default_factory=ScopePolicy)
     projects: list[ProjectBinding] = Field(default_factory=list)
     recall: SessionsRecall = Field(default_factory=SessionsRecall)
+    nudge: SessionsNudge = Field(default_factory=SessionsNudge)
     housekeeping: Housekeeping = Field(default_factory=Housekeeping)
     store: StorePolicy = Field(default_factory=StorePolicy)
     mcp: BridgeMcp = Field(default_factory=BridgeMcp)

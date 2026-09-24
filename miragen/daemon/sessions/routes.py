@@ -54,8 +54,23 @@ def register_session_routes(app: FastAPI, plane: SessionPlane, *, dependencies: 
             "context": result.context,
             "detail": result.detail,
             "recall_pending": result.recall_pending,
+            "continue_with": result.continue_with,
             "accepted": True,
         })
+
+    @app.post("/sessions/v1/memory-written", dependencies=dependencies)
+    async def memory_written(request: Request) -> JSONResponse:
+        """The session's adapter saw an accepted memory write in its own
+        tool results — the only attribution that works when the agent named
+        a repository (or nothing) instead of its session key."""
+        try:
+            body = await request.json()
+            key = session_key(str(body["harness"]), str(body["session_id"]))
+            ref = str(body["ref"]) if body.get("ref") else None
+        except (ValueError, KeyError, TypeError) as exc:
+            return JSONResponse(status_code=422,
+                                content={"detail": str(exc)[:500], "code": "malformed_write"})
+        return JSONResponse({"credited": plane.note_memory_write(key, ref=ref)})
 
     @app.post("/sessions/v1/recall/claim", dependencies=dependencies)
     async def claim_recall(request: Request) -> JSONResponse:
