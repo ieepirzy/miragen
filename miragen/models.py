@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Annotated, Literal, Optional, Union
 
@@ -787,6 +788,25 @@ class LeashSpec(_ProfileModel):
         return {"network"} if mode == "autonomous" else {"write", "command", "network"}
 
 
+# grok-build fields that only the headless transport wires (argv flags or
+# the hermetic GROK_HOME it launches against). "Set" = not the default.
+_GROK_HEADLESS_ONLY_FIELDS = (
+    "grok_hermetic",
+    "grok_tools",
+    "grok_disallowed_tools",
+    "grok_permission_mode",
+    "grok_allow",
+    "grok_deny",
+    "grok_max_turns",
+)
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _grok_field_set(spec: "ExecutorSpec", name: str) -> bool:
+    value = getattr(spec, name)
+    return bool(value) if isinstance(value, (bool, list)) else value is not None
+
+
 class ExecutorSpec(_ProfileModel):
     executor: Literal["codex", "claude-code", "spawn", "kimi-code", "grok-build"] = Field(
         description=(
@@ -867,6 +887,85 @@ class ExecutorSpec(_ProfileModel):
         default=None,
         description="MCP servers injected into the executor's config at startup (e.g. Loimi via Origo).",
     )
+    grok_auth: Optional[Literal["auto", "subscription"]] = Field(
+        default=None,
+        description=(
+            "grok-build only (default 'auto' on grok-build). 'auto' keeps "
+            "grok's own precedence: the GROK_HOME subscription session wins, "
+            "XAI_API_KEY is the silent metered fallback when no session is "
+            "active. 'subscription' removes XAI_API_KEY / GROK_CODE_XAI_API_KEY "
+            "from the grok process env on every transport, so an expired or "
+            "missing login fails the turn instead of billing the API key."
+        ),
+    )
+    grok_hermetic: bool = Field(
+        default=False,
+        description=(
+            "grok-build headless only. miragen owns GROK_HOME's config.toml "
+            "and requirements.toml and rewrites both atomically at every "
+            "start: Claude/Cursor/Codex compat discovery, subagents, memory, "
+            "managed MCPs, remote managed config, the shared leader and trace "
+            "upload are off; the ONLY MCP servers are this spec's "
+            "`mcp_servers` (headers reference `${bearer_token_env}`, never "
+            "the value), pinned by a requirements.toml URL allowlist that "
+            "also blocks project `.grok/config.toml` / `.mcp.json` servers; "
+            "only managed hooks run. The grok process gets an empty HOME "
+            "(so ~/.claude plugins, ~/.agents skills and ~/.claude.json are "
+            "invisible) and no GROK_* env except GROK_HOME. Auth files in "
+            "GROK_HOME are never touched. The home must be dedicated to this "
+            "agent: prepare() refuses a home another agent owns. See "
+            "docs/design/kimi-and-grok-executors.md."
+        ),
+    )
+    grok_tools: Optional[list[str]] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "grok-build headless only: built-in tool allowlist (`--tools`), "
+            "e.g. ['search_tool', 'use_tool'] for MCP-only. None = grok's "
+            "default toolset."
+        ),
+    )
+    grok_disallowed_tools: Optional[list[str]] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "grok-build headless only: tools removed (`--disallowed-tools`); "
+            "'Agent' blocks every subagent. Wins over grok_tools."
+        ),
+    )
+    grok_permission_mode: Optional[
+        Literal["default", "acceptEdits", "auto", "dontAsk", "bypassPermissions", "plan"]
+    ] = Field(
+        default=None,
+        description=(
+            "grok-build headless only: `--permission-mode`. When set it "
+            "replaces the implicit `--always-approve` derived from "
+            "approval_policy='never'. 'dontAsk' denies everything not "
+            "pre-approved by grok_allow — but grok still auto-approves its "
+            "read-only tools (read_file, grep, list_dir, web_search, skills) "
+            "in every mode, so pair it with grok_tools and grok_deny."
+        ),
+    )
+    grok_allow: list[str] = Field(
+        default_factory=list,
+        description=(
+            "grok-build headless only: repeated `--allow` rules, e.g. "
+            "'MCPTool(loimi__store_search)'."
+        ),
+    )
+    grok_deny: list[str] = Field(
+        default_factory=list,
+        description=(
+            "grok-build headless only: repeated `--deny` rules, e.g. 'Bash', "
+            "'Read', 'MCPTool(loimi__*_delete)'. Deny wins over allow."
+        ),
+    )
+    grok_max_turns: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description="grok-build headless only: `--max-turns` cap on agentic turns per job turn.",
+    )
     turn_timeout_s: Optional[int] = Field(
         default=1800,
         gt=0,
@@ -936,13 +1035,46 @@ class ExecutorSpec(_ProfileModel):
                     "grok-build host leash requires grok_transport: acp "
                     "(headless has no pre-tool approval seam)"
                 )
-            if self.mcp_servers and self.grok_transport == "headless":
-                # Same dead-config rule as leash+headless: the headless
-                # transport has no injection seam, so declared servers would
-                # silently never reach the agent.
+            if self.grok_auth is None:
+                self.grok_auth = "auto"
+            if self.mcp_servers and self.grok_transport == "headless" and not self.grok_hermetic:
+                # Same dead-config rule as leash+headless: plain headless has
+                # no injection seam, so declared servers would silently never
+                # reach the agent. grok_hermetic IS the seam (it writes them
+                # into GROK_HOME/config.toml).
                 raise ValueError(
-                    "grok-build `mcp_servers` injection requires grok_transport: acp "
-                    "(headless reads MCP config only from GROK_HOME / project .grok/)"
+                    "grok-build `mcp_servers` with grok_transport: headless requires "
+                    "grok_hermetic: true (miragen then owns GROK_HOME/config.toml); "
+                    "otherwise use grok_transport: acp"
+                )
+            if self.grok_transport != "headless":
+                for field_name in _GROK_HEADLESS_ONLY_FIELDS:
+                    if _grok_field_set(self, field_name):
+                        raise ValueError(
+                            f"`{field_name}` requires grok_transport: headless "
+                            f"(not wired for '{self.grok_transport}')"
+                        )
+            if self.grok_hermetic:
+                for server in self.mcp_servers or []:
+                    env = server.bearer_token_env
+                    if env is not None and not _ENV_NAME_RE.fullmatch(env):
+                        raise ValueError(
+                            f"grok_hermetic: mcp_servers[{server.name}].bearer_token_env "
+                            f"{env!r} is not a plain env var name (it is written as "
+                            "a ${...} reference into config.toml)"
+                        )
+                    if "${" in server.url:
+                        raise ValueError(
+                            f"grok_hermetic: mcp_servers[{server.name}].url must be literal "
+                            "(grok would expand ${...} in it; the URL allowlist needs "
+                            "the exact value)"
+                        )
+            if self.web_search and self.grok_tools is not None and not (
+                {"web_search", "web_fetch"} & set(self.grok_tools)
+            ):
+                raise ValueError(
+                    "grok-build web_search: true is dead config with a grok_tools "
+                    "allowlist that lists neither web_search nor web_fetch"
                 )
         else:
             if self.grok_home is not None:
@@ -951,6 +1083,12 @@ class ExecutorSpec(_ProfileModel):
                 raise ValueError(
                     f"`grok_transport` only applies to the grok-build executor, not '{self.executor}'"
                 )
+            for field_name in ("grok_auth", *_GROK_HEADLESS_ONLY_FIELDS):
+                if _grok_field_set(self, field_name):
+                    raise ValueError(
+                        f"`{field_name}` only applies to the grok-build executor, "
+                        f"not '{self.executor}'"
+                    )
 
         return self
 
