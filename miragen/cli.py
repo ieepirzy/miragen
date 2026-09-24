@@ -373,7 +373,7 @@ def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None,
             how = asyncio.run(ensure_worker_token(profile.memory, principal, Path(token_file)))
         except Exception as exc:  # noqa: BLE001 — surfaced as a CLI error
             raise click.ClickException(f"worker principal {principal}: {exc}") from exc
-        click.echo(f"worker principal {principal}: token {how}")
+        click.echo(f"{utc_stamp()} worker principal {principal}: token {how}")
 
     client = MemoryClient(profile.memory)
     extract = build_model_extractor(model)
@@ -391,24 +391,63 @@ def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None,
         if cutoff.tzinfo is None:
             cutoff = cutoff.replace(tzinfo=UTC)
 
+    click.echo(f"{utc_stamp()} worker started: model {model}, limit {limit}, interval {interval}s"
+               + (f", skipping events received before {skip_before}" if cutoff else ""))
     backoff = 0
     while True:
         results = asyncio.run(
             run_worker_once(client, extract=extract, check=check, embed=embed,
                             limit=limit, lease_seconds=lease_seconds, skip_before=cutoff)
         )
-        for result in results:
-            click.echo(
-                f"job {result.get('job_id')}: {result.get('status')}"
-                + (f" (+{result.get('accepted', 0)} accepted,"
-                   f" {result.get('quarantined', 0)} quarantined,"
-                   f" {len(result.get('dropped', []))} dropped)"
-                   if result.get("status") == "done" else "")
-            )
+        for line in sweep_lines(results):
+            click.echo(f"{utc_stamp()} {line}")
         if once:
             break
+        if drain_backlog(results, limit=limit):
+            continue  # skipping costs no model call: don't pace it like work
         backoff = next_backoff(backoff, results, interval=interval, ceiling=max_backoff)
         _time.sleep(backoff or interval)
+
+
+def utc_stamp() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def drain_backlog(results: list[dict], *, limit: int) -> bool:
+    """A full sweep that only skipped pre-cutoff backlog made no model call,
+    so the next sweep runs at once instead of after `interval`: the backlog
+    drains at claim speed and new jobs aren't queued behind it for hours."""
+    return len(results) >= limit and all(r.get("status") == "skipped_backlog" for r in results)
+
+
+def sweep_lines(results: list[dict]) -> list[str]:
+    """One summary line for the skipped backlog of a sweep (with the span of
+    event times, so progress through the backlog is visible), one line per
+    processed or failed job with its event's time, source kind and scope."""
+    lines = []
+    skipped = [r for r in results if r.get("status") == "skipped_backlog"]
+    if skipped:
+        stamps = sorted(r["event_at"] for r in skipped if r.get("event_at"))
+        span = f": events {stamps[0]} .. {stamps[-1]}" if stamps else ""
+        lines.append(f"skipped {len(skipped)} backlog job(s){span}")
+    for r in results:
+        status = r.get("status")
+        if status == "skipped_backlog":
+            continue
+        where = (f"{r.get('source_kind') or '?'} event {r.get('event_at') or '?'}"
+                 f" in {r.get('scope_id') or '?'}")
+        if status == "done":
+            outcome = ("nothing to extract" if r.get("skipped") else
+                       f"+{r.get('accepted', 0)} accepted, {r.get('quarantined', 0)} quarantined,"
+                       f" {len(r.get('dropped', []))} dropped")
+            lines.append(f"job {r.get('job_id')} done ({where}): {outcome}")
+        else:
+            lines.append(f"job {r.get('job_id')} {status}"
+                         + (f" ({where})" if r.get("event_at") else "")
+                         + (f": {str(r.get('error'))[:300]}" if r.get("error") else ""))
+    return lines
 
 
 async def ensure_worker_token(
