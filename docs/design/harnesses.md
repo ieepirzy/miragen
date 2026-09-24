@@ -57,14 +57,17 @@ home for a persistent conversational agent.
    rule, made because relying on the agent to pull memory itself is brittle.
    If a per-turn system channel turns up in probing, prefer it.
 
+7. **System instructions are stable, and a change forks the session.**
+   `spec.instructions` goes in once, at `session/new`. Nothing is expected
+   to edit the system prompt routinely. Per-turn context (the memory
+   packet, runtime frames) goes in at the user-prompt level.
+   - miragen stores an instructions hash beside each instance's session.
+   - When the hash no longer matches, the next turn forks the Grok session.
+     History is kept, and the fork carries the new instructions.
+   - Instructions are never re-sent every turn.
+
 ## Open
 
-- **Instruction changes.** `spec.instructions` goes in once, at
-  `session/new`. When it changes (the profile is edited and the container
-  restarts), existing sessions keep the old text. The proposal is to store an
-  instructions hash per instance, and on a mismatch fork the session so
-  history is kept and the fork carries the new instructions. This is pending
-  Ilari's decision.
 - **The tool boundary for Grok.** Built-ins are removed through the agent
   profile (`tools: search_tool, use_tool`), a host-side `pre_tool_use` client
   hook denies anything outside the gateway, and the gateway fails closed.
