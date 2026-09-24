@@ -171,16 +171,39 @@ async def test_restart_resumes_the_same_session_via_load(env):
     assert len(loads) == 1 and loads[0]["mcpServers"] == [] and loads[0]["cwd"].endswith("/work/chat")
 
 
-async def test_changed_instructions_fork_the_session_keeping_history(env):
+async def test_changed_instructions_fork_and_deliver_the_update_once(env):
     h = env.harness("You are Mira.")
     await h.run(turn("one"))
     await h.aclose()
     h2 = env.harness("You are Mira, v2.")
     res = await h2.run(turn("HISTORY", run_id="r2"))
-    assert res.output == "turns=2 rules='You are Mira, v2.'\n"
-    assert any("fork" in e for e in env.log())
-    state = json.loads((env.home / "miragen-instances.json").read_text())
-    assert state["chat"]["session_id"] == next(e["to"] for e in env.log() if "fork" in e)
+    # history kept; grok keeps the fork's original rules (verified live) …
+    assert res.output.endswith("turns=2 rules='You are Mira.'\n")
+    fork = next(e for e in env.log() if "fork" in e)
+    state = json.loads((env.home / "miragen-instances.json").read_text())["chat"]
+    assert state["session_id"] == fork["to"] and state["instructions_update_pending"] is False
+    # … so the new instructions ride the first turn after the fork, once
+    turns = json.loads((env.home / "fake-sessions" / f"{fork['to']}.json").read_text())["turns"]
+    assert "<instructions-update" in turns[-1] and "You are Mira, v2." in turns[-1]
+    await h2.run(turn("again", run_id="r3"))
+    turns = json.loads((env.home / "fake-sessions" / f"{fork['to']}.json").read_text())["turns"]
+    assert "<instructions-update" not in turns[-1]
+
+
+async def test_instructions_update_stays_pending_until_a_turn_delivers_it(env):
+    h = env.harness("You are Mira.")
+    await h.run(turn("one"))
+    await h.aclose()
+    h2 = env.harness("You are Mira, v2.", turn_timeout_s=0.5)
+    with pytest.raises(GrokHarnessError):
+        await h2.run(turn("SLEEP", run_id="r2"))
+    state = json.loads((env.home / "miragen-instances.json").read_text())["chat"]
+    assert state["instructions_update_pending"] is True
+    h2.settings.turn_timeout_s = 30
+    await h2.run(turn("retry", run_id="r3"))
+    sid = json.loads((env.home / "miragen-instances.json").read_text())["chat"]["session_id"]
+    turns = json.loads((env.home / "fake-sessions" / f"{sid}.json").read_text())["turns"]
+    assert "<instructions-update" in turns[-1]
 
 
 async def test_memory_packet_rides_in_the_prompt(env):

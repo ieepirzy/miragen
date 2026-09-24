@@ -207,11 +207,13 @@ class GrokHarness:
         except (FileNotFoundError, ValueError):
             return {}
 
-    async def _save_instance(self, instance: str, session_id: str) -> None:
+    async def _save_instance(self, instance: str, session_id: str, *,
+                             update_pending: bool = False) -> None:
         async with self._state_lock:
             state = self._load_state()
             state[instance] = {"session_id": session_id,
                                "instructions_sha": instructions_hash(self.instructions),
+                               "instructions_update_pending": update_pending,
                                "updated_at": time.time()}
             tmp = self._state_path().with_suffix(".tmp")
             tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
@@ -262,15 +264,18 @@ class GrokHarness:
         if known:
             if known.get("instructions_sha") == instructions_hash(self.instructions):
                 return await acp.session_load(known["session_id"], cwd, mcp_servers=[])
-            # Instructions changed: fork so history is kept and the fork
-            # carries the new rules (decision 7).
+            # Instructions changed. Grok fixes a session's system rules at
+            # session/new — neither fork nor load accepts new ones (verified
+            # live, grok 1.0.41). So: fork (history kept), and deliver the new
+            # instructions once, in the first turn of the fork (decision 7).
             try:
-                forked = await acp.request("x.ai/session/fork", {
-                    "sessionId": known["session_id"], "cwd": cwd, "mcpServers": [],
-                    "_meta": rules})
-                session_id = str((forked or {}).get("sessionId") or "")
+                forked = await acp.request("_x.ai/session/fork", {
+                    "sourceSessionId": known["session_id"], "sourceCwd": cwd, "newCwd": cwd,
+                    "mcpServers": []})
+                session_id = str((forked or {}).get("newSessionId") or "")
                 if session_id:
-                    await self._save_instance(instance, session_id)
+                    await acp.session_load(session_id, cwd, mcp_servers=[])
+                    await self._save_instance(instance, session_id, update_pending=True)
                     logger.info("grok harness: forked %s for new instructions", instance)
                     return session_id
             except Exception as exc:
@@ -330,12 +335,22 @@ class GrokHarness:
             return turn.instance, False
         return f"run-{turn.run_id or os.urandom(6).hex()}", True
 
-    @staticmethod
-    def _compose(turn: HarnessTurn) -> str:
-        if not turn.extra_instructions:
-            return turn.prompt
-        return (f"<context source=\"miragen\">\n{turn.extra_instructions}\n</context>\n\n"
-                f"{turn.prompt}")
+    def _update_pending(self, instance: str, ephemeral: bool) -> bool:
+        if ephemeral:
+            return False
+        return bool((self._load_state().get(instance) or {}).get("instructions_update_pending"))
+
+    def _compose(self, turn: HarnessTurn, *, instructions_update: bool = False) -> str:
+        parts = []
+        if instructions_update:
+            parts.append(
+                "<instructions-update source=\"miragen\">\nYour system instructions have "
+                "changed. These replace the instructions you were given at the start of this "
+                f"conversation, from now on:\n\n{self.instructions}\n</instructions-update>")
+        if turn.extra_instructions:
+            parts.append(f"<context source=\"miragen\">\n{turn.extra_instructions}\n</context>")
+        parts.append(turn.prompt)
+        return "\n\n".join(parts)
 
     async def _turn(self, turn: HarnessTurn, on_text: Callable[[str], None] | None) -> HarnessResult:
         if turn.secret_env:
@@ -344,6 +359,7 @@ class GrokHarness:
                 "yet (the gateway holds deployment-level upstream credentials)")
         instance, ephemeral = self._key(turn)
         agent = await self._agent_for(instance, ephemeral=ephemeral)
+        deliver_update = self._update_pending(instance, ephemeral)
         chunks: list[str] = []
         end: dict[str, Any] = {}
         try:
@@ -352,7 +368,8 @@ class GrokHarness:
                 with self.gateway.turn(instance, turn.run_id) as log:
                     try:
                         async with asyncio.timeout(self.settings.turn_timeout_s):
-                            async for update in agent.acp.prompt(agent.session_id, self._compose(turn)):
+                            async for update in agent.acp.prompt(
+                                    agent.session_id, self._compose(turn, instructions_update=deliver_update)):
                                 kind = update.get("type")
                                 if kind == "text":
                                     chunks.append(update["data"])
@@ -379,6 +396,8 @@ class GrokHarness:
         if not agent.acp.alive and not ephemeral:
             await self._drop(instance)  # next turn respawns and session/loads
         stop = end.get("stopReason")
+        if deliver_update and stop not in ("cancelled", "refusal"):
+            await self._save_instance(instance, agent.session_id)  # delivered: clear pending
         if stop == "cancelled":
             raise GrokHarnessError("turn was cancelled")
         if stop == "refusal":

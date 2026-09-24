@@ -176,7 +176,7 @@ def main():
                 send({"jsonrpc": "2.0", "id": rid, "result": {}})
             else:
                 send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": "Authentication required"}})
-        elif method in ("session/new", "session/load", "x.ai/session/fork", "session/prompt") and not _authed:
+        elif method in ("session/new", "session/load", "_x.ai/session/fork", "session/prompt") and not _authed:
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": "Authentication required"}})
         elif method == "session/new":
             sid = str(uuid.uuid4())
@@ -191,12 +191,22 @@ def main():
                 send({"jsonrpc": "2.0", "id": rid, "result": {}})
             else:
                 send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": "session not found"}})
-        elif method == "x.ai/session/fork":
-            old = load(params["sessionId"])
+        elif method == "_x.ai/session/fork":
+            # grok 1.0.41's contract (probed live): sourceSessionId,
+            # sourceCwd, newCwd required; the fork copies the conversation
+            # AND the original rules (new _meta.rules are ignored).
+            missing = [k for k in ("sourceSessionId", "sourceCwd", "newCwd") if k not in params]
+            if missing:
+                send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "Invalid params",
+                      "data": f"invalid params: missing field `{missing[0]}`"}})
+                continue
+            old = load(params["sourceSessionId"])
             sid = str(uuid.uuid4())
-            save(sid, {**old, "rules": (params.get("_meta") or {}).get("rules")})
-            log({"fork": params["sessionId"], "to": sid})
-            send({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": sid}})
+            save(sid, dict(old))
+            log({"fork": params["sourceSessionId"], "to": sid})
+            send({"jsonrpc": "2.0", "id": rid, "result": {
+                "newSessionId": sid, "parentSessionId": params["sourceSessionId"],
+                "chatMessagesCopied": len(old["turns"]), "newCwd": params["newCwd"]}})
         elif method == "session/prompt":
             threading.Thread(target=handle_prompt, args=(rid, params), daemon=True).start()
         elif method == "session/cancel":
