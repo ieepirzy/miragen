@@ -359,13 +359,14 @@ def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None,
             "memory.extraction.enabled is not set on this profile — the "
             "worker only runs where the deployment explicitly enabled it"
         )
-    model = profile.memory.extraction.model or (
-        profile.spec.model if profile.spec else None
-    )
+    from miragen.harness import pydantic_ai_model
+
+    model = profile.memory.extraction.model or pydantic_ai_model(profile)
     if not model:
         raise click.ClickException(
             "no extraction model: set memory.extraction.model (required on "
-            "executor-tier profiles, which have no spec.model)"
+            "executor-tier profiles, which have no spec.model, and on profiles "
+            "whose spec.model names a harness such as grok-build:)"
         )
 
     if principal and token_file:
