@@ -290,6 +290,11 @@ def _save_history_messages(instance: str, messages: list, run_id: str | None) ->
     _append_history_sidecar(instance, run_id, len(messages))
 
 
+def _guidance_kwargs() -> dict:
+    """build_agent's system_guidance, passed only when there is some."""
+    return {"system_guidance": _speak_guidance} if _speak_guidance else {}
+
+
 def _model_ready() -> bool:
     """A base-tier harness is available for turns."""
     return _harness is not None or _agent is not None
@@ -312,8 +317,8 @@ def _model_harness() -> Harness:
             telemetry=_telemetry,
             secret_env=secret_env,
             extra_tools=_runtime_extra_tools(),
-            system_guidance=_speak_guidance,
             extra_instructions=extra_instructions,
+            **_guidance_kwargs(),
         ),
         load_history=lambda instance: _cap_history(_load_history_messages(instance)),
         save_history=_save_history_messages,
@@ -1303,7 +1308,7 @@ async def lifespan(app: FastAPI):
     else:
         _agent, _limits = build_agent(
             _profile, telemetry=_telemetry, extra_tools=_runtime_extra_tools(),
-            system_guidance=_speak_guidance,
+            **_guidance_kwargs(),
         )
         logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode")
 
