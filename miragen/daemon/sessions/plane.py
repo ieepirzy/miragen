@@ -63,6 +63,8 @@ logger = logging.getLogger("miragend.sessions")
 RETRIEVAL_TIMEOUT_S = 8.0
 WRITE_TIMEOUT_S = 15.0
 _PROVISION_VERBS = ["read", "propose", "resolve", "retract"]
+# The extraction worker reads events, proposes records and claims jobs.
+_WORKER_VERBS = ["read", "propose", "maintain"]
 
 
 RECENT_CAPTURE_WINDOW = 200
@@ -118,6 +120,8 @@ class PlaneStats:
     async_recalls_dropped: int = 0
     async_recall_failures: int = 0
     recall_wait_timeouts: int = 0
+    worker_grants: int = 0
+    worker_grant_failures: int = 0
     raw_hooks_shadowed: int = 0
     late_opens: int = 0
     empty_sessions: int = 0
@@ -255,6 +259,7 @@ class SessionPlane:
         self._projects: dict[str, ProjectIdentity] = {}
         self._provisioned: set[str] = set()
         self._unprovisionable: dict[str, str] = {}
+        self._worker_ungranted: set[str] = set()
         self._tasks: set[asyncio.Task] = set()
         self._recalls: dict[str, RecallJob] = {}
         self._recall_seq: dict[str, int] = {}
@@ -365,6 +370,31 @@ class SessionPlane:
         self.principal_source = how
         logger.info(f"principal {principal}: token {how} and persisted at {token_file}")
         return self.principal_source
+
+    async def _grant_worker(self, operator: MemoryClient, scope_id: str) -> None:
+        """The extraction worker's grant on a scope this daemon provisioned.
+        Best-effort: a missing worker principal (not created yet) must not
+        cost the session its own scope; it is counted and logged instead."""
+        worker = self.config.scopes.worker_principal
+        if not worker:
+            return
+        try:
+            await asyncio.wait_for(operator.admin_grant(
+                principal_id=worker, scope_id=scope_id, verbs=_WORKER_VERBS,
+            ), timeout=WRITE_TIMEOUT_S)
+            self.stats.worker_grants += 1
+            self._worker_ungranted.discard(scope_id)
+        except MemoryAPIError as exc:
+            if exc.status_code == 409:
+                self._worker_ungranted.discard(scope_id)
+                return
+            self._worker_ungranted.add(scope_id)
+            self.stats.worker_grant_failures += 1
+            logger.warning(f"worker grant on {scope_id} for {worker} refused: {exc}")
+        except (MemoryUnavailable, asyncio.TimeoutError) as exc:
+            self._worker_ungranted.add(scope_id)
+            self.stats.worker_grant_failures += 1
+            logger.warning(f"worker grant on {scope_id} for {worker} failed: {exc}")
 
     @staticmethod
     def _scope_kind_for(scope_id: str) -> str:
@@ -719,6 +749,13 @@ class SessionPlane:
         read = assignment.read
         policy = self.config.scopes
         detail: str | None = None
+        if write in self._worker_ungranted:
+            # The worker's grant failed earlier (its principal did not exist
+            # yet, or Loimi was away): retry on the scope's next use instead
+            # of waiting for a bridge restart.
+            operator = self._operator_client()
+            if operator is not None:
+                await self._grant_worker(operator, write)
         if assignment.templated and policy.provision == "auto" and write not in self._provisioned:
             failure = self._unprovisionable.get(write)
             if failure is None:
@@ -790,6 +827,7 @@ class SessionPlane:
                 except MemoryAPIError as exc:
                     if exc.status_code != 409:
                         raise
+            await self._grant_worker(operator, scope_id)
         except MemoryAPIError as exc:
             self.stats.provisioning_failures += 1
             self.stats.note_loimi(True)  # it answered — a refusal, not an outage
@@ -1504,6 +1542,13 @@ class SessionPlane:
             "recall": {
                 "enabled": self.config.recall.enabled,
                 "selector_configured": self.selector is not None,
+                # Backend label + model string only: base_url (a hostname)
+                # and credentials never reach this unguarded endpoint.
+                "selector_backend": getattr(self.selector, "backend", "custom")
+                                    if self.selector else None,
+                "selector_model": getattr(self.selector, "model", None),
+                "selector_base_url": bool(getattr(self.selector, "base_url_configured", False)),
+                "selector_timeout_s": self.config.recall.timeout_s,
                 "on_prompt": self.config.recall.on_prompt,
                 "delivery": self.config.recall.delivery,
                 "pending": sum(1 for job in self._recalls.values() if job.delivered is None),

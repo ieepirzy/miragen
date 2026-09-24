@@ -277,6 +277,8 @@ def memory_hook(harness: str) -> None:
     from miragen.memory import MemoryClient, MemoryLifecycle
     from miragen.memory.harness_hooks import handle_hook_event, normalize_hook_payload
 
+    if os.environ.get("MIRAGEN_WORKER"):
+        return  # a memory model call miragen started: never captured (claude_code.py)
     try:
         payload = _json.load(sys.stdin)
         profile = load_profile(os.environ.get("AGENT_PROFILE", "agent.yaml"))
@@ -313,7 +315,25 @@ def memory_hook(harness: str) -> None:
               help="Jobs claimed per sweep.")
 @click.option("--embed-url", envvar="MIRAGEN_MEMORY_EMBED_URL", default=None,
               help="Embed endpoint (POST /embed); enables index-job backfill.")
-def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None) -> None:
+@click.option("--lease", "lease_seconds", default=600, show_default=True,
+              help="Job lease in seconds. Jobs in a sweep run one after another, so keep "
+                   "it above limit × the slowest extraction (a claude-code: extraction "
+                   "plus its checks can take a minute).")
+@click.option("--max-backoff", default=900, show_default=True,
+              help="Upper bound (seconds) of the pause after sweeps where every job failed.")
+@click.option("--skip-before", envvar="MIRAGEN_WORKER_SKIP_BEFORE", default=None,
+              help="ISO timestamp: jobs for events received earlier are completed without "
+                   "a model call. Every captured event queues a job, so a first deployment "
+                   "would otherwise extract the whole history on the model's quota.")
+@click.option("--principal", envvar="MIRAGEN_WORKER_PRINCIPAL", default=None,
+              help="The worker's Loimi principal. With --token-file and LOIMI_OPERATOR_TOKEN, "
+                   "it is created (or a token minted) on first start and the token kept in "
+                   "the file; the bridge's scopes.worker_principal grants it per scope.")
+@click.option("--token-file", envvar="MIRAGEN_WORKER_TOKEN_FILE", default=None,
+              help="Where the worker's own principal token is kept (0600).")
+def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None,
+                  lease_seconds: int, max_backoff: int, skip_before: str | None,
+                  principal: str | None, token_file: str | None) -> None:
     """The bounded extraction worker (memory pass PR 3, §17.5): claims
     consolidate jobs through /memory/v1 as its own maintain-capable
     principal and proposes extracted memories through the same admission
@@ -348,15 +368,34 @@ def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None) 
             "executor-tier profiles, which have no spec.model)"
         )
 
+    if principal and token_file:
+        try:
+            how = asyncio.run(ensure_worker_token(profile.memory, principal, Path(token_file)))
+        except Exception as exc:  # noqa: BLE001 — surfaced as a CLI error
+            raise click.ClickException(f"worker principal {principal}: {exc}") from exc
+        click.echo(f"worker principal {principal}: token {how}")
+
     client = MemoryClient(profile.memory)
     extract = build_model_extractor(model)
     check = build_model_checker(model)
     embed = build_http_embedder(embed_url) if embed_url else None
 
+    cutoff = None
+    if skip_before:
+        from datetime import UTC, datetime
+
+        try:
+            cutoff = datetime.fromisoformat(skip_before.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise click.ClickException(f"--skip-before: not an ISO timestamp: {skip_before}") from exc
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=UTC)
+
+    backoff = 0
     while True:
         results = asyncio.run(
             run_worker_once(client, extract=extract, check=check, embed=embed,
-                            limit=limit)
+                            limit=limit, lease_seconds=lease_seconds, skip_before=cutoff)
         )
         for result in results:
             click.echo(
@@ -368,7 +407,57 @@ def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None) 
             )
         if once:
             break
-        _time.sleep(interval)
+        backoff = next_backoff(backoff, results, interval=interval, ceiling=max_backoff)
+        _time.sleep(backoff or interval)
+
+
+async def ensure_worker_token(
+    spec, principal: str, token_file: Path, *, environ: dict | None = None,
+    client_factory=None,
+) -> str:
+    """The worker's own principal token into `spec.credential_env`: already
+    set → kept; the token file → read; else created (or re-minted when the
+    principal exists) with the operator token, persisted 0600. Returns how."""
+    from miragen.memory import MemoryClient
+    from miragen.memory.client import MemoryAPIError
+
+    env = os.environ if environ is None else environ
+    if env.get(spec.credential_env):
+        return "from environment"
+    if token_file.exists():
+        env[spec.credential_env] = token_file.read_text().strip()
+        return "from file"
+    operator = env.get("LOIMI_OPERATOR_TOKEN")
+    if not operator:
+        raise RuntimeError("no token file yet and LOIMI_OPERATOR_TOKEN is not set")
+    factory = client_factory or (lambda token: MemoryClient(spec, token=token))
+    admin = factory(operator)
+    try:
+        created = await admin.admin_create_principal(
+            principal_id=principal, kind="agent",
+            description="miragen memory-worker (extraction; maintain on granted scopes)",
+        )
+        token, how = created["token"], "created"
+    except MemoryAPIError as exc:
+        if exc.status_code != 409:
+            raise
+        token, how = (await admin.admin_mint_token(principal_id=principal))["token"], "minted"
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(token + "\n")
+    env[spec.credential_env] = token
+    return how
+
+
+def next_backoff(current: int, results: list[dict], *, interval: int, ceiling: int) -> int:
+    """Failed jobs go straight back to pending (Loimi has no retry delay), so
+    a model outage — a subscription rate limit above all — would otherwise
+    re-run every job each sweep. A sweep where every job failed doubles the
+    pause (from `interval`, up to `ceiling`); any success resets it."""
+    if not results or any(r.get("status") != "failed" for r in results):
+        return 0
+    return min(ceiling, max(interval, current * 2))
 
 
 @cli.command(name="memory-conformance")

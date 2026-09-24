@@ -31,4 +31,10 @@ else
     esac
 fi
 
+# A command (the compose `command:`) runs instead of the daemon, as the same
+# unprivileged user — the extraction worker reuses this image that way:
+#   command: ["miragen", "memory-worker", ...]
+if [ "$#" -gt 0 ]; then
+    exec gosu miragend "$@"
+fi
 exec gosu miragend miragend
