@@ -40,7 +40,7 @@ import os
 import re
 import shutil
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,6 +52,10 @@ from grok_build_client import AcpSession
 from miragen.executor.grok_hermetic import hermetic_home_dir, write_hermetic_home
 from miragen.harness.base import HarnessResult, HarnessTurn, InstanceBusyError, parse_harness_model
 from miragen.harness.gateway import ToolGateway
+from miragen.harness.grok_lifecycle import (
+    Decision, Handoff, Ledger, LifecyclePolicy, SessionStats, ThresholdPolicy,
+    accepted_memory_writes, load_policy, memory_save_prompt, rotation_prompt,
+)
 from miragen.models import AgentProfile, RunUsage
 
 logger = logging.getLogger("miragen.harness.grok")
@@ -82,6 +86,14 @@ class GrokSettings:
     max_processes: int = 3
     idle_s: float = 900.0
     turn_timeout_s: float = 600.0
+    # Session lifecycle (grok_lifecycle.py): compaction, rotation, handoff.
+    lifecycle: bool = True
+    policy: LifecyclePolicy = field(default_factory=ThresholdPolicy)
+    handoff_max_chars: int = 4000
+    session_retention_days: float = 30.0
+    # grok's own auto-compaction, as a safety net above the policy (percent
+    # of the model's window; grok-4.7: 500k). None leaves grok's default.
+    native_compact_percent: int | None = 90
 
     @classmethod
     def from_env(cls, *, gateway_url: str) -> "GrokSettings":
@@ -94,6 +106,12 @@ class GrokSettings:
             max_processes=int(env.get("MIRAGEN_GROK_MAX_PROCESSES", "3")),
             idle_s=float(env.get("MIRAGEN_GROK_IDLE_S", "900")),
             turn_timeout_s=float(env.get("MIRAGEN_GROK_TURN_TIMEOUT_S", "600")),
+            lifecycle=env.get("MIRAGEN_GROK_LIFECYCLE", "on").lower() not in ("off", "0", "false"),
+            policy=load_policy(dict(env)),
+            handoff_max_chars=int(env.get("MIRAGEN_GROK_HANDOFF_MAX_CHARS", "4000")),
+            session_retention_days=float(env.get("MIRAGEN_GROK_SESSION_RETENTION_DAYS", "30")),
+            native_compact_percent=(int(env["MIRAGEN_GROK_NATIVE_COMPACT_PERCENT"])
+                                    if env.get("MIRAGEN_GROK_NATIVE_COMPACT_PERCENT") else 90),
         )
 
 
@@ -228,6 +246,11 @@ class GrokHarness:
                            self.tool_timeout_s + 60)
             settings.turn_timeout_s = self.tool_timeout_s + 60
         self._agents: dict[str, _Agent] = {}
+        self._maintenance: dict[str, asyncio.Task] = {}
+        self.ledger = Ledger(settings.grok_home / "lifecycle")
+        # Set by the app: session events for the memory plane
+        # (instance, "compacting" | "closed", info).
+        self.on_lifecycle: Callable[[str, str, dict], Awaitable[None]] | None = None
         self._spawn_lock = asyncio.Lock()
         self._state_lock = asyncio.Lock()
         self._reaper: asyncio.Task | None = None
@@ -238,6 +261,8 @@ class GrokHarness:
         home = self.settings.grok_home
         spec = SimpleNamespace(
             web_search="web_search" in self.builtins, web_fetch="web_fetch" in self.builtins,
+            auto_compact_percent=(self.settings.native_compact_percent
+                                  if self.settings.lifecycle else None),
             mcp_servers=[SimpleNamespace(name=GATEWAY_SERVER, url=self.settings.gateway_url,
                                          bearer_token_env=GATEWAY_TOKEN_ENV,
                                          tool_timeout_sec=self.tool_timeout_s)])
@@ -263,15 +288,21 @@ class GrokHarness:
 
     async def _save_instance(self, instance: str, session_id: str, *,
                              update_pending: bool = False) -> None:
+        await self._update_instance(instance, session_id=session_id,
+                                    instructions_sha=instructions_hash(self.instructions),
+                                    instructions_update_pending=update_pending)
+
+    async def _update_instance(self, instance: str, **fields: Any) -> dict:
+        """Merge fields into the instance's state (lifecycle counters survive
+        a session_id change)."""
         async with self._state_lock:
             state = self._load_state()
-            state[instance] = {"session_id": session_id,
-                               "instructions_sha": instructions_hash(self.instructions),
-                               "instructions_update_pending": update_pending,
-                               "updated_at": time.time()}
+            entry = {**state.get(instance, {}), **fields, "updated_at": time.time()}
+            state[instance] = entry
             tmp = self._state_path().with_suffix(".tmp")
             tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
             os.replace(tmp, self._state_path())
+            return entry
 
     def _env(self, instance: str) -> dict[str, str]:
         env = {k: os.environ[k] for k in ENV_ALLOWLIST if k in os.environ}
@@ -338,6 +369,10 @@ class GrokHarness:
         session_id = await acp.session_new(cwd, mcp_servers=[], yolo=False, meta=rules)
         if not ephemeral:
             await self._save_instance(instance, session_id)
+            if not (known or {}).get("session_started_at"):
+                await self._update_instance(instance, seq=int((known or {}).get("seq") or 1),
+                                            session_started_at=time.time(), turns=0,
+                                            compactions=0, context_tokens=0, memory_writes=0)
         return session_id
 
     async def _agent_for(self, instance: str, *, ephemeral: bool) -> _Agent:
@@ -394,8 +429,11 @@ class GrokHarness:
             return False
         return bool((self._load_state().get(instance) or {}).get("instructions_update_pending"))
 
-    def _compose(self, turn: HarnessTurn, *, instructions_update: bool = False) -> str:
+    def _compose(self, turn: HarnessTurn, *, instructions_update: bool = False,
+                 handoff: Handoff | None = None) -> str:
         parts = []
+        if handoff is not None:
+            parts.append(handoff.render())
         if instructions_update:
             parts.append(
                 "<instructions-update source=\"miragen\">\nYour system instructions have "
@@ -412,10 +450,19 @@ class GrokHarness:
                 "per-launch MCP credentials are not supported by the grok-build harness "
                 "yet (the gateway holds deployment-level upstream credentials)")
         instance, ephemeral = self._key(turn)
+        # A compaction or rotation still running for this instance finishes
+        # first: the turn must land in the session it leaves behind.
+        pending = self._maintenance.get(instance)
+        if pending is not None and not ephemeral:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(pending)
         agent = await self._agent_for(instance, ephemeral=ephemeral)
         deliver_update = self._update_pending(instance, ephemeral)
+        handoff = None if ephemeral else self._pending_handoff(instance)
         chunks: list[str] = []
         end: dict[str, Any] = {}
+        context_tokens: int | None = None
+        native_compactions: list[dict] = []
         try:
             async with agent.lock:
                 agent.last_used = time.monotonic()
@@ -424,9 +471,15 @@ class GrokHarness:
                         async with asyncio.timeout(self.settings.turn_timeout_s):
                             after_tool = False
                             async for update in agent.acp.prompt(
-                                    agent.session_id, self._compose(turn, instructions_update=deliver_update)):
+                                    agent.session_id, self._compose(
+                                        turn, instructions_update=deliver_update,
+                                        handoff=handoff)):
                                 kind = update.get("type")
-                                if kind == "tool_call":
+                                if kind == "usage":
+                                    context_tokens = update["context_tokens"]
+                                elif kind == "compacted":
+                                    native_compactions.append(update)
+                                elif kind == "tool_call":
                                     after_tool = True
                                 elif kind == "text":
                                     text = update["data"]
@@ -461,6 +514,9 @@ class GrokHarness:
         stop = end.get("stopReason")
         if deliver_update and stop not in ("cancelled", "refusal"):
             await self._save_instance(instance, agent.session_id)  # delivered: clear pending
+        if not ephemeral and self.settings.lifecycle and stop not in ("cancelled", "refusal"):
+            await self._after_turn(instance, context_tokens, native_compactions, calls,
+                                   handoff_delivered=handoff is not None)
         if stop == "cancelled":
             raise GrokHarnessError("turn was cancelled")
         if stop == "refusal":
@@ -484,7 +540,220 @@ class GrokHarness:
                 with contextlib.suppress(BaseException):
                     await task
 
+    # ── session lifecycle ────────────────────────────────────────────────
+    def _pending_handoff(self, instance: str) -> Handoff | None:
+        raw = (self._load_state().get(instance) or {}).get("handoff")
+        return Handoff(**raw) if raw else None
+
+    def _stats(self, entry: dict) -> SessionStats:
+        return SessionStats(
+            context_tokens=int(entry.get("context_tokens") or 0),
+            compactions=int(entry.get("compactions") or 0),
+            turns=int(entry.get("turns") or 0),
+            age_s=time.time() - float(entry.get("session_started_at") or time.time()),
+            seq=int(entry.get("seq") or 1))
+
+    async def _after_turn(self, instance: str, context_tokens: int | None,
+                          native: list[dict], calls: list, *, handoff_delivered: bool) -> None:
+        entry = self._load_state().get(instance) or {}
+        writes = accepted_memory_writes(calls)
+        fields: dict[str, Any] = {
+            "turns": int(entry.get("turns") or 0) + 1,
+            "compactions": int(entry.get("compactions") or 0) + len(native),
+            "memory_writes": int(entry.get("memory_writes") or 0) + writes,
+        }
+        if writes:
+            fields["last_memory_write_at"] = time.time()
+        if context_tokens is not None:
+            fields["context_tokens"] = context_tokens
+        if handoff_delivered:
+            fields["handoff"] = None
+        for c in native:
+            # grok compacted on its own (its safety net): no memory save ran first.
+            self.ledger.write(instance, "compaction", trigger="grok", seq=entry.get("seq", 1),
+                              tokens_before=c.get("tokens_before"),
+                              tokens_after=c.get("tokens_after"))
+        entry = await self._update_instance(instance, **fields)
+        stats = self._stats(entry)
+        self.ledger.write(instance, "turn", seq=stats.seq, context_tokens=stats.context_tokens,
+                          turns=stats.turns, compactions=stats.compactions, memory_writes=writes)
+        if native and self.on_lifecycle:
+            with contextlib.suppress(Exception):
+                await self.on_lifecycle(instance, "compacting", {"trigger": "grok"})
+        decision = self.settings.policy.decide(stats)
+        if decision.action == "none":
+            return
+        if decision.action == "rotate":
+            # Visible at once (GET /instances): the next turn lands in a new
+            # session, so a client adds its own recent-transcript context.
+            await self._update_instance(instance, rotation_pending=True)
+        self._schedule(instance, decision)
+
+    def _schedule(self, instance: str, decision: Decision) -> asyncio.Task:
+        task = asyncio.create_task(self._maintain(instance, decision),
+                                   name=f"grok-maintenance-{instance}")
+        self._maintenance[instance] = task
+        task.add_done_callback(lambda t: self._maintenance.pop(instance, None)
+                               if self._maintenance.get(instance) is t else None)
+        return task
+
+    async def rotate(self, instance: str, reason: str = "requested") -> dict:
+        """Rotate now (e.g. the user asked for a fresh start): memory save +
+        handoff, then a new session. Waits for it to finish."""
+        pending = self._maintenance.get(instance)
+        if pending is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(pending)
+        if not self._load_state().get(instance):
+            raise KeyError(instance)
+        await self._update_instance(instance, rotation_pending=True)
+        await self._schedule(instance, Decision("rotate", reason))
+        return self.session_info(instance)
+
+    async def _prompt_text(self, agent: _Agent, text: str) -> tuple[str, int | None, list[dict]]:
+        chunks: list[str] = []
+        context: int | None = None
+        compacted: list[dict] = []
+        async with asyncio.timeout(self.settings.turn_timeout_s):
+            async for update in agent.acp.prompt(agent.session_id, text):
+                kind = update.get("type")
+                if kind == "text":
+                    chunks.append(update["data"])
+                elif kind == "usage":
+                    context = update["context_tokens"]
+                elif kind == "compacted":
+                    compacted.append(update)
+                elif kind == "error":
+                    raise GrokHarnessError(f"grok: {update.get('message')}")
+        return "".join(chunks), context, compacted
+
+    async def _maintain(self, instance: str, decision: Decision) -> None:
+        try:
+            agent = await self._agent_for(instance, ephemeral=False)
+        except Exception as exc:  # noqa: BLE001 — maintenance is retried by the next turn's policy
+            logger.warning("grok harness: maintenance of %s could not start: %s", instance, exc)
+            await self._update_instance(instance, rotation_pending=False)
+            return
+        run_id = f"maintenance-{os.urandom(6).hex()}"
+        try:
+            async with agent.lock:
+                agent.last_used = time.monotonic()
+                if decision.action == "compact":
+                    await self._compact(agent, run_id, decision)
+                else:
+                    await self._rotate(agent, run_id, decision)
+                agent.last_used = time.monotonic()
+        except Exception as exc:  # noqa: BLE001 — logged + ledgered; the session stays usable
+            logger.warning("grok harness: %s of %s failed: %s", decision.action, instance, exc)
+            self.ledger.write(instance, "maintenance_failed", action=decision.action,
+                              reason=decision.reason, error=str(exc)[:300])
+            await self._update_instance(instance, rotation_pending=False)
+        finally:
+            agent.reserved -= 1
+
+    async def _compact(self, agent: _Agent, run_id: str, decision: Decision) -> None:
+        instance = agent.instance
+        entry = self._load_state().get(instance) or {}
+        with self.gateway.turn(instance, run_id) as log:
+            await self._prompt_text(agent, memory_save_prompt(decision.reason))
+            writes = accepted_memory_writes(log.calls)
+        if self.on_lifecycle:
+            with contextlib.suppress(Exception):
+                await self.on_lifecycle(instance, "compacting", {"trigger": "miragen"})
+        _text, _ctx, compacted = await self._prompt_text(
+            agent, "/compact Keep open threads, commitments, the user's latest requests and "
+                   "anything not yet saved to memory.")
+        done = compacted[-1] if compacted else {}
+        after = done.get("tokens_after")
+        fields: dict[str, Any] = {
+            "compactions": int(entry.get("compactions") or 0) + 1,
+            "memory_writes": int(entry.get("memory_writes") or 0) + writes}
+        if writes:
+            fields["last_memory_write_at"] = time.time()
+        if isinstance(after, int):
+            fields["context_tokens"] = after
+        await self._update_instance(instance, **fields)
+        self.ledger.write(instance, "compaction", trigger="miragen", reason=decision.reason,
+                          seq=entry.get("seq", 1), memory_writes=writes,
+                          tokens_before=done.get("tokens_before"), tokens_after=after,
+                          observed=bool(compacted))
+
+    async def _rotate(self, agent: _Agent, run_id: str, decision: Decision) -> None:
+        instance = agent.instance
+        entry = self._load_state().get(instance) or {}
+        limit = self.settings.handoff_max_chars
+        text, error = "", None
+        with self.gateway.turn(instance, run_id) as log:
+            try:
+                text, _ctx, _c = await self._prompt_text(
+                    agent, rotation_prompt(decision.reason, limit))
+            except Exception as exc:  # noqa: BLE001 — best-effort: rotate anyway, say the note is missing
+                error = f"{type(exc).__name__}: {exc}"[:200]
+            writes = accepted_memory_writes(log.calls)
+        text = text.strip()
+        rotated_at = time.time()
+        memory_writes = int(entry.get("memory_writes") or 0) + writes
+        handoff = Handoff(
+            text=text[:limit], truncated=len(text) > limit, prev_seq=int(entry.get("seq") or 1),
+            reason=decision.reason, started_at=float(entry.get("session_started_at") or rotated_at),
+            rotated_at=rotated_at, turns=int(entry.get("turns") or 0),
+            compactions=int(entry.get("compactions") or 0),
+            context_tokens=int(entry.get("context_tokens") or 0), memory_writes=memory_writes,
+            last_memory_write_at=(rotated_at if writes else entry.get("last_memory_write_at")),
+            handoff_error=error or (None if text else "the note came back empty"))
+        if self.on_lifecycle:
+            with contextlib.suppress(Exception):
+                await self.on_lifecycle(instance, "closed", {"reason": decision.reason})
+        old = agent.session_id
+        cwd = str(self.settings.workdirs / instance)
+        rules = {"rules": self.instructions} if self.instructions else {}
+        new = await agent.acp.session_new(cwd, mcp_servers=[], yolo=False, meta=rules)
+        agent.session_id = new
+        retired = list(entry.get("retired") or []) + [{"session_id": old, "retired_at": rotated_at}]
+        retired = self._prune_retired(instance, retired)
+        await self._update_instance(
+            instance, session_id=new, instructions_sha=instructions_hash(self.instructions),
+            instructions_update_pending=False, seq=handoff.prev_seq + 1,
+            session_started_at=rotated_at, turns=0, compactions=0, context_tokens=0,
+            memory_writes=0, last_memory_write_at=None, rotation_pending=False,
+            handoff=handoff.to_json(), retired=retired)
+        self.ledger.write(instance, "rotation", reason=decision.reason, from_seq=handoff.prev_seq,
+                          to_seq=handoff.prev_seq + 1, turns=handoff.turns,
+                          compactions=handoff.compactions, context_tokens=handoff.context_tokens,
+                          memory_writes=writes, handoff_chars=len(text),
+                          handoff_truncated=handoff.truncated, handoff_error=handoff.handoff_error)
+
+    def _prune_retired(self, instance: str, retired: list[dict]) -> list[dict]:
+        """Delete retired sessions' files once past retention; keep the rest."""
+        cutoff = time.time() - self.settings.session_retention_days * 86400
+        keep = []
+        for r in retired:
+            if float(r.get("retired_at") or 0) < cutoff:
+                path = self.session_dir(instance) / str(r.get("session_id"))
+                if path.is_dir():
+                    shutil.rmtree(path)
+                self.ledger.write(instance, "session_pruned", session_id=r.get("session_id"))
+            else:
+                keep.append(r)
+        return keep
+
+    def session_info(self, instance: str) -> dict | None:
+        entry = self._load_state().get(instance)
+        if not entry:
+            return None
+        seq = int(entry.get("seq") or 1)
+        return {"seq": seq, "turns": int(entry.get("turns") or 0),
+                "compactions": int(entry.get("compactions") or 0),
+                "context_tokens": int(entry.get("context_tokens") or 0),
+                "rotation_pending": bool(entry.get("rotation_pending")),
+                # The next turn is the first in a rotated session.
+                "fresh": bool(entry.get("rotation_pending")) or bool(entry.get("handoff")),
+                "maintenance_running": instance in self._maintenance}
+
     async def aclose(self) -> None:
+        for task in list(self._maintenance.values()):
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(asyncio.shield(task), timeout=5)
         if self._reaper is not None:
             self._reaper.cancel()
         for instance in list(self._agents):

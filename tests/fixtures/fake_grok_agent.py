@@ -129,11 +129,48 @@ def chunk(sid: str, text: str) -> None:
                                      "content": {"type": "text", "text": text}}}})
 
 
+def update(sid: str, payload: dict) -> None:
+    # grok 1.0.41 (observed live): usage, compaction and turn bookkeeping
+    # arrive as _x.ai/session_notification, not session/update.
+    method = "_x.ai/session_notification" if payload.get("sessionUpdate") in (
+        "response_completed", "auto_compact_completed", "turn_completed") else "session/update"
+    send({"jsonrpc": "2.0", "method": method,
+          "params": {"sessionId": sid, "update": payload}})
+
+
+def compact(sid: str, data: dict) -> None:
+    """grok's compaction (1.0.41 wire shape): the context shrinks, and an
+    auto_compact_completed update reports before/after."""
+    before = data.get("context", 0)
+    data["context"] = max(1000, before // 6)
+    data["compactions"] = data.get("compactions", 0) + 1
+    data.setdefault("compacted_after_turns", []).append(len(data.get("turns", [])))
+    update(sid, {"sessionUpdate": "auto_compact_completed", "tokens_before": before,
+                 "tokens_after": data["context"], "summary_preview": None})
+
+
 def handle_prompt(rid, params):
     sid = params["sessionId"]
     text = "".join(b.get("text", "") for b in params.get("prompt") or [])
     data = load(sid)
+    if text.startswith("/compact"):
+        # A command, not a model turn: no usage, no turn recorded.
+        data.setdefault("compact_hints", []).append(text[len("/compact"):].strip())
+        compact(sid, data)
+        save(sid, data)
+        update(sid, {"sessionUpdate": "turn_completed", "stop_reason": "end_turn"})
+        send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+        return
     data["turns"].append(text)
+    # Context grows with what is sent; GROW <n> adds n tokens (a big tool result).
+    data["context"] = data.get("context", 0) + len(text) // 4 + 10
+    if "<session-maintenance" in text:
+        # Maintenance turns follow a script the test writes (same directives).
+        script = HOME / "fake-maintenance.txt"
+        text = script.read_text() if script.exists() else "SAY maintenance done"
+        if "handoff" in "".join(b.get("text", "") for b in params.get("prompt") or []).lower():
+            hl = HOME / "fake-handoff.txt"
+            text += "\nSAY " + (hl.read_text() if hl.exists() else "handoff: nothing open")
     save(sid, data)
     stop = "end_turn"
     for line in text.splitlines():
@@ -161,9 +198,20 @@ def handle_prompt(rid, params):
                 break
         elif line == "HISTORY":
             chunk(sid, f"turns={len(data['turns'])} rules={data.get('rules')!r}\n")
+        elif line.startswith("GROW "):
+            data["context"] += int(line.split()[1])
+        elif line == "NATIVECOMPACT":
+            compact(sid, data)  # grok compacting on its own, mid-turn
+        elif line == "LASTTURN":
+            chunk(sid, "last=" + (data["turns"][-2][:300] if len(data["turns"]) > 1 else "") + "\n")
         elif line:
             chunk(sid, "echo: ")
             chunk(sid, line[-80:] + "\n")
+    save(sid, {**load(sid), "context": data["context"], "compactions": data.get("compactions", 0)})
+    # One model call: its input is the whole context at that point.
+    update(sid, {"sessionUpdate": "response_completed", "usage": {
+        "input_tokens": data["context"] - 100, "output_tokens": 5,
+        "cache_read_input_tokens": 100, "cache_creation_input_tokens": 0}})
     send({"jsonrpc": "2.0", "id": rid, "result": {
         "stopReason": stop, "_meta": {"usage": {"inputTokens": 10, "outputTokens": 5}}}})
 

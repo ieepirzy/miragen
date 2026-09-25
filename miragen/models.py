@@ -38,6 +38,9 @@ class ToolCallRecord(BaseModel):
     tool_name: str
     args: str  # JSON-encoded, truncated to 2_000 chars
     ok: bool  # False if the call raised / was denied
+    # The result's own "status" field when it is a JSON object that has one
+    # (e.g. a memory write's "accepted"); never the result's content.
+    result_status: str | None = None
 
 
 # Instance names share the agent-name grammar: they key filesystem paths

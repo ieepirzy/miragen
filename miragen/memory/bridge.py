@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import socket
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import httpx
@@ -43,6 +44,10 @@ class BridgeMemory:
     transport: httpx.AsyncBaseTransport | None = None
     timeout_s: float = 20.0
     _opened: set[str] = field(default_factory=set)
+    # The harness's session sequence for an instance (Grok lifecycle): each
+    # rotated session is its own plane session, so the plane closes one and
+    # writes its episode before the next opens.
+    session_seq: Callable[[str], int] | None = None
 
     @classmethod
     def from_env(cls, spec: MemorySpec, agent_name: str, env: dict[str, str]) -> "BridgeMemory":
@@ -53,7 +58,9 @@ class BridgeMemory:
                    token=env.get(spec.credential_env))
 
     def session_id(self, instance: str | None) -> str:
-        return f"{self.agent_name}-{instance or 'ephemeral'}"
+        base = f"{self.agent_name}-{instance or 'ephemeral'}"
+        seq = self.session_seq(instance) if (self.session_seq and instance) else 1
+        return base if seq <= 1 else f"{base}-s{seq}"
 
     def session_key(self, instance: str | None) -> str:
         """What the plane calls this session (the X-Harness-Session value)."""
@@ -84,10 +91,10 @@ class BridgeMemory:
         instance's first turn in this process, and the plane's recall."""
         parts: list[str] = []
         try:
-            if instance not in self._opened:
+            if self.session_id(instance) not in self._opened:
                 answer = await self._post(self._envelope(
                     instance, "context.started", "SessionStart", source="startup"))
-                self._opened.add(instance)
+                self._opened.add(self.session_id(instance))
                 if answer.get("context"):
                     parts.append(answer["context"])
             answer = await self._post(self._envelope(
@@ -97,7 +104,7 @@ class BridgeMemory:
                 parts.append(answer["context"])
         except Exception as exc:  # the plane is optional to a turn, never fatal
             logger.warning("memory bridge unavailable: %s", exc)
-            self._opened.discard(instance)
+            self._opened.discard(self.session_id(instance))
             return UNAVAILABLE_NOTE
         return "\n\n".join(parts)
 
@@ -109,3 +116,15 @@ class BridgeMemory:
                 ids={"turn_id": run_id} if run_id else None, stop_reason=status))
         except Exception as exc:
             logger.warning("memory bridge capture failed: %s", exc)
+
+    async def lifecycle(self, instance: str, event: str, info: dict) -> None:
+        """The harness compacted or closed a session: the plane writes its
+        episode + working-state checkpoint (compact-N / end)."""
+        name, original = {"compacting": ("context.compacting", "PreCompact"),
+                          "closed": ("context.closed", "SessionEnd")}[event]
+        try:
+            await self._post(self._envelope(instance, name, original, **info))
+            if event == "closed":
+                self._opened.discard(self.session_id(instance))
+        except Exception as exc:  # noqa: BLE001 — the plane is optional to a session, never fatal
+            logger.warning("memory bridge %s event failed: %s", event, exc)
