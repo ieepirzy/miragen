@@ -117,6 +117,11 @@ def render_config(agent: str, spec: "ExecutorSpec") -> str:
         "",
         *_settings(spec),
     ]
+    percent = getattr(spec, "auto_compact_percent", None)
+    if percent:
+        # grok's own auto-compaction; a harness with a session lifecycle sets
+        # it high, as a safety net above its own compaction policy.
+        lines += ["", "[session]", f"auto_compact_threshold_percent = {int(percent)}"]
     for server in spec.mcp_servers or []:
         lines += ["", f"[mcp_servers.{server.name}]", f"url = {_q(server.url)}"]
         timeout = getattr(server, "tool_timeout_sec", None)

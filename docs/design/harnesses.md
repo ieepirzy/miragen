@@ -134,3 +134,55 @@ harness owns its conversation. For Grok Build, that means:
 A busy instance gets a 409. Clients that rotate conversations (Mira's episodes)
 use this to prune retired instances. Run records are telemetry and have their
 own retention (`MIRAGEN_RUN_RETENTION`).
+
+### Session lifecycle (compaction, rotation, handoff)
+
+A conversation instance never ends, but the Grok session behind it does:
+every model call re-sends the whole context. After each turn, the harness asks
+a policy what to do (`miragen/harness/grok_lifecycle.py`):
+
+| Action | What runs | Default trigger |
+|---|---|---|
+| none | — | below the compaction threshold |
+| compact | a memory-save turn, then grok's `/compact` | context ≥ 150k tokens |
+| rotate | one turn that saves memories and writes a handoff note, then a fresh session | the 3rd compaction point, or context ≥ 400k (grok-4.7's window is 500k) |
+
+- **Maintenance runs after the user's turn returns.** It holds the agent lock,
+  so the user's reply is never delayed. The next turn waits for maintenance to
+  finish and then lands in the session it leaves behind.
+- **The instance name never changes**, so a client's conversation never sees
+  sessions. `GET /instances/{name}/session` reports `fresh` (the next turn
+  opens a rotated session) from the moment the policy decides. A client can
+  use it to add its own recent transcript. `POST /instances/{name}/rotate`
+  rotates on request.
+- **The handoff** is best-effort. The model is told the size limit
+  (`MIRAGEN_GROK_HANDOFF_MAX_CHARS`, default 4000); a longer note is cut, not
+  retried. The next session's first turn gets it inside `<handoff>`, together
+  with facts about the previous session: its turns, its compactions, its
+  context size at the end, why it rotated, and how many memory writes the
+  plane accepted and when.
+- **Grok's own auto-compaction** stays on as a safety net at 90% of the window
+  (`MIRAGEN_GROK_NATIVE_COMPACT_PERCENT`). It emits the same
+  `auto_compact_completed` notification, so it is counted and logged, but no
+  memory save runs before it.
+- **The memory plane** sees each rotated session as its own session
+  (`<agent>-<instance>-s<n>`). Compactions and rotations are sent as
+  `context.compacting` and `context.closed`, so the plane writes an episode
+  and a checkpoint for each.
+- **Retired sessions'** files are deleted after
+  `MIRAGEN_GROK_SESSION_RETENTION_DAYS` (default 30).
+- **The policy is a first guess.** The thresholds and "every 3rd" are
+  env-tunable (`MIRAGEN_GROK_COMPACT_AT_TOKENS`,
+  `MIRAGEN_GROK_ROTATE_AT_TOKENS`, `MIRAGEN_GROK_ROTATE_AFTER_COMPACTIONS`), or
+  the whole function can be replaced (`MIRAGEN_GROK_LIFECYCLE_POLICY=module:attr`).
+  `<grok_home>/lifecycle/<instance>.jsonl` records the context size per turn,
+  every compaction's before and after sizes (and whether miragen or grok
+  triggered it), memory writes, and each rotation. That is the data a better
+  policy gets derived from.
+- **Wire facts** (grok 1.0.41, observed live): usage (`response_completed`)
+  and compaction (`auto_compact_completed {tokens_before, tokens_after}`)
+  arrive as `_x.ai/session_notification`, not `session/update`. The context
+  size is the last model call's input plus cache tokens. `/compact <hint>` is a
+  command sent as a prompt, and a session with only a few turns doesn't shrink:
+  recent turns are kept whole.
+- `MIRAGEN_GROK_LIFECYCLE=off` disables all of this.

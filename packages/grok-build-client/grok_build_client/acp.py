@@ -375,7 +375,10 @@ class AcpSession:
             })
             return
 
-        if method == "session/update":
+        # grok 1.0.41 sends usage (response_completed) and compaction
+        # (auto_compact_completed) as its own _x.ai/session_notification,
+        # same params shape as session/update (observed live).
+        if method in ("session/update", "_x.ai/session_notification"):
             for norm in normalize_acp_update(params):
                 await self._updates.put(norm)
             return

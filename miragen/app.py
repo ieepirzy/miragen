@@ -1346,6 +1346,12 @@ async def lifespan(app: FastAPI):
             session_key_for=_bridge_memory.session_key if _bridge_memory is not None else None,
         )
         _gateway_mount.inner = _gateway.asgi
+        if _bridge_memory is not None and hasattr(_harness, "session_info"):
+            # Rotated sessions are separate plane sessions; compactions and
+            # rotations reach the plane as compacting / closed.
+            harness = _harness
+            _bridge_memory.session_seq = lambda name: (harness.session_info(name) or {}).get("seq", 1)
+            harness.on_lifecycle = _bridge_memory.lifecycle
         logger.info(
             f"Agent '{_profile.name}' built in {_profile.mode} mode (harness: {_harness.name})"
         )
@@ -2712,8 +2718,44 @@ async def list_instances():
     for name in sorted(_busy_instances):
         info(name)
 
+    session_info = getattr(_harness, "session_info", None)
+    if session_info is not None:
+        for entry in infos.values():
+            entry["session"] = session_info(entry["name"])
+
     instances = sorted(infos.values(), key=lambda entry: entry["name"])
     return {"count": len(instances), "instances": instances}
+
+
+@app.get("/instances/{name}/session", dependencies=[_internal_auth])
+async def instance_session(name: str):
+    """The harness's session state for an instance (Grok lifecycle): its
+    sequence, context size, and whether the next turn opens a rotated
+    session (`fresh`), so a client can add its own recent transcript."""
+    _check_instance_name(name)
+    session_info = getattr(_harness, "session_info", None)
+    info = session_info(name) if session_info is not None else None
+    if info is None:
+        raise HTTPException(status_code=404, detail=f"instance '{name}' has no harness session")
+    return {"instance": name, **info}
+
+
+@app.post("/instances/{name}/rotate", dependencies=[_internal_auth])
+async def rotate_instance(name: str):
+    """Start the instance's next session now (e.g. the user asked for a fresh
+    start): memory save + handoff note, then a new session. The instance
+    name, and so the client's conversation, stays the same."""
+    _check_instance_name(name)
+    rotate = getattr(_harness, "rotate", None)
+    if rotate is None:
+        raise HTTPException(status_code=409, detail="this agent's harness has no sessions to rotate")
+    if name in _busy_instances:
+        raise HTTPException(status_code=409, detail=f"instance '{name}' has a running turn")
+    try:
+        info = await rotate(name)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"instance '{name}' has no session") from None
+    return {"instance": name, **info}
 
 
 @app.delete("/instances/{name}", dependencies=[_internal_auth])

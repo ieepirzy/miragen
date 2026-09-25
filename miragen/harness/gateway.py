@@ -408,7 +408,8 @@ class ToolGateway:
     def _record(self, log: TurnLog, name: str, arguments: dict, *, ok: bool,
                 result: types.CallToolResult) -> types.CallToolResult:
         log.calls.append(ToolCallRecord(
-            tool_name=name, args=json.dumps(arguments, default=str)[:_ARGS_MAX], ok=ok))
+            tool_name=name, args=json.dumps(arguments, default=str)[:_ARGS_MAX], ok=ok,
+            result_status=_result_status(result)))
         return result
 
     # ── serving ──────────────────────────────────────────────────────────
@@ -444,3 +445,15 @@ def _text_result(value: Any) -> types.CallToolResult:
     text = value if isinstance(value, str) else json.dumps(value, default=str)
     return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
 
+
+def _result_status(result: types.CallToolResult) -> str | None:
+    """A JSON result's top-level "status" string, else None."""
+    if result.isError:
+        return None
+    text = "".join(c.text for c in result.content if isinstance(c, types.TextContent))
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    status = value.get("status") if isinstance(value, dict) else None
+    return status[:40] if isinstance(status, str) else None

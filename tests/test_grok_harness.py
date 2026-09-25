@@ -37,6 +37,11 @@ def speak(text: str) -> str:
     return f"spoke:{text}"
 
 
+def memory_remember(text: str) -> str:
+    """Remember something (the plane's answer shape)."""
+    return '{"status": "accepted", "record_id": "r1"}'
+
+
 def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -64,7 +69,7 @@ class Env:
     def __init__(self, tmp_path, home, grok_bin):
         self.tmp_path, self.home, self.grok_bin = tmp_path, home, grok_bin
         self.port = free_port()
-        self.gateway = ToolGateway(profile(), runtime_tools=[speak])
+        self.gateway = ToolGateway(profile(), runtime_tools=[speak, memory_remember])
         self.harnesses: list[GrokHarness] = []
 
     def harness(self, instructions="You are Mira.", **kw) -> GrokHarness:
