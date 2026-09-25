@@ -95,7 +95,9 @@ from miragen.runtime_tools.scheduling import (
 )
 from miragen.memory.tools import build_memory_tools
 from miragen.memory_mcp import build_memory_mcp
-from miragen.voice import SpeechAudio, VoiceBackend, build_voice_backend
+from miragen.voice import (
+    SpeechAudio, VoiceBackend, build_voice_backend, load_speak_guidance,
+)
 from miragen.voice_mcp import build_voice_mcp
 
 logger = logging.getLogger(__name__)
@@ -109,6 +111,9 @@ _limits: UsageLimits | None = None
 # profiles whose spec.model names one. None for pydantic-ai profiles: their
 # harness wraps the _agent/_limits globals above (see _model_harness).
 _harness: Harness | None = None
+# voice.instructions_file contents: renderer guidance appended to the
+# system instructions (base tier, every harness).
+_speak_guidance: str | None = None
 _scheduler: AsyncIOScheduler = AsyncIOScheduler()
 _run_store: RunStore | None = None
 _executor: "ExecutorBackend | None" = None
@@ -285,6 +290,11 @@ def _save_history_messages(instance: str, messages: list, run_id: str | None) ->
     _append_history_sidecar(instance, run_id, len(messages))
 
 
+def _guidance_kwargs() -> dict:
+    """build_agent's system_guidance, passed only when there is some."""
+    return {"system_guidance": _speak_guidance} if _speak_guidance else {}
+
+
 def _model_ready() -> bool:
     """A base-tier harness is available for turns."""
     return _harness is not None or _agent is not None
@@ -308,6 +318,7 @@ def _model_harness() -> Harness:
             secret_env=secret_env,
             extra_tools=_runtime_extra_tools(),
             extra_instructions=extra_instructions,
+            **_guidance_kwargs(),
         ),
         load_history=lambda instance: _cap_history(_load_history_messages(instance)),
         save_history=_save_history_messages,
@@ -1231,7 +1242,7 @@ def _load_file_secrets() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _profile, _agent, _limits, _harness, _run_store, _executor, _schedule_store, \
+    global _profile, _agent, _limits, _harness, _speak_guidance, _run_store, _executor, _schedule_store, \
         _publication_store, _telemetry, _voice, _memory, _scheduling
 
     _load_file_secrets()
@@ -1276,6 +1287,9 @@ async def lifespan(app: FastAPI):
         if _profile.voice is not None
         else None
     )
+    _speak_guidance = (
+        load_speak_guidance(_profile.voice, profile_path) if _profile.voice is not None else None
+    )
     if _voice is not None:
         logger.info(f"Voice enabled (provider: {_profile.voice.provider})")
 
@@ -1293,7 +1307,8 @@ async def lifespan(app: FastAPI):
         )
     else:
         _agent, _limits = build_agent(
-            _profile, telemetry=_telemetry, extra_tools=_runtime_extra_tools()
+            _profile, telemetry=_telemetry, extra_tools=_runtime_extra_tools(),
+            **_guidance_kwargs(),
         )
         logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode")
 

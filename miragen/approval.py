@@ -14,37 +14,33 @@ from miragen.models import AgentProfile, ApprovalRequest, ApprovalResponse
 logger = logging.getLogger(__name__)
 
 
-async def _run_approval_gate(
-    profile: AgentProfile,
-    call: Any,
-    args: Any,
-    handler: Any,
-) -> Any:
-    """
-    Core approval gate logic — separated from the hook wrapper for testability.
+class ApprovalDenied(Exception):
+    """A gated tool call was not approved. The message is what the model is
+    told; each harness surfaces it its own way (PydanticAI: ModelRetry; the
+    tool gateway: an MCP tool error)."""
 
-    Checks whether `call.tool_name` matches any glob in `profile.approval_required`.
-    If it does, dispatches to the registered handler or webhook and either:
-      - Raises ModelRetry if the tool call is denied
-      - Returns the tool result (optionally prefixed with an approver note)
 
-    Precedence when the gate matches: registered handler > approval_webhook >
-    approval_mode. approval_mode governs what happens when neither of the first
-    two is configured — see _unconfigured_gate_response.
-    """
-    tool_name = call.tool_name
+def approval_gated(profile: AgentProfile, *tool_names: str) -> bool:
+    """Does any of these names match an approval_required glob?"""
     patterns = profile.approval_required or []
+    return any(fnmatch.fnmatch(name, p) for name in tool_names for p in patterns)
 
-    if not any(fnmatch.fnmatch(tool_name, p) for p in patterns):
-        return await handler(args)
 
+async def decide_approval(
+    profile: AgentProfile, tool_name: str, tool_args: dict[str, Any],
+) -> ApprovalResponse:
+    """Harness-neutral approval decision for a call that IS gated.
+
+    Precedence: registered handler > approval_webhook > approval_mode. An
+    approved response may carry an approver note (`prompt`); a denial raises
+    ApprovalDenied with the reason the model should see."""
     # Lazy import to avoid circular dependency at module load time
     from miragen.factory import get_approval_handler
 
     request = ApprovalRequest(
         agent_name=profile.name,
         tool_name=tool_name,
-        tool_args=call.args_as_dict() or {},
+        tool_args=tool_args,
         request_id=str(uuid.uuid4()),
     )
 
@@ -64,17 +60,39 @@ async def _run_approval_gate(
         response = await _unconfigured_gate_response(profile, tool_name, request)
 
     if not response.approved:
-        raise ModelRetry(
+        raise ApprovalDenied(
             f"Tool call '{tool_name}' was not approved."
             + (f" Reason: {response.prompt}" if response.prompt else "")
         )
+    return response
 
-    result = await handler(args)
 
+def with_approver_note(response: ApprovalResponse, result: Any) -> Any:
     if response.prompt:
         return f"[Approver note: {response.prompt}]\n{result}"  # nosemgrep: python.flask.security.audit.directly-returned-format-string.directly-returned-format-string
-
     return result
+
+
+async def _run_approval_gate(
+    profile: AgentProfile,
+    call: Any,
+    args: Any,
+    handler: Any,
+) -> Any:
+    """
+    The PydanticAI hook's use of the gate: pass through ungated calls; for
+    gated ones, deny with ModelRetry or run the tool (prefixing any approver
+    note). The decision itself is decide_approval, shared with the tool
+    gateway.
+    """
+    tool_name = call.tool_name
+    if not approval_gated(profile, tool_name):
+        return await handler(args)
+    try:
+        response = await decide_approval(profile, tool_name, call.args_as_dict() or {})
+    except ApprovalDenied as exc:
+        raise ModelRetry(str(exc)) from exc
+    return with_approver_note(response, await handler(args))
 
 
 async def _unconfigured_gate_response(
@@ -92,7 +110,7 @@ async def _unconfigured_gate_response(
         GET/POST /approvals; denies after approval_timeout_s if unresolved.
     """
     if profile.approval_mode == "strict":
-        raise ModelRetry(
+        raise ApprovalDenied(
             f"Tool call '{tool_name}' denied: approval gate is unconfigured (approval_mode: strict)."
         )
 

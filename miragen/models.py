@@ -447,6 +447,16 @@ class VoiceSpec(_ProfileModel):
         default=None,
         description="Cloud providers only: TTS model override (openai default: gpt-4o-mini-tts).",
     )
+    instructions_file: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Renderer guidance (e.g. a TTS engine's supported tags and language "
+            "handling), kept in its own file and appended to the agent's system "
+            "instructions under 'Speaking aloud' (base tier, every harness). A "
+            "relative path resolves against the profile file's directory."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_provider_fields(self) -> "VoiceSpec":
