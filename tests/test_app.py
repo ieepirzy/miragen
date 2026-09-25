@@ -803,7 +803,31 @@ class TestApprovalsEndpoints:
     async def test_list_approvals_empty(self, client):
         resp = await client.get("/approvals")
         assert resp.status_code == 200
-        assert resp.json() == {"count": 0, "approvals": []}
+        assert resp.json() == {"count": 0, "approvals": [], "version": 0}
+
+    async def test_long_poll_returns_when_a_request_is_queued(self, client):
+        import asyncio
+
+        from miragen.broker import get_broker
+        from miragen.models import ApprovalRequest
+
+        since = (await client.get("/approvals")).json()["version"]
+        poll = asyncio.create_task(client.get("/approvals", params={"since": since, "wait": 30}))
+        await asyncio.sleep(0.05)
+        assert not poll.done()                                  # nothing queued: it waits
+        get_broker().submit(ApprovalRequest(agent_name="a", tool_name="delete_file", tool_args={},
+                                            request_id="r1"), timeout_s=30)
+        data = (await asyncio.wait_for(poll, 2)).json()         # woken at once, not after 30 s
+        assert data["count"] == 1 and data["version"] > since
+        get_broker().resolve("r1", __import__("miragen.models", fromlist=["ApprovalResponse"])
+                             .ApprovalResponse(approved=False))
+        gone = (await client.get("/approvals", params={"since": data["version"], "wait": 30})).json()
+        assert gone["count"] == 0                               # already changed: no wait
+
+    async def test_long_poll_times_out_with_the_same_answer(self, client):
+        since = (await client.get("/approvals")).json()["version"]
+        data = (await client.get("/approvals", params={"since": since, "wait": 0.1})).json()
+        assert data == {"count": 0, "approvals": [], "version": since}
 
     async def test_pending_approval_appears_in_list(self, client):
         from miragen.broker import get_broker
