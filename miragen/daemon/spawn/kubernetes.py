@@ -59,6 +59,7 @@ from miragen.daemon.spawn.base import (
     ServiceSpec,
     SpawnOperationFailed,
     SpawnUnitNotFound,
+    UnitLifecycle,
 )
 
 _DNS1123_LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
@@ -315,6 +316,31 @@ class KubernetesSpawnDriver:
                 return "restarting"
             return "pending"
         return "pending"
+
+    def lifecycle(self, name: str) -> UnitLifecycle | None:
+        try:
+            pod = self._get_pod(name)
+        except SpawnOperationFailed:
+            return None
+        if pod is None:
+            return None
+        statuses = pod.get("status", {}).get("containerStatuses") or []
+        if not statuses:
+            return None
+        state = statuses[0].get("state", {})
+        if "running" in state:
+            return UnitLifecycle(started_at=state["running"].get("startedAt"))
+        if "terminated" in state:
+            terminated = state["terminated"]
+            exit_code = terminated.get("exitCode")
+            reason = terminated.get("reason")
+            return UnitLifecycle(
+                started_at=terminated.get("startedAt"),
+                finished_at=terminated.get("finishedAt"),
+                exit_code=exit_code if isinstance(exit_code, int) else None,
+                oom_killed=(reason == "OOMKilled") if reason is not None else None,
+            )
+        return None
 
     def logs(self, name: str, *, tail: int) -> str:
         resp = self._request(

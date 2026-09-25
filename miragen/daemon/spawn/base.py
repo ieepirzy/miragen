@@ -38,6 +38,22 @@ class ServiceSpec:
     secret_names: tuple[str, ...] = field(default_factory=tuple)
 
 
+@dataclass(frozen=True, slots=True)
+class UnitLifecycle:
+    """When the unit last started and stopped, and how it stopped.
+
+    Every field is optional: a substrate reports what it knows. Timestamps
+    are ISO 8601 strings as the substrate recorded them. A control plane uses
+    these to tell its own stop apart from a later start-then-exit it did not
+    see (mirarun#70), and exit_code/oom_killed to tell a crash from a stop.
+    """
+
+    started_at: str | None = None
+    finished_at: str | None = None
+    exit_code: int | None = None
+    oom_killed: bool | None = None
+
+
 class SpawnDriverError(Exception):
     """Base for all driver-raised errors."""
 
@@ -74,6 +90,13 @@ class SpawnDriver(Protocol):
 
     def status(self, name: str) -> str:
         """The unit's current status string, or 'not found'/'error: ...'."""
+        ...
+
+    def lifecycle(self, name: str) -> UnitLifecycle | None:
+        """When the unit last started/stopped and how, or None if unknown.
+
+        Optional: `LifecycleCore` treats a driver without this method as
+        reporting nothing, so an out-of-tree driver keeps working."""
         ...
 
     def logs(self, name: str, *, tail: int) -> str:

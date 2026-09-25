@@ -208,6 +208,62 @@ class TestStatus:
         assert driver.status("alpha") == "restarting"
 
 
+class TestUnitLifecycle:
+    def test_unknown_agent_reports_nothing(self, driver):
+        assert driver.lifecycle("ghost") is None
+
+    def test_before_kubelet_reports_state_reports_nothing(
+        self, driver, fake_api, tmp_path
+    ):
+        driver.define_service("alpha", _spec(tmp_path))
+        driver.up("alpha")
+        assert driver.lifecycle("alpha") is None
+
+    def test_running_reports_its_start(self, driver, fake_api, tmp_path):
+        driver.define_service("alpha", _spec(tmp_path))
+        driver.up("alpha")
+        fake_api.set_container_state(
+            "alpha", {"running": {"startedAt": "2026-09-14T08:00:00Z"}}
+        )
+        lifecycle = driver.lifecycle("alpha")
+        assert lifecycle.started_at == "2026-09-14T08:00:00Z"
+        assert lifecycle.finished_at is None
+        assert lifecycle.exit_code is None
+        assert lifecycle.oom_killed is None
+
+    def test_terminated_reports_times_exit_code_and_oom(
+        self, driver, fake_api, tmp_path
+    ):
+        driver.define_service("alpha", _spec(tmp_path))
+        driver.up("alpha")
+        fake_api.set_container_state(
+            "alpha",
+            {
+                "terminated": {
+                    "startedAt": "2026-09-14T08:00:00Z",
+                    "finishedAt": "2026-09-14T09:30:00Z",
+                    "exitCode": 137,
+                    "reason": "OOMKilled",
+                }
+            },
+        )
+        lifecycle = driver.lifecycle("alpha")
+        assert lifecycle.started_at == "2026-09-14T08:00:00Z"
+        assert lifecycle.finished_at == "2026-09-14T09:30:00Z"
+        assert lifecycle.exit_code == 137
+        assert lifecycle.oom_killed is True
+
+    def test_clean_exit_is_not_oom(self, driver, fake_api, tmp_path):
+        driver.define_service("alpha", _spec(tmp_path))
+        driver.up("alpha")
+        fake_api.set_container_state(
+            "alpha", {"terminated": {"exitCode": 0, "reason": "Completed"}}
+        )
+        lifecycle = driver.lifecycle("alpha")
+        assert lifecycle.exit_code == 0
+        assert lifecycle.oom_killed is False
+
+
 class TestLifecycle:
     def test_restart_of_a_missing_pod_raises_not_found(self, driver):
         with pytest.raises(SpawnUnitNotFound):
