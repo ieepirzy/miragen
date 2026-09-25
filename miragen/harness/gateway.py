@@ -32,7 +32,9 @@ import secrets
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import mcp.types as types
 from mcp import ClientSession
@@ -176,6 +178,7 @@ class ToolGateway:
         self._active: dict[str, TurnLog] = {}    # instance -> the turn in progress
         self._upstreams: dict[str, _Upstream] = {}
         self._local: dict[str, _LocalTool] = {}
+        self._tz = ZoneInfo(profile.timezone) if profile.timezone else None
 
         unsupported = unsupported_capabilities(profile, native_capabilities)
         if unsupported:
@@ -410,6 +413,8 @@ class ToolGateway:
         log.calls.append(ToolCallRecord(
             tool_name=name, args=json.dumps(arguments, default=str)[:_ARGS_MAX], ok=ok,
             result_status=_result_status(result)))
+        if self._tz is not None:
+            result = with_local_time(result, datetime.now(self._tz))
         return result
 
     # ── serving ──────────────────────────────────────────────────────────
@@ -431,6 +436,13 @@ class ToolGateway:
                 await send({"type": "http.response.body", "body": body})
                 return
         await self._manager.handle_request(scope, receive, send)
+
+
+def with_local_time(result: types.CallToolResult, now: datetime) -> types.CallToolResult:
+    """The result, led by the time it was produced (minute resolution, the
+    agent's zone). Structured content is left as it is."""
+    stamp = types.TextContent(type="text", text=f"[{now:%Y-%m-%d %H:%M %Z}]")
+    return result.model_copy(update={"content": [stamp, *result.content]})
 
 
 def _error(message: str) -> types.CallToolResult:

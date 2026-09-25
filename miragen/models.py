@@ -1217,6 +1217,26 @@ class AgentProfile(_ProfileModel):
         default=None,
         description="Whitelisted @register tool names; None/omitted = no local tools injected.",
     )
+    timezone: Optional[str] = Field(
+        default=None,
+        description=(
+            "IANA time zone of the agent's person, e.g. 'Europe/Helsinki'. When set, the "
+            "tool gateway prefixes every tool result with the local time to the minute, "
+            "so a long-lived session keeps track of when things happened."
+        ),
+    )
+
+    @field_validator("timezone")
+    @classmethod
+    def _timezone_known(cls, tz: Optional[str]) -> Optional[str]:
+        if tz is not None:
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+            try:
+                ZoneInfo(tz)
+            except (ZoneInfoNotFoundError, ValueError) as exc:
+                raise ValueError(f"unknown time zone '{tz}'") from exc
+        return tz
     voice: Optional[VoiceSpec] = Field(
         default=None,
         description=(
