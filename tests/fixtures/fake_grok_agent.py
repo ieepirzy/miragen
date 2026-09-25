@@ -3,7 +3,7 @@
 
 Seeded with the `initialize` answer captured from grok 1.0.41 on 2026-09-24
 (auth method `grok.com`, `x.ai/hooks`, session list/resume/close). It keeps
-sessions under $GROK_HOME/fake-sessions/, requires $GROK_HOME/auth.json to
+sessions under $GROK_HOME/sessions/<quoted cwd>/<id>/ (grok's layout), requires $GROK_HOME/auth.json to
 authenticate, logs its argv/env to $GROK_HOME/fake-agent.log.jsonl, and
 reaches MCP tools the way grok does: through the server declared in
 $GROK_HOME/config.toml, with `${VAR}` header expansion.
@@ -26,9 +26,11 @@ import threading
 import urllib.request
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 HOME = Path(os.environ["GROK_HOME"])
-SESSIONS = HOME / "fake-sessions"
+# grok's real layout (1.0.41): sessions/<percent-encoded cwd>/<session id>/
+SESSIONS = HOME / "sessions"
 SESSIONS.mkdir(parents=True, exist_ok=True)
 LOG = HOME / "fake-agent.log.jsonl"
 
@@ -65,7 +67,8 @@ def log(entry: dict) -> None:
 
 
 def session_path(sid: str) -> Path:
-    return SESSIONS / f"{sid}.json"
+    found = list(SESSIONS.glob(f"*/{sid}/session.json"))
+    return found[0] if found else SESSIONS / "_missing" / sid / "session.json"
 
 
 def load(sid: str) -> dict:
@@ -73,7 +76,11 @@ def load(sid: str) -> dict:
 
 
 def save(sid: str, data: dict) -> None:
-    session_path(sid).write_text(json.dumps(data))
+    path = session_path(sid)
+    if not path.exists():
+        path = SESSIONS / quote(data.get("cwd") or "", safe="") / sid / "session.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data))
 
 
 def gateway() -> tuple[str, str]:
@@ -207,7 +214,7 @@ def main():
                 continue
             old = load(params["sourceSessionId"])
             sid = str(uuid.uuid4())
-            save(sid, dict(old))
+            save(sid, {**old, "cwd": params["newCwd"]})
             log({"fork": params["sourceSessionId"], "to": sid})
             send({"jsonrpc": "2.0", "id": rid, "result": {
                 "newSessionId": sid, "parentSessionId": params["sourceSessionId"],

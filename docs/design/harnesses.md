@@ -119,3 +119,18 @@ voice:
 - Is `requirements.toml`'s MCP allowlist honoured in ACP mode?
 - Does `x.ai/session/fork` accept `rules`?
 - Is `session/load` enough to restore the config-declared MCP server?
+
+### Discarding an instance
+
+`DELETE /instances/{name}` asks the harness to forget the instance when the
+harness owns its conversation. For Grok Build, that means:
+
+- stop its process;
+- drop its session mapping;
+- delete `$GROK_HOME/sessions/<percent-encoded cwd>/`, which holds every
+  session and fork for that working directory;
+- delete the working directory itself.
+
+A busy instance gets a 409. Clients that rotate conversations (Mira's episodes)
+use this to prune retired instances. Run records are telemetry and have their
+own retention (`MIRAGEN_RUN_RETENTION`).

@@ -73,6 +73,10 @@ class HarnessStream(Protocol):
     def result(self) -> HarnessResult: ...
 
 
+class InstanceBusyError(RuntimeError):
+    """The instance has a turn in flight; its state can't be discarded now."""
+
+
 @runtime_checkable
 class Harness(Protocol):
     name: str
