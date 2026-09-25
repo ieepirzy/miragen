@@ -619,9 +619,19 @@ class AgentSpec(_ProfileModel):
         description="Any pydantic-ai model string, e.g. 'anthropic:claude-sonnet-4-6'.",
         min_length=1,
     )
-    instructions: str = Field(
-        description="System prompt; supports YAML block scalar (|).",
+    instructions: Optional[str] = Field(
+        default=None,
+        description="System prompt; supports YAML block scalar (|). Or use instructions_file.",
         min_length=1,
+    )
+    instructions_file: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "System prompt read from a file (e.g. an identity markdown file kept "
+            "under version control). Resolved by the profile loader, relative to "
+            "the profile file; exclusive with `instructions`."
+        ),
     )
     model_settings: Optional[ModelSettings] = None
     capabilities: Optional[list[str | dict]] = Field(
@@ -636,6 +646,14 @@ class AgentSpec(_ProfileModel):
         ge=1,
         description="Maps to UsageLimits(request_limit=N) — caps model round-trips per run.",
     )
+
+    @model_validator(mode="after")
+    def one_instructions_source(self) -> "AgentSpec":
+        if self.instructions is None and self.instructions_file is None:
+            raise ValueError("spec needs `instructions` or `instructions_file`")
+        if self.instructions is not None and self.instructions_file is not None:
+            raise ValueError("set `instructions` or `instructions_file`, not both")
+        return self
 
 
 # ── Budgets ──────────────────────────────────────────────────────────────────
@@ -1132,8 +1150,22 @@ class AgentProfile(_ProfileModel):
     triggers: list[Trigger] = Field(min_length=1)
     approval_required: Optional[list[str]] = Field(
         default=None,
-        description="fnmatch glob patterns for human-in-the-loop gating, e.g. ['delete_*', 'execute_*'].",
+        description=(
+            "Human-in-the-loop gating rules: fnmatch tool globs ('delete_*'), optionally "
+            "with one argument condition — 'tool:arg=g1|g2' (gated when the argument "
+            "matches) or 'tool:arg!=g1|g2' (gated unless it matches; fail closed, e.g. "
+            "'crm_execute_tool:toolName!=find_*|get_*')."
+        ),
     )
+
+    @field_validator("approval_required")
+    @classmethod
+    def _approval_rules_parse(cls, rules: Optional[list[str]]) -> Optional[list[str]]:
+        from miragen.approval import parse_approval_rule
+
+        for rule in rules or []:
+            parse_approval_rule(rule)
+        return rules
     approval_webhook: Optional[HttpUrl] = Field(
         default=None,
         description="URL that receives ApprovalRequest POSTs and returns an ApprovalResponse.",

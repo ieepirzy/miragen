@@ -2202,6 +2202,12 @@ class ExecutorLaunchRequest(BaseModel):
         "control-plane concern.",
     )
     idempotency_key: str = Field(min_length=1, max_length=200)
+    # Base-tier launches only: the named instance the run converses with,
+    # and whether it continues that instance's conversation (instances/v1).
+    # A durable, idempotent launch *into a conversation* — what a control
+    # plane driving a persistent agent needs (Mira).
+    instance: Optional[str] = Field(default=None, pattern=INSTANCE_NAME_PATTERN)
+    use_history: bool = False
     edf: Optional[dict] = None
     context: Optional[ResolutionContext] = None
     expected_sha256: Optional[str] = Field(
@@ -2387,7 +2393,13 @@ async def launch_executor_run(request: ExecutorLaunchRequest, response: Response
     # synchronously so an over-capacity launch answers 429 BEFORE the durable
     # acceptance point — a 429 must never leave a record behind. Claimed after
     # validation on purpose: an invalid EDF deserves its 4xx even at capacity.
-    release = _admit_or_429(None)
+    if (request.instance is not None or request.use_history) and _executor is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="instance/use_history apply to base-tier launches; an executor run's "
+            "thread is its conversation state",
+        )
+    release = _admit_or_429(request.instance)
 
     # Durable acceptance point — no awaits between the idempotency lookup
     # above and this write, so a same-key race cannot slip between them
@@ -2403,6 +2415,8 @@ async def launch_executor_run(request: ExecutorLaunchRequest, response: Response
             model=_profile.executor.model if _profile.executor else None,
             snapshot_sha256=resolved.sha256 if resolved is not None else None,
             provenance=provenance,
+            use_history=request.use_history,
+            instance=request.instance,
             repositories=[
                 RepositoryRevision(
                     name=entry.name,
@@ -2447,6 +2461,8 @@ async def launch_executor_run(request: ExecutorLaunchRequest, response: Response
                 record=record,
                 repositories=checkouts,
                 mcp_secret_env=mcp_secret_env or None,
+                use_history=request.use_history,
+                instance=request.instance,
             )
         except Exception as e:
             # run_agent already wrote the failure to the record; this is just

@@ -75,6 +75,9 @@ def _q(value: str) -> str:
 def _settings(spec: "ExecutorSpec") -> list[str]:
     """Settings shared by config.toml and requirements.toml."""
     web = bool(spec.web_search)
+    # web_fetch keeps grok's SSRF defaults (private, link-local, metadata
+    # and loopback blocked); only its on/off switch is set here.
+    fetch = bool(getattr(spec, "web_fetch", False))
     lines = [
         "[cli]",
         "auto_update = false",
@@ -83,7 +86,7 @@ def _settings(spec: "ExecutorSpec") -> list[str]:
         "[features]",
         "managed_config = false",
         f"backend_tools = {str(web).lower()}",
-        "web_fetch = false",
+        f"web_fetch = {str(fetch).lower()}",
         "",
         "[subagents]",
         "enabled = false",
@@ -116,6 +119,9 @@ def render_config(agent: str, spec: "ExecutorSpec") -> str:
     ]
     for server in spec.mcp_servers or []:
         lines += ["", f"[mcp_servers.{server.name}]", f"url = {_q(server.url)}"]
+        timeout = getattr(server, "tool_timeout_sec", None)
+        if timeout:
+            lines.append(f"tool_timeout_sec = {int(timeout)}")
         if server.bearer_token_env:
             header = "Bearer ${" + server.bearer_token_env + "}"
             lines.append(f"headers = {{ Authorization = {_q(header)} }}")

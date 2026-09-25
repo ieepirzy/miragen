@@ -100,8 +100,10 @@ def _capability_entries(profile: AgentProfile) -> list[tuple[str, dict]]:
     return out
 
 
-def unsupported_capabilities(profile: AgentProfile) -> list[str]:
-    return [name for name, _ in _capability_entries(profile) if name not in GATEWAY_CAPABILITIES]
+def unsupported_capabilities(profile: AgentProfile, native: frozenset[str] = frozenset()) -> list[str]:
+    """Capabilities neither the gateway nor the harness itself can carry."""
+    return [name for name, _ in _capability_entries(profile)
+            if name not in GATEWAY_CAPABILITIES and name not in native]
 
 
 def _plain_signature_tool(fn: Callable, name: str, shim: Callable[[], Any]) -> Callable:
@@ -150,6 +152,7 @@ class ToolGateway:
         bind_context: BindContext | None = None,
         env: dict[str, str] | None = None,
         upstream_client: Callable[..., Any] | None = None,
+        native_capabilities: frozenset[str] = frozenset(),
     ):
         import os
 
@@ -163,13 +166,16 @@ class ToolGateway:
         self._upstreams: dict[str, _Upstream] = {}
         self._local: dict[str, _LocalTool] = {}
 
-        unsupported = unsupported_capabilities(profile)
+        unsupported = unsupported_capabilities(profile, native_capabilities)
         if unsupported:
             raise GatewayConfigError(
-                f"Agent '{profile.name}' uses capabilities {unsupported} that only the "
-                "pydantic-ai harness understands; a gateway harness carries MCP capabilities only"
+                f"Agent '{profile.name}' uses capabilities {unsupported} that this harness "
+                "can't carry (the gateway serves MCP capabilities; the harness itself "
+                f"provides only {sorted(native_capabilities) or 'nothing else'})"
             )
         for cap_name, cfg in _capability_entries(profile):
+            if cap_name not in GATEWAY_CAPABILITIES:
+                continue  # harness-native (e.g. Grok's own web tools)
             name = cfg.get("name")
             if not name:
                 raise GatewayConfigError("gateway MCP capabilities need a 'name' (the tool prefix)")
@@ -249,7 +255,17 @@ class ToolGateway:
     async def _session(self, up: _Upstream) -> AsyncIterator[ClientSession]:
         # miragen authenticates to the upstream with its own credential; the
         # caller's Authorization (the gateway bearer) is never forwarded.
-        headers = {"Authorization": f"Bearer {up.token}"} if up.token else None
+        headers = {"Authorization": f"Bearer {up.token}"} if up.token else {}
+        # Which agent/run/instance is calling, for upstream attribution (a
+        # harness session binds its MCP credentials once, so identity can't
+        # ride a per-run token). Informational: upstream authorization is
+        # still miragen's own credential above.
+        run_id, instance = _CURRENT.get()
+        headers["X-Miragen-Agent"] = self.profile.name
+        if run_id:
+            headers["X-Miragen-Run-Id"] = run_id
+        if instance:
+            headers["X-Miragen-Instance"] = instance
         async with self._client_factory(up.url, headers=headers) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
@@ -304,11 +320,17 @@ class ToolGateway:
             return self._record(log, name, arguments, ok=False,
                                 result=_error(f"unknown tool '{name}'"))
         response = None
-        if approval_gated(self.profile, name, raw):
+        if approval_gated(self.profile, name, raw, args=arguments):
             try:
                 response = await decide_approval(self.profile, name, arguments)
             except ApprovalDenied as exc:
                 return self._record(log, name, arguments, ok=False, result=_error(str(exc)))
+            if self._active.get(instance) is not log:
+                # The turn that asked ended (timeout, cancel) while the approval
+                # waited: nothing may run on behalf of a turn that is gone.
+                logger.warning("gateway: %s approved after its turn ended; not executed", name)
+                return self._record(log, name, arguments, ok=False, result=_error(
+                    f"'{name}' was approved only after this turn had ended; it was not run"))
         token = _CURRENT.set((log.run_id, instance))
         try:
             with self._bind(log.run_id, instance):

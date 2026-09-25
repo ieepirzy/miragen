@@ -56,7 +56,8 @@ def build_model_harness(
         from miragen.harness.grok import GrokHarness, GrokSettings
 
         gateway = ToolGateway(profile, runtime_tools=runtime_tools,
-                              registered_tools=registered_tools, bind_context=bind_context)
+                              registered_tools=registered_tools, bind_context=bind_context,
+                              native_capabilities=GrokHarness.native_capabilities)
         url = gateway_url or f"http://127.0.0.1:{os.environ.get('PORT', '8000')}/mcp/gateway/"
         return GrokHarness(profile, gateway, GrokSettings.from_env(gateway_url=url),
                            system_guidance=system_guidance), gateway
