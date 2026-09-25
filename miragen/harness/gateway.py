@@ -320,7 +320,7 @@ class ToolGateway:
             return self._record(log, name, arguments, ok=False,
                                 result=_error(f"unknown tool '{name}'"))
         response = None
-        if approval_gated(self.profile, name, raw):
+        if approval_gated(self.profile, name, raw, args=arguments):
             try:
                 response = await decide_approval(self.profile, name, arguments)
             except ApprovalDenied as exc:

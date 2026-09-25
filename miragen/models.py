@@ -1150,8 +1150,22 @@ class AgentProfile(_ProfileModel):
     triggers: list[Trigger] = Field(min_length=1)
     approval_required: Optional[list[str]] = Field(
         default=None,
-        description="fnmatch glob patterns for human-in-the-loop gating, e.g. ['delete_*', 'execute_*'].",
+        description=(
+            "Human-in-the-loop gating rules: fnmatch tool globs ('delete_*'), optionally "
+            "with one argument condition — 'tool:arg=g1|g2' (gated when the argument "
+            "matches) or 'tool:arg!=g1|g2' (gated unless it matches; fail closed, e.g. "
+            "'crm_execute_tool:toolName!=find_*|get_*')."
+        ),
     )
+
+    @field_validator("approval_required")
+    @classmethod
+    def _approval_rules_parse(cls, rules: Optional[list[str]]) -> Optional[list[str]]:
+        from miragen.approval import parse_approval_rule
+
+        for rule in rules or []:
+            parse_approval_rule(rule)
+        return rules
     approval_webhook: Optional[HttpUrl] = Field(
         default=None,
         description="URL that receives ApprovalRequest POSTs and returns an ApprovalResponse.",

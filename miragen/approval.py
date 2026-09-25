@@ -20,10 +20,41 @@ class ApprovalDenied(Exception):
     tool gateway: an MCP tool error)."""
 
 
-def approval_gated(profile: AgentProfile, *tool_names: str) -> bool:
-    """Does any of these names match an approval_required glob?"""
-    patterns = profile.approval_required or []
-    return any(fnmatch.fnmatch(name, p) for name in tool_names for p in patterns)
+def parse_approval_rule(rule: str) -> tuple[str, str | None, bool, list[str]]:
+    """``tool_glob`` or ``tool_glob:arg=g1|g2`` (gated when the argument
+    matches one of the globs) or ``tool_glob:arg!=g1|g2`` (gated unless it
+    does — the fail-closed form, e.g. "every CRM call except reads").
+
+    Returns (tool_glob, arg or None, negated, value_globs)."""
+    if ":" not in rule:
+        return rule, None, False, []
+    tool, cond = rule.split(":", 1)
+    negated = "!=" in cond
+    arg, _, values = cond.partition("!=" if negated else "=")
+    arg, globs = arg.strip(), [v.strip() for v in values.split("|") if v.strip()]
+    if not tool or not arg or not globs:
+        raise ValueError(f"approval rule {rule!r}: expected 'tool', 'tool:arg=glob|glob' or "
+                         "'tool:arg!=glob|glob'")
+    return tool, arg, negated, globs
+
+
+def approval_gated(profile: AgentProfile, *tool_names: str, args: dict | None = None) -> bool:
+    """Does this call match an approval_required rule? A rule with an
+    argument condition gates on the argument too; a call whose argument is
+    missing or not a string is gated (fail closed)."""
+    for rule in profile.approval_required or []:
+        tool, arg, negated, globs = parse_approval_rule(rule)
+        if not any(fnmatch.fnmatch(name, tool) for name in tool_names):
+            continue
+        if arg is None:
+            return True
+        value = (args or {}).get(arg)
+        if not isinstance(value, str):
+            return True
+        hit = any(fnmatch.fnmatch(value, g) for g in globs)
+        if hit != negated:
+            return True
+    return False
 
 
 async def decide_approval(
@@ -86,10 +117,11 @@ async def _run_approval_gate(
     gateway.
     """
     tool_name = call.tool_name
-    if not approval_gated(profile, tool_name):
+    call_args = call.args_as_dict() or {}
+    if not approval_gated(profile, tool_name, args=call_args):
         return await handler(args)
     try:
-        response = await decide_approval(profile, tool_name, call.args_as_dict() or {})
+        response = await decide_approval(profile, tool_name, call_args)
     except ApprovalDenied as exc:
         raise ModelRetry(str(exc)) from exc
     return with_approver_note(response, await handler(args))

@@ -224,3 +224,47 @@ async def test_http_endpoint_requires_a_known_instance_credential(seen):
             with gw.turn("inst", "r") as log:
                 done = await c.post("/", json=call, headers={**hdr, "authorization": f"Bearer {token}"})
             assert "spoke:x" in done.text and log.calls[0].tool_name == "speak"
+
+
+# ── argument-aware approval rules ────────────────────────────────────────────
+
+from miragen.approval import approval_gated  # noqa: E402
+
+CRM_RULE = "crm_execute_tool:toolName!=find_*|get_*|search_*|list_*|count_*"
+
+
+@pytest.mark.parametrize("args,gated", [
+    ({"toolName": "find_many_people", "arguments": {}}, False),
+    ({"toolName": "get_tool_catalog"}, False),
+    ({"toolName": "create_one_opportunity"}, True),
+    ({"toolName": "delete_many_people"}, True),
+    ({"toolName": "some_new_twenty_tool"}, True),    # unknown = gated (fail closed)
+    ({}, True),                                      # missing argument = gated
+    ({"toolName": 42}, True),
+])
+def test_negated_rule_gates_everything_but_reads(args, gated):
+    p = profile(approval_required=[CRM_RULE])
+    assert approval_gated(p, "crm_execute_tool", "execute_tool", args=args) is gated
+
+
+def test_positive_rule_and_plain_globs():
+    p = profile(approval_required=["files_write:path=/etc/*|/root/*", "booking_create_booking"])
+    assert approval_gated(p, "files_write", args={"path": "/etc/passwd"})
+    assert not approval_gated(p, "files_write", args={"path": "/tmp/x"})
+    assert approval_gated(p, "booking_create_booking", args={})
+    assert not approval_gated(p, "booking_get_price", args={})
+
+
+@pytest.mark.parametrize("bad", ["tool:", "tool:arg=", ":arg=x", "tool:=x"])
+def test_malformed_rules_fail_profile_validation(bad):
+    with pytest.raises(Exception):
+        profile(approval_required=[bad])
+
+
+async def test_gateway_applies_argument_rules(seen):
+    gw = make(seen, profile=profile(approval_required=["home_lookup:key!=safe_*"],
+                                    approval_mode="strict"))
+    with gw.turn("inst", "r") as log:
+        ok = await gw.call_tool("home_lookup", {"key": "safe_one"}, instance="inst")
+        bad = await gw.call_tool("home_lookup", {"key": "secret"}, instance="inst")
+    assert not ok.isError and bad.isError and "approval_mode: strict" in text(bad)
