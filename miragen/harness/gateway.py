@@ -49,6 +49,9 @@ logger = logging.getLogger("miragen.gateway")
 
 _ARGS_MAX = 2_000
 _UPSTREAM_TOOLS_TTL_S = 300.0
+# A server that failed to list its tools isn't asked again for this long, so
+# an unreachable (e.g. not yet deployed) server doesn't slow every turn.
+_UPSTREAM_BACKOFF_S = 120.0
 # Capabilities a gateway harness can carry. Others (WebSearch, Thinking, Peer,
 # custom PydanticAI capabilities) configure PydanticAI itself and mean
 # nothing to a foreign harness; a profile naming them fails loudly.
@@ -72,8 +75,13 @@ class _Upstream:
     url: str
     token: str | None
     allowed: set[str] | None
+    auth: "OAuthUpstream | None" = None
+    # Send X-Harness-Session for the calling instance (miragen's memory
+    # bridge binds its memory_*/store_* tools to a session this way).
+    bridge_session: bool = False
     tools: list[types.Tool] = field(default_factory=list)
     fetched_at: float = 0.0
+    failed_until: float = 0.0
 
 
 @dataclass
@@ -153,6 +161,8 @@ class ToolGateway:
         env: dict[str, str] | None = None,
         upstream_client: Callable[..., Any] | None = None,
         native_capabilities: frozenset[str] = frozenset(),
+        session_key_for: Callable[[str], str | None] | None = None,
+        oauth_transport: Any = None,
     ):
         import os
 
@@ -160,6 +170,7 @@ class ToolGateway:
         self._env = env if env is not None else dict(os.environ)
         self._bind = bind_context or (lambda run_id, instance: contextlib.nullcontext())
         self._client_factory = upstream_client or streamablehttp_client
+        self._session_key_for = session_key_for or (lambda instance: None)
         self._credentials: dict[str, str] = {}   # token -> instance
         self._by_instance: dict[str, str] = {}   # instance -> token
         self._active: dict[str, TurnLog] = {}    # instance -> the turn in progress
@@ -181,12 +192,32 @@ class ToolGateway:
                 raise GatewayConfigError("gateway MCP capabilities need a 'name' (the tool prefix)")
             if name in self._upstreams:
                 raise GatewayConfigError(f"duplicate MCP capability name '{name}'")
+            optional = bool(cfg.get("optional", False))
             token = None
             if cfg.get("bearer_token_env"):
                 token = self._env.get(cfg["bearer_token_env"])
+                if not token and optional:
+                    logger.warning("gateway: optional MCP '%s' skipped (%s is not set)",
+                                   name, cfg["bearer_token_env"])
+                    continue
+            auth = None
+            if cfg.get("oauth"):
+                if cfg.get("bearer_token_env"):
+                    raise GatewayConfigError(f"MCP '{name}': use bearer_token_env or oauth, not both")
+                from miragen.harness.upstream_auth import OAuthUpstream
+                try:
+                    auth = OAuthUpstream.from_config(cfg["url"], cfg["oauth"], self._env,
+                                                     transport=oauth_transport)
+                except ValueError as exc:
+                    if optional:
+                        logger.warning("gateway: optional MCP '%s' skipped (%s)", name, exc)
+                        continue
+                    raise GatewayConfigError(f"MCP '{name}': {exc}") from exc
             allowed = cfg.get("allowed_tools")
             self._upstreams[name] = _Upstream(name=name, url=cfg["url"], token=token,
-                                              allowed=set(allowed) if allowed else None)
+                                              allowed=set(allowed) if allowed else None,
+                                              auth=auth,
+                                              bridge_session=bool(cfg.get("bridge_session")))
         for fn in runtime_tools or ():
             self._add_local(fn.__name__, fn, runtime=True)
         for tool_name in profile.tools or ():
@@ -245,8 +276,16 @@ class ToolGateway:
     async def _upstream_tools(self, up: _Upstream) -> list[types.Tool]:
         if up.tools and time.monotonic() - up.fetched_at < _UPSTREAM_TOOLS_TTL_S:
             return up.tools
-        async with self._session(up) as session:
-            listed = await session.list_tools()
+        if time.monotonic() < up.failed_until:
+            raise RuntimeError(f"{up.name} unreachable recently; backing off")
+        try:
+            async with self._session(up) as session:
+                listed = await session.list_tools()
+        except Exception:
+            up.failed_until = time.monotonic() + _UPSTREAM_BACKOFF_S
+            if up.auth is not None:
+                up.auth.invalidate()
+            raise
         tools = [t for t in listed.tools if up.allowed is None or t.name in up.allowed]
         up.tools, up.fetched_at = tools, time.monotonic()
         return tools
@@ -255,7 +294,10 @@ class ToolGateway:
     async def _session(self, up: _Upstream) -> AsyncIterator[ClientSession]:
         # miragen authenticates to the upstream with its own credential; the
         # caller's Authorization (the gateway bearer) is never forwarded.
-        headers = {"Authorization": f"Bearer {up.token}"} if up.token else {}
+        token = up.token
+        if up.auth is not None:
+            token = await up.auth.token()
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
         # Which agent/run/instance is calling, for upstream attribution (a
         # harness session binds its MCP credentials once, so identity can't
         # ride a per-run token). Informational: upstream authorization is
@@ -266,6 +308,10 @@ class ToolGateway:
             headers["X-Miragen-Run-Id"] = run_id
         if instance:
             headers["X-Miragen-Instance"] = instance
+            if up.bridge_session:
+                key = self._session_key_for(instance)
+                if key:
+                    headers["X-Harness-Session"] = key
         async with self._client_factory(up.url, headers=headers) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
@@ -338,8 +384,16 @@ class ToolGateway:
                     value = await target.fn_tool.run(arguments)
                     result = _text_result(value)
                 else:
-                    async with self._session(target) as session:
-                        result = await session.call_tool(raw, arguments)
+                    try:
+                        async with self._session(target) as session:
+                            result = await session.call_tool(raw, arguments)
+                    except Exception:
+                        if target.auth is None:
+                            raise
+                        # An expired or revoked token: one fresh authorization.
+                        target.auth.invalidate()
+                        async with self._session(target) as session:
+                            result = await session.call_tool(raw, arguments)
         except Exception as exc:
             logger.warning("gateway tool %s failed: %s", name, exc)
             return self._record(log, name, arguments, ok=False, result=_error(f"{type(exc).__name__}: {exc}"))
