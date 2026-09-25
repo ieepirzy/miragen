@@ -294,3 +294,28 @@ async def test_an_approval_that_outlives_its_turn_is_not_executed(seen):
     finally:
         register_approval_handler(None)
     assert res.isError and "after this turn had ended" in text(res) and ran == []
+
+
+async def test_results_lead_with_local_time_when_the_profile_has_a_timezone(seen):
+    import re
+
+    gw = make(seen, profile=profile(timezone="Europe/Helsinki"))
+    with gw.turn("inst", "run-8") as log:
+        res = await gw.call_tool("speak", {"text": "moi"}, instance="inst")
+        err = await gw.call_tool("nope", {}, instance="inst")
+    assert re.fullmatch(r"\[\d{4}-\d\d-\d\d \d\d:\d\d EES?T\]", res.content[0].text)
+    assert res.content[1].text == "spoke:moi"
+    assert err.isError and err.content[0].text.startswith("[")
+    assert [c.ok for c in log.calls] == [True, False]
+
+
+async def test_no_timezone_no_stamp(seen):
+    gw = make(seen)
+    with gw.turn("inst", "run-9"):
+        res = await gw.call_tool("speak", {"text": "moi"}, instance="inst")
+    assert [c.text for c in res.content] == ["spoke:moi"]
+
+
+def test_unknown_timezone_fails_profile_validation():
+    with pytest.raises(ValueError, match="unknown time zone"):
+        profile(timezone="Europe/Hesa")
