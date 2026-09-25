@@ -14,6 +14,7 @@ nothing here is a second memory model.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import socket
 import time
@@ -266,6 +267,7 @@ class SessionPlane:
         self._locks: dict[str, asyncio.Lock] = {}
         self._lifecycles: dict[str, MemoryLifecycle] = {}
         self._assignments: dict[str, ScopeAssignment] = {}
+        self._known: dict[str, dict] | None = None
         self._projects: dict[str, ProjectIdentity] = {}
         self._provisioned: set[str] = set()
         self._unprovisionable: dict[str, str] = {}
@@ -847,9 +849,45 @@ class SessionPlane:
     def _assignment_for(self, project: ProjectIdentity) -> ScopeAssignment:
         assignment = self._assignments.get(project.id)
         if assignment is None:
-            assignment = assign_scopes(self.config.scopes, self.config.projects, project)
+            assignment = assign_scopes(self.config.scopes, self.config.projects, project,
+                                       known_project_scopes=sorted(self._known_projects()))
             self._assignments[project.id] = assignment
         return assignment
+
+    # ── projects seen (for read_all_projects bindings) ──────────────────────
+    def _known_projects_path(self) -> Path:
+        return self.state_dir / "known_projects.json"
+
+    def _known_projects(self) -> dict[str, dict]:
+        if self._known is None:
+            try:
+                self._known = json.loads(self._known_projects_path().read_text())
+            except (FileNotFoundError, ValueError):
+                self._known = {}
+        return self._known
+
+    def _record_known_project(self, project: ProjectIdentity, scope: str) -> None:
+        """Record a project scope that exists (provisioned or bound). A new
+        one widens every read_all_projects assignment: their cached
+        assignments and lifecycles are rebuilt on next use."""
+        known = self._known_projects()
+        entry = known.get(scope)
+        now = datetime.now().astimezone().isoformat()
+        if entry is not None:
+            entry["last_seen"] = now
+        else:
+            known[scope] = {"project": project.id, "first_seen": now, "last_seen": now}
+            for pid, assignment in list(self._assignments.items()):
+                if assignment.reads_all_projects:
+                    self._assignments.pop(pid, None)
+                    self._lifecycles.pop(assignment.write, None)
+        try:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            tmp = self._known_projects_path().with_suffix(".tmp")
+            tmp.write_text(json.dumps(known, indent=1, sort_keys=True))
+            tmp.replace(self._known_projects_path())
+        except OSError as exc:
+            logger.warning(f"could not persist known projects: {exc}")
 
     async def _lifecycle_for(self, session: ExternalSession) -> tuple[MemoryLifecycle | None, str | None]:
         """The lifecycle bound to this session's project scopes. (None,
@@ -897,6 +935,10 @@ class SessionPlane:
                     write = policy.fallback_write
                     read = [s for s in assignment.read if s != assignment.write] + [write]
                     detail += f"; writing to fallback {write}"
+        if write == assignment.write and (not assignment.templated or write in self._provisioned):
+            self._record_known_project(project, write)
+            assignment = self._assignment_for(project)   # rebuilt if the set grew
+            read = assignment.read
         lifecycle = self._lifecycles.get(write)
         if lifecycle is None:
             spec = MemorySpec(

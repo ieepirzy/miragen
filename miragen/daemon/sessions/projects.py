@@ -117,10 +117,12 @@ class ScopeAssignment:
     whether the write scope is the templated project scope (which may
     still need provisioning) or an explicit/fallback one."""
 
-    def __init__(self, *, read: list[str], write: str, templated: bool) -> None:
+    def __init__(self, *, read: list[str], write: str, templated: bool,
+                 reads_all_projects: bool = False) -> None:
         self.read = read
         self.write = write
         self.templated = templated
+        self.reads_all_projects = reads_all_projects
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"ScopeAssignment(read={self.read}, write={self.write!r}, templated={self.templated})"
@@ -136,11 +138,14 @@ def _binding_matches(binding: ProjectBinding, project: ProjectIdentity) -> bool:
 
 def assign_scopes(
     policy: ScopePolicy, bindings: list[ProjectBinding], project: ProjectIdentity,
+    known_project_scopes: list[str] | None = None,
 ) -> ScopeAssignment:
     for binding in bindings:
         if _binding_matches(binding, project):
-            read = _dedupe([*policy.shared_read, *binding.read, binding.scope])
-            return ScopeAssignment(read=read, write=binding.scope, templated=False)
+            everything = (known_project_scopes or []) if binding.read_all_projects else []
+            read = _dedupe([*policy.shared_read, *binding.read, *everything, binding.scope])
+            return ScopeAssignment(read=read, write=binding.scope, templated=False,
+                                   reads_all_projects=binding.read_all_projects)
     write = policy.project_scope.format(slug=project.slug)
     read = _dedupe([*policy.shared_read, write])
     return ScopeAssignment(read=read, write=write, templated=True)
