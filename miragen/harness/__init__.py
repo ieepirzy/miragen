@@ -6,14 +6,15 @@ import os
 from pathlib import Path
 
 from miragen.harness.base import (
-    PYDANTIC_AI, Harness, HarnessResult, HarnessStream, HarnessTurn, parse_harness_model,
+    PYDANTIC_AI, Harness, HarnessResult, HarnessStream, HarnessTurn, InstanceBusyError,
+    parse_harness_model,
 )
 from miragen.harness.pydantic_ai import PydanticAIHarness
 from miragen.models import AgentProfile
 
 __all__ = [
     "PYDANTIC_AI", "Harness", "HarnessResult", "HarnessStream", "HarnessTurn",
-    "PydanticAIHarness", "build_model_harness", "parse_harness_model", "profile_harness",
+    "InstanceBusyError", "PydanticAIHarness", "build_model_harness", "parse_harness_model", "profile_harness",
     "pydantic_ai_model",
 ]
 

@@ -41,7 +41,7 @@ from miragen.edf import (
 from miragen.executor import ExecutorBackend, ExecutorResult, RepositoryCheckout, build_executor
 from miragen.factory import build_agent, registered_handlers, registered_tools
 from miragen.harness import (
-    PYDANTIC_AI, Harness, HarnessTurn, PydanticAIHarness, build_model_harness, profile_harness,
+    PYDANTIC_AI, Harness, HarnessTurn, InstanceBusyError, PydanticAIHarness, build_model_harness, profile_harness,
     pydantic_ai_model,
 )
 from miragen.load import load_profile
@@ -2726,17 +2726,23 @@ async def delete_instance(name: str):
             status_code=409,
             detail=f"instance '{name}' has a running turn; retry after it finishes",
         )
-    history = _history_file(name)
-    sidecar = _history_sidecar(name)
-    if not history.exists() and not sidecar.exists():
-        raise HTTPException(
-            status_code=404, detail=f"instance '{name}' has no persisted state"
-        )
     deleted = []
-    for path in (history, sidecar):
+    # A harness that owns its conversation natively (Grok Build) holds the
+    # real state: its process, session files and working directory.
+    forget = getattr(_harness, "forget", None)
+    if forget is not None:
+        try:
+            deleted += await forget(name)
+        except InstanceBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    for path in (_history_file(name), _history_sidecar(name)):
         if path.exists():
             path.unlink()
             deleted.append(path.name)
+    if not deleted:
+        raise HTTPException(
+            status_code=404, detail=f"instance '{name}' has no persisted state"
+        )
     return {"instance": name, "deleted": deleted}
 
 

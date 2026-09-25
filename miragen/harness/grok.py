@@ -38,17 +38,19 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import quote
 
 from grok_build_client import AcpSession
 
 from miragen.executor.grok_hermetic import hermetic_home_dir, write_hermetic_home
-from miragen.harness.base import HarnessResult, HarnessTurn, parse_harness_model
+from miragen.harness.base import HarnessResult, HarnessTurn, InstanceBusyError, parse_harness_model
 from miragen.harness.gateway import ToolGateway
 from miragen.models import AgentProfile, RunUsage
 
@@ -490,6 +492,38 @@ class GrokHarness:
 
     def status(self) -> dict[str, Any]:
         return {"processes": sorted(self._agents), "max_processes": self.settings.max_processes}
+
+    def session_dir(self, instance: str) -> Path:
+        """Where grok keeps an instance's sessions (forks included): one
+        directory per working directory, named by the percent-encoded cwd."""
+        cwd = str(self.settings.workdirs / instance)
+        return self.settings.grok_home / "sessions" / quote(cwd, safe="")
+
+    async def forget(self, instance: str) -> list[str]:
+        """Discard an instance's conversation for good: stop its process, drop
+        its session mapping, and delete grok's session files and the working
+        directory. Returns what was removed (empty: nothing was there)."""
+        removed: list[str] = []
+        async with self._spawn_lock:
+            agent = self._agents.get(instance)
+            if agent is not None and agent.busy:
+                raise InstanceBusyError(f"instance '{instance}' has a running turn")
+            if agent is not None:
+                await self._drop(instance)
+                removed.append("process")
+            async with self._state_lock:
+                state = self._load_state()
+                if state.pop(instance, None) is not None:
+                    tmp = self._state_path().with_suffix(".tmp")
+                    tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
+                    os.replace(tmp, self._state_path())
+                    removed.append("session_mapping")
+            for label, path in (("grok_sessions", self.session_dir(instance)),
+                                ("workdir", self.settings.workdirs / instance)):
+                if path.is_dir():
+                    shutil.rmtree(path)
+                    removed.append(label)
+        return removed
 
 
 class _GrokStream:

@@ -108,6 +108,10 @@ async def env(tmp_path, home, grok_bin):
         await bg
 
 
+def fake_session(env, sid: str) -> Path:
+    return next((env.home / "sessions").glob(f"*/{sid}/session.json"))
+
+
 def turn(prompt, instance="chat", use_history=True, run_id="r1", **kw) -> HarnessTurn:
     return HarnessTurn(prompt=prompt, instance=instance, use_history=use_history, run_id=run_id, **kw)
 
@@ -183,10 +187,10 @@ async def test_changed_instructions_fork_and_deliver_the_update_once(env):
     state = json.loads((env.home / "miragen-instances.json").read_text())["chat"]
     assert state["session_id"] == fork["to"] and state["instructions_update_pending"] is False
     # … so the new instructions ride the first turn after the fork, once
-    turns = json.loads((env.home / "fake-sessions" / f"{fork['to']}.json").read_text())["turns"]
+    turns = json.loads(fake_session(env, fork['to']).read_text())["turns"]
     assert "<instructions-update" in turns[-1] and "You are Mira, v2." in turns[-1]
     await h2.run(turn("again", run_id="r3"))
-    turns = json.loads((env.home / "fake-sessions" / f"{fork['to']}.json").read_text())["turns"]
+    turns = json.loads(fake_session(env, fork['to']).read_text())["turns"]
     assert "<instructions-update" not in turns[-1]
 
 
@@ -202,7 +206,7 @@ async def test_instructions_update_stays_pending_until_a_turn_delivers_it(env):
     h2.settings.turn_timeout_s = 30
     await h2.run(turn("retry", run_id="r3"))
     sid = json.loads((env.home / "miragen-instances.json").read_text())["chat"]["session_id"]
-    turns = json.loads((env.home / "fake-sessions" / f"{sid}.json").read_text())["turns"]
+    turns = json.loads(fake_session(env, sid).read_text())["turns"]
     assert "<instructions-update" in turns[-1]
 
 
@@ -210,7 +214,7 @@ async def test_memory_packet_rides_in_the_prompt(env):
     h = env.harness()
     await h.run(turn("question", extra_instructions="MEMORY: Ilari likes rye bread"))
     sid = json.loads((env.home / "miragen-instances.json").read_text())["chat"]["session_id"]
-    turns = json.loads((env.home / "fake-sessions" / f"{sid}.json").read_text())["turns"]
+    turns = json.loads(fake_session(env, sid).read_text())["turns"]
     assert "MEMORY: Ilari likes rye bread" in turns[0] and turns[0].rstrip().endswith("question")
 
 
@@ -395,3 +399,68 @@ async def test_clocks_are_ordered_for_gated_calls(env):
     assert h.tool_timeout_s == 1020
     assert h.settings.turn_timeout_s >= h.tool_timeout_s + 60
     assert "tool_timeout_sec = 1020" in (env.home / "config.toml").read_text()
+
+
+def test_session_dir_matches_grok_on_disk_layout(tmp_path):
+    """Name observed live (grok 1.0.41, miragen image): the directory is the
+    percent-encoded working directory."""
+    h = GrokHarness.__new__(GrokHarness)
+    h.settings = GrokSettings(grok_home=Path("/agent/grok-home"),
+                              workdirs=Path("/agent/workspaces"), gateway_url="http://x/")
+    assert h.session_dir("conv_1b945f6f2f397d9e") == Path(
+        "/agent/grok-home/sessions/%2Fagent%2Fworkspaces%2Fconv_1b945f6f2f397d9e")
+
+
+async def test_forget_discards_process_session_files_and_workdir(env):
+    h = env.harness()
+    await h.run(turn("one", instance="old"))
+    await h.run(turn("keep me", instance="other", run_id="r2"))
+    sessions = h.session_dir("old")
+    assert sessions.is_dir() and any(sessions.iterdir())
+    removed = await h.forget("old")
+    assert set(removed) == {"process", "session_mapping", "grok_sessions", "workdir"}
+    assert not sessions.exists() and not (env.tmp_path / "work" / "old").exists()
+    assert "old" not in h.status()["processes"]
+    assert "old" not in json.loads((env.home / "miragen-instances.json").read_text())
+    # the other instance is untouched
+    assert h.session_dir("other").is_dir()
+    assert (await h.run(turn("HISTORY", instance="other", run_id="r3"))).output.startswith("turns=2 ")
+    # the forgotten name starts over with a new session, not a load
+    res = await h.run(turn("HISTORY", instance="old", run_id="r4"))
+    assert res.output.startswith("turns=1 ")
+    assert await h.forget("never-existed") == []
+
+
+async def test_forget_removes_forked_sessions_too(env):
+    h = env.harness("You are Mira.")
+    await h.run(turn("one"))
+    await h.aclose()
+    h2 = env.harness("You are Mira, v2.")
+    await h2.run(turn("two", run_id="r2"))           # forks within the same cwd
+    assert len(list(h2.session_dir("chat").iterdir())) == 2
+    await h2.forget("chat")
+    assert not h2.session_dir("chat").exists()
+
+
+async def test_forget_refuses_a_busy_instance(env):
+    from miragen.harness import InstanceBusyError
+    h = env.harness()
+    agent = await h._agent_for("busy", ephemeral=False)  # reserved = a turn holds it
+    with pytest.raises(InstanceBusyError):
+        await h.forget("busy")
+    assert agent.acp.alive
+    agent.reserved -= 1
+
+
+async def test_http_delete_instance_discards_the_grok_conversation(app_with_grok, env):
+    from httpx import ASGITransport, AsyncClient
+    app_module = app_with_grok
+    async with AsyncClient(transport=ASGITransport(app=app_module.app), base_url="http://t") as c:
+        await c.post("/run", json={"prompt": "one", "use_history": True, "instance": "chat"})
+        r = await c.delete("/instances/chat")
+        assert r.status_code == 200, r.text
+        assert {"process", "grok_sessions", "workdir"} <= set(r.json()["deleted"])
+        assert not app_module._harness.session_dir("chat").exists()
+        r2 = await c.post("/run", json={"prompt": "HISTORY", "use_history": True, "instance": "chat"})
+        assert r2.json()["output"].startswith("turns=1 ")  # a fresh conversation
+        assert (await c.delete("/instances/nope")).status_code == 404
