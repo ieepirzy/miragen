@@ -197,6 +197,9 @@ class HandleResult:
 
 
 ASYNC_RECALL_CAPABILITY = "async-recall"
+# The client doesn't want recalled memories with its prompts (it reaches older
+# context through the memory tools): capture still runs, the search doesn't.
+NO_PROMPT_RECALL_CAPABILITY = "no-prompt-recall"
 STOP_CONTINUE_CAPABILITY = "stop-continue"
 NOTHING_DURABLE = "nothing durable"
 # The longest any claim may hold its HTTP request open.
@@ -1098,7 +1101,8 @@ class SessionPlane:
         waits for the selector inside the hook, as before."""
         recall = self.config.recall
         prompt = envelope.event.content or ""
-        if not recall.on_prompt or self.selector is None or len(prompt) < recall.min_prompt_chars:
+        if (not recall.on_prompt or self.selector is None or len(prompt) < recall.min_prompt_chars
+                or NO_PROMPT_RECALL_CAPABILITY in envelope.client.capabilities):
             # The previous prompt's result must not surface in this turn.
             self._drop_recall(session.key)
             return None, None, None

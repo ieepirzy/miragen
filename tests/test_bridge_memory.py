@@ -101,3 +101,25 @@ def test_from_env_requires_the_plane_url():
     b = BridgeMemory.from_env(spec(), "mira", {"MIRAGEND_URL": "http://10.8.0.4:8420/",
                                                "MIRAGEND_TOKEN": "t"})
     assert b.base_url == "http://10.8.0.4:8420" and b.token == "t"
+
+
+async def test_recall_off_keeps_capture_and_session_start_but_no_per_prompt_recall(tmp_path):
+    calls = []
+    ph = PlaneHarness(tmp_path, selector=vault_selector(calls))
+    s = spec().model_copy(update={"recall": spec().recall.model_copy(update={"enabled": False})})
+    app = create_app(None, token="bridge-secret", sessions=ph.plane)
+    bridge = BridgeMemory(spec=s, agent_name="mira", base_url="http://plane", token="bridge-secret",
+                          transport=httpx.ASGITransport(app=app))
+    first = await bridge.prepare(instance="conv_1", run_id="r1", prompt="hello there, Mira")
+    assert "[memory guide" in first                      # the session-start context stays
+    scope = next(sc for sc in ph.plane._lifecycles if "mira" in sc)
+    await ph.plane._lifecycles[scope].remember(instance="x", run_id="seed",
+                                               content="the storage code is 4417")
+    second = await bridge.prepare(instance="conv_1", run_id="r2",
+                                  prompt="what was the storage code again?")
+    assert "4417" not in second and "[recalled memories" not in second
+    assert calls == []                                   # the plane skipped the selector too
+    await bridge.finish(instance="conv_1", run_id="r2", output="Let me look.", status="succeeded")
+    await ph.drain()
+    assert any(e["content"] == "what was the storage code again?" for e in ph.service.events.values()
+               if isinstance(e.get("content"), str))       # the prompt was still captured
