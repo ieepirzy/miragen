@@ -559,7 +559,10 @@ class MemoryRecallSpec(_ProfileModel):
             "Run the optional recall lane at the boundary: bounded hybrid "
             "search + a zero-or-more relevance selection (one model call on "
             "cache misses). Requires a resolvable model; without one the "
-            "lane reports itself unconfigured rather than degrading."
+            "lane reports itself unconfigured rather than degrading. Bridge "
+            "backend: false means no recalled memories with each prompt (the "
+            "session-start context and the memory tools remain; turns are "
+            "still captured)."
         ),
     )
     model: Optional[str] = Field(

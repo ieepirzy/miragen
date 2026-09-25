@@ -29,6 +29,9 @@ from miragen.models import MemorySpec
 logger = logging.getLogger("miragen.memory.bridge")
 
 HARNESS = "miragen"
+# miragen.daemon.sessions.plane.NO_PROMPT_RECALL_CAPABILITY (not imported: the
+# bridge must not pull in the daemon).
+NO_PROMPT_RECALL = "no-prompt-recall"
 UNAVAILABLE_NOTE = (
     "[memory] the memory service could not be reached for this turn: stored "
     "memories and working state were not checked. Don't claim to remember "
@@ -74,7 +77,8 @@ class BridgeMemory:
                       "content": content[:20_000] if content else content,
                       "attributes": attributes},
             "client": {"host": socket.gethostname(), "remote": True,
-                       "project_remote": self.spec.project, "capabilities": []},
+                       "project_remote": self.spec.project,
+                       "capabilities": [] if self.spec.recall.enabled else [NO_PROMPT_RECALL]},
         }
 
     async def _post(self, envelope: dict) -> dict:
@@ -100,7 +104,9 @@ class BridgeMemory:
             answer = await self._post(self._envelope(
                 instance, "input.received", "UserPromptSubmit", content=prompt,
                 ids={"prompt_id": run_id} if run_id else None))
-            if answer.get("context"):
+            # recall.enabled: false keeps the capture but not the per-prompt
+            # context (an older plane may still answer with recall).
+            if answer.get("context") and self.spec.recall.enabled:
                 parts.append(answer["context"])
         except Exception as exc:  # the plane is optional to a turn, never fatal
             logger.warning("memory bridge unavailable: %s", exc)
