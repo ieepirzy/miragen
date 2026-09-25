@@ -31,10 +31,16 @@ COPY . /build/
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# The installer leaves /usr/local/bin/grok as a symlink into /root (mode
+# 0700), which the unprivileged agentuser cannot follow: `grok` then simply
+# doesn't exist for the agent. Replace the link with the real binary.
 RUN set -o pipefail \
     && curl -fsSL https://x.ai/cli/install.sh -o /tmp/grok-install.sh \
     && GROK_BIN_DIR=/usr/local/bin bash /tmp/grok-install.sh \
     && rm -f /tmp/grok-install.sh \
+    && real="$(readlink -f /usr/local/bin/grok)" \
+    && cp --remove-destination "$real" /usr/local/bin/grok \
+    && chmod 0755 /usr/local/bin/grok \
     && command -v grok
 
 RUN pip install --no-cache-dir \
@@ -53,6 +59,9 @@ RUN adduser --disabled-password --gecos "" agentuser \
     && chown -R agentuser /agent
 
 USER agentuser
+
+# The agent user must be able to run grok (the harness and executor spawn it).
+RUN grok --version
 
 # Workspace (agent.yaml + tools.py) is mounted at runtime — nothing baked in.
 # Set AGENT_PROFILE to a path relative to /agent, e.g. agent.yaml (default).
