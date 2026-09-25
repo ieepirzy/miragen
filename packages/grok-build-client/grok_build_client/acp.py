@@ -8,6 +8,7 @@ session/update notifications and session/request_permission for host gates.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import json
 import os
@@ -20,6 +21,27 @@ from grok_build_client.normalize import normalize_acp_update
 from grok_build_client.util import resolve_grok_bin
 
 PermissionDecision = Literal["allow", "deny"]
+
+
+class AcpAuthError(RuntimeError):
+    """The agent is not logged in (strict_auth)."""
+
+
+def permission_outcome(params: dict[str, Any], decision: str) -> dict[str, Any]:
+    """ACP RequestPermissionOutcome for a decision.
+
+    The agent offers `options` ({optionId, kind}); the client answers
+    {"outcome": "selected", "optionId": ...} with an option of the matching
+    kind, preferring the once-only variant, or {"outcome": "cancelled"} when
+    no option fits — never a bare allow/reject string (grok rejects those as
+    "unknown permission option")."""
+    want = ("allow_once", "allow_always") if decision == "allow" else ("reject_once", "reject_always")
+    options = [o for o in (params.get("options") or []) if isinstance(o, dict)]
+    for kind in want:
+        for option in options:
+            if option.get("kind") == kind and option.get("optionId"):
+                return {"outcome": "selected", "optionId": option["optionId"]}
+    return {"outcome": "cancelled"}
 PermissionHandler = Callable[[dict[str, Any]], PermissionDecision | Awaitable[PermissionDecision]]
 
 
@@ -33,6 +55,13 @@ class AcpSession:
     model: str | None = None
     env: Mapping[str, str] | None = None
     permission_handler: PermissionHandler | None = None
+    # Extra `grok agent` options (before the mode), e.g. ["--agent-profile", path].
+    extra_args: list[str] = field(default_factory=list)
+    # Working directory of the agent process.
+    cwd: str | None = None
+    # Raise AcpAuthError when authentication fails instead of carrying on and
+    # failing later at session/new (the historical, lenient behaviour).
+    strict_auth: bool = False
     # Test seam: inject a pre-built (reader, writer, kill) triple instead of spawning.
     _transport_factory: Callable[[], Awaitable[tuple[asyncio.StreamReader, asyncio.StreamWriter, Callable[[], None]]]] | None = None
 
@@ -45,6 +74,8 @@ class AcpSession:
     _updates: asyncio.Queue[dict[str, Any] | None] = field(default_factory=asyncio.Queue, init=False, repr=False)
     _reader_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
+    _stderr_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    _stderr_tail: collections.deque = field(default_factory=lambda: collections.deque(maxlen=50), init=False, repr=False)
 
     async def __aenter__(self) -> "AcpSession":
         await self.start()
@@ -74,6 +105,7 @@ class AcpSession:
             argv.append("--always-approve")
         if self.model:
             argv.extend(["-m", self.model])
+        argv.extend(self.extra_args)
         argv.extend(["--no-leader", "stdio"])
 
         env = dict(self.env) if self.env is not None else os.environ.copy()
@@ -86,10 +118,11 @@ class AcpSession:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            cwd=self.cwd,
             start_new_session=True,
             limit=16 * 1024 * 1024,
         )
-        assert proc.stdin and proc.stdout
+        assert proc.stdin and proc.stdout and proc.stderr
         self._proc = proc
         self._reader = proc.stdout
         # StreamWriter-like wrapper around stdin
@@ -100,13 +133,35 @@ class AcpSession:
                 os.killpg(proc.pid, signal.SIGKILL)
 
         self._kill = _kill
+        # stderr must be drained: a chatty agent filling the pipe blocks.
+        self._stderr_task = asyncio.create_task(self._drain_stderr(proc.stderr))
+
+    async def _drain_stderr(self, stream: asyncio.StreamReader) -> None:
+        with contextlib.suppress(Exception):
+            while True:
+                line = await stream.readline()
+                if not line:
+                    return
+                self._stderr_tail.append(line.decode(errors="replace").rstrip())
+
+    def stderr_tail(self) -> list[str]:
+        """The agent's last stderr lines, for diagnostics."""
+        return list(self._stderr_tail)
+
+    @property
+    def alive(self) -> bool:
+        return (self._reader_task is not None and not self._reader_task.done()
+                and not self._closed)
 
     async def _handshake(self) -> None:
         init = await self.request("initialize", {
             "protocolVersion": 1,
+            # No client-side filesystem or terminal: this client implements
+            # neither, and an agent told otherwise would send requests that
+            # never get an answer.
             "clientCapabilities": {
-                "fs": {"readTextFile": True, "writeTextFile": True},
-                "terminal": True,
+                "fs": {"readTextFile": False, "writeTextFile": False},
+                "terminal": False,
             },
             "clientInfo": {"name": "grok-build-client", "version": "0.1.0"},
         })
@@ -128,14 +183,19 @@ class AcpSession:
             method_id = next(iter(x for x in methods if x))
         else:
             method_id = "cached_token"
+        self.auth_method = method_id
         try:
             await self.request("authenticate", {
                 "methodId": method_id,
                 "_meta": {"headless": True},
             })
-        except Exception:
-            # Some agent builds auto-auth from GROK_HOME; non-fatal if already in.
-            pass
+        except Exception as exc:
+            if self.strict_auth:
+                raise AcpAuthError(
+                    f"grok agent authentication ({method_id}) failed: {exc}. "
+                    "Log in once into this GROK_HOME (grok login --device-code)."
+                ) from exc
+            # Lenient mode: some agent builds auto-auth from GROK_HOME.
 
     async def session_new(
         self,
@@ -162,12 +222,27 @@ class AcpSession:
             raise RuntimeError(f"session/new missing sessionId: {result!r}")
         return str(session_id)
 
-    async def session_load(self, session_id: str, cwd: str | None = None) -> str:
-        params: dict[str, Any] = {"sessionId": session_id}
+    async def session_load(
+        self,
+        session_id: str,
+        cwd: str | None = None,
+        *,
+        mcp_servers: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Resume a stored session. ACP's session/load takes the working
+        directory and MCP servers again — a load without them resumes a
+        session with no client-provided tools."""
+        params: dict[str, Any] = {"sessionId": session_id, "mcpServers": mcp_servers or []}
         if cwd:
             params["cwd"] = cwd
         result = await self.request("session/load", params)
-        return str(result.get("sessionId") or session_id)
+        return str((result or {}).get("sessionId") or session_id)
+
+    async def cancel(self, session_id: str) -> None:
+        """Ask the agent to stop the in-flight turn (ACP session/cancel
+        notification); the pending session/prompt then ends 'cancelled'."""
+        await self._send({"jsonrpc": "2.0", "method": "session/cancel",
+                          "params": {"sessionId": session_id}})
 
     async def prompt(self, session_id: str, text: str) -> AsyncIterator[dict[str, Any]]:
         """Send a prompt; yield normalized updates until the request completes."""
@@ -292,7 +367,7 @@ class AcpSession:
         # Permission request (server → client request with id)
         if method in ("session/request_permission", "request_permission") and "id" in msg:
             decision = await self._decide_permission(params)
-            await self._respond(msg["id"], {"outcome": {"outcome": decision}})
+            await self._respond(msg["id"], {"outcome": permission_outcome(params, decision)})
             await self._updates.put({
                 "type": "permission_request",
                 "decision": decision,
@@ -305,7 +380,14 @@ class AcpSession:
                 await self._updates.put(norm)
             return
 
-        # Ignore other notifications / unknown methods
+        if "id" in msg and method:
+            # A request this client doesn't implement: answer it. Dropping it
+            # would leave the agent waiting forever.
+            await self._send({"jsonrpc": "2.0", "id": msg["id"], "error": {
+                "code": -32601, "message": f"method not supported by this client: {method}"}})
+            return
+
+        # Other notifications are ignored
 
     async def _decide_permission(self, params: dict[str, Any]) -> str:
         # Map allow/deny onto ACP outcome strings used by Grok (allow | reject)
@@ -317,17 +399,20 @@ class AcpSession:
         return "allow" if result == "allow" else "reject"
 
     async def _respond(self, req_id: Any, result: dict[str, Any]) -> None:
+        await self._send({"jsonrpc": "2.0", "id": req_id, "result": result})
+
+    async def _send(self, msg: dict[str, Any]) -> None:
         if self._writer is None:
             return
-        msg = {"jsonrpc": "2.0", "id": req_id, "result": result}
-        payload = (json.dumps(msg) + "\n").encode()
-        self._writer.write(payload)  # type: ignore[union-attr]
+        self._writer.write((json.dumps(msg) + "\n").encode())  # type: ignore[union-attr]
         await self._writer.drain()  # type: ignore[union-attr]
 
     async def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
         if self._reader_task is not None:
             self._reader_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):

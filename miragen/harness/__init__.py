@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from miragen.harness.base import (
@@ -37,7 +38,26 @@ def pydantic_ai_model(profile: AgentProfile) -> str | None:
     return profile.spec.model
 
 
-def build_model_harness(profile: AgentProfile, *, runs_root: Path) -> Harness:
-    """A long-lived non-PydanticAI harness for this profile."""
+def build_model_harness(
+    profile: AgentProfile,
+    *,
+    runs_root: Path,
+    runtime_tools: list | None = None,
+    registered_tools: dict | None = None,
+    bind_context=None,
+    gateway_url: str | None = None,
+    system_guidance: str | None = None,
+):
+    """A long-lived non-PydanticAI harness for this profile, plus the tool
+    gateway it acts through: (harness, gateway)."""
     name = profile_harness(profile)
+    if name == "grok-build":
+        from miragen.harness.gateway import ToolGateway
+        from miragen.harness.grok import GrokHarness, GrokSettings
+
+        gateway = ToolGateway(profile, runtime_tools=runtime_tools,
+                              registered_tools=registered_tools, bind_context=bind_context)
+        url = gateway_url or f"http://127.0.0.1:{os.environ.get('PORT', '8000')}/mcp/gateway/"
+        return GrokHarness(profile, gateway, GrokSettings.from_env(gateway_url=url),
+                           system_guidance=system_guidance), gateway
     raise ValueError(f"harness '{name}' is not available in this build")

@@ -72,3 +72,50 @@ home for a persistent conversational agent.
   profile (`tools: search_tool, use_tool`), a host-side `pre_tool_use` client
   hook denies anything outside the gateway, and the gateway fails closed.
   Nothing is claimed until a live probe with a subscription login shows it.
+
+## The Grok Build harness (PR C)
+
+A profile opts in with `spec.model: grok-build:<model>` (`grok-build:` alone
+means Grok's default model):
+
+```yaml
+name: mira
+mode: interactive
+triggers: [{type: http}]
+spec:
+  model: grok-build:grok-4.6
+  instructions: |            # the session's rules; a change forks the session
+    You are Mira…
+  capabilities:              # MCP only on a gateway harness
+    - MCP: {name: mira, url: http://mira:8441/mcp, bearer_token_env: MIRA_MCP_TOKEN}
+approval_required: ["mira_perform_device_action"]   # enforced by the gateway
+voice:
+  provider: http
+  url: http://mira-voice:8450/speak
+  instructions_file: speak-instructions.md
+```
+
+**Runtime shape**
+- There is one `grok agent … stdio` process per instance. Each process gets:
+  - `--agent-profile <GROK_HOME>/miragen-agent-profile.md` (`tools: search_tool, use_tool`);
+  - an allowlisted environment: `HOME=<GROK_HOME>/hermetic-home`, the instance's `MIRAGEN_GATEWAY_TOKEN`, and no `XAI_API_KEY` or `GROK_*`;
+  - a working directory of `<MIRAGEN_GROK_WORKDIRS>/<instance>`.
+- **Session state.** `<GROK_HOME>/miragen-instances.json` maps each instance to its Grok session id and an instructions hash.
+  - A (re)started process resumes the session with `session/load`.
+  - A changed hash forks the session (`x.ai/session/fork` with the new `rules`).
+- **Ephemeral runs.** A run without `use_history`/instance gets a fresh session in a process that exits after the turn.
+- **Eviction.** `MIRAGEN_GROK_MAX_PROCESSES` (default 3) caps idle processes (least recently used goes first), and `MIRAGEN_GROK_IDLE_S` (default 900) stops idle ones. Either way the conversation resumes on the next turn.
+- **Timeouts.** `MIRAGEN_GROK_TURN_TIMEOUT_S` (default 600) sends `session/cancel` and drops the process.
+- **Tool calls.** The gateway is served at `/mcp/gateway/` on the agent's own port, and is the only MCP server in the hermetic config.
+  - Permission requests that don't name a `gateway__*` tool are rejected host-side.
+  - Approvals and tool-call records happen in the gateway.
+- **Login.** Log in once per `GROK_HOME`, on the subscription:
+  `docker exec -it -e HOME=/agent/grok-home/hermetic-home -e GROK_HOME=/agent/grok-home <container> grok login --device-code`.
+  A missing login fails the turn with that instruction (strict auth). The harness never falls back to an API key.
+
+**Verified against a scripted `grok agent`** (`tests/fixtures/fake_grok_agent.py`, seeded with grok 1.0.41's real `initialize`), and still owed a live, logged-in probe:
+- Does the agent profile actually remove the built-ins?
+- Do permission requests name `gateway__<tool>`?
+- Is `requirements.toml`'s MCP allowlist honoured in ACP mode?
+- Does `x.ai/session/fork` accept `rules`?
+- Is `session/load` enough to restore the config-declared MCP server?

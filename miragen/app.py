@@ -10,7 +10,7 @@ import re
 import shutil
 import uuid
 from collections.abc import Callable
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -38,7 +38,7 @@ from miragen.edf import (
     resolve_edf,
 )
 from miragen.executor import ExecutorBackend, ExecutorResult, RepositoryCheckout, build_executor
-from miragen.factory import build_agent, registered_handlers
+from miragen.factory import build_agent, registered_handlers, registered_tools
 from miragen.harness import (
     PYDANTIC_AI, Harness, HarnessTurn, PydanticAIHarness, build_model_harness, profile_harness,
     pydantic_ai_model,
@@ -111,6 +111,9 @@ _limits: UsageLimits | None = None
 # profiles whose spec.model names one. None for pydantic-ai profiles: their
 # harness wraps the _agent/_limits globals above (see _model_harness).
 _harness: Harness | None = None
+# The tool gateway a non-PydanticAI harness acts through (served at
+# /mcp/gateway with its own per-instance credentials).
+_gateway = None
 # voice.instructions_file contents: renderer guidance appended to the
 # system instructions (base tier, every harness).
 _speak_guidance: str | None = None
@@ -293,6 +296,19 @@ def _save_history_messages(instance: str, messages: list, run_id: str | None) ->
 def _guidance_kwargs() -> dict:
     """build_agent's system_guidance, passed only when there is some."""
     return {"system_guidance": _speak_guidance} if _speak_guidance else {}
+
+
+@contextmanager
+def _bind_run_context(run_id: str | None, instance: str | None):
+    """Run/instance context for a runtime tool called through the gateway
+    (the same contextvars run_agent sets around a PydanticAI run)."""
+    run_token = _current_run_id.set(run_id)
+    instance_token = _current_instance.set(instance)
+    try:
+        yield
+    finally:
+        _current_run_id.reset(run_token)
+        _current_instance.reset(instance_token)
 
 
 def _model_ready() -> bool:
@@ -1242,7 +1258,7 @@ def _load_file_secrets() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _profile, _agent, _limits, _harness, _speak_guidance, _run_store, _executor, _schedule_store, \
+    global _profile, _agent, _limits, _harness, _gateway, _speak_guidance, _run_store, _executor, _schedule_store, \
         _publication_store, _telemetry, _voice, _memory, _scheduling
 
     _load_file_secrets()
@@ -1301,7 +1317,15 @@ async def lifespan(app: FastAPI):
         _executor.prepare()
         logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode (executor tier: {_profile.executor.executor})")
     elif profile_harness(_profile) != PYDANTIC_AI:
-        _harness = build_model_harness(_profile, runs_root=_run_store.root)
+        _harness, _gateway = build_model_harness(
+            _profile,
+            runs_root=_run_store.root,
+            runtime_tools=_runtime_extra_tools(),
+            registered_tools=registered_tools(),
+            bind_context=_bind_run_context,
+            system_guidance=_speak_guidance,
+        )
+        _gateway_mount.inner = _gateway.asgi
         logger.info(
             f"Agent '{_profile.name}' built in {_profile.mode} mode (harness: {_harness.name})"
         )
@@ -1378,6 +1402,7 @@ async def lifespan(app: FastAPI):
             voice_mcp.session_manager.run(),
             memory_mcp.session_manager.run(),
             schedule_mcp.session_manager.run(),
+            _gateway.running() if _gateway is not None else nullcontext(),
         ):
             _scheduler.start()
             logger.info("Scheduler started")
@@ -1395,6 +1420,8 @@ async def lifespan(app: FastAPI):
         # instance); stop them with the container.
         await _harness.aclose()
         _harness = None
+    _gateway_mount.inner = _mcp_not_ready
+    _gateway = None
 
     if _telemetry is not None:
         _telemetry.shutdown()
@@ -1480,6 +1507,21 @@ app.mount("/mcp/memory", _memory_mcp_guard)
 # Runtime tool library: scheduling, executor tier — same pattern.
 _schedule_mcp_guard = _TokenGuardASGI(_mcp_not_ready)
 app.mount("/mcp/schedule", _schedule_mcp_guard)
+
+
+class _SwappableASGI:
+    """A mount whose app is set by the lifespan. The tool gateway does its
+    own auth (per-instance credentials), so no internal-token guard here."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        await self.inner(scope, receive, send)
+
+
+_gateway_mount = _SwappableASGI(_mcp_not_ready)
+app.mount("/mcp/gateway", _gateway_mount)
 
 
 # ── HTTP trigger schemas ────────────────────────────────────────────────────────────────
