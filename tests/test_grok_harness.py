@@ -354,3 +354,25 @@ async def test_voice_guidance_is_part_of_the_session_rules(env):
     res = await h.run(turn("HISTORY", instance="voice"))
     assert "You are Mira." in res.output
     assert "## Speaking aloud" in res.output and "Tags: [laugh]" in res.output
+
+
+async def test_web_capabilities_enable_grok_builtins_and_nothing_else(env):
+    p = AgentProfile.model_validate({
+        "name": "mira", "mode": "interactive", "triggers": [{"type": "http"}],
+        "inject_timestamp": False,
+        "spec": {"model": "grok-build:grok-4.6", "instructions": "You are Mira.",
+                 "capabilities": ["WebSearch", "WebFetch"]}})
+    base = env.harness()
+    h = GrokHarness(p, env.gateway, base.settings)
+    env.harnesses.append(h)
+    assert "tools: search_tool, use_tool, web_fetch, web_search" in \
+        (env.home / "miragen-agent-profile.md").read_text()
+    config = (env.home / "config.toml").read_text()
+    assert "web_fetch = true" in config and "backend_tools = true" in config
+    assert "disable_web_search = false" in config
+    fetch = {"toolCall": {"title": "Fetch https://x", "_meta": {"x.ai/tool": {"name": "web_fetch"}}}}
+    shell = {"toolCall": {"title": "run", "_meta": {"x.ai/tool": {"name": "run_terminal_cmd"}}}}
+    assert await h._permission(fetch) == "allow"
+    assert await h._permission(shell) == "deny"
+    # without the capabilities, web tools are neither granted nor allowed
+    assert await base._permission(fetch) == "deny"

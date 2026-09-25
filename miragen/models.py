@@ -619,9 +619,19 @@ class AgentSpec(_ProfileModel):
         description="Any pydantic-ai model string, e.g. 'anthropic:claude-sonnet-4-6'.",
         min_length=1,
     )
-    instructions: str = Field(
-        description="System prompt; supports YAML block scalar (|).",
+    instructions: Optional[str] = Field(
+        default=None,
+        description="System prompt; supports YAML block scalar (|). Or use instructions_file.",
         min_length=1,
+    )
+    instructions_file: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "System prompt read from a file (e.g. an identity markdown file kept "
+            "under version control). Resolved by the profile loader, relative to "
+            "the profile file; exclusive with `instructions`."
+        ),
     )
     model_settings: Optional[ModelSettings] = None
     capabilities: Optional[list[str | dict]] = Field(
@@ -636,6 +646,14 @@ class AgentSpec(_ProfileModel):
         ge=1,
         description="Maps to UsageLimits(request_limit=N) — caps model round-trips per run.",
     )
+
+    @model_validator(mode="after")
+    def one_instructions_source(self) -> "AgentSpec":
+        if self.instructions is None and self.instructions_file is None:
+            raise ValueError("spec needs `instructions` or `instructions_file`")
+        if self.instructions is not None and self.instructions_file is not None:
+            raise ValueError("set `instructions` or `instructions_file`, not both")
+        return self
 
 
 # ── Budgets ──────────────────────────────────────────────────────────────────

@@ -178,7 +178,7 @@ def build_agent(
     # `extra_instructions` rides the system prompt, NOT message history —
     # this is what makes a per-run memory packet transient (§17.3): it is
     # regenerated each run and never persisted into a saved conversation.
-    instructions = profile.spec.instructions
+    instructions = profile.spec.instructions or ""
     if system_guidance:
         # Stable, profile-level additions to the system prompt (the voice
         # renderer guidance): part of who the agent is, unlike the per-run

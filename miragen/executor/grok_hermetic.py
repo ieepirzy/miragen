@@ -75,6 +75,9 @@ def _q(value: str) -> str:
 def _settings(spec: "ExecutorSpec") -> list[str]:
     """Settings shared by config.toml and requirements.toml."""
     web = bool(spec.web_search)
+    # web_fetch keeps grok's SSRF defaults (private, link-local, metadata
+    # and loopback blocked); only its on/off switch is set here.
+    fetch = bool(getattr(spec, "web_fetch", False))
     lines = [
         "[cli]",
         "auto_update = false",
@@ -83,7 +86,7 @@ def _settings(spec: "ExecutorSpec") -> list[str]:
         "[features]",
         "managed_config = false",
         f"backend_tools = {str(web).lower()}",
-        "web_fetch = false",
+        f"web_fetch = {str(fetch).lower()}",
         "",
         "[subagents]",
         "enabled = false",

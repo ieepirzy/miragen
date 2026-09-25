@@ -97,7 +97,8 @@ async def test_lists_runtime_and_upstream_tools_namespaced_and_filtered(seen):
     names = {t.name for t in await gw._list_tools()}
     assert names == {"speak", "home_lookup"}  # delete_everything not in allowed_tools
     # miragen authenticates upstream with its own credential
-    assert seen[0] == ("http://up/mcp", {"Authorization": "Bearer upstream-secret"})
+    assert seen[0] == ("http://up/mcp", {"Authorization": "Bearer upstream-secret",
+                                         "X-Miragen-Agent": "g"})
 
 
 async def test_registered_tool_is_served_with_a_run_context_shim(seen):
@@ -125,6 +126,25 @@ async def test_runtime_tool_runs_with_app_context_bound_and_is_recorded(seen):
     assert text(res) == "spoke:moi" and bound == [("run-7", "inst")]
     assert [(c.tool_name, json.loads(c.args), c.ok) for c in log.calls] == [
         ("speak", {"text": "moi"}, True)]
+
+
+async def test_upstream_calls_carry_run_and_instance_identity(seen):
+    gw = make(seen)
+    with gw.turn("tg-111", "run-42"):
+        await gw.call_tool("home_lookup", {"key": "k"}, instance="tg-111")
+    url, headers = seen[-1]
+    assert headers["X-Miragen-Run-Id"] == "run-42" and headers["X-Miragen-Instance"] == "tg-111"
+    assert headers["Authorization"] == "Bearer upstream-secret"  # miragen's own credential
+
+
+def test_native_capabilities_are_left_to_the_harness(seen):
+    p = profile(spec={"model": "grok-build:x", "instructions": "i",
+                      "capabilities": ["WebSearch", "WebFetch"]})
+    make(seen, profile=p, native_capabilities=frozenset({"WebSearch", "WebFetch"}))
+    with pytest.raises(GatewayConfigError, match="Thinking"):
+        make(seen, profile=profile(spec={"model": "grok-build:x", "instructions": "i",
+                                         "capabilities": [{"Thinking": {"effort": "low"}}]}),
+             native_capabilities=frozenset({"WebSearch", "WebFetch"}))
 
 
 async def test_upstream_call_is_proxied_and_disallowed_tools_refused(seen):

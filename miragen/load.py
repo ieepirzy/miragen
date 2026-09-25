@@ -208,6 +208,27 @@ def interpolate_env(value: Any, path: str = "") -> Any:
 
 # ── Loader ───────────────────────────────────────────────────────────────────
 
+def _resolve_instructions_file(raw: dict, profile_path: Path) -> None:
+    """spec.instructions_file → spec.instructions (the file's text): the
+    loaded profile carries the text, exactly as if it had been inline."""
+    spec = raw.get("spec")
+    if not isinstance(spec, dict) or not spec.get("instructions_file"):
+        return
+    if spec.get("instructions"):
+        raise ValueError("set spec.instructions or spec.instructions_file, not both")
+    file = Path(spec["instructions_file"])
+    if not file.is_absolute():
+        file = profile_path.resolve().parent / file
+    try:
+        text = file.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError(f"spec.instructions_file {file} is not readable: {exc}") from exc
+    if not text:
+        raise ValueError(f"spec.instructions_file {file} is empty")
+    spec["instructions"] = text
+    del spec["instructions_file"]
+
+
 def load_profile(path: str | Path) -> AgentProfile:
     """
     Load and validate an agent profile YAML file.
@@ -227,6 +248,7 @@ def load_profile(path: str | Path) -> AgentProfile:
         raise ValueError(f"Agent profile must be a YAML mapping, got: {type(raw).__name__}")
 
     raw = interpolate_env(raw)
+    _resolve_instructions_file(raw, path)
 
     # Validate + coerce via Pydantic
     profile = AgentProfile.model_validate(raw)

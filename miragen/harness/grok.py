@@ -112,6 +112,17 @@ class _Agent:
         return self.reserved > 0 or self.lock.locked()
 
 
+def _capability_names(profile: AgentProfile) -> list[tuple[str, dict]]:
+    out = []
+    for entry in profile.spec.capabilities or [] if profile.spec else []:
+        if isinstance(entry, str):
+            out.append((entry, {}))
+        elif isinstance(entry, dict) and len(entry) == 1:
+            name, cfg = next(iter(entry.items()))
+            out.append((name, cfg or {}))
+    return out
+
+
 def instructions_hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
@@ -121,6 +132,19 @@ _GATEWAY_TOOL = re.compile(rf"^{GATEWAY_SERVER}__[A-Za-z0-9_.-]+$")
 _IDENTITY_FIELDS = ("toolName", "tool_name", "name", "title")
 _DISPATCH_SERVER = ("server", "server_name", "serverName", "mcp_server")
 _DISPATCH_TOOL = ("tool", "tool_name", "toolName", "name")
+
+
+def _identity(params: dict[str, Any]) -> tuple[list[str], dict | None]:
+    call = params.get("toolCall")
+    if not isinstance(call, dict):
+        return [], None
+    names = [call.get(k) for k in _IDENTITY_FIELDS if isinstance(call.get(k), str)]
+    meta = call.get("_meta") if isinstance(call.get("_meta"), dict) else {}
+    tool_meta = meta.get("x.ai/tool") if isinstance(meta.get("x.ai/tool"), dict) else {}
+    if isinstance(tool_meta.get("name"), str):
+        names.append(tool_meta["name"])  # grok's own tool identity (seen live)
+    raw = call.get("rawInput") if isinstance(call.get("rawInput"), dict) else None
+    return names, raw
 
 
 def is_gateway_tool_call(params: dict[str, Any]) -> bool:
@@ -135,14 +159,10 @@ def is_gateway_tool_call(params: dict[str, Any]) -> bool:
     This layer only sees tools that ask permission. Grok auto-runs some
     read-only built-ins without asking, so removing built-ins through the
     agent profile remains the primary barrier; the gateway is the last."""
-    call = params.get("toolCall")
-    if not isinstance(call, dict):
-        return False
-    names = [call.get(k) for k in _IDENTITY_FIELDS if isinstance(call.get(k), str)]
+    names, raw = _identity(params)
     if any(_GATEWAY_TOOL.fullmatch(n) for n in names):
         return True
-    raw = call.get("rawInput")
-    if any(n in DISPATCHERS for n in names) and isinstance(raw, dict):
+    if any(n in DISPATCHERS for n in names) and raw is not None:
         server = next((raw[k] for k in _DISPATCH_SERVER if isinstance(raw.get(k), str)), None)
         tool = next((raw[k] for k in _DISPATCH_TOOL if isinstance(raw.get(k), str)), None)
         if server is not None:
@@ -151,8 +171,22 @@ def is_gateway_tool_call(params: dict[str, Any]) -> bool:
     return False
 
 
+def builtin_tool_call(params: dict[str, Any], enabled: frozenset[str]) -> str | None:
+    """The enabled grok built-in this permission request is for, or None.
+    Identity fields only, exact names."""
+    names, _raw = _identity(params)
+    return next((n for n in names if n in enabled), None)
+
+
+# miragen capability name -> the grok built-in it enables. Everything else
+# about these tools stays grok's (web_fetch's SSRF block on private,
+# link-local, metadata and loopback addresses is on by default).
+NATIVE_CAPABILITIES: dict[str, str] = {"WebSearch": "web_search", "WebFetch": "web_fetch"}
+
+
 class GrokHarness:
     name = NAME
+    native_capabilities = frozenset(NATIVE_CAPABILITIES)
 
     def __init__(
         self,
@@ -169,6 +203,8 @@ class GrokHarness:
         self.gateway = gateway
         self.settings = settings
         self.model = parse_harness_model(profile.spec.model)[1] or None
+        caps = {name for name, _ in _capability_names(profile)}
+        self.builtins = frozenset(NATIVE_CAPABILITIES[c] for c in caps if c in NATIVE_CAPABILITIES)
         # System instructions = identity + stable profile-level guidance
         # (the voice renderer's 'Speaking aloud' section). Part of the
         # session's rules, so a change forks the session (decision 7).
@@ -185,15 +221,17 @@ class GrokHarness:
     # ── home, profile, state ─────────────────────────────────────────────
     def prepare(self) -> None:
         home = self.settings.grok_home
-        spec = SimpleNamespace(web_search=False, mcp_servers=[SimpleNamespace(
-            name=GATEWAY_SERVER, url=self.settings.gateway_url, bearer_token_env=GATEWAY_TOKEN_ENV)])
+        spec = SimpleNamespace(
+            web_search="web_search" in self.builtins, web_fetch="web_fetch" in self.builtins,
+            mcp_servers=[SimpleNamespace(name=GATEWAY_SERVER, url=self.settings.gateway_url,
+                                         bearer_token_env=GATEWAY_TOKEN_ENV)])
         write_hermetic_home(home, self.profile.name, spec)
         # Built-in tools removed: the MCP dispatchers are all that's left.
         (home / PROFILE_FILE).write_text(
             "---\n"
             f"name: miragen-{self.profile.name}\n"
             "description: miragen base-tier agent; acts only through the miragen tool gateway\n"
-            "tools: search_tool, use_tool\n"
+            f"tools: {', '.join(['search_tool', 'use_tool', *sorted(self.builtins)])}\n"
             "---\n"
         )
         self.settings.workdirs.mkdir(parents=True, exist_ok=True)
@@ -230,7 +268,7 @@ class GrokHarness:
 
     # ── processes ────────────────────────────────────────────────────────
     async def _permission(self, params: dict[str, Any]) -> str:
-        if is_gateway_tool_call(params):
+        if is_gateway_tool_call(params) or builtin_tool_call(params, self.builtins):
             return "allow"
         logger.warning("grok harness: refused a non-gateway tool permission request")
         return "deny"
