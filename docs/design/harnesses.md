@@ -186,3 +186,17 @@ a policy what to do (`miragen/harness/grok_lifecycle.py`):
   command sent as a prompt, and a session with only a few turns doesn't shrink:
   recent turns are kept whole.
 - `MIRAGEN_GROK_LIFECYCLE=off` disables all of this.
+
+### Turns in a conversation instance
+
+`POST /instances/{name}/turns {prompt, idempotency_key, provenance?}` → 202
+`{turn_id}` starts a turn with the instance's history. It is the base tier's
+name for an instance launch through `/executor-runs`, which stays for
+executor jobs, and it has the same durable, idempotent acceptance: a retried
+key returns the same turn (200, `duplicate: true`).
+
+A turn is asynchronous because it can take minutes (tools, approvals). The id
+is how a caller waits for it (`GET /instances/{name}/turns/{turn_id}`, the
+same record as `/runs/{turn_id}`), resumes waiting after its own restart
+without sending the turn twice, and attributes the turn's tool calls,
+approvals and usage.
