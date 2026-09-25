@@ -119,6 +119,9 @@ def render_config(agent: str, spec: "ExecutorSpec") -> str:
     ]
     for server in spec.mcp_servers or []:
         lines += ["", f"[mcp_servers.{server.name}]", f"url = {_q(server.url)}"]
+        timeout = getattr(server, "tool_timeout_sec", None)
+        if timeout:
+            lines.append(f"tool_timeout_sec = {int(timeout)}")
         if server.bearer_token_env:
             header = "Bearer ${" + server.bearer_token_env + "}"
             lines.append(f"headers = {{ Authorization = {_q(header)} }}")

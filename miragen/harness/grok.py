@@ -212,6 +212,19 @@ class GrokHarness:
 
         self.instructions = with_voice_guidance(profile.spec.instructions or "", system_guidance)
         self._session_factory = session_factory or AcpSession
+        # Clock order (outer waits for inner): approval wait < grok's MCP
+        # tool-call timeout < this harness's turn timeout. A gated call can
+        # wait approval_timeout_s in the gateway; grok must not give up on
+        # that call first, and the turn must not end under it.
+        # (Without gated tools grok's own default applies, and the turn
+        # timeout stays exactly as configured.)
+        self.tool_timeout_s: int | None = (
+            profile.approval_timeout_s + 120 if profile.approval_required else None)
+        if self.tool_timeout_s and settings.turn_timeout_s < self.tool_timeout_s + 60:
+            logger.warning("grok harness: raising the turn timeout from %.0fs to %ds so it "
+                           "outlasts gated tool calls", settings.turn_timeout_s,
+                           self.tool_timeout_s + 60)
+            settings.turn_timeout_s = self.tool_timeout_s + 60
         self._agents: dict[str, _Agent] = {}
         self._spawn_lock = asyncio.Lock()
         self._state_lock = asyncio.Lock()
@@ -224,7 +237,8 @@ class GrokHarness:
         spec = SimpleNamespace(
             web_search="web_search" in self.builtins, web_fetch="web_fetch" in self.builtins,
             mcp_servers=[SimpleNamespace(name=GATEWAY_SERVER, url=self.settings.gateway_url,
-                                         bearer_token_env=GATEWAY_TOKEN_ENV)])
+                                         bearer_token_env=GATEWAY_TOKEN_ENV,
+                                         tool_timeout_sec=self.tool_timeout_s)])
         write_hermetic_home(home, self.profile.name, spec)
         # Built-in tools removed: the MCP dispatchers are all that's left.
         (home / PROFILE_FILE).write_text(

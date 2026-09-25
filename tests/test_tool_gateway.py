@@ -268,3 +268,29 @@ async def test_gateway_applies_argument_rules(seen):
         ok = await gw.call_tool("home_lookup", {"key": "safe_one"}, instance="inst")
         bad = await gw.call_tool("home_lookup", {"key": "secret"}, instance="inst")
     assert not ok.isError and bad.isError and "approval_mode: strict" in text(bad)
+
+
+async def test_an_approval_that_outlives_its_turn_is_not_executed(seen):
+    """A gated call whose turn ended while the approval waited (turn timeout,
+    cancel) must not run when the approval finally arrives."""
+    import asyncio
+    release = asyncio.Event()
+
+    async def slow_handler(req):
+        await release.wait()
+        return ApprovalResponse(approved=True)
+    register_approval_handler(slow_handler)
+    ran = []
+    try:
+        gw = make(seen, profile=profile(approval_required=["speak"]))
+        gw._local["speak"].fn_tool.fn = lambda text: ran.append(text) or "spoke"
+        with gw.turn("inst", "r1"):
+            call = asyncio.create_task(gw.call_tool("speak", {"text": "late"}, instance="inst"))
+            await asyncio.sleep(0.05)
+        # the turn is over; a new one may even have started in the instance
+        with gw.turn("inst", "r2"):
+            release.set()
+            res = await call
+    finally:
+        register_approval_handler(None)
+    assert res.isError and "after this turn had ended" in text(res) and ran == []

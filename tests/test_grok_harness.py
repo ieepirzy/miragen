@@ -382,3 +382,16 @@ async def test_text_after_a_tool_call_starts_a_new_paragraph(env):
     h = env.harness()
     res = await h.run(turn('SAY Checking.\nCALL speak {"text": "x"}'))
     assert res.output == "Checking.\n\ntool[speak]=spoke:x\n"
+
+
+async def test_clocks_are_ordered_for_gated_calls(env):
+    p = AgentProfile.model_validate({
+        "name": "mira", "mode": "interactive", "triggers": [{"type": "http"}],
+        "approval_required": ["crm_*"], "approval_mode": "queue", "approval_timeout_s": 900,
+        "spec": {"model": "grok-build:", "instructions": "i"}})
+    base = env.harness(turn_timeout_s=600)
+    h = GrokHarness(p, env.gateway, base.settings)
+    env.harnesses.append(h)
+    assert h.tool_timeout_s == 1020
+    assert h.settings.turn_timeout_s >= h.tool_timeout_s + 60
+    assert "tool_timeout_sec = 1020" in (env.home / "config.toml").read_text()

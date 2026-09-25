@@ -325,6 +325,12 @@ class ToolGateway:
                 response = await decide_approval(self.profile, name, arguments)
             except ApprovalDenied as exc:
                 return self._record(log, name, arguments, ok=False, result=_error(str(exc)))
+            if self._active.get(instance) is not log:
+                # The turn that asked ended (timeout, cancel) while the approval
+                # waited: nothing may run on behalf of a turn that is gone.
+                logger.warning("gateway: %s approved after its turn ended; not executed", name)
+                return self._record(log, name, arguments, ok=False, result=_error(
+                    f"'{name}' was approved only after this turn had ended; it was not run"))
         token = _CURRENT.set((log.run_id, instance))
         try:
             with self._bind(log.run_id, instance):
