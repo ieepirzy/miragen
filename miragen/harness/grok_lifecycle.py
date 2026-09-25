@@ -76,7 +76,9 @@ def load_policy(env: dict[str, str]) -> LifecyclePolicy:
     ref = env.get("MIRAGEN_GROK_LIFECYCLE_POLICY")
     if ref:
         module, _, attr = ref.partition(":")
-        obj = getattr(importlib.import_module(module), attr)
+        # The module comes from the deployment's own environment (same trust
+        # as the code it runs), never from a request or the model.
+        obj = getattr(importlib.import_module(module), attr)  # nosemgrep: python.lang.security.audit.non-literal-import.non-literal-import
         # A class or factory is called; a ready policy object is used as is.
         return obj() if isinstance(obj, type) or not hasattr(obj, "decide") else obj
     return ThresholdPolicy(
