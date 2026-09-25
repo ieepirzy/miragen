@@ -406,13 +406,22 @@ class GrokHarness:
                 with self.gateway.turn(instance, turn.run_id) as log:
                     try:
                         async with asyncio.timeout(self.settings.turn_timeout_s):
+                            after_tool = False
                             async for update in agent.acp.prompt(
                                     agent.session_id, self._compose(turn, instructions_update=deliver_update)):
                                 kind = update.get("type")
-                                if kind == "text":
-                                    chunks.append(update["data"])
+                                if kind == "tool_call":
+                                    after_tool = True
+                                elif kind == "text":
+                                    text = update["data"]
+                                    # Grok streams each message segment around a
+                                    # tool call separately; keep them apart.
+                                    if after_tool and chunks and not chunks[-1].endswith("\n"):
+                                        text = "\n\n" + text
+                                    after_tool = False
+                                    chunks.append(text)
                                     if on_text:
-                                        on_text(update["data"])
+                                        on_text(text)
                                 elif kind == "error":
                                     raise GrokHarnessError(
                                         f"grok: {update.get('message')}; "

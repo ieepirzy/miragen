@@ -376,3 +376,9 @@ async def test_web_capabilities_enable_grok_builtins_and_nothing_else(env):
     assert await h._permission(shell) == "deny"
     # without the capabilities, web tools are neither granted nor allowed
     assert await base._permission(fetch) == "deny"
+
+
+async def test_text_after_a_tool_call_starts_a_new_paragraph(env):
+    h = env.harness()
+    res = await h.run(turn('SAY Checking.\nCALL speak {"text": "x"}'))
+    assert res.output == "Checking.\n\ntool[speak]=spoke:x\n"

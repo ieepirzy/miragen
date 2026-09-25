@@ -131,8 +131,13 @@ def handle_prompt(rid, params):
     stop = "end_turn"
     for line in text.splitlines():
         line = line.strip()
-        if line.startswith("CALL "):
+        if line.startswith("SAY "):
+            chunk(sid, line[4:])  # no trailing newline: the next segment must be kept apart
+        elif line.startswith("CALL "):
             _, tool, raw = line.split(" ", 2)
+            send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {
+                "sessionUpdate": "tool_call", "toolCallId": tool, "title": f"gateway__{tool}",
+                "kind": "other", "status": "pending"}}})
             decision = ask(sid, f"gateway__{tool}", json.loads(raw))
             if decision == "yes-once":
                 chunk(sid, f"tool[{tool}]={call_gateway(tool, json.loads(raw))}\n")
