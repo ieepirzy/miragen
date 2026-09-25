@@ -583,13 +583,26 @@ class MemorySpec(_ProfileModel):
     lifecycle: working-state restore + guidance injection at the run
     boundary, durable event capture, and the agent memory tools."""
 
-    backend: Literal["loimi", "ephemeral"] = Field(
+    backend: Literal["loimi", "ephemeral", "bridge"] = Field(
         default="loimi",
         description=(
             "'loimi' (or any implementation of the memory backend protocol "
             "at endpoint_env) — durable, production. 'ephemeral' — the "
             "built-in in-process backend: full lifecycle, ZERO durability "
-            "(state dies with the process); dev/demo only."
+            "(state dies with the process); dev/demo only. 'bridge' — take "
+            "part in a hosted miragend session plane (endpoint_env = its URL, "
+            "credential_env = its bearer) like an external harness session: "
+            "the plane owns the Loimi principal, scopes and recall selector; "
+            "memory tools come from its MCP (an MCP capability with "
+            "bridge_session: true)."
+        ),
+    )
+    project: Optional[str] = Field(
+        default=None,
+        max_length=512,
+        description=(
+            "bridge backend: the project this agent's sessions belong to (a "
+            "repository remote such as 'github.com/ieepirzy/mira', or a name)."
         ),
     )
     endpoint_env: str = Field(
@@ -600,11 +613,25 @@ class MemorySpec(_ProfileModel):
         default="LOIMI_MEMORY_TOKEN",
         description="Env var NAME holding this agent's minted principal token — never the value.",
     )
-    scopes: MemoryScopesSpec
+    scopes: Optional[MemoryScopesSpec] = None
     hooks: MemoryHooksSpec = Field(default_factory=MemoryHooksSpec)
     guidance: MemoryGuidanceSpec = Field(default_factory=MemoryGuidanceSpec)
     extraction: MemoryExtractionSpec = Field(default_factory=MemoryExtractionSpec)
     recall: MemoryRecallSpec = Field(default_factory=MemoryRecallSpec)
+
+    @model_validator(mode="after")
+    def _backend_fields(self) -> "MemorySpec":
+        if self.backend == "bridge":
+            if self.scopes is not None:
+                raise ValueError("memory backend 'bridge': the session plane owns scopes; "
+                                 "remove `scopes`")
+            if not self.project:
+                raise ValueError("memory backend 'bridge' needs `project`")
+        elif self.scopes is None:
+            raise ValueError(f"memory backend '{self.backend}' needs `scopes`")
+        elif self.project is not None:
+            raise ValueError("`project` applies to the bridge backend only")
+        return self
 
 
 # ── PydanticAI spec (their layer) ───────────────────────────────────────────

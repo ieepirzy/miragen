@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import uuid
+from types import SimpleNamespace
 from collections.abc import Callable
 from contextlib import asynccontextmanager, contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
@@ -111,6 +112,8 @@ _limits: UsageLimits | None = None
 # profiles whose spec.model names one. None for pydantic-ai profiles: their
 # harness wraps the _agent/_limits globals above (see _model_harness).
 _harness: Harness | None = None
+# memory.backend: bridge — the hosted session plane this agent reports to.
+_bridge_memory = None
 # The tool gateway a non-PydanticAI harness acts through (served at
 # /mcp/gateway with its own per-instance credentials).
 _gateway = None
@@ -474,8 +477,8 @@ def _build_memory_lifecycle(profile: AgentProfile) -> "MemoryLifecycle | None":
     native seam (miragen owns every turn); executor-tier native hooks land
     with the hook-bridge PR, so a profile demanding them today must refuse
     to start."""
-    if profile.memory is None:
-        return None
+    if profile.memory is None or profile.memory.backend == "bridge":
+        return None  # the bridge backend is BridgeMemory, not a local lifecycle
     if profile.memory.hooks.mode == "native_required" and profile.is_executor:
         from miragen.memory.harness_hooks import executor_hook_support
 
@@ -630,6 +633,10 @@ async def run_agent(
             trigger=record.trigger if record is not None else "direct",
             prompt_hint=prompt,
         )
+    elif _bridge_memory is not None:
+        memory_packet = SimpleNamespace(text=await _bridge_memory.prepare(
+            instance=instance, run_id=record.run_id if record is not None else None,
+            prompt=prompt))
 
     history_instance = instance or DEFAULT_INSTANCE
     turn = HarnessTurn(
@@ -672,6 +679,9 @@ async def run_agent(
                     instance=instance, run_id=record.run_id, trigger=record.trigger,
                     status="failed", error=str(e),
                 )
+        if _bridge_memory is not None:
+            await _bridge_memory.finish(instance=instance, run_id=record.run_id if record else None,
+                                        output=None, status="failed")
         raise
     finally:
         _current_run_id.reset(run_id_token)
@@ -700,6 +710,9 @@ async def run_agent(
                 instance=instance, run_id=record.run_id, trigger=record.trigger,
                 status="succeeded", summary=output,
             )
+    if _bridge_memory is not None:
+        await _bridge_memory.finish(instance=instance, run_id=record.run_id if record else None,
+                                    output=output, status="succeeded")
 
     return output
 
@@ -1258,7 +1271,7 @@ def _load_file_secrets() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _profile, _agent, _limits, _harness, _gateway, _speak_guidance, _run_store, _executor, _schedule_store, \
+    global _profile, _agent, _limits, _harness, _gateway, _bridge_memory, _speak_guidance, _run_store, _executor, _schedule_store, \
         _publication_store, _telemetry, _voice, _memory, _scheduling
 
     _load_file_secrets()
@@ -1294,6 +1307,12 @@ async def lifespan(app: FastAPI):
 
     # Built before the agent: the memory tools close over the lifecycle.
     _memory = _build_memory_lifecycle(_profile)
+    if _profile.memory is not None and _profile.memory.backend == "bridge":
+        from miragen.memory.bridge import BridgeMemory
+
+        _bridge_memory = BridgeMemory.from_env(_profile.memory, _profile.name, dict(os.environ))
+        logger.info(f"Memory through the session plane at {_bridge_memory.base_url} "
+                    f"(project {_profile.memory.project})")
     if _memory is not None:
         logger.info(f"Memory enabled (backend: {_profile.memory.backend})")
 
@@ -1324,6 +1343,7 @@ async def lifespan(app: FastAPI):
             registered_tools=registered_tools(),
             bind_context=_bind_run_context,
             system_guidance=_speak_guidance,
+            session_key_for=_bridge_memory.session_key if _bridge_memory is not None else None,
         )
         _gateway_mount.inner = _gateway.asgi
         logger.info(
@@ -2790,6 +2810,10 @@ async def run_stream(request: RunRequest):
                 trigger="http",
                 prompt_hint=prompt,
             )
+        elif _bridge_memory is not None:
+            memory_packet = SimpleNamespace(text=await _bridge_memory.prepare(
+                instance=instance, run_id=record.run_id if record is not None else None,
+                prompt=prompt))
         turn = HarnessTurn(
             prompt=prompt,
             instance=history_instance,
@@ -2854,6 +2878,9 @@ async def run_stream(request: RunRequest):
                         instance=instance, run_id=record.run_id,
                         trigger="http", status="succeeded", summary="".join(chunks),
                     )
+                if _bridge_memory is not None:
+                    await _bridge_memory.finish(instance=instance, run_id=record.run_id,
+                                                output="".join(chunks), status="succeeded")
                 if run_span is not None and usage is not None:
                     if usage.input_tokens:
                         run_span.set_attribute("gen_ai.usage.input_tokens", usage.input_tokens)

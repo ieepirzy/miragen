@@ -53,6 +53,8 @@ _CAPABILITY_REGISTRY: dict[str, Any] = {
 _MCP_CONFIG_KEYS = frozenset(
     {"url", "name", "allowed_tools", "defer_loading", "authorization_token"}
 )
+# Keys only the tool gateway (non-PydanticAI harnesses) understands.
+_GATEWAY_ONLY_MCP_KEYS = frozenset({"oauth", "bridge_session", "optional"})
 
 
 def _build_mcp(cfg: dict) -> Any:
@@ -69,6 +71,12 @@ def _build_mcp(cfg: dict) -> Any:
     them through tool search, so an agent attached to several servers does not
     pay every schema's context cost on every request.
     """
+    gateway_only = sorted(set(cfg) & _GATEWAY_ONLY_MCP_KEYS)
+    if gateway_only:
+        raise ValueError(
+            f"MCP capability key(s) {gateway_only} are served by the tool gateway, i.e. on "
+            "harness models such as grok-build:<model>, not on pydantic-ai models."
+        )
     unknown = sorted(set(cfg) - _MCP_CONFIG_KEYS)
     if unknown:
         raise ValueError(
@@ -256,7 +264,12 @@ def load_profile(path: str | Path) -> AgentProfile:
     # Eagerly resolve capabilities so we catch unknown names at load time
     # rather than at agent construction time (model tier only — executor
     # profiles carry no capability list; the executor's tools are its own)
-    if profile.spec is not None and profile.spec.capabilities:
+    from miragen.harness import PYDANTIC_AI, profile_harness
+
+    # PydanticAI capabilities are resolved eagerly to catch unknown names at
+    # load time; a gateway harness validates its capabilities when it builds.
+    if profile.spec is not None and profile.spec.capabilities \
+            and profile_harness(profile) == PYDANTIC_AI:
         resolve_capabilities(profile.spec.capabilities)
 
     return profile
