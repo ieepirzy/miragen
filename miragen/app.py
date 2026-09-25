@@ -22,7 +22,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger as APIntervalTrigger
-from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent
@@ -2833,6 +2833,7 @@ async def delete_instance(name: str):
 class ApprovalListResponse(BaseModel):
     count: int
     approvals: list[PendingApproval]
+    version: int = 0   # changes whenever the pending set does (long-poll `since`)
 
 
 class ResolveApprovalResponse(BaseModel):
@@ -2840,9 +2841,17 @@ class ResolveApprovalResponse(BaseModel):
 
 
 @app.get("/approvals", response_model=ApprovalListResponse, dependencies=[_internal_auth])
-async def list_approvals():
-    pending = get_broker().pending()
-    return ApprovalListResponse(count=len(pending), approvals=pending)
+async def list_approvals(
+    since: Optional[int] = Query(default=None, description=(
+        "Long-poll: the `version` from your last answer. With `wait`, the call "
+        "returns as soon as the pending set changes, or after `wait` seconds.")),
+    wait: float = Query(default=0, ge=0, le=60),
+):
+    broker = get_broker()
+    if since is not None and wait > 0:
+        await broker.wait_for_change(since, wait)
+    pending = broker.pending()
+    return ApprovalListResponse(count=len(pending), approvals=pending, version=broker.version)
 
 
 @app.post("/approvals/{request_id}", response_model=ResolveApprovalResponse, dependencies=[_internal_auth])
