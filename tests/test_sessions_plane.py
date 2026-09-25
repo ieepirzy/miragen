@@ -1347,3 +1347,57 @@ async def test_a_failed_worker_grant_is_retried_when_the_scope_is_used_again(tmp
     h.service.principals["mira-worker"] = {"kind": "agent"}  # the worker started later
     await h.send("SessionStart", source="startup", session="s-2", pid=4243)
     assert ("mira-worker", PROJECT_SCOPE, "maintain") in h.service.grants
+
+
+class TestReadAllProjects:
+    """A personal assistant's binding reads every project scope the plane
+    has seen, and still writes only to its own."""
+
+    def config(self):
+        return SessionsConfig(
+            principal=PRINCIPAL, scopes=ScopePolicy(shared_read=[SHARED]),
+            projects=[ProjectBinding(match="/w/mira", scope="group:mira", read_all_projects=True)],
+            recall=SessionsRecall(enabled=False),
+        )
+
+    def bound(self, h):
+        h.service.scopes["group:mira"] = {"kind": "group"}
+        for verb in ("read", "propose", "resolve", "retract"):
+            h.service.grants.add((PRINCIPAL, "group:mira", verb))
+
+    async def test_reads_every_project_seen_and_widens_as_new_ones_appear(self, tmp_path):
+        h = Harness(tmp_path, config=self.config())
+        self.bound(h)
+        await h.send("SessionStart", source="startup")                           # github.com/org/repo
+        await h.send("SessionStart", source="startup", session="m-1", cwd="/w/mira")
+        mira = h.plane.registry.get("claude-code:m-1")
+        assert mira.scope == "group:mira"
+        read = h.plane._lifecycles["group:mira"].spec.scopes.read
+        assert PROJECT_SCOPE in read and SHARED in read and "group:mira" in read
+        assert h.plane._lifecycles["group:mira"].spec.scopes.default_write == "group:mira"
+        # a project that appears later is readable from Mira's next use on
+        await h.send("SessionStart", source="startup", session="s-9", cwd="/w/other")
+        other = h.plane.registry.get("claude-code:s-9").scope
+        assert "group:mira" not in h.plane._lifecycles            # stale read set dropped
+        await h.send("SessionStart", source="startup", session="m-2", cwd="/w/mira")
+        assert other in h.plane._lifecycles["group:mira"].spec.scopes.read
+        # other projects stay isolated from Mira's and each other's scopes
+        assert h.plane._lifecycles[other].spec.scopes.read == [SHARED, other]
+
+    async def test_known_projects_survive_a_restart(self, tmp_path):
+        h = Harness(tmp_path, config=self.config())
+        self.bound(h)
+        await h.send("SessionStart", source="startup")
+        h2 = Harness(tmp_path, config=self.config())
+        self.bound(h2)
+        await h2.send("SessionStart", source="startup", session="m-1", cwd="/w/mira")
+        assert PROJECT_SCOPE in h2.plane._lifecycles["group:mira"].spec.scopes.read
+
+    def test_assign_scopes_read_all(self):
+        policy = ScopePolicy(shared_read=[SHARED])
+        binding = ProjectBinding(match="/w", scope="group:w", read_all_projects=True)
+        a = assign_scopes(policy, [binding], REPO, known_project_scopes=["group:p1", "group:w"])
+        assert a.read == [SHARED, "group:p1", "group:w"] and a.write == "group:w"
+        plain = ProjectBinding(match="/w", scope="group:w")
+        assert assign_scopes(policy, [plain], REPO, known_project_scopes=["group:p1"]).read == [
+            SHARED, "group:w"]

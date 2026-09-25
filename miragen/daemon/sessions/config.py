@@ -43,6 +43,14 @@ class ProjectBinding(_Model):
         default_factory=list,
         description="Extra read scopes for sessions in this project.",
     )
+    read_all_projects: bool = Field(
+        default=False,
+        description=(
+            "Also read every project scope this plane has seen (a personal "
+            "assistant working across all of its owner's projects). The set "
+            "grows as new projects appear; nothing is written outside `scope`."
+        ),
+    )
 
 
 class ScopePolicy(_Model):
