@@ -31,11 +31,18 @@ COPY . /build/
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# The installer links /usr/local/bin/grok (and `agent`) into /root/.grok/,
+# which agentuser can't traverse ("grok CLI not found on PATH" at runtime):
+# the real binary goes into /usr/local/bin, world-executable.
 RUN set -o pipefail \
     && curl -fsSL https://x.ai/cli/install.sh -o /tmp/grok-install.sh \
     && GROK_BIN_DIR=/usr/local/bin bash /tmp/grok-install.sh \
     && rm -f /tmp/grok-install.sh \
-    && command -v grok
+    && command -v grok \
+    && real="$(readlink -f /usr/local/bin/grok)" \
+    && cp --remove-destination "$real" /usr/local/bin/grok \
+    && chmod 0755 /usr/local/bin/grok \
+    && ln -sf /usr/local/bin/grok /usr/local/bin/agent
 
 RUN pip install --no-cache-dir \
     /build/packages/grok-build-client
@@ -53,6 +60,9 @@ RUN adduser --disabled-password --gecos "" agentuser \
     && chown -R agentuser /agent
 
 USER agentuser
+
+# The user that runs miragen must be able to run grok (checked at build time).
+RUN grok --version
 
 # Workspace (agent.yaml + tools.py) is mounted at runtime — nothing baked in.
 # Set AGENT_PROFILE to a path relative to /agent, e.g. agent.yaml (default).
