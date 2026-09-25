@@ -2310,6 +2310,48 @@ async def resolve_profile(request: ResolveRequest):
     return body
 
 
+class TurnRequest(BaseModel):
+    """One turn in a conversation instance (base tier)."""
+
+    prompt: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    provenance: RunProvenance | None = None
+
+
+@app.post("/instances/{name}/turns", status_code=202, dependencies=[_internal_auth])
+async def start_turn(name: str, request: TurnRequest, response: Response):
+    """Start a turn in a conversation instance, with its history.
+
+    The base tier's name for what /executor-runs does for it: the same
+    durable, idempotent acceptance (a retried idempotency_key returns the
+    original turn with 200 and duplicate: true), the same admission, and the
+    turn's record is readable at GET /instances/{name}/turns/{turn_id} (or
+    /runs/{turn_id}). A turn is asynchronous: it can take minutes (tools,
+    approvals), so this answers at once with the turn's id."""
+    _check_instance_name(name)
+    if _executor is not None:
+        raise HTTPException(status_code=409, detail="an executor-tier agent has no "
+                            "conversation instances; use /executor-runs")
+    result = await launch_executor_run(
+        ExecutorLaunchRequest(prompt=request.prompt, idempotency_key=request.idempotency_key,
+                              provenance=request.provenance, instance=name, use_history=True),
+        response)
+    return {"turn_id": result["run_id"], "instance": name,
+            **{k: v for k, v in result.items() if k in ("status", "duplicate")}}
+
+
+@app.get("/instances/{name}/turns/{turn_id}", response_model=RunRecord, dependencies=[_internal_auth])
+async def get_turn(name: str, turn_id: str):
+    """A turn's record (status, output, tool calls, usage), if it belongs to
+    this instance."""
+    _check_instance_name(name)
+    record = await get_run(turn_id)
+    instance = record.get("instance") if isinstance(record, dict) else getattr(record, "instance", None)
+    if instance != name:
+        raise HTTPException(status_code=404, detail=f"no turn {turn_id} in instance '{name}'")
+    return record
+
+
 @app.post("/executor-runs", status_code=202, dependencies=[_internal_auth])
 async def launch_executor_run(request: ExecutorLaunchRequest, response: Response):
     """Idempotent, provenance-carrying executor launch.

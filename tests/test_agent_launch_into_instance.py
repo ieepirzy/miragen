@@ -102,3 +102,23 @@ def test_missing_instructions_file_fails_loudly(tmp_path):
         "spec:\n  model: test\n  instructions_file: nope.md\n")
     with pytest.raises(ValueError, match="not readable"):
         load_profile(tmp_path / "agent.yaml")
+
+
+async def test_turns_endpoint_is_the_base_tier_name_for_instance_launches(client):
+    c, agent = client
+    body = {"prompt": "p", "idempotency_key": "t1"}
+    r = await c.post("/instances/tg-111/turns", json=body)
+    assert r.status_code == 202, r.text
+    turn_id = r.json()["turn_id"]
+    assert r.json()["instance"] == "tg-111"
+    rec = await _wait(c, turn_id)
+    assert rec["status"] == "succeeded" and rec["instance"] == "tg-111" and rec["use_history"] is True
+    # the same record under the turn's own path, only in its instance
+    assert (await c.get(f"/instances/tg-111/turns/{turn_id}")).json()["run_id"] == turn_id
+    assert (await c.get(f"/instances/other/turns/{turn_id}")).status_code == 404
+    # a retried key is the same turn, not a second one
+    dup = await c.post("/instances/tg-111/turns", json=body)
+    assert dup.status_code == 200 and dup.json()["duplicate"] is True
+    assert dup.json()["turn_id"] == turn_id and agent.run.await_count == 1
+    assert (await c.post("/instances/NOT..VALID/turns", json={"prompt": "p",
+                                                               "idempotency_key": "t2"})).status_code == 422
