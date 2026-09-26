@@ -408,6 +408,41 @@ class ToolGateway:
             ] + list(result.content)})
         return self._record(log, name, arguments, ok=not result.isError, result=result)
 
+    async def read_tool(self, name: str, arguments: dict) -> types.CallToolResult:
+        """Call a read-only upstream tool outside any turn (the host's inbox
+        watchers, miragen/watch.py). Same upstream, credential and allowed_tools
+        as the model's call, but narrower: only upstream MCP tools the server
+        annotates readOnlyHint, never one approval_required gates, and never
+        recorded as a turn. Raises PermissionError for anything else."""
+        try:
+            kind, target, raw = self._resolve(name)
+        except KeyError:
+            raise PermissionError(f"unknown tool '{name}'") from None
+        if kind != "upstream":
+            raise PermissionError(f"'{name}' is not an upstream MCP tool")
+        if approval_gated(self.profile, name, raw, args=arguments):
+            raise PermissionError(f"'{name}' needs approval; it can't be watched")
+        listed = {t.name: t for t in await self._upstream_tools(target)}
+        tool = listed.get(raw)
+        if tool is None:
+            raise PermissionError(f"unknown tool '{name}'")
+        hints = getattr(tool, "annotations", None)
+        if not getattr(hints, "readOnlyHint", False):
+            raise PermissionError(f"'{name}' is not annotated read-only by its server")
+        token = _CURRENT.set((None, None))
+        try:
+            try:
+                async with self._session(target) as session:
+                    return await session.call_tool(raw, arguments)
+            except Exception:
+                if target.auth is None:
+                    raise
+                target.auth.invalidate()
+                async with self._session(target) as session:
+                    return await session.call_tool(raw, arguments)
+        finally:
+            _CURRENT.reset(token)
+
     def _record(self, log: TurnLog, name: str, arguments: dict, *, ok: bool,
                 result: types.CallToolResult) -> types.CallToolResult:
         log.calls.append(ToolCallRecord(

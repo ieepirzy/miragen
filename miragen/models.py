@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Annotated, Literal, Optional, Union
+from typing import Annotated, Any, Literal, Optional, Union
 
 from apscheduler.triggers.cron import CronTrigger as _APCronTrigger
 
@@ -1156,6 +1156,31 @@ class ExecutorSpec(_ProfileModel):
 
 # ── Top-level agent profile ──────────────────────────────────────────────────
 
+class WatchSource(BaseModel):
+    """One source the host polls outside turns, for the agent's inbox
+    (miragen/watch.py): a read-only gateway tool called with fixed arguments,
+    whose result is diffed against the previous poll."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(description="Source name shown in the inbox, e.g. 'email'.")
+    tool: str = Field(description=(
+        "Gateway tool name ('<capability>_<tool>', e.g. 'home_search_emails'). Must be an "
+        "upstream MCP tool annotated readOnlyHint and not matched by approval_required. "
+        "Call it as widely as the agent itself would, or the inbox can miss what the "
+        "tool shows."))
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    every_s: float = Field(default=300.0, ge=30.0, description="Poll interval (seconds).")
+    items: Optional[str] = Field(default=None, description=(
+        "Dotted path to the list of items in the tool's JSON result; omitted = the result "
+        "itself is the list."))
+    id: Optional[str] = Field(default=None, description=(
+        "Dotted path to a stable id inside an item. With it, an edited item is 'changed'; "
+        "without it, items are identified by their whole content (an edit reads as new)."))
+    show: list[str] = Field(default_factory=list, description=(
+        "Dotted paths shown for an entry (e.g. sender, subject); omitted = the item, cut short."))
+
+
 class AgentProfile(_ProfileModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
@@ -1181,6 +1206,10 @@ class AgentProfile(_ProfileModel):
     )
     mode: Literal["autonomous", "interactive", "hybrid"]
     triggers: list[Trigger] = Field(min_length=1)
+    watch: list[WatchSource] = Field(default_factory=list, description=(
+        "Sources the host polls between turns (read-only gateway tools) to keep an inbox of "
+        "what is new or changed; served at GET /inbox and acknowledged with POST /inbox/ack. "
+        "Lets a background check wake the model only when something changed."))
     approval_required: Optional[list[str]] = Field(
         default=None,
         description=(
