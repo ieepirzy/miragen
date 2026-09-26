@@ -46,6 +46,8 @@ logger = logging.getLogger("miragen.watch")
 
 SEEN_RETENTION_S = 14 * 24 * 3600
 MAX_ENTRIES_PER_SOURCE = 100
+# One hung upstream call must not stall every source (polls run in turn).
+POLL_TIMEOUT_S = 90.0
 _SUMMARY_CHARS = 400
 
 ReadTool = Callable[[str, dict], Awaitable[Any]]
@@ -136,7 +138,9 @@ class Inbox:
         now = self.clock()
         src["polled_at"] = now
         try:
-            items = _dig(payload_of(await self.read_tool(spec.tool, dict(spec.arguments))), spec.items)
+            raw = await asyncio.wait_for(self.read_tool(spec.tool, dict(spec.arguments)),
+                                         timeout=POLL_TIMEOUT_S)
+            items = _dig(payload_of(raw), spec.items)
             if isinstance(items, dict) and items.get("ok") is False:
                 raise WatchError(f"tool reported failure: {str(items.get('error'))[:300]}")
             if not isinstance(items, list):
@@ -148,7 +152,9 @@ class Inbox:
             self.changed.set()
             return 0
 
-        baseline = src["status"] == "never" and not src["seen"]
+        # The first *successful* poll is the baseline (a failed first poll must
+        # not make the whole window "new" on the next success).
+        baseline = src.get("last_ok_at") is None
         seen: dict[str, list] = src["seen"]
         current: list[tuple[str, str, Any]] = []
         for item in items:
@@ -215,8 +221,9 @@ class Inbox:
         return {
             "enabled": bool(self.sources),
             "seq": self.state["seq"],
-            "sources": {name: {k: src.get(k) for k in ("status", "polled_at", "last_ok_at",
-                                                       "last_error", "overflow")}
+            "sources": {name: {**{k: src.get(k) for k in ("status", "polled_at", "last_ok_at",
+                                                          "last_error", "overflow")},
+                               "every_s": self.sources[name].every_s}
                         for name, src in self.state["sources"].items() if name in self.sources},
             "entries": list(self.state["entries"]),
         }

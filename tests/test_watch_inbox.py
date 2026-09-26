@@ -233,3 +233,29 @@ async def test_inbox_over_the_real_gateway_path(tmp_path):
     inbox = Inbox(gw.profile.watch, gw.read_tool, tmp_path / "inbox.json")
     await inbox.poll("email")
     assert inbox.view()["sources"]["email"]["status"] == "ok"
+
+
+async def test_a_hung_upstream_times_out_into_status_error(tmp_path, monkeypatch):
+    import asyncio
+
+    import miragen.watch as watch
+    monkeypatch.setattr(watch, "POLL_TIMEOUT_S", 0.05)
+
+    async def hangs(name, args):
+        await asyncio.sleep(10)
+    inbox = Inbox([WatchSource(name="email", tool="home_search_emails", items="results",
+                               id="locator")], hangs, tmp_path / "inbox.json")
+    await inbox.poll("email")
+    src = inbox.view()["sources"]["email"]
+    assert src["status"] == "error" and "Timeout" in src["last_error"]
+    assert src["every_s"] == 300.0
+
+
+async def test_a_failed_first_poll_does_not_make_the_next_success_all_new(tmp_path):
+    inbox, tool, _ = make(tmp_path, RuntimeError("OAuth not ready"))
+    await inbox.poll("email")
+    assert inbox.view()["sources"]["email"]["status"] == "error"
+    tool.result = mails(("a", "x", "1"), ("b", "y", "2"))
+    assert await inbox.poll("email") == 0        # this is the baseline
+    tool.result = mails(("c", "z", "3"), ("a", "x", "1"), ("b", "y", "2"))
+    assert await inbox.poll("email") == 1
