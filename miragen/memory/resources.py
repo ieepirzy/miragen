@@ -182,7 +182,7 @@ def inspect_resources(checkout: str | Path, locators: list[dict]) -> list[dict]:
             or ("python_symbol" if locator.get("symbol") else "python_file"),
             "repository": locator.get("repository")
             or (before or {}).get("repository", f"path:{root}"),
-            "path": locator["path"],
+            "path": locator.get("path"),
             "symbol": locator.get("symbol"),
         }
         row = {
@@ -194,6 +194,11 @@ def inspect_resources(checkout: str | Path, locators: list[dict]) -> list[dict]:
             "verifier": VERIFIER,
             "limitations": "Exact source bytes only; no runtime or semantic assertion verification.",
         }
+        if resource["path"] is None:
+            row["snapshot"] = None
+            row["limitations"] += " Locator is missing a required 'path'."
+            observations.append(row)
+            continue
         if failure or resource["repository"] != (before or {}).get("repository"):
             row["snapshot"] = None
             row["limitations"] += " " + (failure or "Repository identity mismatch.")

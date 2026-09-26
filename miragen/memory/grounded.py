@@ -29,8 +29,8 @@ async def recall(
     query: str = "",
     inspect: bool = False,
 ):
-    resources = await asyncio.to_thread(inspect_resources, checkout, locators)
     if inspect:
+        resources = await asyncio.to_thread(inspect_resources, checkout, locators)
         found = await lifecycle.client.lookup_resources(
             {
                 "scope_ids": lifecycle.spec.scopes.read,
@@ -65,6 +65,7 @@ async def recall(
             "permission_to_act": False,
             "resources": resources,
         }
+    resources = list(locators)
     packet = MemoryPacket(text="")
 
     async def refresh():
@@ -132,7 +133,7 @@ async def check(lifecycle, checkout: str, locators: list[dict], *, limit: int = 
     return {
         "receipts": receipts,
         "omitted": omitted,
-        "truncated": bool(omitted) or found["truncated"],
+        "truncated": bool(omitted) or found.get("truncated", False),
     }
 
 
@@ -169,7 +170,13 @@ async def remember(
     if observation["outcome"] != "present":
         return {"status": "unverified", "observation": observation}
     data = await asyncio.to_thread(_read, Path(checkout).resolve(), locator["path"])
-    source = _symbols(data)[locator["symbol"]][0] if locator.get("symbol") else data
+    if locator.get("symbol"):
+        matches = _symbols(data).get(locator["symbol"])
+        if not matches:
+            return {"status": "unverified", "detail": "source changed before capture"}
+        source = matches[0]
+    else:
+        source = data
     if digest(source) != observation["content_digest"]:
         return {"status": "unverified", "detail": "source changed before capture"}
     client = lifecycle.client

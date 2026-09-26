@@ -298,7 +298,10 @@ class MemoryLifecycle:
             return "ok" if result.text else "omitted" if packet.rendering["omitted"] else "none_selected"
         except (MemoryUnavailable, MemoryAPIError) as exc:
             self._degrade(f"optional recall: {exc}")
-            packet.text += "\n[optional recall degraded — memories may exist that could not be searched]"
+            packet.text += (
+                "\n[optional recall degraded — memories may exist that could "
+                "not be searched; do not conclude the store is empty]"
+            )
             return f"degraded: {exc}"
         except Exception as exc:
             self._degrade(f"relevance selection: {exc}")
