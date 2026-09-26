@@ -11,7 +11,7 @@ import shutil
 import uuid
 from types import SimpleNamespace
 from collections.abc import Callable
-from contextlib import asynccontextmanager, contextmanager, nullcontext
+from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -118,6 +118,9 @@ _bridge_memory = None
 # The tool gateway a non-PydanticAI harness acts through (served at
 # /mcp/gateway with its own per-instance credentials).
 _gateway = None
+# The inbox (profile `watch`): host-side polling of read-only tools, served
+# at /inbox. None when the profile watches nothing or has no gateway.
+_inbox = None
 # voice.instructions_file contents: renderer guidance appended to the
 # system instructions (base tier, every harness).
 _speak_guidance: str | None = None
@@ -1275,7 +1278,7 @@ def _load_file_secrets() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _profile, _agent, _limits, _harness, _gateway, _bridge_memory, _speak_guidance, _run_store, _executor, _schedule_store, \
+    global _profile, _agent, _limits, _harness, _gateway, _inbox, _bridge_memory, _speak_guidance, _run_store, _executor, _schedule_store, \
         _publication_store, _telemetry, _voice, _memory, _scheduling
 
     _load_file_secrets()
@@ -1350,6 +1353,10 @@ async def lifespan(app: FastAPI):
             session_key_for=_bridge_memory.session_key if _bridge_memory is not None else None,
         )
         _gateway_mount.inner = _gateway.asgi
+        if _profile.watch:
+            from miragen.watch import Inbox
+            _inbox = Inbox(_profile.watch, _gateway.read_tool, _run_store.root / "inbox.json")
+            logger.info("Inbox watching %s", ", ".join(s.name for s in _profile.watch))
         if _bridge_memory is not None and hasattr(_harness, "session_info"):
             # Rotated sessions are separate plane sessions; compactions and
             # rotations reach the plane as compacting / closed.
@@ -1436,7 +1443,16 @@ async def lifespan(app: FastAPI):
         ):
             _scheduler.start()
             logger.info("Scheduler started")
-            yield
+            inbox_stop = asyncio.Event()
+            inbox_task = (asyncio.create_task(_inbox.run(inbox_stop), name="inbox")
+                          if _inbox is not None else None)
+            try:
+                yield
+            finally:
+                inbox_stop.set()
+                if inbox_task is not None:
+                    with suppress(Exception):
+                        await asyncio.wait_for(inbox_task, timeout=10)
     finally:
         _ask_human_guard.inner = _mcp_not_ready
         _voice_mcp_guard.inner = _mcp_not_ready
@@ -1452,6 +1468,7 @@ async def lifespan(app: FastAPI):
         _harness = None
     _gateway_mount.inner = _mcp_not_ready
     _gateway = None
+    _inbox = None
 
     if _telemetry is not None:
         _telemetry.shutdown()
@@ -2852,6 +2869,27 @@ class ApprovalListResponse(BaseModel):
 
 class ResolveApprovalResponse(BaseModel):
     resolved: bool
+
+
+class InboxAckRequest(BaseModel):
+    through: int = Field(ge=0, description="Acknowledge entries with seq <= this.")
+
+
+@app.get("/inbox", dependencies=[_internal_auth])
+async def get_inbox():
+    """What is new or changed in the profile's watched sources (miragen/watch.py).
+    A source whose status isn't 'ok', or with overflow set, may hold more than
+    its entries show: treat it as 'look', never as 'nothing new'."""
+    if _inbox is None:
+        return {"enabled": False, "seq": 0, "sources": {}, "entries": []}
+    return _inbox.view()
+
+
+@app.post("/inbox/ack", dependencies=[_internal_auth])
+async def ack_inbox(body: InboxAckRequest):
+    if _inbox is None:
+        return {"acked": 0}
+    return {"acked": _inbox.ack(body.through)}
 
 
 @app.get("/approvals", response_model=ApprovalListResponse, dependencies=[_internal_auth])
