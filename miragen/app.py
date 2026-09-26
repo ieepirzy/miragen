@@ -29,6 +29,7 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
 
+from miragen import access_log
 from miragen import events as run_events
 from miragen.broker import PendingApproval, get_broker
 from miragen.edf import (
@@ -1461,6 +1462,9 @@ async def lifespan(app: FastAPI):
 # ── App ────────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(lifespan=lifespan)
+
+# Routine health / approval / run polling stays out of the access log.
+access_log.install()
 
 
 # ── ask_human MCP mount ──────────────────────────────────────────────────────
