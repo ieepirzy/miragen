@@ -424,7 +424,9 @@ class ToolGateway:
             raise PermissionError(f"'{name}' needs approval; it can't be watched")
         listed = {t.name: t for t in await self._upstream_tools(target)}
         tool = listed.get(raw)
-        hints = getattr(tool, "annotations", None) if tool is not None else None
+        if tool is None:
+            raise PermissionError(f"unknown tool '{name}'")
+        hints = getattr(tool, "annotations", None)
         if not getattr(hints, "readOnlyHint", False):
             raise PermissionError(f"'{name}' is not annotated read-only by its server")
         token = _CURRENT.set((None, None))
