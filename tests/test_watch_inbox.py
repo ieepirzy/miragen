@@ -283,3 +283,14 @@ async def test_a_compare_path_missing_everywhere_is_an_error(tmp_path):
     await inbox.poll("email")
     src = inbox.view()["sources"]["email"]
     assert src["status"] == "error" and "statsu" in src["last_error"]
+
+
+async def test_changing_a_sources_definition_rebaselines_instead_of_flooding(tmp_path):
+    rows = [{"id": i, "status": "reserved", "updated_at": "t1"} for i in range(5)]
+    inbox, tool, clock = make(tmp_path, rows, items=None, id="id", show=[])
+    await inbox.poll("email")
+    spec = inbox.sources["email"].model_copy(update={"compare": ["status"]})
+    again = Inbox([spec], tool, tmp_path / "inbox.json", clock=clock)
+    assert await again.poll("email") == 0         # same data, new hashing: no entries
+    tool.result = [{**r, "status": "confirmed"} if r["id"] == 3 else r for r in rows]
+    assert await again.poll("email") == 1

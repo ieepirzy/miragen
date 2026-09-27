@@ -153,8 +153,12 @@ class Inbox:
             return 0
 
         # The first *successful* poll is the baseline (a failed first poll must
-        # not make the whole window "new" on the next success).
-        baseline = src.get("last_ok_at") is None
+        # not make the whole window "new" on the next success), and so is the
+        # first poll after the source's definition changed (a new `compare`
+        # hashes every item differently: that isn't a change in the data).
+        definition = _digest(spec.model_dump(include={"tool", "arguments", "items", "id",
+                                                      "compare"}))
+        baseline = src.get("last_ok_at") is None or src.get("definition") != definition
         seen: dict[str, list] = src["seen"]
         missing = [p for p in spec.compare if items and all(_dig(i, p) is None for i in items)]
         if missing:  # a typo here would silently hide every edit: fail open
@@ -186,6 +190,7 @@ class Inbox:
         cutoff = now - SEEN_RETENTION_S
         src["seen"] = {k: v for k, v in seen.items() if v[1] >= cutoff}
         src["status"], src["last_ok_at"], src["last_error"] = "ok", now, None
+        src["definition"] = definition
         self._save()
         if added:
             logger.info("inbox: %s has %d new or changed item(s)", name, added)
