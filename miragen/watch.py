@@ -158,7 +158,12 @@ class Inbox:
         # hashes every item differently: that isn't a change in the data).
         definition = _digest(spec.model_dump(include={"tool", "arguments", "items", "id",
                                                       "compare"}))
-        baseline = src.get("last_ok_at") is None or src.get("definition") != definition
+        baseline = src.get("last_ok_at") is None
+        # Re-hashing known items only: new ones are still reported (never a
+        # false negative), edits to known ones aren't. State from before
+        # definitions were recorded hashed whole items, i.e. an empty compare.
+        previous = src.get("definition") or (None if spec.compare else definition)
+        rehash = not baseline and previous != definition
         seen: dict[str, list] = src["seen"]
         missing = [p for p in spec.compare if items and all(_dig(i, p) is None for i in items)]
         if missing:  # a typo here would silently hide every edit: fail open
@@ -183,7 +188,9 @@ class Inbox:
             src["overflow"] = True
         for key, digest, item in current:
             before = seen.get(key)
-            if not baseline and (before is None or before[0] != digest):
+            if baseline or (rehash and before is not None):
+                pass
+            elif before is None or before[0] != digest:
                 self._add_entry(name, "new" if before is None else "changed", key, spec, item, now)
                 added += 1
             seen[key] = [digest, now]

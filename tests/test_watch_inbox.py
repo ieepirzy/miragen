@@ -294,3 +294,25 @@ async def test_changing_a_sources_definition_rebaselines_instead_of_flooding(tmp
     assert await again.poll("email") == 0         # same data, new hashing: no entries
     tool.result = [{**r, "status": "confirmed"} if r["id"] == 3 else r for r in rows]
     assert await again.poll("email") == 1
+
+
+async def test_a_rebaseline_still_reports_items_that_are_really_new(tmp_path):
+    rows = [{"id": 1, "status": "reserved", "updated_at": "t1"}]
+    inbox, tool, clock = make(tmp_path, rows, items=None, id="id", show=[])
+    await inbox.poll("email")
+    spec = inbox.sources["email"].model_copy(update={"compare": ["status"]})
+    again = Inbox([spec], tool, tmp_path / "inbox.json", clock=clock)
+    tool.result = rows + [{"id": 2, "status": "reserved", "updated_at": "t9"}]  # arrived meanwhile
+    assert await again.poll("email") == 1
+    assert again.view()["entries"][-1]["key"] == "id:2"
+
+
+async def test_state_from_before_definitions_is_not_rebaselined(tmp_path):
+    """Upgrading miragen must not swallow an edit on the first poll after it."""
+    inbox, tool, clock = make(tmp_path, mails(("a", "x", "v1")))
+    await inbox.poll("email")
+    inbox.state["sources"]["email"].pop("definition")        # state written by #164/#165
+    inbox._save()
+    again = Inbox(list(inbox.sources.values()), tool, tmp_path / "inbox.json", clock=clock)
+    tool.result = mails(("a", "x", "v2"))
+    assert await again.poll("email") == 1
