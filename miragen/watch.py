@@ -153,12 +153,29 @@ class Inbox:
             return 0
 
         # The first *successful* poll is the baseline (a failed first poll must
-        # not make the whole window "new" on the next success).
+        # not make the whole window "new" on the next success), and so is the
+        # first poll after the source's definition changed (a new `compare`
+        # hashes every item differently: that isn't a change in the data).
+        definition = _digest(spec.model_dump(include={"tool", "arguments", "items", "id",
+                                                      "compare"}))
         baseline = src.get("last_ok_at") is None
+        # Re-hashing known items only: new ones are still reported (never a
+        # false negative), edits to known ones aren't. State from before
+        # definitions were recorded hashed whole items, i.e. an empty compare.
+        previous = src.get("definition") or (None if spec.compare else definition)
+        rehash = not baseline and previous != definition
         seen: dict[str, list] = src["seen"]
+        missing = [p for p in spec.compare if items and all(_dig(i, p) is None for i in items)]
+        if missing:  # a typo here would silently hide every edit: fail open
+            src["status"] = "error"
+            src["last_error"] = f"compare path(s) {missing} missing from every item"
+            logger.warning("inbox: %s: %s", name, src["last_error"])
+            self._save()
+            self.changed.set()
+            return 0
         current: list[tuple[str, str, Any]] = []
         for item in items:
-            digest = _digest(item)
+            digest = _digest({p: _dig(item, p) for p in spec.compare} if spec.compare else item)
             ident = _dig(item, spec.id) if spec.id else None
             key = f"id:{ident}" if ident not in (None, "") else f"h:{digest}"
             current.append((key, digest, item))
@@ -171,13 +188,16 @@ class Inbox:
             src["overflow"] = True
         for key, digest, item in current:
             before = seen.get(key)
-            if not baseline and (before is None or before[0] != digest):
+            if baseline or (rehash and before is not None):
+                pass
+            elif before is None or before[0] != digest:
                 self._add_entry(name, "new" if before is None else "changed", key, spec, item, now)
                 added += 1
             seen[key] = [digest, now]
         cutoff = now - SEEN_RETENTION_S
         src["seen"] = {k: v for k, v in seen.items() if v[1] >= cutoff}
         src["status"], src["last_ok_at"], src["last_error"] = "ok", now, None
+        src["definition"] = definition
         self._save()
         if added:
             logger.info("inbox: %s has %d new or changed item(s)", name, added)

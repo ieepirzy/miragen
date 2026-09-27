@@ -259,3 +259,60 @@ async def test_a_failed_first_poll_does_not_make_the_next_success_all_new(tmp_pa
     assert await inbox.poll("email") == 0        # this is the baseline
     tool.result = mails(("c", "z", "3"), ("a", "x", "1"), ("b", "y", "2"))
     assert await inbox.poll("email") == 1
+
+
+async def test_compare_ignores_fields_background_jobs_touch(tmp_path):
+    def rows(status, updated):
+        return [{"id": 7, "status": status, "move_date": "2026-09-28", "updated_at": updated}]
+    inbox, tool, _ = make(tmp_path, rows("reserved", "t1"), name="email", items=None, id="id",
+                          show=["status"], compare=["status", "move_date"])
+    await inbox.poll("email")
+    tool.result = rows("reserved", "t2")               # only updated_at moved
+    assert await inbox.poll("email") == 0
+    tool.result = rows("confirmed", "t3")              # a real change
+    assert await inbox.poll("email") == 1
+    assert inbox.view()["entries"][-1]["kind"] == "changed"
+    tool.result = rows("confirmed", "t3") + [{"id": 8, "status": "reserved", "move_date": "x",
+                                              "updated_at": "t4"}]
+    assert await inbox.poll("email") == 1               # a new booking is new by id
+
+
+async def test_a_compare_path_missing_everywhere_is_an_error(tmp_path):
+    inbox, _tool, _ = make(tmp_path, [{"id": 1, "status": "x"}], items=None, id="id",
+                           compare=["statsu"])          # typo
+    await inbox.poll("email")
+    src = inbox.view()["sources"]["email"]
+    assert src["status"] == "error" and "statsu" in src["last_error"]
+
+
+async def test_changing_a_sources_definition_rebaselines_instead_of_flooding(tmp_path):
+    rows = [{"id": i, "status": "reserved", "updated_at": "t1"} for i in range(5)]
+    inbox, tool, clock = make(tmp_path, rows, items=None, id="id", show=[])
+    await inbox.poll("email")
+    spec = inbox.sources["email"].model_copy(update={"compare": ["status"]})
+    again = Inbox([spec], tool, tmp_path / "inbox.json", clock=clock)
+    assert await again.poll("email") == 0         # same data, new hashing: no entries
+    tool.result = [{**r, "status": "confirmed"} if r["id"] == 3 else r for r in rows]
+    assert await again.poll("email") == 1
+
+
+async def test_a_rebaseline_still_reports_items_that_are_really_new(tmp_path):
+    rows = [{"id": 1, "status": "reserved", "updated_at": "t1"}]
+    inbox, tool, clock = make(tmp_path, rows, items=None, id="id", show=[])
+    await inbox.poll("email")
+    spec = inbox.sources["email"].model_copy(update={"compare": ["status"]})
+    again = Inbox([spec], tool, tmp_path / "inbox.json", clock=clock)
+    tool.result = rows + [{"id": 2, "status": "reserved", "updated_at": "t9"}]  # arrived meanwhile
+    assert await again.poll("email") == 1
+    assert again.view()["entries"][-1]["key"] == "id:2"
+
+
+async def test_state_from_before_definitions_is_not_rebaselined(tmp_path):
+    """Upgrading miragen must not swallow an edit on the first poll after it."""
+    inbox, tool, clock = make(tmp_path, mails(("a", "x", "v1")))
+    await inbox.poll("email")
+    inbox.state["sources"]["email"].pop("definition")        # state written by #164/#165
+    inbox._save()
+    again = Inbox(list(inbox.sources.values()), tool, tmp_path / "inbox.json", clock=clock)
+    tool.result = mails(("a", "x", "v2"))
+    assert await again.poll("email") == 1
