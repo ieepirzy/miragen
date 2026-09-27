@@ -156,9 +156,17 @@ class Inbox:
         # not make the whole window "new" on the next success).
         baseline = src.get("last_ok_at") is None
         seen: dict[str, list] = src["seen"]
+        missing = [p for p in spec.compare if items and all(_dig(i, p) is None for i in items)]
+        if missing:  # a typo here would silently hide every edit: fail open
+            src["status"] = "error"
+            src["last_error"] = f"compare path(s) {missing} missing from every item"
+            logger.warning("inbox: %s: %s", name, src["last_error"])
+            self._save()
+            self.changed.set()
+            return 0
         current: list[tuple[str, str, Any]] = []
         for item in items:
-            digest = _digest(item)
+            digest = _digest({p: _dig(item, p) for p in spec.compare} if spec.compare else item)
             ident = _dig(item, spec.id) if spec.id else None
             key = f"id:{ident}" if ident not in (None, "") else f"h:{digest}"
             current.append((key, digest, item))

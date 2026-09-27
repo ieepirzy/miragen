@@ -259,3 +259,27 @@ async def test_a_failed_first_poll_does_not_make_the_next_success_all_new(tmp_pa
     assert await inbox.poll("email") == 0        # this is the baseline
     tool.result = mails(("c", "z", "3"), ("a", "x", "1"), ("b", "y", "2"))
     assert await inbox.poll("email") == 1
+
+
+async def test_compare_ignores_fields_background_jobs_touch(tmp_path):
+    def rows(status, updated):
+        return [{"id": 7, "status": status, "move_date": "2026-09-28", "updated_at": updated}]
+    inbox, tool, _ = make(tmp_path, rows("reserved", "t1"), name="email", items=None, id="id",
+                          show=["status"], compare=["status", "move_date"])
+    await inbox.poll("email")
+    tool.result = rows("reserved", "t2")               # only updated_at moved
+    assert await inbox.poll("email") == 0
+    tool.result = rows("confirmed", "t3")              # a real change
+    assert await inbox.poll("email") == 1
+    assert inbox.view()["entries"][-1]["kind"] == "changed"
+    tool.result = rows("confirmed", "t3") + [{"id": 8, "status": "reserved", "move_date": "x",
+                                              "updated_at": "t4"}]
+    assert await inbox.poll("email") == 1               # a new booking is new by id
+
+
+async def test_a_compare_path_missing_everywhere_is_an_error(tmp_path):
+    inbox, _tool, _ = make(tmp_path, [{"id": 1, "status": "x"}], items=None, id="id",
+                           compare=["statsu"])          # typo
+    await inbox.poll("email")
+    src = inbox.view()["sources"]["email"]
+    assert src["status"] == "error" and "statsu" in src["last_error"]

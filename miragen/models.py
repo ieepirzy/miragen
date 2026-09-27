@@ -1179,6 +1179,10 @@ class WatchSource(BaseModel):
         "without it, items are identified by their whole content (an edit reads as new)."))
     show: list[str] = Field(default_factory=list, description=(
         "Dotted paths shown for an entry (e.g. sender, subject); omitted = the item, cut short."))
+    compare: list[str] = Field(default_factory=list, description=(
+        "Dotted paths that make an item 'changed' (e.g. status, date). Omitted = the whole "
+        "item, so any field a background job touches (updated_at…) counts. A new item is "
+        "found by its id either way. A path missing from every item is a poll error."))
 
 
 class AgentProfile(_ProfileModel):
