@@ -9,7 +9,8 @@ itself goes through this interface.
 
 Selection is by model prefix, mirroring the ``claude-code:<model>`` selector
 convention: ``spec.model: grok-build:grok-4.6`` picks the Grok Build
-harness; any other string is a pydantic-ai model string.
+harness, ``claude-code:sonnet`` the Claude Code harness; any other string is
+a pydantic-ai model string.
 
 (The executor tier is a different thing: one-off worker jobs with a
 workspace, diff harvest and resumable threads. It does not go through here.)
@@ -17,6 +18,7 @@ workspace, diff harvest and resumable threads. It does not go through here.)
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
@@ -29,6 +31,7 @@ PYDANTIC_AI = "pydantic-ai"
 # id (may be empty: "use the harness default").
 HARNESS_PREFIXES: dict[str, str] = {
     "grok-build:": "grok-build",
+    "claude-code:": "claude-code",
 }
 
 
@@ -71,6 +74,37 @@ class HarnessStream(Protocol):
 
     @property
     def result(self) -> HarnessResult: ...
+
+
+class TaskStream:
+    """A HarnessStream over a turn task that pushes text as it arrives."""
+
+    def __init__(self):
+        self._queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self._task: asyncio.Task | None = None
+        self._result: HarnessResult | None = None
+
+    def attach(self, task: asyncio.Task) -> None:
+        self._task = task
+        task.add_done_callback(lambda _t: self._queue.put_nowait(None))
+
+    def push(self, text: str) -> None:
+        self._queue.put_nowait(text)
+
+    async def __aiter__(self):
+        while True:
+            item = await self._queue.get()
+            if item is None:
+                break
+            yield item
+        assert self._task is not None
+        self._result = await self._task  # re-raises a failed turn
+
+    @property
+    def result(self) -> HarnessResult:
+        if self._result is None:
+            raise RuntimeError("stream not finished")
+        return self._result
 
 
 class InstanceBusyError(RuntimeError):

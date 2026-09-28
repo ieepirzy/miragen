@@ -53,15 +53,24 @@ def build_model_harness(
     """A long-lived non-PydanticAI harness for this profile, plus the tool
     gateway it acts through: (harness, gateway)."""
     name = profile_harness(profile)
-    if name == "grok-build":
-        from miragen.harness.gateway import ToolGateway
-        from miragen.harness.grok import GrokHarness, GrokSettings
+    if name not in ("grok-build", "claude-code"):
+        raise ValueError(f"harness '{name}' is not available in this build")
+    from miragen.harness.gateway import ToolGateway
+    from miragen.harness.served import ServedLedger
 
-        gateway = ToolGateway(profile, runtime_tools=runtime_tools,
-                              registered_tools=registered_tools, bind_context=bind_context,
-                              native_capabilities=GrokHarness.native_capabilities,
-                              session_key_for=session_key_for)
-        url = gateway_url or f"http://127.0.0.1:{os.environ.get('PORT', '8000')}/mcp/gateway/"
-        return GrokHarness(profile, gateway, GrokSettings.from_env(gateway_url=url),
-                           system_guidance=system_guidance), gateway
-    raise ValueError(f"harness '{name}' is not available in this build")
+    if name == "grok-build":
+        from miragen.harness.grok import GrokHarness as cls, GrokSettings as settings_cls
+    else:
+        from miragen.harness.claude_code import (
+            ClaudeCodeHarness as cls, ClaudeCodeSettings as settings_cls,
+        )
+    gateway = ToolGateway(profile, runtime_tools=runtime_tools,
+                          registered_tools=registered_tools, bind_context=bind_context,
+                          native_capabilities=cls.native_capabilities,
+                          session_key_for=session_key_for)
+    url = gateway_url or f"http://127.0.0.1:{os.environ.get('PORT', '8000')}/mcp/gateway/"
+    # Which harness last served each instance, shared by all of them, so a
+    # swap of spec.model shows up as `fresh` (miragen/harness/served.py).
+    served = ServedLedger(runs_root / "harness" / "served.json")
+    return cls(profile, gateway, settings_cls.from_env(gateway_url=url),
+               system_guidance=system_guidance, served=served), gateway
