@@ -322,11 +322,9 @@ async def test_context_is_the_last_calls_prompt_and_compaction_knobs_reach_the_c
         yield result(client.session_id)  # usage summed over both calls: not the context
 
     env.script = script
-    h = env.harness(auto_compact_window=100000, auto_compact_pct=50)
+    h = env.harness(auto_compact_window=100000)
     await h.run(turn("hi"))
     assert h.session_info("chat")["context_tokens"] == 1239
     o = FakeClient.instances[0].options
     assert o.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "100000"
-    assert o.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "50"
-    keep = o.env["MIRAGEN_ENV_KEEP"].split()
-    assert {"CLAUDE_CODE_AUTO_COMPACT_WINDOW", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"} <= set(keep)
+    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" in o.env["MIRAGEN_ENV_KEEP"].split()

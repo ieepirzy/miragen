@@ -88,12 +88,12 @@ class ClaudeCodeSettings:
     turn_timeout_s: float = 600.0
     effort: str | None = None
     # Claude Code's own auto-compaction (there is no miragen policy here):
-    # the window it compacts against (Claude Code's floor is 100k) and a
-    # percentage that lowers the threshold further. None leaves its default,
-    # which compacts near the model's full window: every heartbeat and tool
-    # step re-sends the whole session, so a persistent agent wants it low.
+    # the window it compacts against. None leaves its default, the model's
+    # full window (sonnet: compaction at 967k, observed); every heartbeat and
+    # tool step re-sends the whole session, so a persistent agent wants it
+    # low. 100000 is Claude Code's floor and compacts at 67k (observed via
+    # get_context_usage; CLAUDE_AUTOCOMPACT_PCT_OVERRIDE did not move it).
     auto_compact_window: int | None = None
-    auto_compact_pct: int | None = None
 
     @classmethod
     def from_env(cls, *, gateway_url: str) -> "ClaudeCodeSettings":
@@ -110,8 +110,6 @@ class ClaudeCodeSettings:
             effort=env.get("MIRAGEN_CLAUDE_EFFORT") or None,
             auto_compact_window=(int(env["MIRAGEN_CLAUDE_AUTO_COMPACT_WINDOW"])
                                  if env.get("MIRAGEN_CLAUDE_AUTO_COMPACT_WINDOW") else None),
-            auto_compact_pct=(int(env["MIRAGEN_CLAUDE_AUTO_COMPACT_PCT"])
-                              if env.get("MIRAGEN_CLAUDE_AUTO_COMPACT_PCT") else None),
         )
 
 
@@ -261,8 +259,6 @@ class ClaudeCodeHarness:
             env["MCP_TOOL_TIMEOUT"] = str(self.tool_timeout_s * 1000)
         if self.settings.auto_compact_window:
             env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(self.settings.auto_compact_window)
-        if self.settings.auto_compact_pct:
-            env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(self.settings.auto_compact_pct)
         if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
             env["CLAUDE_CODE_OAUTH_TOKEN"] = os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
         keep = [k for k in ENV_ALLOWLIST if k in os.environ]
