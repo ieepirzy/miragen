@@ -49,6 +49,32 @@ class ServedLedger:
             tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
             os.replace(tmp, self.path)
 
+    def seed(self, harness: str, state_file: Path) -> int:
+        """Start the ledger from a harness's own instance map (``{instance:
+        {"seq": n, …}}``) when the ledger does not exist yet: the first deploy
+        with this ledger may already be a swap (e.g. to Claude Code because
+        Grok is rate limited), and without a record of who served the
+        instance, that first swap would not show as `fresh`. Returns how many
+        instances were seeded (0 when the ledger exists or there is nothing
+        to seed)."""
+        with self._lock:
+            if self.path.exists():
+                return 0
+            try:
+                known = json.loads(state_file.read_text())
+            except (FileNotFoundError, ValueError, OSError):
+                return 0
+            state = {name: {"harness": harness, "seq": int(entry.get("seq") or 1),
+                            "at": float(entry.get("updated_at") or time.time()), "seeded": True}
+                     for name, entry in known.items() if isinstance(entry, dict)}
+            if not state:
+                return 0
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
+            os.replace(tmp, self.path)
+            return len(state)
+
     def forget(self, instance: str) -> None:
         with self._lock:
             state = self._load()

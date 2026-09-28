@@ -87,6 +87,13 @@ class ClaudeCodeSettings:
     idle_s: float = 900.0
     turn_timeout_s: float = 600.0
     effort: str | None = None
+    # Claude Code's own auto-compaction (there is no miragen policy here):
+    # the window it compacts against (Claude Code's floor is 100k) and a
+    # percentage that lowers the threshold further. None leaves its default,
+    # which compacts near the model's full window: every heartbeat and tool
+    # step re-sends the whole session, so a persistent agent wants it low.
+    auto_compact_window: int | None = None
+    auto_compact_pct: int | None = None
 
     @classmethod
     def from_env(cls, *, gateway_url: str) -> "ClaudeCodeSettings":
@@ -101,6 +108,10 @@ class ClaudeCodeSettings:
             idle_s=float(env.get("MIRAGEN_CLAUDE_IDLE_S", "900")),
             turn_timeout_s=float(env.get("MIRAGEN_CLAUDE_TURN_TIMEOUT_S", "600")),
             effort=env.get("MIRAGEN_CLAUDE_EFFORT") or None,
+            auto_compact_window=(int(env["MIRAGEN_CLAUDE_AUTO_COMPACT_WINDOW"])
+                                 if env.get("MIRAGEN_CLAUDE_AUTO_COMPACT_WINDOW") else None),
+            auto_compact_pct=(int(env["MIRAGEN_CLAUDE_AUTO_COMPACT_PCT"])
+                              if env.get("MIRAGEN_CLAUDE_AUTO_COMPACT_PCT") else None),
         )
 
 
@@ -205,9 +216,9 @@ class ClaudeCodeHarness:
             f"os.execve({real!r}, [{real!r}, *sys.argv[1:]], env)\n")
         wrapper.chmod(0o700)
         if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") and not self._logged_in():
-            logger.warning(
-                "claude-code harness: no CLAUDE_CODE_OAUTH_TOKEN and no login in %s; turns will "
-                "fail. Mint a subscription token with `claude setup-token`.", home)
+            logger.warning("claude-code harness: no subscription credential (neither the "
+                           "setup-token env var nor a login in CLAUDE_CONFIG_DIR); turns will "
+                           "fail until one is provided (`claude setup-token`)")
 
     def _logged_in(self) -> bool:
         return (self.settings.claude_home / ".credentials.json").is_file()
@@ -248,6 +259,10 @@ class ClaudeCodeHarness:
         }
         if self.tool_timeout_s:
             env["MCP_TOOL_TIMEOUT"] = str(self.tool_timeout_s * 1000)
+        if self.settings.auto_compact_window:
+            env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(self.settings.auto_compact_window)
+        if self.settings.auto_compact_pct:
+            env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(self.settings.auto_compact_pct)
         if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
             env["CLAUDE_CODE_OAUTH_TOKEN"] = os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
         keep = [k for k in ENV_ALLOWLIST if k in os.environ]
@@ -407,6 +422,7 @@ class ClaudeCodeHarness:
         agent = await self._agent_for(instance, ephemeral=ephemeral)
         chunks: list[str] = []
         result: Any = None
+        context: int | None = None
         try:
             async with agent.lock:
                 agent.last_used = time.monotonic()
@@ -419,6 +435,10 @@ class ClaudeCodeHarness:
                                 if isinstance(message, AssistantMessage):
                                     if message.parent_tool_use_id:
                                         continue
+                                    if message.usage:
+                                        # The last model call's prompt = the context
+                                        # size (the result's usage sums every call).
+                                        context = _context_tokens(message.usage)
                                     for block in message.content:
                                         if isinstance(block, ToolUseBlock):
                                             after_tool = True
@@ -465,26 +485,26 @@ class ClaudeCodeHarness:
         if result is None:
             raise ClaudeCodeHarnessError("claude ended the turn without a result")
         if not ephemeral:
-            await self._after_turn(instance, result)
+            await self._after_turn(instance, context)
         if result.is_error:
             raise ClaudeCodeHarnessError(
                 f"claude: {result.subtype}: {(result.result or '').strip()[:500]}")
         return HarnessResult(output="".join(chunks), usage=_usage(result.usage or {}),
                              tool_calls=calls)
 
-    async def _after_turn(self, instance: str, result: Any) -> None:
+    async def _after_turn(self, instance: str, context: int | None) -> None:
         entry = self._load_state().get(instance) or {}
         seq = int(entry.get("seq") or 1)
         if self.served is not None and self.served.switched(instance, NAME):
             # Back from another harness: the plane sees a new session.
             prev = self.served.get(instance) or {}
             seq = max(seq, int(prev.get("seq") or 0) + 1)
-        usage = result.usage or {}
-        context = sum(int(usage.get(k) or 0) for k in (
-            "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+        fields: dict[str, Any] = {}
+        if context is not None:
+            fields["context_tokens"] = context
         await self._update_instance(
             instance, seq=seq, turns=int(entry.get("turns") or 0) + 1, lost=False, rotated=False,
-            last_turn_input_tokens=context)
+            **fields)
         if self.served is not None:
             self.served.mark(instance, NAME, seq)
 
@@ -514,7 +534,7 @@ class ClaudeCodeHarness:
         return {"seq": int(entry.get("seq") or self._first_seq(instance)),
                 "turns": int(entry.get("turns") or 0),
                 "compactions": int(entry.get("compactions") or 0),
-                "context_tokens": int(entry.get("last_turn_input_tokens") or 0),
+                "context_tokens": int(entry.get("context_tokens") or 0),
                 "rotation_pending": False,
                 # The next turn doesn't continue the conversation the client
                 # saw last: new, rotated, lost, or served by another harness.
@@ -539,7 +559,8 @@ class ClaudeCodeHarness:
                 await self.on_lifecycle(instance, "closed", {"reason": reason})
         entry = self._load_state().get(instance) or {}
         await self._update_instance(instance, session_id=None, rotated=True, turns=0,
-                                    compactions=0, seq=int(entry.get("seq") or 1) + 1)
+                                    compactions=0, context_tokens=0,
+                                    seq=int(entry.get("seq") or 1) + 1)
         return self.session_info(instance) or {}
 
     async def forget(self, instance: str) -> list[str]:
@@ -579,6 +600,11 @@ class ClaudeCodeHarness:
 
     def status(self) -> dict[str, Any]:
         return {"processes": sorted(self._agents), "max_processes": self.settings.max_processes}
+
+
+def _context_tokens(usage: dict[str, Any]) -> int:
+    return sum(int(usage.get(k) or 0) for k in (
+        "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
 
 
 def _usage(raw: dict[str, Any]) -> RunUsage:

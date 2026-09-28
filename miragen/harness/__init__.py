@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -72,5 +73,12 @@ def build_model_harness(
     # Which harness last served each instance, shared by all of them, so a
     # swap of spec.model shows up as `fresh` (miragen/harness/served.py).
     served = ServedLedger(runs_root / "harness" / "served.json")
+    # Conversations that predate the ledger were all Grok's: record that
+    # once, so the first swap away from Grok already reads as a swap.
+    seeded = served.seed("grok-build", Path(os.environ.get("MIRAGEN_GROK_HOME", "/agent/grok-home"))
+                         / "miragen-instances.json")
+    if seeded:
+        logging.getLogger("miragen.harness").info(
+            "harness ledger seeded with %d Grok instance(s)", seeded)
     return cls(profile, gateway, settings_cls.from_env(gateway_url=url),
                system_guidance=system_guidance, served=served), gateway

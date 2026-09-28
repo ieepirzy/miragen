@@ -68,8 +68,8 @@ class FakeClient:
         self.disconnected = True
 
 
-def text(t: str):
-    return sdk.AssistantMessage(content=[sdk.TextBlock(text=t)], model="sonnet")
+def text(t: str, usage=None):
+    return sdk.AssistantMessage(content=[sdk.TextBlock(text=t)], model="sonnet", usage=usage)
 
 
 def result(session_id: str, *, is_error=False, subtype="success", result_text="ok"):
@@ -295,3 +295,38 @@ async def test_rotate_starts_a_new_session_and_forget_removes_everything(env):
     with pytest.raises(KeyError):
         await h.rotate("chat")
 
+
+
+def test_first_swap_after_deploy_is_fresh_from_grok_state(tmp_path, monkeypatch):
+    """The real deploy: Grok is rate limited, so the ledger never saw a Grok
+    turn; the only record is Grok's own instance map."""
+    grok_home = tmp_path / "grok-home"
+    grok_home.mkdir()
+    (grok_home / "miragen-instances.json").write_text(json.dumps({"chat": {"session_id": "g", "seq": 5}}))
+    monkeypatch.setenv("MIRAGEN_GROK_HOME", str(grok_home))
+    monkeypatch.setenv("MIRAGEN_CLAUDE_HOME", str(tmp_path / "claude-home"))
+    harness, _gateway = build_model_harness(profile(), runs_root=tmp_path / "runs")
+    assert harness.session_info("chat") == {**harness.session_info("chat"), "fresh": True, "seq": 6}
+    assert harness.session_info("heartbeat") is None
+    # Seeding happens once: a later ledger is never overwritten.
+    harness.served.mark("chat", "claude-code", 6)
+    build_model_harness(profile(), runs_root=tmp_path / "runs")
+    assert harness.served.get("chat")["harness"] == "claude-code"
+
+
+async def test_context_is_the_last_calls_prompt_and_compaction_knobs_reach_the_child(env):
+    def script(client, prompt):
+        yield text("step", usage={"input_tokens": 5, "cache_read_input_tokens": 1000})
+        yield text("done", usage={"input_tokens": 9, "cache_read_input_tokens": 1200,
+                                  "cache_creation_input_tokens": 30})
+        yield result(client.session_id)  # usage summed over both calls: not the context
+
+    env.script = script
+    h = env.harness(auto_compact_window=100000, auto_compact_pct=50)
+    await h.run(turn("hi"))
+    assert h.session_info("chat")["context_tokens"] == 1239
+    o = FakeClient.instances[0].options
+    assert o.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "100000"
+    assert o.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "50"
+    keep = o.env["MIRAGEN_ENV_KEEP"].split()
+    assert {"CLAUDE_CODE_AUTO_COMPACT_WINDOW", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"} <= set(keep)
