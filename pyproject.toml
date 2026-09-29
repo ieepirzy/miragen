@@ -75,7 +75,9 @@ dev = [
 # supersedes the legacy `openai-codex-sdk` CLI wrapper: it adds ChatGPT
 # subscription auth and a host-answerable command-approval channel (issue #38).
 codex = [
-    "openai-codex>=0.144",
+    # Pinned: the codex harness's tool boundary (feature flags) is verified per
+    # codex release, and this package pins the bundled binary (0.159.0).
+    "openai-codex==0.159.0",
 ]
 # Claude Code executor backend (claude-agent-sdk is the official Anthropic
 # package; the spawn backend needs no extra at all).

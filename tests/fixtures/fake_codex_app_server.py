@@ -82,6 +82,14 @@ def run_turn(tid, turn, text):
     elif prompt == "WEIRD":
         out = ask("some/new/request", {"threadId": tid, "turnId": turn})
         message(tid, turn, f"weird={json.dumps(out)}")
+    elif prompt.startswith("SLOWCALL "):
+        # A tool call that arrives after the client has given up on the turn.
+        import time as _t
+        _t.sleep(float(prompt.split()[1]))
+        out = ask("item/tool/call", {"threadId": tid, "turnId": turn, "callId": "c2",
+                                     "namespace": None, "tool": "speak", "arguments": {"text": "late"}})
+        log({"late_call": out})
+        message(tid, turn, "late done")
     elif prompt == "HISTORY":
         message(tid, turn, f"turns={len(threads[tid])} carried={carried.get(tid, 0)}")
     elif prompt == "FAIL":
@@ -137,6 +145,16 @@ def main():
             log({"turn_start": params})
             send({"id": rid, "result": {"turn": {"id": turn, "status": "inProgress"}}})
             run_turn(params["threadId"], turn, text)
+        elif method == "experimentalFeature/list":
+            from miragen.harness.codex import FEATURES_OFF
+
+            # (a file, not env: the harness passes only an env allowlist)
+            cfg = HOME / "fake-features.json"
+            cfg = json.loads(cfg.read_text()) if cfg.exists() else {}
+            off = set(FEATURES_OFF) - set(cfg.get("missing", []))
+            on = set(cfg.get("on", ["unified_exec"]))
+            send({"id": rid, "result": {"data": [
+                {"name": f, "enabled": f in on} for f in sorted(off | on)]}})
         elif method == "thread/inject_items":
             log({"inject_items": params})
             carried[params["threadId"]] = len(params["items"])

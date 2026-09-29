@@ -74,6 +74,9 @@ FEATURES_OFF = (
     "goals", "skill_search", "skill_mcp_dependency_install", "tool_suggest", "sleep_tool", "hooks",
 )
 _CARRY_MAX_ITEMS = 200
+# Stays enabled whatever the config says (codex 0.159), but has no tool of its
+# own once shell_tool is off (verified live: no shell in any probe).
+_FORCED_ON = frozenset({"unified_exec"})
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # Codex's web tool (web.run) searches and opens pages: it carries both.
 NATIVE_CAPABILITIES = frozenset({"WebSearch", "WebFetch"})
@@ -152,7 +155,8 @@ class AppServer:
 
     @property
     def alive(self) -> bool:
-        return self.proc is not None and self.proc.returncode is None
+        return (self.proc is not None and self.proc.returncode is None
+                and bool(self._tasks) and not self._tasks[0].done())
 
     async def start(self) -> None:
         self.proc = await asyncio.create_subprocess_exec(
@@ -175,8 +179,11 @@ class AppServer:
         fut = asyncio.get_running_loop().create_future()
         self._pending[rid] = fut
         await self._send({"id": rid, "method": method, "params": params})
-        async with asyncio.timeout(timeout):
-            return await fut
+        try:
+            async with asyncio.timeout(timeout):
+                return await fut
+        finally:
+            self._pending.pop(rid, None)
 
     def subscribe(self, thread_id: str) -> asyncio.Queue:
         return self._subscribers.setdefault(thread_id, asyncio.Queue())
@@ -254,6 +261,7 @@ class _Agent:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_used: float = field(default_factory=time.monotonic)
     reserved: int = 0
+    active_turn: str | None = None
 
     @property
     def busy(self) -> bool:
@@ -359,6 +367,13 @@ class CodexHarness:
     # ── server requests: gateway tool calls run, everything else is denied ──
     async def _on_request(self, instance: str, method: str, params: dict) -> dict:
         if method == "item/tool/call":
+            agent = self._agents.get(instance)
+            active = agent.active_turn if agent is not None else None
+            if active is None or params.get("turnId") != active:
+                # A call from a turn nobody is waiting on any more (cancelled
+                # or timed out): it must not run under the next turn.
+                logger.warning("codex harness: refused a tool call from a stale turn")
+                return _tool_output(_error_result("this turn is no longer active"))
             if params.get("namespace"):
                 return _tool_output(_error_result(f"unknown tool {params.get('tool')}"))
             args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
@@ -404,6 +419,20 @@ class CodexHarness:
             params["model"] = self.model
         return params
 
+    async def _verify_features(self, server: AppServer) -> None:
+        """Fail closed unless every flag the boundary relies on exists and is
+        off in this codex: a renamed flag would silently bring a tool (the
+        shell) back, and Codex only logs an unknown setting as ignored."""
+        listed = {f.get("name"): f for f in
+                  ((await server.request("experimentalFeature/list", {})) or {}).get("data") or []}
+        missing = [f for f in FEATURES_OFF if f not in listed]
+        still_on = [f for f in FEATURES_OFF
+                    if f in listed and listed[f].get("enabled") and f not in _FORCED_ON]
+        if missing or still_on:
+            raise CodexHarnessError(
+                f"codex harness: this codex doesn't honour the tool boundary (unknown flags "
+                f"{missing}, still enabled {still_on}); refusing to run")
+
     def _rollout(self, thread_id: str) -> Path | None:
         sessions = self.settings.codex_home / "sessions"
         return next(sessions.rglob(f"*{thread_id}.jsonl"), None) if sessions.is_dir() else None
@@ -424,9 +453,12 @@ class CodexHarness:
                            on_request=on_request)
         try:
             await server.start()
+            await self._verify_features(server)
             thread_id = await self._open_thread(server, instance, workdir, ephemeral=ephemeral)
         except BaseException:
             await server.close()
+            if ephemeral:
+                shutil.rmtree(workdir, ignore_errors=True)
             raise
         return _Agent(instance=instance, server=server, thread_id=thread_id, ephemeral=ephemeral)
 
@@ -527,6 +559,11 @@ class CodexHarness:
                     items.append(cleaned)
         return items[-_CARRY_MAX_ITEMS:]
 
+    def _seq(self, instance: str, entry: dict) -> int:
+        """The plane session number now (the same before and after a turn)."""
+        own = int(entry.get("seq") or 0) or self._first_seq(instance)
+        return self.served.seq_for(instance, NAME, own) if self.served is not None else own
+
     def _first_seq(self, instance: str) -> int:
         prev = self.served.get(instance) if self.served is not None else None
         return int(prev.get("seq") or 0) + 1 if prev else 1
@@ -567,7 +604,9 @@ class CodexHarness:
             for agent in list(self._agents.values()):
                 if not agent.busy and now - agent.last_used > self.settings.idle_s:
                     async with self._spawn_lock:
-                        await self._drop(agent.instance)
+                        # Re-check under the lock: a turn may have reserved it meanwhile.
+                        if self._agents.get(agent.instance) is agent and not agent.busy:
+                            await self._drop(agent.instance)
 
     # ── turns ────────────────────────────────────────────────────────────
     def _key(self, turn: HarnessTurn) -> tuple[str, bool]:
@@ -587,6 +626,9 @@ class CodexHarness:
             raise CodexHarnessError("per-launch MCP credentials are not supported by the codex "
                                     "harness (the gateway holds deployment-level credentials)")
         instance, ephemeral = self._key(turn)
+        # A `lost` the client could see before this turn is now consumed; one
+        # raised while starting this turn must survive it (next turn: fresh).
+        lost_before = bool((self._load_state().get(instance) or {}).get("lost"))
         agent = await self._agent_for(instance, ephemeral=ephemeral)
         final: list[str] = []
         other: list[str] = []
@@ -610,6 +652,7 @@ class CodexHarness:
                                 params["effort"] = self.settings.effort
                             started = await agent.server.request("turn/start", params)
                             turn_id = (started or {}).get("turn", {}).get("id")
+                            agent.active_turn = turn_id
                             while True:
                                 msg = await queue.get()
                                 method, p = msg.get("method"), msg.get("params") or {}
@@ -664,7 +707,19 @@ class CodexHarness:
                         await agent.server.close()
                         raise CodexHarnessError(
                             f"turn exceeded {self.settings.turn_timeout_s:.0f}s; cancelled") from None
+                    except asyncio.CancelledError:
+                        # The caller went away: stop the turn in codex too, so it
+                        # doesn't keep running (and calling tools) unattended.
+                        if turn_id:
+                            with contextlib.suppress(BaseException):
+                                await asyncio.shield(agent.server.request(
+                                    "turn/interrupt", {"threadId": agent.thread_id,
+                                                       "turnId": turn_id}, timeout=10))
+                        with contextlib.suppress(BaseException):
+                            await asyncio.shield(agent.server.close())
+                        raise
                     finally:
+                        agent.active_turn = None
                         agent.server.unsubscribe(agent.thread_id)
                     calls = list(log.calls)
                 agent.last_used = time.monotonic()
@@ -680,7 +735,7 @@ class CodexHarness:
                     path.unlink(missing_ok=True)
                 shutil.rmtree(self.settings.workdirs / instance, ignore_errors=True)
         if not ephemeral and status == "completed":
-            await self._after_turn(instance, context, compacted)
+            await self._after_turn(instance, context, compacted, lost_before=lost_before)
         if status != "completed":
             raise CodexHarnessError(f"codex turn {status or 'ended'}: {error or 'no detail'}")
         output = "\n\n".join(final) if final else "\n\n".join(other)
@@ -688,17 +743,17 @@ class CodexHarness:
             on_text(output)
         return HarnessResult(output=output, usage=_usage(usage), tool_calls=calls)
 
-    async def _after_turn(self, instance: str, context: int | None, compacted: int) -> None:
+    async def _after_turn(self, instance: str, context: int | None, compacted: int, *,
+                          lost_before: bool = False) -> None:
         entry = self._load_state().get(instance) or {}
-        seq = int(entry.get("seq") or 1)
-        if self.served is not None and self.served.switched(instance, NAME):
-            prev = self.served.get(instance) or {}
-            seq = max(seq, int(prev.get("seq") or 0) + 1)
+        seq = self._seq(instance, entry)
         fields: dict[str, Any] = {}
         if context is not None:
             fields["context_tokens"] = context
+        if lost_before or not entry.get("lost"):
+            fields["lost"] = False
         await self._update_instance(
-            instance, seq=seq, turns=int(entry.get("turns") or 0) + 1, lost=False, rotated=False,
+            instance, seq=seq, turns=int(entry.get("turns") or 0) + 1, rotated=False,
             compactions=int(entry.get("compactions") or 0) + compacted, **fields)
         if self.served is not None:
             self.served.mark(instance, NAME, seq)
@@ -726,7 +781,7 @@ class CodexHarness:
         if not entry and not switched:
             return None
         entry = entry or {}
-        return {"seq": int(entry.get("seq") or self._first_seq(instance)),
+        return {"seq": self._seq(instance, entry),
                 "turns": int(entry.get("turns") or 0),
                 "compactions": int(entry.get("compactions") or 0),
                 "context_tokens": int(entry.get("context_tokens") or 0),

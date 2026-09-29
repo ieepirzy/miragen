@@ -275,3 +275,58 @@ async def test_a_vanished_tool_stays_declared_and_the_thread_resumes(env):
     assert env.state()["chat"]["thread_id"] == tid
     resume = next(e for e in env.log() if "thread_resume" in e)["thread_resume"]
     assert {t["name"] for t in resume["dynamicTools"]} == {"speak", "lamp"}
+
+
+async def test_a_codex_that_does_not_honour_the_flags_is_refused(env):
+    features = env.home / "fake-features.json"
+    features.write_text(json.dumps({"missing": ["shell_tool"]}))  # renamed in some release
+    with pytest.raises(CodexHarnessError, match="doesn't honour the tool boundary"):
+        await env.harness().run(turn("hi"))
+    features.write_text(json.dumps({"on": ["unified_exec", "multi_agent"]}))
+    with pytest.raises(CodexHarnessError, match="still enabled"):
+        await env.harness().run(turn("hi", run_id="r2"))
+
+
+async def test_a_cancelled_turn_is_interrupted_and_its_late_tool_calls_refused(env):
+    import asyncio
+
+    h = env.harness()
+    task = asyncio.create_task(h.run(turn("SLOWCALL 0.5")))
+    await asyncio.sleep(0.3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert h.status()["processes"] == []  # the process was stopped, not left running
+    res = await h.run(turn("next", run_id="r2"))
+    assert res.output.startswith("echo: next") and res.tool_calls == []
+
+
+async def test_seq_is_the_same_before_and_after_the_first_turn_back(env):
+    h = env.harness()
+    await h.run(turn("one"))
+    env.served.mark("chat", "grok-build", 6)  # grok served s6 meanwhile
+    before = h.session_info("chat")["seq"]
+    await h.run(turn("two", run_id="r2"))
+    assert before == h.session_info("chat")["seq"] == 7
+
+
+async def test_a_lost_thread_found_during_a_turn_is_reported_after_it(env):
+    h = env.harness()
+    await h.run(turn("one"))
+    await h.aclose()
+    for f in (env.home / "sessions").rglob("*.jsonl"):
+        f.unlink()
+    h2 = env.harness()
+    assert h2.session_info("chat")["fresh"] is False  # nobody can know yet
+    await h2.run(turn("two", run_id="r2"))
+    assert h2.session_info("chat")["fresh"] is True   # so the client adds its transcript
+    await h2.run(turn("three", run_id="r3"))
+    assert h2.session_info("chat")["fresh"] is False
+
+
+async def test_tool_calls_run_only_for_the_active_turn(env):
+    h = env.harness()
+    await h.run(turn("one"))  # the instance has an agent, no active turn now
+    out = await h._on_request("chat", "item/tool/call", {
+        "turnId": "old-turn", "tool": "speak", "arguments": {"text": "x"}})
+    assert out["success"] is False and "no longer active" in out["contentItems"][0]["text"]
