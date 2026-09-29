@@ -90,7 +90,8 @@ def run_turn(tid, turn, text):
         append(tid, {"type": "compacted", "payload": {"message": "", "replacement_history": [
             msg_item("user", "SUMMARISED")["payload"],
             {"type": "compaction", "id": "c", "encrypted_content": "ENC"}]}})
-        note("thread/compacted", {"threadId": tid, "turnId": turn})
+        note("item/completed", {"threadId": tid, "turnId": turn,
+                                "item": {"type": "contextCompaction", "id": "cc"}})
         message(tid, turn, "compacted")
     elif prompt == "ONLYCOMMENTARY":
         pass

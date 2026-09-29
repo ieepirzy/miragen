@@ -619,7 +619,17 @@ class CodexHarness:
                                         + " | ".join(agent.server.stderr[-5:]))
                                 if p.get("turnId") not in (None, turn_id) and method != "turn/completed":
                                     continue
-                                if method == "item/completed":
+                                if method == "thread/compacted" or (
+                                        method == "item/completed"
+                                        and (p.get("item") or {}).get("type") == "contextCompaction"):
+                                    # Auto-compaction arrives as a contextCompaction
+                                    # item (observed); thread/compacted is the manual one.
+                                    compacted += 1
+                                    if self.on_lifecycle is not None:
+                                        with contextlib.suppress(Exception):
+                                            await self.on_lifecycle(instance, "compacting",
+                                                                    {"trigger": "codex"})
+                                elif method == "item/completed":
                                     item = p.get("item") or {}
                                     if item.get("type") == "agentMessage" and item.get("text"):
                                         text = item["text"]
@@ -635,12 +645,6 @@ class CodexHarness:
                                     last = tu.get("last") or {}
                                     if isinstance(last.get("inputTokens"), int):
                                         context = last["inputTokens"]
-                                elif method == "thread/compacted":
-                                    compacted += 1
-                                    if self.on_lifecycle is not None:
-                                        with contextlib.suppress(Exception):
-                                            await self.on_lifecycle(instance, "compacting",
-                                                                    {"trigger": "codex"})
                                 elif method == "error":
                                     error = json.dumps(p.get("error") or p)[:500]
                                 elif method == "turn/completed":
