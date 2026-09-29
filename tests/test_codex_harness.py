@@ -221,3 +221,18 @@ async def test_rotate_and_forget(env):
     assert {"process", "session_mapping", "workdir",
             f"codex_thread:{first}", f"codex_thread:{second}"} <= set(removed)
     assert h.session_info("chat") is None and env.served.get("chat") is None
+
+
+async def test_tool_names_the_model_api_rejects_get_aliases(env):
+    h = env.harness()
+
+    def odd_tool(text: str) -> str:
+        """An upstream-style name with a dot."""
+        return f"odd:{text}"
+
+    h.gateway._add_local("home.odd", odd_tool, runtime=True)
+    tools = await h._dynamic_tools()
+    assert [t["name"] for t in tools] == ["speak", "home_odd"]
+    res = await h.run(turn('CALL home_odd {"text": "x"}'))
+    assert res.output == "tool[home_odd]=odd:x ok=True"
+    assert [c.tool_name for c in res.tool_calls] == ["home.odd"]

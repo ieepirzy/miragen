@@ -41,6 +41,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -68,6 +69,7 @@ FEATURES_OFF = (
     "browser_use_external", "in_app_browser", "computer_use", "image_generation", "view_image",
     "goals", "skill_search", "skill_mcp_dependency_install", "tool_suggest", "sleep_tool", "hooks",
 )
+_TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # Codex's web tool (web.run) searches and opens pages: it carries both.
 NATIVE_CAPABILITIES = frozenset({"WebSearch", "WebFetch"})
 _APPROVAL_REQUESTS = {
@@ -279,6 +281,7 @@ class CodexHarness:
                            self.tool_timeout_s + 60)
             settings.turn_timeout_s = self.tool_timeout_s + 60
         self._agents: dict[str, _Agent] = {}
+        self._aliases: dict[str, str] = {}  # dynamic tool name -> gateway tool name
         self._spawn_lock = asyncio.Lock()
         self._state_lock = asyncio.Lock()
         self._reaper: asyncio.Task | None = None
@@ -354,7 +357,9 @@ class CodexHarness:
             if params.get("namespace"):
                 return _tool_output(_error_result(f"unknown tool {params.get('tool')}"))
             args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
-            result = await self.gateway.call_tool(str(params.get("tool")), args, instance=instance)
+            tool = str(params.get("tool"))
+            result = await self.gateway.call_tool(self._aliases.get(tool, tool), args,
+                                                  instance=instance)
             return _tool_output(result)
         answer = _APPROVAL_REQUESTS.get(method)
         logger.warning("codex harness: refused %s", method)
@@ -364,10 +369,25 @@ class CodexHarness:
 
     # ── processes ────────────────────────────────────────────────────────
     async def _dynamic_tools(self) -> list[dict]:
-        return [{"type": "function", "name": t.name, "description": t.description or t.name,
-                 "inputSchema": t.inputSchema or {"type": "object", "properties": {}},
-                 "deferLoading": False}
-                for t in await self.gateway._list_tools()]
+        """The gateway's tools as dynamic tools. A name the model API won't
+        take (``[A-Za-z0-9_-]{1,64}``) gets an alias that maps back to the
+        gateway name, so one odd upstream tool can't break the thread."""
+        out, aliases = [], {}
+        for t in await self.gateway._list_tools():
+            name = t.name
+            if not _TOOL_NAME.fullmatch(name):
+                base = re.sub(r"[^A-Za-z0-9_-]", "_", name)[:58]
+                name = base
+                n = 1
+                while name in aliases or any(o["name"] == name for o in out):
+                    n += 1
+                    name = f"{base}_{n}"
+                aliases[name] = t.name
+            out.append({"type": "function", "name": name, "description": t.description or t.name,
+                        "inputSchema": t.inputSchema or {"type": "object", "properties": {}},
+                        "deferLoading": False})
+        self._aliases.update(aliases)
+        return out
 
     async def _thread_params(self, workdir: Path) -> dict[str, Any]:
         params: dict[str, Any] = {
