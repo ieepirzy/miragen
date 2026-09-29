@@ -40,6 +40,15 @@ class ServedLedger:
         entry = self.get(instance)
         return entry is not None and entry.get("harness") != harness
 
+    def seq_for(self, instance: str, harness: str, own: int) -> int:
+        """The plane session number `harness` should use now: its own, or —
+        when another harness served the instance last — one past that
+        harness's, so the plane never reuses or goes back to a session."""
+        entry = self.get(instance)
+        if entry is not None and entry.get("harness") != harness:
+            return max(own, int(entry.get("seq") or 0) + 1)
+        return own
+
     def mark(self, instance: str, harness: str, seq: int) -> None:
         with self._lock:
             state = self._load()

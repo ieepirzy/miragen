@@ -58,8 +58,13 @@ class FakeClient:
         self.prompts.append(prompt)
 
     async def receive_response(self):
-        for message in self.script(self, self.prompts[-1]):
-            yield message
+        messages = self.script(self, self.prompts[-1])
+        if hasattr(messages, "__aiter__"):
+            async for message in messages:
+                yield message
+        else:
+            for message in messages:
+                yield message
 
     async def interrupt(self):
         pass
@@ -328,3 +333,43 @@ async def test_context_is_the_last_calls_prompt_and_compaction_knobs_reach_the_c
     o = FakeClient.instances[0].options
     assert o.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "100000"
     assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" in o.env["MIRAGEN_ENV_KEEP"].split()
+
+
+async def test_a_cancelled_turn_is_interrupted_and_the_process_replaced(env):
+    import asyncio
+
+    gate = asyncio.Event()
+
+    def slow(client, prompt):
+        async def gen():
+            await gate.wait()
+            yield text("late")
+            yield result(client.session_id)
+        return gen()
+
+    class Stream:
+        def __init__(self, agen):
+            self.agen = agen
+
+        def __aiter__(self):
+            return self.agen
+
+    env.script = lambda c, p: Stream(slow(c, p)) if p == "slow" else echo(c, p)
+    h = env.harness()
+    task = asyncio.create_task(h.run(turn("slow")))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert FakeClient.instances[0].disconnected  # not left holding the rest of that turn
+    res = await h.run(turn("next", run_id="r2"))
+    assert res.output == "echo: next" and len(FakeClient.instances) == 2
+
+
+async def test_seq_is_the_same_before_and_after_the_first_turn_back(env):
+    h = env.harness()
+    await h.run(turn("one"))
+    env.served.mark("chat", "grok-build", 6)
+    before = h.session_info("chat")["seq"]
+    await h.run(turn("two", run_id="r2"))
+    assert before == h.session_info("chat")["seq"] == 7

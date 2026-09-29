@@ -520,7 +520,10 @@ class GrokHarness:
         if deliver_update and stop not in ("cancelled", "refusal"):
             await self._save_instance(instance, agent.session_id)  # delivered: clear pending
         if not ephemeral and self.served is not None and stop not in ("cancelled", "refusal"):
-            seq = int((self._load_state().get(instance) or {}).get("seq") or 1)
+            own = int((self._load_state().get(instance) or {}).get("seq") or 1)
+            seq = self.served.seq_for(instance, NAME, own)
+            if seq != own:  # back from another harness: a new plane session, never an old one
+                await self._update_instance(instance, seq=seq)
             self.served.mark(instance, NAME, seq)
         if not ephemeral and self.settings.lifecycle and stop not in ("cancelled", "refusal"):
             await self._after_turn(instance, context_tokens, native_compactions, calls,
@@ -750,6 +753,8 @@ class GrokHarness:
         if not entry:
             return None
         seq = int(entry.get("seq") or 1)
+        if self.served is not None:
+            seq = self.served.seq_for(instance, NAME, seq)
         return {"seq": seq, "turns": int(entry.get("turns") or 0),
                 "compactions": int(entry.get("compactions") or 0),
                 "context_tokens": int(entry.get("context_tokens") or 0),

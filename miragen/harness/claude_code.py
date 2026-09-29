@@ -335,9 +335,18 @@ class ClaudeCodeHarness:
             instance, workdir, resume=known, new_id=None if known else session_id, stderr=stderr))
         try:
             await client.connect()
-        except BaseException:
+        except BaseException as exc:
             with contextlib.suppress(Exception):
                 await client.disconnect()
+            if known and isinstance(exc, Exception):
+                # A session file that exists but won't resume (corrupt,
+                # incompatible): don't fail every turn on it — start over.
+                logger.warning("claude-code harness: session %s of %s would not resume (%s); "
+                               "starting a new one", known, instance, exc)
+                await self._update_instance(instance, session_id=None, lost=True)
+                return await self._spawn(instance, ephemeral=ephemeral)
+            if ephemeral:
+                shutil.rmtree(workdir, ignore_errors=True)
             raise
         if not ephemeral and not known:
             entry = self._load_state().get(instance) or {}
@@ -347,6 +356,11 @@ class ClaudeCodeHarness:
                                         session_started_at=time.time())
         return _Agent(instance=instance, client=client, session_id=session_id,
                       ephemeral=ephemeral, stderr=stderr)
+
+    def _seq(self, instance: str, entry: dict) -> int:
+        """The plane session number now (the same before and after a turn)."""
+        own = int(entry.get("seq") or 0) or self._first_seq(instance)
+        return self.served.seq_for(instance, NAME, own) if self.served is not None else own
 
     def _first_seq(self, instance: str) -> int:
         """A new conversation continues the plane's session numbering after
@@ -390,9 +404,12 @@ class ClaudeCodeHarness:
             now = time.monotonic()
             for agent in list(self._agents.values()):
                 if not agent.busy and now - agent.last_used > self.settings.idle_s:
-                    logger.info("claude-code harness: stopping idle process for %s", agent.instance)
                     async with self._spawn_lock:
-                        await self._drop(agent.instance)
+                        # Re-check under the lock: a turn may have reserved it meanwhile.
+                        if self._agents.get(agent.instance) is agent and not agent.busy:
+                            logger.info("claude-code harness: stopping idle process for %s",
+                                        agent.instance)
+                            await self._drop(agent.instance)
 
     # ── turns ────────────────────────────────────────────────────────────
     def _key(self, turn: HarnessTurn) -> tuple[str, bool]:
@@ -415,6 +432,9 @@ class ClaudeCodeHarness:
                 "per-launch MCP credentials are not supported by the claude-code harness "
                 "(the gateway holds deployment-level upstream credentials)")
         instance, ephemeral = self._key(turn)
+        # A `lost` the client could see before this turn is now consumed; one
+        # raised while starting this turn must survive it (next turn: fresh).
+        lost_before = bool((self._load_state().get(instance) or {}).get("lost"))
         agent = await self._agent_for(instance, ephemeral=ephemeral)
         chunks: list[str] = []
         result: Any = None
@@ -456,6 +476,15 @@ class ClaudeCodeHarness:
                         agent.dead = True
                         raise ClaudeCodeHarnessError(
                             f"turn exceeded {self.settings.turn_timeout_s:.0f}s; cancelled") from None
+                    except asyncio.CancelledError:
+                        # The caller went away (e.g. a dropped stream). The rest of
+                        # this turn would stay queued in the SDK's message stream
+                        # and be read as the next turn's reply, and its tool calls
+                        # would run under the next turn: stop it and respawn.
+                        with contextlib.suppress(Exception):
+                            await agent.client.interrupt()
+                        agent.dead = True
+                        raise
                     except ClaudeCodeHarnessError:
                         raise
                     except Exception as exc:
@@ -481,26 +510,24 @@ class ClaudeCodeHarness:
         if result is None:
             raise ClaudeCodeHarnessError("claude ended the turn without a result")
         if not ephemeral:
-            await self._after_turn(instance, context)
+            await self._after_turn(instance, context, lost_before=lost_before)
         if result.is_error:
             raise ClaudeCodeHarnessError(
                 f"claude: {result.subtype}: {(result.result or '').strip()[:500]}")
         return HarnessResult(output="".join(chunks), usage=_usage(result.usage or {}),
                              tool_calls=calls)
 
-    async def _after_turn(self, instance: str, context: int | None) -> None:
+    async def _after_turn(self, instance: str, context: int | None, *,
+                          lost_before: bool = False) -> None:
         entry = self._load_state().get(instance) or {}
-        seq = int(entry.get("seq") or 1)
-        if self.served is not None and self.served.switched(instance, NAME):
-            # Back from another harness: the plane sees a new session.
-            prev = self.served.get(instance) or {}
-            seq = max(seq, int(prev.get("seq") or 0) + 1)
+        seq = self._seq(instance, entry)
         fields: dict[str, Any] = {}
         if context is not None:
             fields["context_tokens"] = context
+        if lost_before or not entry.get("lost"):
+            fields["lost"] = False
         await self._update_instance(
-            instance, seq=seq, turns=int(entry.get("turns") or 0) + 1, lost=False, rotated=False,
-            **fields)
+            instance, seq=seq, turns=int(entry.get("turns") or 0) + 1, rotated=False, **fields)
         if self.served is not None:
             self.served.mark(instance, NAME, seq)
 
@@ -527,7 +554,7 @@ class ClaudeCodeHarness:
         if not entry and not switched:
             return None
         entry = entry or {}
-        return {"seq": int(entry.get("seq") or self._first_seq(instance)),
+        return {"seq": self._seq(instance, entry),
                 "turns": int(entry.get("turns") or 0),
                 "compactions": int(entry.get("compactions") or 0),
                 "context_tokens": int(entry.get("context_tokens") or 0),
