@@ -256,16 +256,19 @@ The binary is the one bundled with openai-codex (`CODEX_BIN` overrides it).
 off all built-in tools. Each layer was verified live against codex 0.159:
 
 1. **Feature flags** (`FEATURES_OFF`) remove the shell (`shell_tool`,
-   `unified_exec`), the code-mode host, sub-agents, plugins, apps, memories,
-   the browser and computer use, image tools and hooks. The model still sees
-   some tool names, but none of them can reach a file or a process:
-   - `exec`: its host is off.
+   `unified_exec`), sub-agents, plugins, apps, memories, the browser and
+   computer use, image tools and hooks. The model still sees some tool names,
+   but none of them can reach a file or a process:
+   - `exec` (code mode) stays on: gpt-6 models call every tool, including
+     the dynamic ones, as JS inside it. With its host off, every tool call
+     failed (observed live on `gpt-6-sol`).
    - `collaboration.*`: a spawned sub-agent gets the same restricted tools.
    - `apply_patch`: routed to approvals.
    - `web.run`.
 
-   With the code-mode host on, it would be a bare ECMAScript isolate: no
-   `process`, `require`, `import`, `fetch` or sockets.
+   Code mode is a bare ECMAScript isolate: no `process`, `require`,
+   `import`, `fetch` or sockets. Its nested calls go through layer 2 like
+   any other.
 2. **Deny by default.** The thread runs with sandbox `read-only`,
    `approvalPolicy: untrusted` and the `user` reviewer. Every file change,
    command, permission escalation and elicitation arrives at miragen as a
@@ -283,8 +286,13 @@ the experimental app-server API, and are always in context. Each call arrives
 as `item/tool/call` and runs through `ToolGateway.call_tool`, which handles
 approvals, run binding and call records. The list is re-declared on resume.
 A 90-second call did not time out, so approval waits are not cut short by
-Codex.
+Codex. Verified in the image through `POST /instances/{name}/turns` with an
+upstream MCP tool and `approval_mode: queue`. Once approved, the action ran
+once; when denied, it never ran.
 
+- **Tool-set changes.** Codex fixes a thread's dynamic tools at `thread/start`; `thread/resume` and `thread/fork` ignore new ones (observed). The instance state records the declared set.
+  - **Same or fewer tools** (an upstream is down right now): the thread resumes with the declared set, and a missing tool fails at call time.
+  - **A new tool name:** a new thread declares the union, and the old thread's model-visible history since its last compaction is carried in with `thread/inject_items`. That history is the compaction's replacement history, including its encrypted summary, followed by the user and assistant messages. Verified live: the new thread used the new tool and still knew facts from the old one. If the carry fails, the instance reports `fresh`.
 - **Sessions.** `<MIRAGEN_CODEX_HOME>/miragen-instances.json` maps each instance to its thread. A resume that fails (the rollout is gone) starts a new thread and reports `fresh`. `rotate` starts a new thread; `forget` deletes the rollouts and the working directory.
 - **Output.** A turn's reply is its `final_answer` messages; `commentary` is used only when there is no final answer. Notifications are filtered by thread, so sub-agent text never leaks into the reply.
 - **Lifecycle.** Codex compacts on its own at `MIRAGEN_CODEX_AUTO_COMPACT_TOKENS` (`model_auto_compact_token_limit`). `thread/compacted` reaches the memory plane as `context.compacting`. `context_tokens` is the last model call's input.

@@ -96,7 +96,8 @@ def test_codex_prefix_builds_the_harness_with_a_hermetic_home(tmp_path, monkeypa
     assert harness.name == "codex" and harness.model == "gpt-5.5"
     config = (tmp_path / "codex-home" / "config.toml").read_text()
     assert "shell_tool = false" in config and "unified_exec = false" in config
-    assert "code_mode_host = false" in config and "multi_agent = false" in config
+    assert "multi_agent = false" in config
+    assert "code_mode_host" not in config  # gpt-6 models call tools through code mode
     assert 'web_search = "live"' in config and "model_auto_compact_token_limit = 60000" in config
     assert "mcp_servers" not in config
     assert not (tmp_path / "codex-home" / "hooks.json").exists()
@@ -151,7 +152,7 @@ async def test_restart_resumes_the_thread_and_a_lost_rollout_starts_fresh(env):
     await h.aclose()
     h2 = env.harness()
     res = await h2.run(turn("HISTORY", run_id="r2"))
-    assert res.output == "turns=2"
+    assert res.output == "turns=2 carried=0"
     resume = next(e for e in env.log() if "thread_resume" in e)["thread_resume"]
     assert resume["threadId"] == tid and [t["name"] for t in resume["dynamicTools"]] == ["speak"]
     assert h2.session_info("chat")["fresh"] is False
@@ -236,3 +237,41 @@ async def test_tool_names_the_model_api_rejects_get_aliases(env):
     res = await h.run(turn('CALL home_odd {"text": "x"}'))
     assert res.output == "tool[home_odd]=odd:x ok=True"
     assert [c.tool_name for c in res.tool_calls] == ["home.odd"]
+
+
+def _odd(text: str) -> str:
+    """Another tool."""
+    return text
+
+
+async def test_new_tools_move_to_a_new_thread_carrying_the_history(env):
+    h = env.harness()
+    await h.run(turn("remember PELICAN"))
+    await h.run(turn("COMPACT", run_id="r2"))
+    await h.run(turn("after compaction", run_id="r3"))
+    old = env.state()["chat"]["thread_id"]
+    await h.aclose()
+    h2 = env.harness()
+    h2.gateway._add_local("lamp", _odd, runtime=True)  # an upstream tool appeared
+    res = await h2.run(turn("HISTORY", run_id="r4"))
+    state = env.state()["chat"]
+    assert state["thread_id"] != old and set(state["tools"]) == {"speak", "lamp"}
+    inject = next(e for e in env.log() if "inject_items" in e)["inject_items"]
+    texts = [i.get("encrypted_content") or i["content"][0]["text"] for i in inject["items"]]
+    # From the last compaction on: its summary + messages, then later turns.
+    assert texts == ["SUMMARISED", "ENC", "reply", "after compaction", "reply"]
+    assert res.output == "turns=1 carried=5"
+    assert h2.session_info("chat")["fresh"] is False  # carried: no transcript needed
+
+
+async def test_a_vanished_tool_stays_declared_and_the_thread_resumes(env):
+    h = env.harness()
+    h.gateway._add_local("lamp", _odd, runtime=True)
+    await h.run(turn("one"))
+    tid = env.state()["chat"]["thread_id"]
+    await h.aclose()
+    h2 = env.harness()  # 'lamp' is gone (its upstream is down)
+    await h2.run(turn("two", run_id="r2"))
+    assert env.state()["chat"]["thread_id"] == tid
+    resume = next(e for e in env.log() if "thread_resume" in e)["thread_resume"]
+    assert {t["name"] for t in resume["dynamicTools"]} == {"speak", "lamp"}

@@ -11,6 +11,7 @@ from pathlib import Path
 HOME = Path(os.environ["CODEX_HOME"])
 LOG = HOME / "fake.log.jsonl"
 threads: dict[str, list[str]] = {}
+carried: dict[str, int] = {}
 pending: dict[int, dict] = {}
 next_id = 1000
 
@@ -49,8 +50,21 @@ def message(tid, turn, text, phase="final_answer"):
                             "item": {"type": "agentMessage", "text": text, "phase": phase}})
 
 
+def append(tid, entry):
+    if rollout(tid).exists():
+        with rollout(tid).open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+
+def msg_item(role, text):
+    kind = "input_text" if role == "user" else "output_text"
+    return {"type": "response_item", "payload": {"type": "message", "role": role, "id": "x",
+                                                 "content": [{"type": kind, "text": text}]}}
+
+
 def run_turn(tid, turn, text):
     threads[tid].append(text)
+    append(tid, msg_item("user", text))
     prompt = text.rsplit("\n\n", 1)[-1]
     status, error = "completed", None
     # A sub-agent's notification on another thread must be ignored.
@@ -69,16 +83,20 @@ def run_turn(tid, turn, text):
         out = ask("some/new/request", {"threadId": tid, "turnId": turn})
         message(tid, turn, f"weird={json.dumps(out)}")
     elif prompt == "HISTORY":
-        message(tid, turn, f"turns={len(threads[tid])}")
+        message(tid, turn, f"turns={len(threads[tid])} carried={carried.get(tid, 0)}")
     elif prompt == "FAIL":
         status, error = "failed", {"message": "You've hit your usage limit."}
     elif prompt == "COMPACT":
+        append(tid, {"type": "compacted", "payload": {"message": "", "replacement_history": [
+            msg_item("user", "SUMMARISED")["payload"],
+            {"type": "compaction", "id": "c", "encrypted_content": "ENC"}]}})
         note("thread/compacted", {"threadId": tid, "turnId": turn})
         message(tid, turn, "compacted")
     elif prompt == "ONLYCOMMENTARY":
         pass
     else:
         message(tid, turn, f"echo: {text}")
+    append(tid, msg_item("assistant", "reply"))
     note("thread/tokenUsage/updated", {"threadId": tid, "turnId": turn, "tokenUsage": {
         "total": {"inputTokens": 900, "cachedInputTokens": 400, "outputTokens": 20},
         "last": {"inputTokens": 450, "cachedInputTokens": 200, "outputTokens": 10}}})
@@ -100,7 +118,7 @@ def main():
             threads[tid] = []
             if not params.get("ephemeral"):
                 rollout(tid).parent.mkdir(parents=True, exist_ok=True)
-                rollout(tid).write_text("{}\n")
+                rollout(tid).write_text(json.dumps({"type": "session_meta"}) + "\n")
             log({"thread_start": params, "id": tid})
             send({"id": rid, "result": {"thread": {"id": tid}}})
         elif method == "thread/resume":
@@ -109,18 +127,19 @@ def main():
             if not rollout(tid).exists():
                 send({"id": rid, "error": {"code": -32600, "message": f"no rollout found for {tid}"}})
                 continue
-            threads.setdefault(tid, [None] * int(rollout(tid).read_text().count("\n") - 1))
+            users = [line for line in rollout(tid).read_text().splitlines() if '"role": "user"' in line]
+            threads.setdefault(tid, [None] * len(users))
             send({"id": rid, "result": {"thread": {"id": tid}}})
         elif method == "turn/start":
             turn = str(uuid.uuid4())
             text = params["input"][0]["text"]
             log({"turn_start": params})
             send({"id": rid, "result": {"turn": {"id": turn, "status": "inProgress"}}})
-            tid = params["threadId"]
-            if rollout(tid).exists():
-                with rollout(tid).open("a") as f:
-                    f.write("{}\n")
-            run_turn(tid, turn, text)
+            run_turn(params["threadId"], turn, text)
+        elif method == "thread/inject_items":
+            log({"inject_items": params})
+            carried[params["threadId"]] = len(params["items"])
+            send({"id": rid, "result": {}})
         else:
             send({"id": rid, "result": {}})
 

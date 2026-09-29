@@ -9,8 +9,10 @@ the Grok and Claude Code harnesses, so a profile swaps between them with
 live (codex 0.159):
 
 1. **Feature flags** take the shell and the rest of the coding-agent kit out
-   of the model's tool list (``FEATURES_OFF``). What stays listed — the
-   code-mode ``exec`` entry point (its host is off), ``apply_patch``, the
+   of the model's tool list (``FEATURES_OFF``). What stays listed — code
+   mode's ``exec`` (a bare ECMAScript isolate: no process, require, import,
+   fetch or sockets; it only calls the nested tools, which route through
+   layer 2 like any other call), ``apply_patch``, the
    collaboration (sub-agent) tools, ``web.run`` — has no filesystem or
    process access of its own. The gateway's tools are *dynamic tools*
    declared on the thread (experimental app-server API): always visible,
@@ -63,12 +65,15 @@ STATE_FILE = "miragen-instances.json"
 ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
                  "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy")
 # Everything of Codex's coding-agent kit that a feature flag can switch off.
+# NOT code_mode_host: gpt-6 models reach dynamic tools only through code
+# mode's exec (observed live: with the host off every tool call failed).
 FEATURES_OFF = (
-    "shell_tool", "unified_exec", "shell_snapshot", "code_mode_host", "multi_agent",
+    "shell_tool", "unified_exec", "shell_snapshot", "multi_agent",
     "multi_agent_v2", "apps", "plugins", "remote_plugin", "memories", "browser_use",
     "browser_use_external", "in_app_browser", "computer_use", "image_generation", "view_image",
     "goals", "skill_search", "skill_mcp_dependency_install", "tool_suggest", "sleep_tool", "hooks",
 )
+_CARRY_MAX_ITEMS = 200
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # Codex's web tool (web.run) searches and opens pages: it carries both.
 NATIVE_CAPABILITIES = frozenset({"WebSearch", "WebFetch"})
@@ -428,25 +433,99 @@ class CodexHarness:
     async def _open_thread(self, server: AppServer, instance: str, workdir: Path, *,
                            ephemeral: bool) -> str:
         params = await self._thread_params(workdir)
-        known = None if ephemeral else (self._load_state().get(instance) or {}).get("thread_id")
-        if known:
+        current = {t["name"]: t for t in params["dynamicTools"]}
+        entry = {} if ephemeral else (self._load_state().get(instance) or {})
+        known = entry.get("thread_id")
+        declared: dict[str, dict] | None = entry.get("tools")
+        carry: list[dict] = []
+        if known and declared is not None and set(current) <= set(declared):
+            # Codex fixes a thread's dynamic tools at thread/start (resume and
+            # fork ignore new ones). Same or fewer tools: resume, keeping the
+            # declared set — a tool whose upstream is down right now stays
+            # declared and fails at call time rather than forcing a new thread.
             try:
-                result = await server.request("thread/resume", {"threadId": known, **params,
-                                                                "excludeTurns": True})
+                result = await server.request("thread/resume", {
+                    "threadId": known, **params, "dynamicTools": list(declared.values()),
+                    "excludeTurns": True})
                 return result["thread"]["id"]
             except CodexHarnessError as exc:
                 logger.warning("codex harness: thread %s of %s could not resume (%s); starting "
                                "a new one", known, instance, exc)
                 await self._update_instance(instance, thread_id=None, lost=True)
+                known = None
+        elif known:
+            # New tools: a new thread declares them, and the old thread's
+            # history (since its last compaction) is carried into it.
+            carry = self._carry_items(known)
+            logger.info("codex harness: %s gained tools %s; moving to a new thread with %d "
+                        "carried item(s)", instance, sorted(set(current) - set(declared or {})),
+                        len(carry))
+            current = {**(declared or {}), **current}
+            params["dynamicTools"] = list(current.values())
         result = await server.request("thread/start", {**params, "ephemeral": ephemeral})
         thread_id = result["thread"]["id"]
+        lost = False
+        if carry:
+            try:
+                await server.request("thread/inject_items", {"threadId": thread_id, "items": carry})
+            except CodexHarnessError:
+                # An item the API won't take back (e.g. a compaction summary):
+                # retry with plain messages, then give up on the carry.
+                plain = [i for i in carry if i.get("type") == "message"]
+                try:
+                    await server.request("thread/inject_items", {"threadId": thread_id,
+                                                                 "items": plain})
+                except CodexHarnessError as exc:
+                    logger.warning("codex harness: could not carry %s's history (%s)", instance, exc)
+                    lost = True
+        elif known and not entry.get("lost"):
+            lost = True  # a new thread without the old one's history
         if not ephemeral:
             entry = self._load_state().get(instance) or {}
+            fields: dict[str, Any] = {"lost": True} if lost else {}
             await self._update_instance(
                 instance, thread_id=thread_id, threads=[*(entry.get("threads") or []), thread_id],
-                seq=int(entry.get("seq") or 0) or self._first_seq(instance),
-                session_started_at=time.time())
+                tools=current, seq=int(entry.get("seq") or 0) or self._first_seq(instance),
+                session_started_at=time.time(), **fields)
         return thread_id
+
+    def _carry_items(self, thread_id: str) -> list[dict]:
+        """The model-visible history of a thread since its last compaction,
+        as raw Responses items: the compaction's replacement history (with
+        its summary), then the user/assistant messages after it."""
+        path = self._rollout(thread_id)
+        if path is None:
+            return []
+        items: list[dict] = []
+
+        def clean(item: dict) -> dict | None:
+            kind = item.get("type")
+            if kind == "message" and item.get("role") in ("user", "assistant"):
+                text = "".join(c.get("text", "") for c in item.get("content") or []
+                               if isinstance(c, dict))
+                if text.startswith("<environment_context"):
+                    return None
+                return {"type": "message", "role": item["role"], "content": item["content"]}
+            if kind == "compaction" and item.get("encrypted_content"):
+                return {"type": "compaction", "encrypted_content": item["encrypted_content"]}
+            return None
+
+        for line in path.read_text().splitlines():
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            payload = entry.get("payload") or {}
+            if entry.get("type") == "compacted":
+                items = [c for c in map(clean, payload.get("replacement_history") or []) if c]
+                if not items and payload.get("message"):
+                    items = [{"type": "message", "role": "user", "content": [
+                        {"type": "input_text", "text": payload["message"]}]}]
+            elif entry.get("type") == "response_item":
+                cleaned = clean(payload)
+                if cleaned:
+                    items.append(cleaned)
+        return items[-_CARRY_MAX_ITEMS:]
 
     def _first_seq(self, instance: str) -> int:
         prev = self.served.get(instance) if self.served is not None else None
