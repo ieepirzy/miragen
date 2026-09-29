@@ -289,6 +289,12 @@ A 90-second call did not time out, so approval waits are not cut short by
 Codex. Verified in the image through `POST /instances/{name}/turns` with an
 upstream MCP tool and `approval_mode: queue`. Once approved, the action ran
 once; when denied, it never ran.
+A 16-minute approval wait was tested with gpt-6-sol. Code mode does not block on
+a pending tool call: `exec` yields, and the model polls `wait`. There were 20 polls
+in about 9 minutes, each a full-context model call, but only one approval request.
+The run ended when OpenAI reported the model at capacity, not on a Codex timeout.
+So a long approval costs quota on Codex, which blocking MCP calls on Grok and
+Claude do not.
 
 - **Tool-set changes.** Codex fixes a thread's dynamic tools at `thread/start`; `thread/resume` and `thread/fork` ignore new ones (observed). The instance state records the declared set.
   - **Same or fewer tools** (an upstream is down right now): the thread resumes with the declared set, and a missing tool fails at call time.
