@@ -243,3 +243,52 @@ numbering after the other harness (`seq`). Grok, on a swap back, keeps its
 own `seq`.
 
 **Verified live** (claude 2.1.284, claude-agent-sdk 0.2.161, subscription token, real gateway): a gateway tool call attributed to its instance through the env-expanded bearer; no built-ins reachable; a bogus `ANTHROPIC_API_KEY` in the parent did not reach the child; resume after a restart; streaming; ephemeral runs; rotate and forget; WebSearch + WebFetch; `MCP_TOOL_TIMEOUT` honoured through the wrapper (a 4 s limit timed out a 12 s tool); ~260 MB RSS per claude process.
+
+## The Codex harness
+
+`spec.model: codex:<model>` (e.g. `codex:gpt-6-sol`) runs base-tier turns on
+the ChatGPT subscription through `codex app-server` (JSON-RPC over stdio,
+`miragen/harness/codex.py`). There is one long-lived app-server per instance;
+a thread per instance is the conversation, and it is resumed after restarts.
+The binary is the one bundled with openai-codex (`CODEX_BIN` overrides it).
+
+**The tool boundary is three layers**, because Codex has no switch that turns
+off all built-in tools. Each layer was verified live against codex 0.159:
+
+1. **Feature flags** (`FEATURES_OFF`) remove the shell (`shell_tool`,
+   `unified_exec`), the code-mode host, sub-agents, plugins, apps, memories,
+   the browser and computer use, image tools and hooks. The model still sees
+   some tool names, but none of them can reach a file or a process:
+   - `exec`: its host is off.
+   - `collaboration.*`: a spawned sub-agent gets the same restricted tools.
+   - `apply_patch`: routed to approvals.
+   - `web.run`.
+
+   With the code-mode host on, it would be a bare ECMAScript isolate: no
+   `process`, `require`, `import`, `fetch` or sockets.
+2. **Deny by default.** The thread runs with sandbox `read-only`,
+   `approvalPolicy: untrusted` and the `user` reviewer. Every file change,
+   command, permission escalation and elicitation arrives at miragen as a
+   server request and is declined; so is any request miragen doesn't know.
+   This covers requests from inside code mode and from sub-agents too.
+3. **Nothing worth taking.** The process gets an allowlisted environment:
+   no `OPENAI_API_KEY`/`CODEX_API_KEY`, no upstream MCP secrets and no gateway
+   credential. `auth.json` sits in `CODEX_HOME`, which no remaining tool can
+   read. A login with `auth_mode` other than `chatgpt` is refused.
+
+**The gateway's tools are dynamic tools, not MCP.** Codex defers MCP tools
+behind a discovery step that the model often skips (observed: it answered
+without ever finding the tool). Dynamic tools are declared on the thread, use
+the experimental app-server API, and are always in context. Each call arrives
+as `item/tool/call` and runs through `ToolGateway.call_tool`, which handles
+approvals, run binding and call records. The list is re-declared on resume.
+A 90-second call did not time out, so approval waits are not cut short by
+Codex.
+
+- **Sessions.** `<MIRAGEN_CODEX_HOME>/miragen-instances.json` maps each instance to its thread. A resume that fails (the rollout is gone) starts a new thread and reports `fresh`. `rotate` starts a new thread; `forget` deletes the rollouts and the working directory.
+- **Output.** A turn's reply is its `final_answer` messages; `commentary` is used only when there is no final answer. Notifications are filtered by thread, so sub-agent text never leaks into the reply.
+- **Lifecycle.** Codex compacts on its own at `MIRAGEN_CODEX_AUTO_COMPACT_TOKENS` (`model_auto_compact_token_limit`). `thread/compacted` reaches the memory plane as `context.compacting`. `context_tokens` is the last model call's input.
+- **Instructions.** `spec.instructions` (plus voice guidance and a short tool note) replaces Codex's own base instructions.
+- **Login.** Once per `CODEX_HOME`, on the subscription:
+  `docker exec -it -e CODEX_HOME=/agent/codex-home <container> codex login --device-auth`.
+- **Costs.** About 220 MB RSS per app-server. Models on the subscription (2026-09-29): `gpt-6-astra` (default), `gpt-6-sol`, `gpt-6-luna`, and older `gpt-5.x`.
