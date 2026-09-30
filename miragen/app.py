@@ -42,7 +42,8 @@ from miragen.edf import (
 from miragen.executor import ExecutorBackend, ExecutorResult, RepositoryCheckout, build_executor
 from miragen.factory import build_agent, registered_handlers, registered_tools
 from miragen.harness import (
-    PYDANTIC_AI, Harness, HarnessTurn, InstanceBusyError, PydanticAIHarness, build_model_harness, profile_harness,
+    PYDANTIC_AI, Harness, HarnessTurn, InstanceBusyError, PydanticAIHarness, build_model_harness,
+    forget_inactive_harnesses, profile_harness,
     pydantic_ai_model,
 )
 from miragen.load import load_profile
@@ -2850,6 +2851,13 @@ async def delete_instance(name: str):
             deleted += await forget(name)
         except InstanceBusyError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if _profile is not None and _profile.spec is not None and _run_store is not None:
+        # spec.model can swap harnesses, each keeping its own conversation:
+        # the ones not running now hold state for this instance too, and
+        # swapping back must not resume a deleted conversation.
+        deleted += await asyncio.to_thread(
+            forget_inactive_harnesses, name, active=getattr(_harness, "name", None),
+            runs_root=_run_store.root)
     for path in (_history_file(name), _history_sidecar(name)):
         if path.exists():
             path.unlink()

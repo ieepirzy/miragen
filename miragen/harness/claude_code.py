@@ -147,6 +147,42 @@ def _sdk_client(options):
     return ClaudeSDKClient(options)
 
 
+def _session_file(claude_home: Path, session_id: str) -> Path | None:
+    projects = claude_home / "projects"
+    return next(projects.glob(f"*/{session_id}.jsonl"), None) if projects.is_dir() else None
+
+
+def purge_instance(settings: ClaudeCodeSettings, instance: str) -> list[str]:
+    """Delete everything this harness keeps on disk for an instance: its
+    session mapping, every Claude Code session it has had, and its working
+    directory. No process handling: the harness's own ``forget`` stops the
+    process first; the app calls this directly when another harness is the
+    active one (an instance-level DELETE discards every harness's state)."""
+    removed: list[str] = []
+    state_path = settings.claude_home / STATE_FILE
+    try:
+        state = json.loads(state_path.read_text())
+    except (FileNotFoundError, ValueError):
+        state = {}
+    entry = state.pop(instance, None)
+    if entry is not None:
+        tmp = state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
+        os.replace(tmp, state_path)
+        removed.append("session_mapping")
+    for sid in (entry or {}).get("sessions") or []:
+        path = _session_file(settings.claude_home, sid)
+        if path is not None:
+            path.unlink()
+            shutil.rmtree(path.with_suffix(""), ignore_errors=True)
+            removed.append(f"claude_session:{sid}")
+    workdir = settings.workdirs / instance
+    if workdir.is_dir():
+        shutil.rmtree(workdir)
+        removed.append("workdir")
+    return removed
+
+
 class ClaudeCodeHarness:
     name = NAME
     native_capabilities = frozenset(NATIVE_CAPABILITIES)
@@ -278,14 +314,17 @@ class ClaudeCodeHarness:
         return PermissionResultDeny(message="Only miragen gateway tools are available.")
 
     def _session_file(self, session_id: str) -> Path | None:
-        projects = self.settings.claude_home / "projects"
-        return next(projects.glob(f"*/{session_id}.jsonl"), None) if projects.is_dir() else None
+        return _session_file(self.settings.claude_home, session_id)
 
     def _options(self, instance: str, workdir: Path, *, resume: str | None, new_id: str | None,
-                 stderr: deque):
+                 stderr: deque, ephemeral: bool = False):
         from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 
         async def pre_compact(_input, _tool_use_id, _context):
+            if ephemeral:
+                # A one-off run has no instance: nothing of it may outlive the
+                # turn (no state entry, no plane session event).
+                return {}
             if self.on_lifecycle is not None:
                 with contextlib.suppress(Exception):
                     await self.on_lifecycle(instance, "compacting", {"trigger": "claude-code"})
@@ -332,7 +371,8 @@ class ClaudeCodeHarness:
         session_id = known or str(uuid.uuid4())
         stderr: deque = deque(maxlen=40)
         client = self._client_factory(self._options(
-            instance, workdir, resume=known, new_id=None if known else session_id, stderr=stderr))
+            instance, workdir, resume=known, new_id=None if known else session_id, stderr=stderr,
+            ephemeral=ephemeral))
         try:
             await client.connect()
         except BaseException as exc:
@@ -554,6 +594,13 @@ class ClaudeCodeHarness:
         if not entry and not switched:
             return None
         entry = entry or {}
+        # A mapped session whose file is gone (and that no running process
+        # holds) cannot be resumed: the next turn starts a new one, so say so
+        # now, before the client submits that turn without its transcript.
+        sid = entry.get("session_id")
+        agent = self._agents.get(instance)
+        missing = bool(sid) and self._session_file(sid) is None and not (
+            agent is not None and not agent.dead and agent.session_id == sid)
         return {"seq": self._seq(instance, entry),
                 "turns": int(entry.get("turns") or 0),
                 "compactions": int(entry.get("compactions") or 0),
@@ -562,7 +609,7 @@ class ClaudeCodeHarness:
                 # The next turn doesn't continue the conversation the client
                 # saw last: new, rotated, lost, or served by another harness.
                 "fresh": (not entry.get("session_id") or bool(entry.get("rotated"))
-                          or bool(entry.get("lost")) or switched),
+                          or bool(entry.get("lost")) or missing or switched),
                 "maintenance_running": False,
                 "harness": NAME}
 
@@ -596,23 +643,9 @@ class ClaudeCodeHarness:
                 await self._drop(instance)
                 removed.append("process")
             async with self._state_lock:
-                state = self._load_state()
-                entry = state.pop(instance, None)
-                if entry is not None:
-                    self._write_state(state)
-                    removed.append("session_mapping")
+                removed += purge_instance(self.settings, instance)
             if self.served is not None:
                 self.served.forget(instance)
-            for sid in (entry or {}).get("sessions") or []:
-                path = self._session_file(sid)
-                if path is not None:
-                    path.unlink()
-                    shutil.rmtree(path.with_suffix(""), ignore_errors=True)
-                    removed.append(f"claude_session:{sid}")
-            workdir = self.settings.workdirs / instance
-            if workdir.is_dir():
-                shutil.rmtree(workdir)
-                removed.append("workdir")
         return removed
 
     async def aclose(self) -> None:

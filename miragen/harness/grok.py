@@ -780,8 +780,7 @@ class GrokHarness:
     def session_dir(self, instance: str) -> Path:
         """Where grok keeps an instance's sessions (forks included): one
         directory per working directory, named by the percent-encoded cwd."""
-        cwd = str(self.settings.workdirs / instance)
-        return self.settings.grok_home / "sessions" / quote(cwd, safe="")
+        return session_dir(self.settings, instance)
 
     async def forget(self, instance: str) -> list[str]:
         """Discard an instance's conversation for good: stop its process, drop
@@ -796,20 +795,40 @@ class GrokHarness:
                 await self._drop(instance)
                 removed.append("process")
             async with self._state_lock:
-                state = self._load_state()
-                if state.pop(instance, None) is not None:
-                    tmp = self._state_path().with_suffix(".tmp")
-                    tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
-                    os.replace(tmp, self._state_path())
-                    removed.append("session_mapping")
+                removed += purge_instance(self.settings, instance)
             if self.served is not None:
                 self.served.forget(instance)
-            for label, path in (("grok_sessions", self.session_dir(instance)),
-                                ("workdir", self.settings.workdirs / instance)):
-                if path.is_dir():
-                    shutil.rmtree(path)
-                    removed.append(label)
         return removed
+
+
+def session_dir(settings: GrokSettings, instance: str) -> Path:
+    cwd = str(settings.workdirs / instance)
+    return settings.grok_home / "sessions" / quote(cwd, safe="")
+
+
+def purge_instance(settings: GrokSettings, instance: str) -> list[str]:
+    """Delete everything this harness keeps on disk for an instance: its
+    session mapping, grok's session files and the working directory. No
+    process handling: ``GrokHarness.forget`` stops the process first; the app
+    calls this directly when another harness is the active one (an
+    instance-level DELETE discards every harness's state)."""
+    removed: list[str] = []
+    state_path = settings.grok_home / STATE_FILE
+    try:
+        state = json.loads(state_path.read_text())
+    except (FileNotFoundError, ValueError):
+        state = {}
+    if state.pop(instance, None) is not None:
+        tmp = state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
+        os.replace(tmp, state_path)
+        removed.append("session_mapping")
+    for label, path in (("grok_sessions", session_dir(settings, instance)),
+                        ("workdir", settings.workdirs / instance)):
+        if path.is_dir():
+            shutil.rmtree(path)
+            removed.append(label)
+    return removed
 
 
 def _usage(raw: dict[str, Any]) -> RunUsage:

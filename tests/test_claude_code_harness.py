@@ -373,3 +373,85 @@ async def test_seq_is_the_same_before_and_after_the_first_turn_back(env):
     before = h.session_info("chat")["seq"]
     await h.run(turn("two", run_id="r2"))
     assert before == h.session_info("chat")["seq"] == 7
+
+
+async def test_a_missing_session_file_reads_fresh_before_the_turn(env):
+    # The client asks for session info before it submits a turn: a mapped
+    # session whose file is gone must already read `fresh` then, not only
+    # once the turn has gone to a new, empty session.
+    h = env.harness()
+    await h.run(turn("one"))
+    await h.aclose()
+    for f in (env.home / "projects").glob("*/*.jsonl"):
+        f.unlink()
+    h2 = env.harness()
+    assert h2.session_info("chat")["fresh"] is True
+    await h2.run(turn("two", run_id="r2"))
+    # The loss is still visible after that first turn on the new session...
+    assert h2.session_info("chat")["fresh"] is True
+    await h2.run(turn("three", run_id="r3"))
+    # ...and consumed by the next one.
+    assert h2.session_info("chat")["fresh"] is False
+
+
+async def test_ephemeral_compaction_persists_nothing(env):
+    events = []
+
+    async def lifecycle(instance, event, info):
+        events.append((instance, event))
+
+    def compacting(client, prompt):
+        async def gen():
+            for matcher in client.options.hooks["PreCompact"]:
+                for hook in matcher.hooks:
+                    await hook({"hook_event_name": "PreCompact", "trigger": "auto"}, None, {})
+            yield text("done")
+            yield result(client.session_id)
+        return gen()
+
+    env.script = compacting
+    h = env.harness()
+    h.on_lifecycle = lifecycle
+    await h.run(turn("hi", instance=None, use_history=False, run_id="e1"))
+    assert h.session_info("run-e1") is None
+    assert not (env.home / "miragen-instances.json").exists() or "run-e1" not in env.state()
+    assert events == []
+    # A persistent instance still records its compactions.
+    await h.run(turn("hi"))
+    assert env.state()["chat"]["compactions"] == 1 and events == [("chat", "compacting")]
+
+
+async def test_delete_purges_the_inactive_harnesses_state_too(env, monkeypatch):
+    # Grok served "chat", then the profile swapped to Claude Code, which also
+    # served it. DELETE (Claude active) must discard Grok's conversation too:
+    # swapping back must not resume it.
+    pytest.importorskip("grok_build_client")
+    from miragen.harness import forget_inactive_harnesses
+    from miragen.harness.grok import GrokHarness, GrokSettings, session_dir
+
+    grok_home, grok_work = env.tmp_path / "grok-home", env.tmp_path / "grok-work"
+    monkeypatch.setenv("MIRAGEN_GROK_HOME", str(grok_home))
+    monkeypatch.setenv("MIRAGEN_GROK_WORKDIRS", str(grok_work))
+    gsettings = GrokSettings.from_env(gateway_url="http://x/")
+    grok_home.mkdir()
+    (grok_home / "miragen-instances.json").write_text(
+        json.dumps({"chat": {"session_id": "g1", "seq": 2}, "other": {"session_id": "g2"}}))
+    session_dir(gsettings, "chat").mkdir(parents=True)
+    (grok_work / "chat").mkdir(parents=True)
+    env.served.mark("chat", "grok-build", 2)
+
+    h = env.harness()
+    await h.run(turn("hi"))
+    removed = await h.forget("chat")
+    removed += forget_inactive_harnesses("chat", active="claude-code",
+                                         runs_root=env.tmp_path / "runs")
+    assert {"grok-build:session_mapping", "grok-build:grok_sessions",
+            "grok-build:workdir"} <= set(removed)
+    assert json.loads((grok_home / "miragen-instances.json").read_text()) == {
+        "other": {"session_id": "g2"}}
+    assert not session_dir(gsettings, "chat").exists() and not (grok_work / "chat").exists()
+    prof = AgentProfile.model_validate({
+        "name": "mira", "mode": "interactive", "triggers": [{"type": "http"}],
+        "spec": {"model": "grok-build:grok-4.7", "instructions": "x"}})
+    g = GrokHarness(prof, ToolGateway(prof), gsettings, served=env.served)
+    assert g.session_info("chat") is None

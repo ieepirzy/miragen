@@ -131,6 +131,12 @@ harness owns its conversation. For Grok Build, that means:
   session and fork for that working directory;
 - delete the working directory itself.
 
+A profile can swap harnesses (`spec.model`), and each keeps its own
+conversation on disk, so DELETE also discards what the harnesses *not*
+running now hold for the instance (mapping, session files, working
+directory; `forget_inactive_harnesses`) and its entry in the served-by
+ledger. Otherwise swapping back would resume the deleted conversation.
+
 A busy instance gets a 409. Clients that rotate conversations (Mira's episodes)
 use this to prune retired instances. Run records are telemetry and have their
 own retention (`MIRAGEN_RUN_RETENTION`).

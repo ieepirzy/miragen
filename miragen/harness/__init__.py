@@ -15,8 +15,8 @@ from miragen.models import AgentProfile
 
 __all__ = [
     "PYDANTIC_AI", "Harness", "HarnessResult", "HarnessStream", "HarnessTurn",
-    "InstanceBusyError", "PydanticAIHarness", "build_model_harness", "parse_harness_model", "profile_harness",
-    "pydantic_ai_model",
+    "InstanceBusyError", "PydanticAIHarness", "build_model_harness", "forget_inactive_harnesses",
+    "parse_harness_model", "profile_harness", "pydantic_ai_model",
 ]
 
 
@@ -82,3 +82,34 @@ def build_model_harness(
             "harness ledger seeded with %d Grok instance(s)", seeded)
     return cls(profile, gateway, settings_cls.from_env(gateway_url=url),
                system_guidance=system_guidance, served=served), gateway
+
+
+def forget_inactive_harnesses(instance: str, *, active: str | None, runs_root: Path) -> list[str]:
+    """Delete an instance's state held by every harness except the running
+    one (whose own ``forget`` handles its process too).
+
+    A profile can swap harnesses, and each keeps its own conversation on
+    disk. An instance-level DELETE discards the conversation, so it must
+    discard all of them: otherwise swapping back to a harness that served the
+    instance earlier would resume the deleted conversation. Also drops the
+    instance from the shared served-by ledger, so nothing reports a switch
+    from a conversation that no longer exists."""
+    from miragen.harness import claude_code
+    from miragen.harness.served import ServedLedger
+
+    removed: list[str] = []
+    if active != claude_code.NAME:
+        removed += [f"{claude_code.NAME}:{item}" for item in claude_code.purge_instance(
+            claude_code.ClaudeCodeSettings.from_env(gateway_url=""), instance)]
+    if active != "grok-build":
+        try:
+            from miragen.harness import grok
+        except ImportError:
+            # grok-build-client is an optional extra: a build without it has
+            # never run the Grok harness, so it holds no Grok state.
+            grok = None
+        if grok is not None:
+            removed += [f"{grok.NAME}:{item}" for item in grok.purge_instance(
+                grok.GrokSettings.from_env(gateway_url=""), instance)]
+    ServedLedger(runs_root / "harness" / "served.json").forget(instance)
+    return removed
