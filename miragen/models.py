@@ -1249,6 +1249,18 @@ class AgentProfile(_ProfileModel):
         ge=1,
         description="queue mode only — how long a request may wait before it's denied.",
     )
+    approval_delivery: Literal["blocking", "async"] = Field(
+        default="blocking",
+        description=(
+            "queue mode, tool-gateway harnesses (grok-build, claude-code, codex) only. "
+            "'blocking' (default): a gated call waits inside the turn until it is "
+            "resolved. 'async': the call returns at once ('approval requested, not run "
+            "yet') and the turn goes on; when POST /approvals/{id} approves it, miragen "
+            "runs the call with the arguments frozen at request time and returns the "
+            "outcome in that response (also GET /approvals/{id}/outcome), for the "
+            "client to deliver as a later message. Denied or expired: it never runs."
+        ),
+    )
     tools: Optional[list[str]] = Field(
         default=None,
         description="Whitelisted @register tool names; None/omitted = no local tools injected.",
@@ -1420,11 +1432,17 @@ class AgentProfile(_ProfileModel):
 
     @model_validator(mode="after")
     def validate_approval_mode_needs_approval_required(self) -> AgentProfile:
-        non_default = self.approval_mode != "open" or self.approval_timeout_s != 300
+        non_default = (self.approval_mode != "open" or self.approval_timeout_s != 300
+                       or self.approval_delivery != "blocking")
         if non_default and not self.approval_required:
             raise ValueError(
                 "approval_mode/approval_timeout_s are set but approval_required is empty — "
                 "these only take effect once at least one glob is in approval_required "
                 "(dead config, likely a typo)"
             )
+        if self.approval_delivery == "async" and (
+                self.approval_mode != "queue" or self.approval_webhook is not None):
+            raise ValueError(
+                "approval_delivery: async needs approval_mode: queue and no approval_webhook "
+                "(the approval is resolved over /approvals, which then runs the call)")
         return self

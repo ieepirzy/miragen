@@ -273,4 +273,11 @@ def load_profile(path: str | Path) -> AgentProfile:
             and profile_harness(profile) == PYDANTIC_AI:
         resolve_capabilities(profile.spec.capabilities)
 
+    if profile.approval_delivery == "async" and (
+            profile.spec is None or profile_harness(profile) == PYDANTIC_AI):
+        raise ValueError(
+            "approval_delivery: async works on tool-gateway harnesses (grok-build:, "
+            "claude-code:, codex: models) only: there miragen answers the tool call itself "
+            "and can run it later; a PydanticAI or executor-tier call can't be deferred")
+
     return profile
