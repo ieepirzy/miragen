@@ -330,3 +330,12 @@ async def test_tool_calls_run_only_for_the_active_turn(env):
     out = await h._on_request("chat", "item/tool/call", {
         "turnId": "old-turn", "tool": "speak", "arguments": {"text": "x"}})
     assert out["success"] is False and "no longer active" in out["contentItems"][0]["text"]
+
+
+async def test_usage_is_per_turn_not_the_threads_running_total(env):
+    h = env.harness()
+    first = await h.run(turn("one"))
+    second = await h.run(turn("two", run_id="r2"))
+    for res in (first, second):  # two calls per turn, a repeated update ignored
+        assert (res.usage.input_tokens, res.usage.cached_input_tokens,
+                res.usage.output_tokens, res.usage.requests) == (900, 400, 20, 2)

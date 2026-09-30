@@ -632,7 +632,13 @@ class CodexHarness:
         agent = await self._agent_for(instance, ephemeral=ephemeral)
         final: list[str] = []
         other: list[str] = []
-        usage: dict = {}
+        # tokenUsage.total is the THREAD's running total; this turn's usage
+        # is the final total minus the total before the turn (the first
+        # update's total less that call's own `last`). Codex can repeat an
+        # update, so totals — not a sum of `last` — are the source of truth.
+        before: dict | None = None
+        total: dict = {}
+        requests = 0
         context: int | None = None
         compacted = 0
         error: str | None = None
@@ -684,8 +690,15 @@ class CodexHarness:
                                             other.append(text)
                                 elif method == "thread/tokenUsage/updated":
                                     tu = p.get("tokenUsage") or {}
-                                    usage = tu.get("total") or usage
                                     last = tu.get("last") or {}
+                                    new_total = tu.get("total") or {}
+                                    if before is None and new_total:
+                                        before = {k: v - int(last.get(k) or 0)
+                                                  for k, v in new_total.items()
+                                                  if isinstance(v, int)}
+                                    if new_total and new_total != total:
+                                        requests += 1
+                                        total = new_total
                                     if isinstance(last.get("inputTokens"), int):
                                         context = last["inputTokens"]
                                 elif method == "error":
@@ -741,7 +754,10 @@ class CodexHarness:
         output = "\n\n".join(final) if final else "\n\n".join(other)
         if not final and other and on_text:
             on_text(output)
-        return HarnessResult(output=output, usage=_usage(usage), tool_calls=calls)
+        turn_usage = {k: v - (before or {}).get(k, 0) for k, v in total.items()
+                      if isinstance(v, int)}
+        return HarnessResult(output=output, usage=_usage(turn_usage, requests=requests),
+                             tool_calls=calls)
 
     async def _after_turn(self, instance: str, context: int | None, compacted: int, *,
                           lost_before: bool = False) -> None:
@@ -872,9 +888,9 @@ def _tool_output(result: Any) -> dict:
             "success": not result.isError}
 
 
-def _usage(raw: dict[str, Any]) -> RunUsage:
+def _usage(raw: dict[str, Any], *, requests: int = 1) -> RunUsage:
     def pick(key):
         return raw.get(key) if isinstance(raw.get(key), int) else None
-    return RunUsage(requests=1, input_tokens=pick("inputTokens"),
+    return RunUsage(requests=max(requests, 1), input_tokens=pick("inputTokens"),
                     output_tokens=pick("outputTokens"),
                     cached_input_tokens=pick("cachedInputTokens"))

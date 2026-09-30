@@ -12,6 +12,7 @@ HOME = Path(os.environ["CODEX_HOME"])
 LOG = HOME / "fake.log.jsonl"
 threads: dict[str, list[str]] = {}
 carried: dict[str, int] = {}
+running = {"in": 0, "cached": 0, "out": 0}
 pending: dict[int, dict] = {}
 next_id = 1000
 
@@ -106,9 +107,18 @@ def run_turn(tid, turn, text):
     else:
         message(tid, turn, f"echo: {text}")
     append(tid, msg_item("assistant", "reply"))
-    note("thread/tokenUsage/updated", {"threadId": tid, "turnId": turn, "tokenUsage": {
-        "total": {"inputTokens": 900, "cachedInputTokens": 400, "outputTokens": 20},
-        "last": {"inputTokens": 450, "cachedInputTokens": 200, "outputTokens": 10}}})
+    # Two model calls per turn, as codex reports them: `total` is the
+    # thread's running total across turns; the last update is repeated.
+    for _ in range(2):
+        running["in"] += 450
+        running["cached"] += 200
+        running["out"] += 10
+        update = {"threadId": tid, "turnId": turn, "tokenUsage": {
+            "total": {"inputTokens": running["in"], "cachedInputTokens": running["cached"],
+                      "outputTokens": running["out"]},
+            "last": {"inputTokens": 450, "cachedInputTokens": 200, "outputTokens": 10}}}
+        note("thread/tokenUsage/updated", update)
+    note("thread/tokenUsage/updated", update)
     note("turn/completed", {"threadId": tid, "turn": {"id": turn, "status": status, "error": error}})
 
 
