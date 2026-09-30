@@ -50,8 +50,11 @@ from urllib.parse import quote
 from grok_build_client import AcpSession
 
 from miragen.executor.grok_hermetic import hermetic_home_dir, write_hermetic_home
-from miragen.harness.base import HarnessResult, HarnessTurn, InstanceBusyError, parse_harness_model
+from miragen.harness.base import (
+    HarnessResult, HarnessTurn, InstanceBusyError, TaskStream, parse_harness_model,
+)
 from miragen.harness.gateway import ToolGateway
+from miragen.harness.served import ServedLedger
 from miragen.harness.grok_lifecycle import (
     Decision, Handoff, Ledger, LifecyclePolicy, SessionStats, ThresholdPolicy,
     accepted_memory_writes, load_policy, memory_save_prompt, rotation_prompt,
@@ -216,6 +219,7 @@ class GrokHarness:
         *,
         session_factory: Callable[..., AcpSession] | None = None,
         system_guidance: str | None = None,
+        served: ServedLedger | None = None,
     ):
         if profile.spec is None:
             raise GrokHarnessError("the grok-build harness runs base-tier (spec:) profiles")
@@ -232,6 +236,7 @@ class GrokHarness:
 
         self.instructions = with_voice_guidance(profile.spec.instructions or "", system_guidance)
         self._session_factory = session_factory or AcpSession
+        self.served = served
         # Clock order (outer waits for inner): approval wait < grok's MCP
         # tool-call timeout < this harness's turn timeout. A gated call can
         # wait approval_timeout_s in the gateway; grok must not give up on
@@ -514,6 +519,12 @@ class GrokHarness:
         stop = end.get("stopReason")
         if deliver_update and stop not in ("cancelled", "refusal"):
             await self._save_instance(instance, agent.session_id)  # delivered: clear pending
+        if not ephemeral and self.served is not None and stop not in ("cancelled", "refusal"):
+            own = int((self._load_state().get(instance) or {}).get("seq") or 1)
+            seq = self.served.seq_for(instance, NAME, own)
+            if seq != own:  # back from another harness: a new plane session, never an old one
+                await self._update_instance(instance, seq=seq)
+            self.served.mark(instance, NAME, seq)
         if not ephemeral and self.settings.lifecycle and stop not in ("cancelled", "refusal"):
             await self._after_turn(instance, context_tokens, native_compactions, calls,
                                    handoff_delivered=handoff is not None)
@@ -528,8 +539,8 @@ class GrokHarness:
         return await self._turn(turn, None)
 
     @contextlib.asynccontextmanager
-    async def stream(self, turn: HarnessTurn) -> AsyncIterator["_GrokStream"]:
-        stream = _GrokStream()
+    async def stream(self, turn: HarnessTurn) -> AsyncIterator[TaskStream]:
+        stream = TaskStream()
         task = asyncio.create_task(self._turn(turn, stream.push))
         stream.attach(task)
         try:
@@ -742,12 +753,16 @@ class GrokHarness:
         if not entry:
             return None
         seq = int(entry.get("seq") or 1)
+        if self.served is not None:
+            seq = self.served.seq_for(instance, NAME, seq)
         return {"seq": seq, "turns": int(entry.get("turns") or 0),
                 "compactions": int(entry.get("compactions") or 0),
                 "context_tokens": int(entry.get("context_tokens") or 0),
                 "rotation_pending": bool(entry.get("rotation_pending")),
-                # The next turn is the first in a rotated session.
-                "fresh": bool(entry.get("rotation_pending")) or bool(entry.get("handoff")),
+                # The next turn is the first in a rotated session, or another
+                # harness served the turns since this session last saw one.
+                "fresh": (bool(entry.get("rotation_pending")) or bool(entry.get("handoff"))
+                          or (self.served is not None and self.served.switched(instance, NAME))),
                 "maintenance_running": instance in self._maintenance}
 
     async def aclose(self) -> None:
@@ -765,8 +780,7 @@ class GrokHarness:
     def session_dir(self, instance: str) -> Path:
         """Where grok keeps an instance's sessions (forks included): one
         directory per working directory, named by the percent-encoded cwd."""
-        cwd = str(self.settings.workdirs / instance)
-        return self.settings.grok_home / "sessions" / quote(cwd, safe="")
+        return session_dir(self.settings, instance)
 
     async def forget(self, instance: str) -> list[str]:
         """Discard an instance's conversation for good: stop its process, drop
@@ -781,47 +795,40 @@ class GrokHarness:
                 await self._drop(instance)
                 removed.append("process")
             async with self._state_lock:
-                state = self._load_state()
-                if state.pop(instance, None) is not None:
-                    tmp = self._state_path().with_suffix(".tmp")
-                    tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
-                    os.replace(tmp, self._state_path())
-                    removed.append("session_mapping")
-            for label, path in (("grok_sessions", self.session_dir(instance)),
-                                ("workdir", self.settings.workdirs / instance)):
-                if path.is_dir():
-                    shutil.rmtree(path)
-                    removed.append(label)
+                removed += purge_instance(self.settings, instance)
+            if self.served is not None:
+                self.served.forget(instance)
         return removed
 
 
-class _GrokStream:
-    def __init__(self):
-        self._queue: asyncio.Queue[str | None] = asyncio.Queue()
-        self._task: asyncio.Task | None = None
-        self._result: HarnessResult | None = None
+def session_dir(settings: GrokSettings, instance: str) -> Path:
+    cwd = str(settings.workdirs / instance)
+    return settings.grok_home / "sessions" / quote(cwd, safe="")
 
-    def attach(self, task: asyncio.Task) -> None:
-        self._task = task
-        task.add_done_callback(lambda _t: self._queue.put_nowait(None))
 
-    def push(self, text: str) -> None:
-        self._queue.put_nowait(text)
-
-    async def __aiter__(self):
-        while True:
-            item = await self._queue.get()
-            if item is None:
-                break
-            yield item
-        assert self._task is not None
-        self._result = await self._task  # re-raises a failed turn
-
-    @property
-    def result(self) -> HarnessResult:
-        if self._result is None:
-            raise RuntimeError("stream not finished")
-        return self._result
+def purge_instance(settings: GrokSettings, instance: str) -> list[str]:
+    """Delete everything this harness keeps on disk for an instance: its
+    session mapping, grok's session files and the working directory. No
+    process handling: ``GrokHarness.forget`` stops the process first; the app
+    calls this directly when another harness is the active one (an
+    instance-level DELETE discards every harness's state)."""
+    removed: list[str] = []
+    state_path = settings.grok_home / STATE_FILE
+    try:
+        state = json.loads(state_path.read_text())
+    except (FileNotFoundError, ValueError):
+        state = {}
+    if state.pop(instance, None) is not None:
+        tmp = state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
+        os.replace(tmp, state_path)
+        removed.append("session_mapping")
+    for label, path in (("grok_sessions", session_dir(settings, instance)),
+                        ("workdir", settings.workdirs / instance)):
+        if path.is_dir():
+            shutil.rmtree(path)
+            removed.append(label)
+    return removed
 
 
 def _usage(raw: dict[str, Any]) -> RunUsage:

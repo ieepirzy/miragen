@@ -131,6 +131,12 @@ harness owns its conversation. For Grok Build, that means:
   session and fork for that working directory;
 - delete the working directory itself.
 
+A profile can swap harnesses (`spec.model`), and each keeps its own
+conversation on disk, so DELETE also discards what the harnesses *not*
+running now hold for the instance (mapping, session files, working
+directory; `forget_inactive_harnesses`) and its entry in the served-by
+ledger. Otherwise swapping back would resume the deleted conversation.
+
 A busy instance gets a 409. Clients that rotate conversations (Mira's episodes)
 use this to prune retired instances. Run records are telemetry and have their
 own retention (`MIRAGEN_RUN_RETENTION`).
@@ -200,3 +206,40 @@ is how a caller waits for it (`GET /instances/{name}/turns/{turn_id}`, the
 same record as `/runs/{turn_id}`), resumes waiting after its own restart
 without sending the turn twice, and attributes the turn's tool calls,
 approvals and usage.
+
+## The Claude Code harness
+
+`spec.model: claude-code:<model>` (e.g. `claude-code:sonnet`; `claude-code:`
+alone means Claude Code's default) runs the same base-tier turns on the Claude
+subscription. It exists so a persistent agent can swap subscriptions (Grok
+rate limited → Claude, and back) by changing `spec.model` and redeploying,
+without any change on the client side.
+
+**Runtime shape** (`miragen/harness/claude_code.py`, through claude-agent-sdk):
+- **Processes.** There is one long-lived `claude` process per instance, run as the SDK's CLI binary (bundled with claude-agent-sdk; `CLAUDE_BIN` overrides it). Eviction and timeouts work as for Grok (`MIRAGEN_CLAUDE_MAX_PROCESSES`, `MIRAGEN_CLAUDE_IDLE_S`, `MIRAGEN_CLAUDE_TURN_TIMEOUT_S`); `MIRAGEN_CLAUDE_EFFORT` sets the effort level.
+- **Hermetic.**
+  - `CLAUDE_CONFIG_DIR=<MIRAGEN_CLAUDE_HOME>` (default `/agent/claude-home`) with no settings sources, no skills, no plugins and no CLAUDE.md.
+  - The built-in tools are removed (`tools=[]`); the profile's `WebSearch`/`WebFetch` capabilities map to Claude Code's own.
+  - `--strict-mcp-config` makes the gateway (server name `gw`) the only MCP server. Its bearer is `${MIRAGEN_GATEWAY_TOKEN}`, expanded from the child's environment.
+  - `can_use_tool` allows only `mcp__gw__*` and the enabled web tools; permission mode is `default` (never `bypassPermissions`, which would skip the callback).
+  - Tool search is off (`ENABLE_TOOL_SEARCH=false`): it would defer gateway tools behind a built-in the harness removes.
+  - Prompts are delivered verbatim (no `@path` expansion, no slash commands).
+- **Subscription only.** The SDK merges the parent environment into the child's, so the CLI is launched through an exec wrapper (`<claude_home>/miragen-claude`) that keeps an allowlist. The child sees `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) or a login in `CLAUDE_CONFIG_DIR`, and never `ANTHROPIC_API_KEY`, a base URL or the deployment's upstream MCP secrets.
+- **Sessions.** `<claude_home>/miragen-instances.json` maps each instance to its Claude Code session. It is separate from Grok's, so swapping back resumes Grok's own sessions. A (re)started process resumes with `--resume`. A missing session file starts a new session and reports `fresh`.
+- **Per-turn context** (the memory packet) rides the prompt. The system prompt is `spec.instructions` (plus voice guidance) and stays byte-stable, so the prompt cache holds. An instructions change takes effect when the process next starts: Claude Code takes the system prompt per launch, not per session.
+- **Lifecycle.** Claude Code compacts on its own. By default that happens near the model's full window (sonnet: 967k, observed), so a persistent agent sets `MIRAGEN_CLAUDE_AUTO_COMPACT_WINDOW` (→ `CLAUDE_CODE_AUTO_COMPACT_WINDOW`; 100000 is Claude Code's floor and compacts at 67k, observed via `get_context_usage`). Its PreCompact hook reaches the memory plane as `context.compacting`. There is no miragen compaction/rotation policy and no handoff note here. `POST /instances/{name}/rotate` starts a new session (the plane sees `context.closed`), and `DELETE /instances/{name}` removes the process, mapping, session files and working directory.
+- **Clock order** as for Grok: with gated tools, `MCP_TOOL_TIMEOUT` is `approval_timeout_s + 120` s and the turn timeout is raised above it.
+
+### Swapping harnesses
+
+Each harness keeps its own conversation state, so after a swap the next turn
+continues a conversation that missed whatever the other harness served. Both
+harnesses record which of them served each instance's last turn
+(`<runs>/harness/served.json`, `miragen/harness/served.py`) and report
+`fresh: true` from `GET /instances/{name}/session` when that was the other
+one. A client adds its own recent transcript on `fresh`, exactly as after a
+rotation. The Claude Code harness also continues the memory plane's session
+numbering after the other harness (`seq`). Grok, on a swap back, keeps its
+own `seq`.
+
+**Verified live** (claude 2.1.284, claude-agent-sdk 0.2.161, subscription token, real gateway): a gateway tool call attributed to its instance through the env-expanded bearer; no built-ins reachable; a bogus `ANTHROPIC_API_KEY` in the parent did not reach the child; resume after a restart; streaming; ephemeral runs; rotate and forget; WebSearch + WebFetch; `MCP_TOOL_TIMEOUT` honoured through the wrapper (a 4 s limit timed out a 12 s tool); ~260 MB RSS per claude process.

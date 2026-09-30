@@ -56,13 +56,15 @@ RUN pip install --no-cache-dir \
 # Docker copies the image directory's ownership into a fresh named volume.
 RUN adduser --disabled-password --gecos "" agentuser \
     && mkdir -p /agent/runs /agent/workspaces /agent/histories /agent/schedules \
-       /agent/memory /agent/grok-home /agent/codex-home /agent/kimi-home \
+       /agent/memory /agent/grok-home /agent/claude-home /agent/codex-home /agent/kimi-home \
     && chown -R agentuser /agent
 
 USER agentuser
 
 # The user that runs miragen must be able to run grok (checked at build time).
 RUN grok --version
+# ...and the Claude Code CLI bundled with claude-agent-sdk (the claude-code harness).
+RUN python -c "import subprocess; from miragen.harness.claude_code import bundled_cli; subprocess.run([bundled_cli(), '--version'], check=True)"
 
 # Workspace (agent.yaml + tools.py) is mounted at runtime — nothing baked in.
 # Set AGENT_PROFILE to a path relative to /agent, e.g. agent.yaml (default).

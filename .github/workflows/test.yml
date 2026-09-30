@@ -23,7 +23,7 @@ jobs:
       - name: Install
         run: |
           pip install -e ./packages/grok-build-client
-          pip install -e ".[dev]"
+          pip install -e ".[dev,claude-code]"
 
       # Coverage is measured on every leg so the command stays identical
       # across the matrix; only 3.12's reports are published, because the

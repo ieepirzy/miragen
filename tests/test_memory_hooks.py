@@ -288,9 +288,11 @@ class TestSupportDetection:
     def test_codex_is_supported_via_bridge(self):
         assert executor_hook_support("codex")["native_hooks"] is True
 
-    def test_claude_code_reflects_installed_sdk(self):
-        # The dev environment has no claude-agent-sdk: the report must say
-        # so rather than assume from documentation (§18.7).
+    def test_claude_code_reflects_installed_sdk(self, monkeypatch):
+        # Without claude-agent-sdk the report must say so rather than assume
+        # from documentation (§18.7). (CI installs the SDK for the Claude Code
+        # harness tests, so its absence is simulated.)
+        monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
         support = executor_hook_support("claude-code")
         assert support["native_hooks"] is False
         assert "not installed" in support["detail"]
@@ -423,9 +425,10 @@ class TestAdapterIntegration:
         assert not (tmp_path / "codex-home" / "hooks.json").exists()
         assert executor.memory_hook_capabilities()["memory_enabled"] is False
 
-    def test_claude_code_options_omit_hooks_without_sdk(self, tmp_path):
-        """No claude-agent-sdk in this environment: the adapter must not
-        fabricate a hooks option it cannot honor."""
+    def test_claude_code_options_omit_hooks_without_sdk(self, tmp_path, monkeypatch):
+        """No claude-agent-sdk: the adapter must not fabricate a hooks option
+        it cannot honor."""
+        monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
         from miragen.executor.claude_code import ClaudeCodeExecutor
         from miragen.models import AgentProfile
 

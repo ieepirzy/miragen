@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -14,8 +15,8 @@ from miragen.models import AgentProfile
 
 __all__ = [
     "PYDANTIC_AI", "Harness", "HarnessResult", "HarnessStream", "HarnessTurn",
-    "InstanceBusyError", "PydanticAIHarness", "build_model_harness", "parse_harness_model", "profile_harness",
-    "pydantic_ai_model",
+    "InstanceBusyError", "PydanticAIHarness", "build_model_harness", "forget_inactive_harnesses",
+    "parse_harness_model", "profile_harness", "pydantic_ai_model",
 ]
 
 
@@ -53,15 +54,62 @@ def build_model_harness(
     """A long-lived non-PydanticAI harness for this profile, plus the tool
     gateway it acts through: (harness, gateway)."""
     name = profile_harness(profile)
-    if name == "grok-build":
-        from miragen.harness.gateway import ToolGateway
-        from miragen.harness.grok import GrokHarness, GrokSettings
+    if name not in ("grok-build", "claude-code"):
+        raise ValueError(f"harness '{name}' is not available in this build")
+    from miragen.harness.gateway import ToolGateway
+    from miragen.harness.served import ServedLedger
 
-        gateway = ToolGateway(profile, runtime_tools=runtime_tools,
-                              registered_tools=registered_tools, bind_context=bind_context,
-                              native_capabilities=GrokHarness.native_capabilities,
-                              session_key_for=session_key_for)
-        url = gateway_url or f"http://127.0.0.1:{os.environ.get('PORT', '8000')}/mcp/gateway/"
-        return GrokHarness(profile, gateway, GrokSettings.from_env(gateway_url=url),
-                           system_guidance=system_guidance), gateway
-    raise ValueError(f"harness '{name}' is not available in this build")
+    if name == "grok-build":
+        from miragen.harness.grok import GrokHarness as cls, GrokSettings as settings_cls
+    else:
+        from miragen.harness.claude_code import (
+            ClaudeCodeHarness as cls, ClaudeCodeSettings as settings_cls,
+        )
+    gateway = ToolGateway(profile, runtime_tools=runtime_tools,
+                          registered_tools=registered_tools, bind_context=bind_context,
+                          native_capabilities=cls.native_capabilities,
+                          session_key_for=session_key_for)
+    url = gateway_url or f"http://127.0.0.1:{os.environ.get('PORT', '8000')}/mcp/gateway/"
+    # Which harness last served each instance, shared by all of them, so a
+    # swap of spec.model shows up as `fresh` (miragen/harness/served.py).
+    served = ServedLedger(runs_root / "harness" / "served.json")
+    # Conversations that predate the ledger were all Grok's: record that
+    # once, so the first swap away from Grok already reads as a swap.
+    seeded = served.seed("grok-build", Path(os.environ.get("MIRAGEN_GROK_HOME", "/agent/grok-home"))
+                         / "miragen-instances.json")
+    if seeded:
+        logging.getLogger("miragen.harness").info(
+            "harness ledger seeded with %d Grok instance(s)", seeded)
+    return cls(profile, gateway, settings_cls.from_env(gateway_url=url),
+               system_guidance=system_guidance, served=served), gateway
+
+
+def forget_inactive_harnesses(instance: str, *, active: str | None, runs_root: Path) -> list[str]:
+    """Delete an instance's state held by every harness except the running
+    one (whose own ``forget`` handles its process too).
+
+    A profile can swap harnesses, and each keeps its own conversation on
+    disk. An instance-level DELETE discards the conversation, so it must
+    discard all of them: otherwise swapping back to a harness that served the
+    instance earlier would resume the deleted conversation. Also drops the
+    instance from the shared served-by ledger, so nothing reports a switch
+    from a conversation that no longer exists."""
+    from miragen.harness import claude_code
+    from miragen.harness.served import ServedLedger
+
+    removed: list[str] = []
+    if active != claude_code.NAME:
+        removed += [f"{claude_code.NAME}:{item}" for item in claude_code.purge_instance(
+            claude_code.ClaudeCodeSettings.from_env(gateway_url=""), instance)]
+    if active != "grok-build":
+        try:
+            from miragen.harness import grok
+        except ImportError:
+            # grok-build-client is an optional extra: a build without it has
+            # never run the Grok harness, so it holds no Grok state.
+            grok = None
+        if grok is not None:
+            removed += [f"{grok.NAME}:{item}" for item in grok.purge_instance(
+                grok.GrokSettings.from_env(gateway_url=""), instance)]
+    ServedLedger(runs_root / "harness" / "served.json").forget(instance)
+    return removed

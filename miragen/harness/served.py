@@ -1,0 +1,93 @@
+"""Which harness last served each instance (harness-neutral).
+
+A profile can swap harnesses (``spec.model: grok-build:…`` ↔
+``claude-code:…``), for example while one subscription is rate limited.
+Each harness keeps its own conversation state, so after a swap the next
+harness resumes a conversation that knows nothing about the turns the other
+one served. Both harnesses record themselves here after every turn and
+report ``fresh`` from ``session_info`` when the last turn was someone
+else's, so a client adds its own recent transcript (as after a rotation).
+
+No entry means "unknown" (state from before this ledger existed), which is
+not a switch.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+from pathlib import Path
+
+
+class ServedLedger:
+    def __init__(self, path: Path):
+        self.path = path
+        self._lock = threading.Lock()
+
+    def _load(self) -> dict[str, dict]:
+        try:
+            return json.loads(self.path.read_text())
+        except (FileNotFoundError, ValueError):
+            return {}
+
+    def get(self, instance: str) -> dict | None:
+        return self._load().get(instance)
+
+    def switched(self, instance: str, harness: str) -> bool:
+        """Was this instance's last turn served by a different harness?"""
+        entry = self.get(instance)
+        return entry is not None and entry.get("harness") != harness
+
+    def seq_for(self, instance: str, harness: str, own: int) -> int:
+        """The plane session number `harness` should use now: its own, or —
+        when another harness served the instance last — one past that
+        harness's, so the plane never reuses or goes back to a session."""
+        entry = self.get(instance)
+        if entry is not None and entry.get("harness") != harness:
+            return max(own, int(entry.get("seq") or 0) + 1)
+        return own
+
+    def mark(self, instance: str, harness: str, seq: int) -> None:
+        with self._lock:
+            state = self._load()
+            state[instance] = {"harness": harness, "seq": seq, "at": time.time()}
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
+            os.replace(tmp, self.path)
+
+    def seed(self, harness: str, state_file: Path) -> int:
+        """Start the ledger from a harness's own instance map (``{instance:
+        {"seq": n, …}}``) when the ledger does not exist yet: the first deploy
+        with this ledger may already be a swap (e.g. to Claude Code because
+        Grok is rate limited), and without a record of who served the
+        instance, that first swap would not show as `fresh`. Returns how many
+        instances were seeded (0 when the ledger exists or there is nothing
+        to seed)."""
+        with self._lock:
+            if self.path.exists():
+                return 0
+            try:
+                known = json.loads(state_file.read_text())
+            except (FileNotFoundError, ValueError, OSError):
+                return 0
+            state = {name: {"harness": harness, "seq": int(entry.get("seq") or 1),
+                            "at": float(entry.get("updated_at") or time.time()), "seeded": True}
+                     for name, entry in known.items() if isinstance(entry, dict)}
+            if not state:
+                return 0
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
+            os.replace(tmp, self.path)
+            return len(state)
+
+    def forget(self, instance: str) -> None:
+        with self._lock:
+            state = self._load()
+            if state.pop(instance, None) is not None:
+                tmp = self.path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
+                os.replace(tmp, self.path)

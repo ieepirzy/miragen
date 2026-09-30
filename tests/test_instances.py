@@ -303,6 +303,26 @@ class TestInstancesEndpoint:
         assert not app_module._history_file("alpha").exists()
         assert not app_module._history_sidecar("alpha").exists()
 
+    async def test_delete_discards_state_of_harnesses_not_running_now(
+            self, client, tmp_path, monkeypatch):
+        # spec.model swapped away from Claude Code after it served "alpha":
+        # DELETE must discard that conversation too, or swapping back would
+        # resume it.
+        home = tmp_path / "claude-home"
+        monkeypatch.setenv("MIRAGEN_CLAUDE_HOME", str(home))
+        home.mkdir()
+        (home / "miragen-instances.json").write_text(
+            '{"alpha": {"session_id": "s1", "sessions": ["s1"], "seq": 1}}')
+        session = home / "projects" / "-w" / "s1.jsonl"
+        session.parent.mkdir(parents=True)
+        session.touch()
+        (home / "workspaces" / "alpha").mkdir(parents=True)
+        resp = await client.delete("/instances/alpha")
+        assert resp.status_code == 200
+        assert "claude-code:session_mapping" in resp.json()["deleted"]
+        assert not session.exists() and not (home / "workspaces" / "alpha").exists()
+        assert (home / "miragen-instances.json").read_text().strip() == "{}"
+
     async def test_delete_unknown_is_404(self, client):
         assert (await client.delete("/instances/nope")).status_code == 404
 

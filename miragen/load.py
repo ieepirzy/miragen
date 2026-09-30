@@ -75,7 +75,8 @@ def _build_mcp(cfg: dict) -> Any:
     if gateway_only:
         raise ValueError(
             f"MCP capability key(s) {gateway_only} are served by the tool gateway, i.e. on "
-            "harness models such as grok-build:<model>, not on pydantic-ai models."
+            "harness models such as grok-build:<model> or claude-code:<model>, not on "
+            "pydantic-ai models."
         )
     unknown = sorted(set(cfg) - _MCP_CONFIG_KEYS)
     if unknown:
