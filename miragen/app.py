@@ -2877,6 +2877,10 @@ class ApprovalListResponse(BaseModel):
 
 class ResolveApprovalResponse(BaseModel):
     resolved: bool
+    # approval_delivery: async only — what happened: executed (bool), ok,
+    # result_text (truncated), approved/expired/reason, tool_name, tool_args,
+    # run_id, instance. None for blocking approvals (the waiting turn goes on).
+    outcome: Optional[dict] = None
 
 
 class InboxAckRequest(BaseModel):
@@ -2914,9 +2918,18 @@ async def list_approvals(
     return ApprovalListResponse(count=len(pending), approvals=pending, version=broker.version)
 
 
-@app.post("/approvals/{request_id}", response_model=ResolveApprovalResponse, dependencies=[_internal_auth])
+@app.post("/approvals/{request_id}", response_model=ResolveApprovalResponse,
+          response_model_exclude_none=True, dependencies=[_internal_auth])
 async def resolve_approval(request_id: str, response: ApprovalResponse):
+    """Answer a queued approval. A blocking one resumes the turn that waits
+    on it. An async one (approval_delivery: async) runs now when approved —
+    this call returns once it has, with its outcome — and never runs when
+    denied; answering it again is a 404, so it can't run twice."""
     broker = get_broker()
+    if broker.is_async(request_id):
+        outcome = await broker.resolve_async(request_id, response)
+        if outcome is not None:
+            return ResolveApprovalResponse(resolved=True, outcome=outcome)
     if not broker.resolve(request_id, response):
         pending_ids = [p.request.request_id for p in broker.pending()]
         raise HTTPException(
@@ -2924,6 +2937,17 @@ async def resolve_approval(request_id: str, response: ApprovalResponse):
             detail={"error": f"unknown, already resolved, or expired approval '{request_id}'", "pending": pending_ids},
         )
     return ResolveApprovalResponse(resolved=True)
+
+
+@app.get("/approvals/{request_id}/outcome", dependencies=[_internal_auth])
+async def approval_outcome(request_id: str):
+    """A resolved async approval's outcome (e.g. for a client whose POST timed
+    out while the approved call ran). The last few hundred are kept, in
+    memory: a restart forgets them."""
+    outcome = get_broker().outcome(request_id)
+    if outcome is None:
+        raise HTTPException(status_code=404, detail=f"no outcome for approval '{request_id}'")
+    return outcome
 
 
 @app.post("/run/stream", dependencies=[_internal_auth])

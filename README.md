@@ -546,6 +546,7 @@ Every agent container exposes:
 | `/history` | GET | Read-only slice of persisted conversation history (`?limit=` or `?run_id=`) |
 | `/approvals` | GET | List pending `approval_mode: queue` requests |
 | `/approvals/{request_id}` | POST | Resolve a pending approval request |
+| `/approvals/{request_id}/outcome` | GET | A resolved async approval's outcome (`approval_delivery: async`) |
 | `/profiles/resolve` | POST | Validate + resolve an EDF (canonical doc, SHA-256, executable profile) without starting a run |
 | `/executor-runs` | POST | Idempotent, provenance-carrying executor launch (durable before ack) |
 | `/runs/{run_id}/snapshot` | GET | Immutable resolved-EDF snapshot persisted at launch |
@@ -704,6 +705,44 @@ POST /approvals/{request_id}
 { "approved": false, "prompt": "That file is read-only, try another path." }
 → {"resolved": true}
 ```
+
+### Async delivery: the turn doesn't wait
+
+```yaml
+approval_mode: queue
+approval_delivery: async   # blocking (default) | async
+```
+
+With `blocking`, a gated call waits inside the turn until someone answers it. With `async` the gated call answers at once, and the turn goes on:
+
+```json
+{"status": "approval_pending", "code": "ab12cd",
+ "message": "Approval requested (code ab12cd). 'book' has NOT run yet. …"}
+```
+
+The request is queued as usual (`GET /approvals` shows `"delivery": "async"`).
+
+- **Approve.** `POST /approvals/{id}` with `approved: true` runs the call itself, then returns its outcome:
+  - It uses the arguments frozen at request time and the same upstream, credential and `allowed_tools`.
+  - It runs under the asking turn's run id and instance.
+
+  ```json
+  {"resolved": true, "outcome": {"approved": true, "executed": true, "ok": true,
+    "result_text": "…", "truncated": false, "tool_name": "book", "tool_args": {…},
+    "run_id": "…", "instance": "chat", "approver_note": null}}
+  ```
+
+  The client delivers the outcome as a later message; Mira's relay pushes it into the chat.
+- **Deny or expire.** A denied or expired request never runs. The outcome says `executed: false`, plus `reason` or `expired`.
+- **Answering twice is a 404,** so a call can't run twice.
+- **Recovering an outcome.** `GET /approvals/{id}/outcome` returns a resolved request's outcome. Use it if the POST timed out while the call ran.
+
+Scope and limits:
+- **Harnesses.** Async delivery works on tool-gateway harnesses only (`grok-build:`, `claude-code:`, `codex:` models), because there miragen answers the tool call itself. PydanticAI profiles are rejected at load.
+- **Registered handlers.** A registered approval handler still decides in-process, and blocks.
+- **The turn-ended guard doesn't apply.** Blocking approvals refuse to run an approval that arrives after its turn ended. For async ones, running after the turn is the point.
+- **Restarts.** The queue, like the blocking one, is in memory: a restart drops pending async requests and kept outcomes. A later answer is a 404, and nothing runs. That fails safe, because the agent was told the call had not run.
+- **Why async.** The model makes no requests while it waits. On Codex, a blocking wait makes the model poll the code-mode `wait` tool, and each poll is a full-context model call.
 
 Resolving an unknown, already-resolved, or expired id returns `404` with the still-pending ids, and doesn't touch any other request. `GET /health` includes `pending_approvals` as a quick liveness+context check.
 

@@ -50,6 +50,7 @@ from miragen.models import AgentProfile, ToolCallRecord
 logger = logging.getLogger("miragen.gateway")
 
 _ARGS_MAX = 2_000
+_OUTCOME_MAX = 4_000  # characters of an approved async call's result kept/returned
 _UPSTREAM_TOOLS_TTL_S = 300.0
 # A server that failed to list its tools isn't asked again for this long, so
 # an unreachable (e.g. not yet deployed) server doesn't slow every turn.
@@ -370,6 +371,8 @@ class ToolGateway:
                                 result=_error(f"unknown tool '{name}'"))
         response = None
         if approval_gated(self.profile, name, raw, args=arguments):
+            if self.profile.approval_delivery == "async" and not _approval_handler_registered():
+                return self._defer(log, name, arguments, kind, target, raw, instance)
             try:
                 response = await decide_approval(self.profile, name, arguments)
             except ApprovalDenied as exc:
@@ -380,33 +383,75 @@ class ToolGateway:
                 logger.warning("gateway: %s approved after its turn ended; not executed", name)
                 return self._record(log, name, arguments, ok=False, result=_error(
                     f"'{name}' was approved only after this turn had ended; it was not run"))
-        token = _CURRENT.set((log.run_id, instance))
         try:
-            with self._bind(log.run_id, instance):
-                if kind == "local":
-                    value = await target.fn_tool.run(arguments)
-                    result = _text_result(value)
-                else:
-                    try:
-                        async with self._session(target) as session:
-                            result = await session.call_tool(raw, arguments)
-                    except Exception:
-                        if target.auth is None:
-                            raise
-                        # An expired or revoked token: one fresh authorization.
-                        target.auth.invalidate()
-                        async with self._session(target) as session:
-                            result = await session.call_tool(raw, arguments)
+            result = await self._execute(kind, target, raw, arguments, log.run_id, instance)
         except Exception as exc:
             logger.warning("gateway tool %s failed: %s", name, exc)
             return self._record(log, name, arguments, ok=False, result=_error(f"{type(exc).__name__}: {exc}"))
-        finally:
-            _CURRENT.reset(token)
         if response is not None and response.prompt:
             result = result.model_copy(update={"content": [
                 types.TextContent(type="text", text=with_approver_note(response, "").rstrip())
             ] + list(result.content)})
         return self._record(log, name, arguments, ok=not result.isError, result=result)
+
+    async def _execute(self, kind: str, target: Any, raw: str, arguments: dict,
+                       run_id: str | None, instance: str | None) -> types.CallToolResult:
+        token = _CURRENT.set((run_id, instance))
+        try:
+            with self._bind(run_id, instance):
+                if kind == "local":
+                    return _text_result(await target.fn_tool.run(arguments))
+                try:
+                    async with self._session(target) as session:
+                        return await session.call_tool(raw, arguments)
+                except Exception:
+                    if target.auth is None:
+                        raise
+                    # An expired or revoked token: one fresh authorization.
+                    target.auth.invalidate()
+                    async with self._session(target) as session:
+                        return await session.call_tool(raw, arguments)
+        finally:
+            _CURRENT.reset(token)
+
+    def _defer(self, log: TurnLog, name: str, arguments: dict, kind: str, target: Any,
+               raw: str, instance: str) -> types.CallToolResult:
+        """approval_delivery: async. Queue the call and answer at once; the
+        approval (POST /approvals/{id}) runs it later with these arguments,
+        frozen now, under the asking turn's run id and instance."""
+        import copy
+        import uuid
+
+        from miragen.broker import get_broker
+        from miragen.models import ApprovalRequest
+
+        frozen = copy.deepcopy(arguments)
+        request = ApprovalRequest(agent_name=self.profile.name, tool_name=name,
+                                  tool_args=copy.deepcopy(arguments), request_id=str(uuid.uuid4()))
+        code = approval_code(request.request_id)
+        run_id = log.run_id
+
+        async def execute(response) -> dict:
+            try:
+                result = await self._execute(kind, target, raw, frozen, run_id, instance)
+            except Exception as exc:
+                logger.warning("gateway: approved %s failed: %s", name, exc)
+                return {"executed": True, "ok": False, "run_id": run_id, "instance": instance,
+                        "result_text": f"{type(exc).__name__}: {exc}"}
+            text = "".join(c.text for c in result.content if isinstance(c, types.TextContent))
+            if not text and result.structuredContent is not None:
+                text = json.dumps(result.structuredContent, default=str)
+            return {"executed": True, "ok": not result.isError, "run_id": run_id,
+                    "instance": instance, "approver_note": response.prompt,
+                    "result_text": text[:_OUTCOME_MAX], "truncated": len(text) > _OUTCOME_MAX}
+
+        get_broker().submit_async(request, self.profile.approval_timeout_s, execute)
+        logger.info("gateway: %s waits for approval %s (async)", name, code)
+        return self._record(log, name, arguments, ok=True, result=_text_result({
+            "status": "approval_pending", "code": code,
+            "message": (f"Approval requested (code {code}). '{name}' has NOT run yet. Ilari "
+                        "decides; if approved it runs then, and its result arrives in a later "
+                        "message. Don't wait for it or ask again now.")}))
 
     async def read_tool(self, name: str, arguments: dict) -> types.CallToolResult:
         """Call a read-only upstream tool outside any turn (the host's inbox
@@ -471,6 +516,19 @@ class ToolGateway:
                 await send({"type": "http.response.body", "body": body})
                 return
         await self._manager.handle_request(scope, receive, send)
+
+
+def approval_code(request_id: str) -> str:
+    """The short code a person approves with (Mira's relay uses the same)."""
+    return request_id.replace("-", "")[:6]
+
+
+def _approval_handler_registered() -> bool:
+    """A registered approval handler decides in-process, and blocks: async
+    delivery applies to the /approvals queue only."""
+    from miragen.factory import get_approval_handler
+
+    return get_approval_handler() is not None
 
 
 def with_local_time(result: types.CallToolResult, now: datetime) -> types.CallToolResult:
