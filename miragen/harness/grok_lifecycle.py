@@ -70,10 +70,11 @@ class ThresholdPolicy:
         return Decision("none")
 
 
-def load_policy(env: dict[str, str]) -> LifecyclePolicy:
-    """``MIRAGEN_GROK_LIFECYCLE_POLICY=module:attr`` (a policy object or a
-    zero-argument factory), else ThresholdPolicy from the env numbers."""
-    ref = env.get("MIRAGEN_GROK_LIFECYCLE_POLICY")
+def load_policy(env: dict[str, str], prefix: str = "MIRAGEN_GROK_") -> LifecyclePolicy:
+    """``<prefix>LIFECYCLE_POLICY=module:attr`` (a policy object or a
+    zero-argument factory), else ThresholdPolicy from the env numbers.
+    Each harness reads its own prefix (``MIRAGEN_GROK_``, ``MIRAGEN_CODEX_``)."""
+    ref = env.get(f"{prefix}LIFECYCLE_POLICY")
     if ref:
         module, _, attr = ref.partition(":")
         # The module comes from the deployment's own environment (same trust
@@ -82,9 +83,9 @@ def load_policy(env: dict[str, str]) -> LifecyclePolicy:
         # A class or factory is called; a ready policy object is used as is.
         return obj() if isinstance(obj, type) or not hasattr(obj, "decide") else obj
     return ThresholdPolicy(
-        compact_at_tokens=int(env.get("MIRAGEN_GROK_COMPACT_AT_TOKENS", "150000")),
-        rotate_at_tokens=int(env.get("MIRAGEN_GROK_ROTATE_AT_TOKENS", "400000")),
-        rotate_after_compactions=int(env.get("MIRAGEN_GROK_ROTATE_AFTER_COMPACTIONS", "3")),
+        compact_at_tokens=int(env.get(f"{prefix}COMPACT_AT_TOKENS", "150000")),
+        rotate_at_tokens=int(env.get(f"{prefix}ROTATE_AT_TOKENS", "400000")),
+        rotate_after_compactions=int(env.get(f"{prefix}ROTATE_AFTER_COMPACTIONS", "3")),
     )
 
 
