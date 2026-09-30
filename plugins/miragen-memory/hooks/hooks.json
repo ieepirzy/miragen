@@ -37,6 +37,17 @@
         ]
       }
     ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}\" python3 -m miragen_hook claude-code",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PreCompact": [
       {
         "hooks": [
@@ -67,7 +78,7 @@
           {
             "type": "command",
             "command": "PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}\" python3 -m miragen_hook claude-code",
-            "timeout": 5,
+            "timeout": 20,
             "statusMessage": "miragen memory"
           }
         ]

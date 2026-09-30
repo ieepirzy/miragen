@@ -73,6 +73,18 @@ def normalize_acp_update(params: dict[str, Any]) -> list[dict[str, Any]]:
             "raw": params,
         }]
 
+    if kind == "response_completed":
+        # One model call finished; its input is the whole context at that
+        # call (grok 1.0.41: input + cache read + cache creation).
+        usage = update.get("usage") if isinstance(update.get("usage"), dict) else {}
+        context = sum(int(usage.get(k) or 0) for k in (
+            "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+        return [{"type": "usage", "context_tokens": context, "raw": params}] if usage else []
+
+    if kind == "auto_compact_completed":
+        return [{"type": "compacted", "tokens_before": update.get("tokens_before"),
+                 "tokens_after": update.get("tokens_after"), "raw": params}]
+
     if kind == "tool_call_update":
         return [{
             "type": "tool_call",

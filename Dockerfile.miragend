@@ -20,10 +20,30 @@ COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr
 
 COPY . /build/
 
+# Claude Code, for `claude-code:<model>` memory model calls (the recall
+# selector here, the extraction worker next to it): they run on the
+# operator's subscription via CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`),
+# not a metered key. Native installer, pinned; the binary is copied out of
+# root's home so the unprivileged miragend user can run it. ~220 MB —
+# INSTALL_CLAUDE_CODE=0 builds without it.
+ARG INSTALL_CLAUDE_CODE=1
+ARG CLAUDE_CODE_VERSION=2.1.280
+
 RUN pip install --no-cache-dir "/build[daemon]" \
-    && apt-get update && apt-get install -y --no-install-recommends gosu \
+    && apt-get update && apt-get install -y --no-install-recommends gosu curl ca-certificates \
+    && if [ "$INSTALL_CLAUDE_CODE" = "1" ]; then \
+         curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_CODE_VERSION" \
+         && cp -L /root/.local/bin/claude /usr/local/bin/claude \
+         && rm -rf /root/.local/share/claude /root/.local/bin/claude \
+         && claude --version; \
+       fi \
     && rm -rf /var/lib/apt/lists/* \
     && adduser --disabled-password --gecos "" miragend
+
+# Claude Code writes its config under CLAUDE_CONFIG_DIR; keep it on the state
+# volume (writable by miragend) and never self-update inside the image.
+ENV DISABLE_AUTOUPDATER=1 \
+    CLAUDE_CONFIG_DIR=/var/lib/miragend/claude
 
 COPY entrypoint.miragend.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh

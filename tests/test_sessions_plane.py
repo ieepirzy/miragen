@@ -704,3 +704,700 @@ class TestHttp:
         assert attrs["mira.run.trigger"] == "input.received"
         assert attrs["mira.project.id"] == "github.com/org/repo"
         assert "secret plan" not in json.dumps(attrs)
+
+
+class TestStatusLine:
+    """The opening context always ends with one `[memory status]` line, so
+    an agent never has to read meaning into silence (memory-effectiveness
+    P3)."""
+
+    async def test_recall_off_is_said_out_loud(self, tmp_path):
+        h = Harness(tmp_path)
+        result = await h.send("SessionStart", source="startup")
+        status = result.context.splitlines()[-1]
+        assert status.startswith("[memory status] automatic recall is OFF")
+        assert "memory_recall searches on demand" in status
+        assert status.endswith("capture ok")
+
+    async def test_recall_on_without_a_query_says_it_runs_per_prompt(self, tmp_path):
+        async def selector(request, cards):
+            return SelectionResult(selections=[])
+
+        h = Harness(tmp_path, selector=selector)
+        result = await h.send("SessionStart", source="startup")
+        assert "automatic recall on; it runs on each prompt of 5+ characters" in result.context.splitlines()[-1]
+
+    async def test_recent_capture_failures_are_announced(self, tmp_path):
+        h = Harness(tmp_path)
+        h.plane.stats.note_capture(True, PROJECT_SCOPE)
+        h.plane.stats.note_capture(False, PROJECT_SCOPE)
+        result = await h.send("SessionStart", source="startup")
+        assert "capture FAILING: 1 of 2 recent writes to this project" in result.context.splitlines()[-1]
+        snapshot = h.plane.stats.snapshot()
+        assert snapshot["recent_capture_failures"] == 1
+        assert "recent_captures" not in snapshot  # the deque never reaches /health
+
+    async def test_other_projects_and_old_failures_are_not_blamed(self, tmp_path):
+        import time as _time
+
+        from miragen.daemon.sessions import plane as plane_mod
+
+        h = Harness(tmp_path)
+        h.plane.stats.note_capture(False, "group:project.somewhere-else")
+        h.plane.stats.recent_captures.append(
+            (_time.monotonic() - plane_mod.RECENT_CAPTURE_SECONDS - 1, PROJECT_SCOPE, False))
+        result = await h.send("SessionStart", source="startup")
+        assert result.context.splitlines()[-1].endswith("capture ok")
+
+    async def test_failed_episodes_count_as_capture_failures(self, tmp_path):
+        h = Harness(tmp_path)
+        h.plane.stats.note_outcome(False, PROJECT_SCOPE)  # what a lost episode records
+        result = await h.send("SessionStart", source="startup")
+        assert "capture FAILING" in result.context.splitlines()[-1]
+
+    async def test_no_tools_means_no_tool_advice(self, tmp_path):
+        h = Harness(tmp_path)
+        h.plane.config.mcp.enabled = False
+        status = (await h.send("SessionStart", source="startup")).context.splitlines()[-1]
+        assert "automatic recall is OFF" in status and "memory_recall" not in status
+
+    async def test_recall_only_at_open_is_not_claimed_per_prompt(self, tmp_path):
+        async def selector(request, cards):
+            return SelectionResult(selections=[])
+
+        h = Harness(tmp_path, selector=selector)
+        h.plane.config.recall.on_prompt = False
+        status = (await h.send("SessionStart", source="startup")).context.splitlines()[-1]
+        assert "only at session open" in status and "each prompt" not in status
+
+    async def test_retrieval_timeout_is_announced_once_not_every_prompt(self, tmp_path, monkeypatch):
+        import asyncio as _asyncio
+
+        from miragen.daemon.sessions import plane as plane_mod
+        from miragen.memory.lifecycle import MemoryLifecycle
+
+        async def hang(self, **kwargs):
+            await _asyncio.sleep(1)
+
+        monkeypatch.setattr(plane_mod, "RETRIEVAL_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(MemoryLifecycle, "prepare_context", hang)
+        h = Harness(tmp_path)
+        first = await h.send("SessionStart", source="startup")
+        assert first.context.startswith("[memory status] memory UNAVAILABLE for this session (retrieval timed out)")
+        again = await h.send("UserPromptSubmit", prompt="still slow?", prompt_id="p-1")
+        assert again.context is None  # the late-open retry stays quiet
+
+    async def test_injected_memories_are_counted_and_citation_asked(self, tmp_path):
+        from miragen.memory.lifecycle import MemoryPacket
+
+        h = Harness(tmp_path)
+        packet = MemoryPacket(text="", optional_status="ok", items=[
+            {"kind": "working_state"}, {"revision_id": "r1"}, {"revision_id": "r2"}])
+        line = h.plane._status_line(packet, project_scope="group:project.x")
+        assert "2 memories in group:project.x injected above — cite the ids" in line
+
+
+def test_only_rendered_recall_entries_are_tracked():
+    """Entries past the optional budget are not in the text, so they must
+    not be in the manifest or counted for citation either."""
+    from miragen.memory.selection import fit_optional_entries, render_optional_section
+
+    entries = [{"record_id": f"rec-{i}aaaaaa", "revision_id": f"rev-{i}", "type": "claim",
+                "text": "x" * 60 + "\nline two", "reason": "r"} for i in range(5)]
+    fitted = fit_optional_entries(entries, 250)
+    section = render_optional_section(entries, 250).text
+    assert 0 < len(fitted) < len(entries)
+    assert all(e["record_id"][:8] in section for e in fitted)
+    assert not any(e["record_id"][:8] in section for e in entries[len(fitted):])
+
+
+@pytest.mark.parametrize("status,degraded,expected", [
+    ("empty", None, "searched in group:project.x: nothing stored matches yet"),
+    ("none_selected", None, "searched in group:project.x: nothing relevant to this"),
+    ("degraded: selector: boom", None, "recall DEGRADED"),
+    (None, "prepare: unreachable", "recall DEGRADED"),
+])
+def test_status_line_recall_states(tmp_path, status, degraded, expected):
+    from miragen.memory.lifecycle import MemoryPacket
+
+    h = Harness(tmp_path)
+    packet = MemoryPacket(text="", optional_status=status, degraded=degraded)
+    assert expected in h.plane._status_line(packet, project_scope="group:project.x")
+
+
+class TestEpisodeRefinalize:
+    async def test_refinalize_with_a_different_digest_is_dedupe_not_failure(self, tmp_path):
+        """First digest per occurrence wins. A re-finalize whose digest
+        differs (journal replay rebuilding it from events that now capture —
+        seen on the VPS right after the #111 deploy) must not count as a
+        lost write or degrade memory."""
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup")
+        await h.send("UserPromptSubmit", prompt="hello there", prompt_id="p-1")
+        await h.send("SessionEnd", reason="prompt_input_exit")
+        await h.drain()
+        session = h.plane.registry.get("claude-code:s-1")
+        failures = h.plane.stats.capture_failures
+        session.turns.append("a turn the first digest never saw")
+        await h.plane._finalize(session, occurrence="end")
+        assert len(h.events("session_episode")) == 1
+        assert h.plane.stats.capture_failures == failures
+        assert "episode capture" not in (h.plane.stats.last_loimi_error or "")
+        assert h.plane.stats.episodes == 1 and session.episodes_written == ["end"]
+
+
+# ── project re-resolution: launched from ~, cd'd into repositories ───────────
+
+HOME = "/home/ilari"
+
+
+class TestProjectReResolution:
+    """Sessions start in ~ and cd into repositories. The binding follows,
+    stickily: only a repository replaces it (MiraDesign's rule)."""
+
+    async def test_a_session_launched_from_home_binds_to_the_repo_it_moves_into(self, tmp_path):
+        h = Harness(tmp_path)
+        home = {"home": HOME}
+        await h.send("SessionStart", source="startup", cwd=HOME, client_extra=home)
+        session = h.plane.registry.get("claude-code:s-1")
+        assert session.project.id == f"path:{HOME}"
+        first_scope = session.scope
+
+        result = await h.send("UserPromptSubmit", prompt="fix the tests", cwd="/w/repo",
+                              client_extra=home)
+        assert session.project.id == REPO.id and session.scope == PROJECT_SCOPE != first_scope
+        assert session.projects_seen == [f"path:{HOME}", REPO.id]
+        assert h.plane.stats.project_switches == 1
+        # The model gets the new project's context on that very prompt.
+        assert result.context and f"scope={PROJECT_SCOPE}" in result.context
+        assert not session.reopen_pending
+
+        # Captures from now on land in the repository's scope.
+        await h.send("Stop", last_assistant_message="done", cwd="/w/repo", client_extra=home)
+        await h.drain()
+        assert any(e["scope_id"] == PROJECT_SCOPE for e in h.events("harness:"))
+
+    async def test_the_binding_is_sticky_when_the_agent_cds_back_home(self, tmp_path):
+        h = Harness(tmp_path)
+        home = {"home": HOME}
+        await h.send("SessionStart", source="startup", cwd="/w/repo", client_extra=home)
+        await h.send("UserPromptSubmit", prompt="look around", cwd=HOME, client_extra=home)
+        await h.send("UserPromptSubmit", prompt="and in /tmp", cwd="/tmp/x", client_extra=home)
+        session = h.plane.registry.get("claude-code:s-1")
+        assert session.project.id == REPO.id, "~ and non-repositories never downgrade"
+        assert h.plane.stats.project_switches == 0
+
+    async def test_moving_between_repositories_follows_the_latest(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", cwd="/w/repo")
+        await h.send("UserPromptSubmit", prompt="now the other one", cwd="/w/other")
+        session = h.plane.registry.get("claude-code:s-1")
+        assert session.project.id == OTHER.id
+        assert session.projects_seen == [REPO.id, OTHER.id]
+
+    async def test_home_is_never_a_repository_even_with_a_dotfiles_remote(self, tmp_path):
+        h = Harness(tmp_path)
+        home = {"home": HOME}
+        await h.send("SessionStart", source="startup", cwd="/w/repo", client_extra=home)
+        await h.send("UserPromptSubmit", prompt="edit my dotfiles", cwd=HOME,
+                     host="laptop", project_remote="git@github.com:ilari/dotfiles.git",
+                     client_extra=home)
+        assert h.plane.registry.get("claude-code:s-1").project.id == REPO.id
+
+    async def test_a_remote_session_rebinds_from_the_reported_remote(self, tmp_path):
+        h = Harness(tmp_path)
+        home = {"home": HOME}
+        await h.send("SessionStart", source="startup", cwd=HOME, host="laptop",
+                     client_extra=home)
+        session = h.plane.registry.get("claude-code:s-1")
+        assert session.project.id == "dir:ilari"
+        await h.send("UserPromptSubmit", prompt="go", cwd="/home/ilari/src/miragen",
+                     host="laptop", project_remote="https://github.com/ieepirzy/miragen.git",
+                     client_extra=home)
+        assert session.project.id == "github.com/ieepirzy/miragen"
+
+    async def test_the_episode_lists_every_project_it_touched(self, tmp_path):
+        h = Harness(tmp_path)
+        home = {"home": HOME}
+        await h.send("SessionStart", source="startup", cwd=HOME, client_extra=home)
+        await h.send("UserPromptSubmit", prompt="work in repo", cwd="/w/repo", client_extra=home)
+        await h.send("SessionEnd", reason="clear", cwd="/w/repo", client_extra=home)
+        await h.drain()
+        (episode,) = h.events("session_episode")
+        assert episode["scope_id"] == PROJECT_SCOPE
+        assert episode["attributes"]["projects"] == [f"path:{HOME}", REPO.id]
+
+    async def test_an_unchanged_cwd_is_not_re_resolved(self, tmp_path):
+        calls = []
+        h = Harness(tmp_path)
+        original = h.plane._resolve
+
+        def counting(cwd):
+            calls.append(cwd)
+            return original(cwd)
+
+        h.plane._resolve = counting
+        h.plane._projects.clear()
+        await h.send("SessionStart", source="startup")
+        for _ in range(3):
+            # Empty the per-cwd cache so only the session's fingerprint can
+            # prevent the (blocking, git-spawning) resolution.
+            h.plane._projects.clear()
+            await h.send("UserPromptSubmit", prompt="again please")
+        assert calls == ["/w/repo"]
+        await h.send("UserPromptSubmit", prompt="elsewhere now", cwd="/w/other")
+        assert calls == ["/w/repo", "/w/other"]
+
+    async def test_a_capture_queued_before_a_switch_stays_in_its_project(self, tmp_path):
+        """Captures queue behind the session lock; a prompt from another
+        repository must not move an earlier turn into that repository."""
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", cwd="/w/repo", host="laptop",
+                     project_remote=REPO.remote)
+        await h.send("Stop", last_assistant_message="work done IN REPO", cwd="/w/repo",
+                     host="laptop", project_remote=REPO.remote)
+        await h.send("UserPromptSubmit", prompt="now the other repository", cwd="/w/other",
+                     host="laptop", project_remote=OTHER.remote)
+        await h.drain()
+        (turn,) = [e for e in h.events("harness:") if "IN REPO" in (e.get("content") or "")]
+        assert turn["scope_id"] == PROJECT_SCOPE
+
+    async def test_a_dotfiles_home_covers_its_subdirectories(self, tmp_path):
+        h = Harness(tmp_path)
+        dotfiles = ProjectIdentity(id="github.com/ilari/dotfiles", slug="github.com-ilari-dotfiles",
+                                   name="dotfiles", root=HOME, remote="git@github.com:ilari/dotfiles.git")
+        original = h.plane._resolve
+        h.plane._resolve = lambda cwd: dotfiles if (cwd or "").startswith(HOME) else original(cwd)
+        home = {"home": HOME}
+        await h.send("SessionStart", source="startup", cwd="/w/repo", client_extra=home)
+        await h.send("UserPromptSubmit", prompt="look at my notes", cwd=f"{HOME}/Documents",
+                     client_extra=home)
+        assert h.plane.registry.get("claude-code:s-1").project.id == REPO.id
+
+
+# ── asynchronous recall: search now, select in the background ────────────────
+
+ASYNC = {"capabilities": ["async-recall"]}
+
+
+async def _seeded(tmp_path, selector, **kwargs):
+    h = Harness(tmp_path, selector=selector, **kwargs)
+    await h.send("SessionStart", source="startup", client_extra=ASYNC)
+    lifecycle = h.plane._lifecycles[PROJECT_SCOPE]
+    await lifecycle.remember(instance=REPO.slug, run_id="seed",
+                             content="the hel1 deploy needs the vault mounted first")
+    await lifecycle.remember(instance=REPO.slug, run_id="seed2", content="lunch was good")
+    return h
+
+
+def _vault_selector(calls=None, gate=None):
+    async def selector(request, cards):
+        if calls is not None:
+            calls.append(request)
+        if gate is not None:
+            await gate.wait()
+        return SelectionResult(selections=[
+            Selection(record_id=c["record_id"], reason="same vault mount")
+            for c in cards if "vault" in c["payload"]["text"]
+        ])
+    return selector
+
+
+class TestAsyncRecall:
+    async def test_the_prompt_gets_a_notice_and_the_claim_gets_the_memory(self, tmp_path):
+        import asyncio
+
+        gate = asyncio.Event()
+        h = await _seeded(tmp_path, _vault_selector(gate=gate))
+        manifests_before = len(h.service.manifests)
+        result = await h.send("UserPromptSubmit", prompt="why does the hel1 deploy fail on vault",
+                              prompt_id="p-1", client_extra=ASYNC)
+        assert result.recall_pending == 1
+        assert "running in the background" in result.context
+        assert "vault mounted" not in result.context, "the prompt never waits for the selector"
+
+        pending = await h.plane.claim_recall("claude-code", "s-1", 1, wait=0)
+        assert pending == {"state": "pending"}
+        gate.set()
+        ready = await h.plane.claim_recall("claude-code", "s-1", 1, wait=5)
+        assert ready["state"] == "ready"
+        assert "vault mounted" in ready["context"] and "lunch" not in ready["context"]
+        assert await h.plane.claim_recall("claude-code", "s-1", 1, wait=0) == {"state": "delivered"}
+        # Counted and manifested when DELIVERED, exactly once.
+        await h.drain()
+        assert h.plane.stats.async_recalls_delivered == 1
+        new = h.service.manifests[manifests_before:]
+        assert len(new) == 1 and new[0]["policy"]["delivery"] == "async"
+
+    async def test_nothing_stored_means_no_notice_and_nothing_pending(self, tmp_path):
+        h = Harness(tmp_path, selector=_vault_selector())
+        await h.send("SessionStart", source="startup", client_extra=ASYNC)
+        result = await h.send("UserPromptSubmit", prompt="why does the hel1 deploy fail",
+                              client_extra=ASYNC)
+        assert result.recall_pending is None
+        assert result.context is None or "background" not in result.context
+        assert h.plane.stats.async_recalls_started == 0
+
+    async def test_a_new_prompt_supersedes_and_cancels_the_old_selection(self, tmp_path):
+        import asyncio
+
+        gate = asyncio.Event()
+        calls = []
+        h = await _seeded(tmp_path, _vault_selector(calls, gate=gate))
+        first = await h.send("UserPromptSubmit", prompt="vault question one here",
+                             client_extra=ASYNC)
+        await asyncio.sleep(0)
+        old_task = h.plane._recalls["claude-code:s-1"].task
+        second = await h.send("UserPromptSubmit", prompt="vault question two here",
+                              client_extra=ASYNC)
+        assert (first.recall_pending, second.recall_pending) == (1, 2)
+        await asyncio.sleep(0)
+        assert old_task.cancelled()
+        assert await h.plane.claim_recall("claude-code", "s-1", 1, wait=0) == {"state": "stale"}
+        gate.set()
+        assert (await h.plane.claim_recall("claude-code", "s-1", 2, wait=5))["state"] == "ready"
+        assert h.plane.stats.async_recalls_dropped == 1
+
+    async def test_compaction_and_session_end_drop_the_pending_result(self, tmp_path):
+        h = await _seeded(tmp_path, _vault_selector())
+        await h.send("UserPromptSubmit", prompt="vault question for compaction",
+                     client_extra=ASYNC)
+        await h.send("PreCompact", trigger="auto", client_extra=ASYNC)
+        assert await h.plane.claim_recall("claude-code", "s-1", 1, wait=1) == {"state": "stale"}
+        await h.send("UserPromptSubmit", prompt="vault question before the end",
+                     client_extra=ASYNC)
+        await h.send("SessionEnd", reason="clear", client_extra=ASYNC)
+        assert await h.plane.claim_recall("claude-code", "s-1", 2, wait=1) == {"state": "stale"}
+
+    async def test_a_failed_selection_is_said_once_and_never_reads_as_nothing(self, tmp_path):
+        async def broken(request, cards):
+            raise RuntimeError("claude exited 1: rate limited")
+
+        h = await _seeded(tmp_path, broken)
+        await h.send("UserPromptSubmit", prompt="vault question number one", client_extra=ASYNC)
+        failed = await h.plane.claim_recall("claude-code", "s-1", 1, wait=5)
+        assert failed["state"] == "failed" and "recall failed" in failed["context"]
+        await h.send("UserPromptSubmit", prompt="vault question number two", client_extra=ASYNC)
+        assert await h.plane.claim_recall("claude-code", "s-1", 2, wait=5) == {"state": "empty"}
+        assert h.plane.stats.async_recall_failures == 2
+        assert h.plane.judgments.written == 0, "a failed call is not a label"
+
+    async def test_every_selection_leaves_a_judgment_row(self, tmp_path):
+        import json as _json
+        import stat as _stat
+
+        h = await _seeded(tmp_path, _vault_selector())
+        await h.send("UserPromptSubmit", prompt="why does the hel1 deploy fail on vault, was lunch good",
+                     client_extra=ASYNC)
+        await h.plane.claim_recall("claude-code", "s-1", 1, wait=5)
+        (log,) = (h.state_dir / "judgments").glob("judgments-*.jsonl")
+        assert _stat.S_IMODE(log.stat().st_mode) == 0o600, "it holds prompt text"
+        rows = [_json.loads(line) for line in log.read_text().splitlines()]
+        judged, delivery = rows
+        assert judged["query"].endswith("why does the hel1 deploy fail on vault, was lunch good")
+        labels = {c["text"]: (c["selected"], c["reason"]) for c in judged["candidates"]}
+        assert labels["the hel1 deploy needs the vault mounted first"] == (True, "same vault mount")
+        assert labels["lunch was good"] == (False, None), "a non-pick is a hard negative"
+        assert delivery == {**delivery, "recall_id": judged["recall_id"], "delivery": "context"}
+        assert h.plane.describe()["judgments"]["written"] == 1
+
+    async def test_adapters_without_the_capability_keep_the_sync_path(self, tmp_path):
+        h = await _seeded(tmp_path, _vault_selector())
+        result = await h.send("UserPromptSubmit", prompt="why does the hel1 deploy fail on vault")
+        assert result.recall_pending is None
+        assert "vault mounted" in result.context
+
+    async def test_the_claim_route_answers_the_adapter(self, tmp_path):
+        h = await _seeded(tmp_path, _vault_selector())
+        await h.send("UserPromptSubmit", prompt="why does the hel1 deploy fail on vault",
+                     client_extra=ASYNC)
+        await h.drain()
+        client = TestClient(create_app(None, token="", sessions=h.plane))
+        answer = client.post("/sessions/v1/recall/claim",
+                             json={"harness": "claude-code", "session_id": "s-1", "seq": 1})
+        assert answer.status_code == 200 and answer.json()["state"] == "ready"
+        bad = client.post("/sessions/v1/recall/claim", json={"harness": "claude-code"})
+        assert bad.status_code == 422
+
+
+class TestAsyncRecallReviewFixes:
+    async def test_the_claim_answers_before_the_manifest_is_written(self, tmp_path):
+        import asyncio
+
+        h = await _seeded(tmp_path, _vault_selector())
+        await h.send("UserPromptSubmit", prompt="why does the hel1 deploy fail on vault",
+                     client_extra=ASYNC)
+        lifecycle = h.plane._lifecycles[PROJECT_SCOPE]
+        slow = asyncio.Event()
+        original = lifecycle.record_recall_manifest
+
+        async def slow_manifest(*args, **kwargs):
+            await slow.wait()
+            return await original(*args, **kwargs)
+
+        lifecycle.record_recall_manifest = slow_manifest
+        ready = await asyncio.wait_for(h.plane.claim_recall("claude-code", "s-1", 1, wait=5), 2)
+        assert ready["state"] == "ready", "a slow Loimi must not hold the answer"
+        slow.set()
+        await h.drain()
+
+    async def test_a_swept_session_leaves_no_recall_behind(self, tmp_path):
+        from datetime import timedelta
+
+        h = await _seeded(tmp_path, _vault_selector())
+        await h.send("UserPromptSubmit", prompt="why does the hel1 deploy fail on vault",
+                     client_extra=ASYNC)
+        h.alive.clear()
+        await h.plane.sweep(now=datetime.now(timezone.utc) + timedelta(days=3))
+        assert "claude-code:s-1" not in h.plane._recalls
+        assert h.plane.describe()["recall"]["pending"] == 0
+
+# ── end-of-work save nudge (P1a) ─────────────────────────────────────────────
+
+NUDGE_CAPS = {"capabilities": ["async-recall", "stop-continue"]}
+
+
+class TestEndOfWorkNudge:
+    async def _work(self, h, prompts, *, start=0, extra=NUDGE_CAPS):
+        for i in range(start, start + prompts):
+            await h.send("UserPromptSubmit", prompt=f"do step {i} of the work", client_extra=extra)
+
+    async def _stop(self, h, message="done", extra=NUDGE_CAPS):
+        return (await h.send("Stop", last_assistant_message=message, client_extra=extra)).continue_with
+
+    async def test_no_nudge_before_real_work(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        await self._work(h, 4)
+        assert await self._stop(h) is None
+
+    async def test_it_fires_asks_again_once_then_lets_go(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        await self._work(h, 5)
+        first = await self._stop(h)
+        assert "end-of-work save" in first and "session='claude-code:s-1'" in first
+        assert "> do step 4 of the work" in first, "the session's own prompts are quoted"
+        again = await self._stop(h, "I think we're done")
+        assert "asked again" in again
+        assert await self._stop(h, "still done") is None, "at most one re-ask"
+        stats = h.plane.stats
+        assert (stats.nudges_fired, stats.nudges_reasked, stats.nudges_ignored) == (1, 1, 1)
+
+    async def test_saving_or_saying_nothing_durable_answers_it(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        await self._work(h, 5)
+        assert await self._stop(h) is not None
+        h.plane.note_memory_write("claude-code:s-1")
+        assert await self._stop(h, "saved two memories") is None
+        await self._work(h, 15, start=5)
+        assert await self._stop(h) is not None, "the next one comes 15 prompts later"
+        assert await self._stop(h, "Nothing durable.") is None
+        assert h.plane.stats.nudges_answered == 2
+
+    async def test_an_agent_that_already_saved_is_not_nagged(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        await self._work(h, 3)
+        h.plane.note_memory_write("claude-code:s-1")
+        await self._work(h, 2, start=3)
+        assert await self._stop(h) is None
+        assert h.plane.stats.nudges_fired == 0
+
+    async def test_compaction_makes_the_next_one_due_and_the_cap_holds(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        await self._work(h, 5)
+        fired = 0
+        for round_ in range(6):
+            if await self._stop(h):
+                fired += 1
+                await self._stop(h, "nothing durable")
+            await h.send("PreCompact", trigger="auto", client_extra=NUDGE_CAPS)
+            await self._work(h, 1, start=10 + round_)
+        assert fired == 3, "max_per_session"
+
+    async def test_adapters_without_the_capability_and_child_sessions_are_never_nudged(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup")
+        await self._work(h, 6, extra=None)
+        assert await self._stop(h, extra=None) is None
+        await h.send("SessionStart", source="startup", session="kid",
+                     client_extra={**NUDGE_CAPS, "parent_session": "claude-code:s-1"})
+        for i in range(6):
+            await h.send("UserPromptSubmit", prompt=f"child step {i} here", session="kid",
+                         client_extra={**NUDGE_CAPS, "parent_session": "claude-code:s-1"})
+        child = await h.send("Stop", last_assistant_message="x", session="kid",
+                             client_extra={**NUDGE_CAPS, "parent_session": "claude-code:s-1"})
+        assert child.continue_with is None
+
+    async def test_bridge_writes_are_attributed_to_the_session(self, tmp_path):
+        from miragen.daemon.sessions.bridge_mcp import build_bridge_mcp
+
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        mcp = build_bridge_mcp(lambda: h.plane)
+        await mcp.call_tool("memory_remember", {"content": "tests need port 55433",
+                                                "session": "claude-code:s-1"})
+        assert h.plane.registry.get("claude-code:s-1").counters.memory_writes == 1
+        await mcp.call_tool("memory_checkpoint", {"state": {"goal": "x"},
+                                                  "project": "claude-code:s-1"})
+        assert h.plane.registry.get("claude-code:s-1").counters.memory_writes == 2
+
+
+class TestNudgeReviewFixes:
+    async def _prompts(self, h, n, start=0):
+        for i in range(start, start + n):
+            await h.send("UserPromptSubmit", prompt=f"do step {i} of it", client_extra=NUDGE_CAPS)
+
+    async def _stop(self, h, message="done"):
+        return (await h.send("Stop", last_assistant_message=message,
+                             client_extra=NUDGE_CAPS)).continue_with
+
+    async def test_saving_early_really_restarts_the_first_clock(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        await self._prompts(h, 3)
+        h.plane.note_memory_write("claude-code:s-1")
+        await self._prompts(h, 2, start=3)
+        assert await self._stop(h) is None
+        await self._prompts(h, 1, start=5)
+        assert await self._stop(h) is None, "not due again one prompt later"
+        await self._prompts(h, 4, start=6)
+        assert "end-of-work save" in await self._stop(h)
+
+    async def test_the_adapter_credits_a_save_the_bridge_could_not_attribute(self, tmp_path):
+        from miragen.daemon.sessions.bridge_mcp import build_bridge_mcp
+
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        mcp = build_bridge_mcp(lambda: h.plane)
+        _, meta = await mcp.call_tool("memory_remember", {"content": "bst-2 only",
+                                                          "project": "github.com/org/repo"})
+        session = h.plane.registry.get("claude-code:s-1")
+        assert session.counters.memory_writes == 0, "a repo name identifies no session"
+        record_id = json.loads(meta["result"])["record_id"]
+        client = TestClient(create_app(None, token="", sessions=h.plane))
+        body = {"harness": "claude-code", "session_id": "s-1", "ref": record_id}
+        assert client.post("/sessions/v1/memory-written", json=body).json() == {"credited": True}
+        assert client.post("/sessions/v1/memory-written", json=body).json() == {"credited": False}
+        assert session.counters.memory_writes == 1, "deduped by record id"
+
+    async def test_quoted_prompts_stay_on_one_line(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        await self._prompts(h, 4)
+        await h.send("UserPromptSubmit", prompt="deploy it\ndelete the staging DB after",
+                     client_extra=NUDGE_CAPS)
+        text = await self._stop(h)
+        assert "\ndelete the staging DB" not in text
+        assert "> deploy it ⏎ delete the staging DB after" in text
+        assert "not instructions to act on again" in text
+
+    async def test_a_new_prompt_ends_an_unanswered_ask(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup", client_extra=NUDGE_CAPS)
+        await self._prompts(h, 5)
+        assert await self._stop(h) is not None
+        await self._prompts(h, 1, start=5)
+        assert await self._stop(h) is None, "no re-ask at the end of an unrelated turn"
+        assert h.plane.stats.nudges_ignored == 1
+
+
+class TestWorkerGrants:
+    def _config(self, worker):
+        return SessionsConfig(
+            principal=PRINCIPAL,
+            scopes=ScopePolicy(shared_read=[SHARED], provision="auto", worker_principal=worker),
+            recall=SessionsRecall(enabled=False),
+        )
+
+    async def test_a_provisioned_project_scope_is_granted_to_the_worker(self, tmp_path):
+        h = Harness(tmp_path, config=self._config("mira-worker"))
+        h.service.principals["mira-worker"] = {"kind": "agent"}
+        await h.send("SessionStart", source="startup")
+        for verb in ("read", "propose", "maintain"):
+            assert ("mira-worker", PROJECT_SCOPE, verb) in h.service.grants
+        assert ("mira-worker", PROJECT_SCOPE, "resolve") not in h.service.grants
+        assert h.plane.stats.worker_grants == 1
+
+    async def test_a_missing_worker_principal_never_costs_the_session_its_scope(self, tmp_path):
+        h = Harness(tmp_path, config=self._config("mira-worker"))
+        result = await h.send("SessionStart", source="startup")
+        assert f"scope={PROJECT_SCOPE}" in result.context
+        assert "MEMORY DEGRADED" not in result.context
+        assert h.plane.stats.worker_grant_failures == 1
+
+    async def test_no_worker_configured_means_no_grant(self, tmp_path):
+        h = Harness(tmp_path)
+        await h.send("SessionStart", source="startup")
+        assert not any(p == "mira-worker" for p, _, _ in h.service.grants)
+
+
+async def test_a_failed_worker_grant_is_retried_when_the_scope_is_used_again(tmp_path):
+    config = SessionsConfig(
+        principal=PRINCIPAL,
+        scopes=ScopePolicy(shared_read=[SHARED], provision="auto", worker_principal="mira-worker"),
+        recall=SessionsRecall(enabled=False),
+    )
+    h = Harness(tmp_path, config=config)
+    await h.send("SessionStart", source="startup")
+    assert ("mira-worker", PROJECT_SCOPE, "maintain") not in h.service.grants
+    h.service.principals["mira-worker"] = {"kind": "agent"}  # the worker started later
+    await h.send("SessionStart", source="startup", session="s-2", pid=4243)
+    assert ("mira-worker", PROJECT_SCOPE, "maintain") in h.service.grants
+
+
+class TestReadAllProjects:
+    """A personal assistant's binding reads every project scope the plane
+    has seen, and still writes only to its own."""
+
+    def config(self):
+        return SessionsConfig(
+            principal=PRINCIPAL, scopes=ScopePolicy(shared_read=[SHARED]),
+            projects=[ProjectBinding(match="/w/mira", scope="group:mira", read_all_projects=True)],
+            recall=SessionsRecall(enabled=False),
+        )
+
+    def bound(self, h):
+        h.service.scopes["group:mira"] = {"kind": "group"}
+        for verb in ("read", "propose", "resolve", "retract"):
+            h.service.grants.add((PRINCIPAL, "group:mira", verb))
+
+    async def test_reads_every_project_seen_and_widens_as_new_ones_appear(self, tmp_path):
+        h = Harness(tmp_path, config=self.config())
+        self.bound(h)
+        await h.send("SessionStart", source="startup")                           # github.com/org/repo
+        await h.send("SessionStart", source="startup", session="m-1", cwd="/w/mira")
+        mira = h.plane.registry.get("claude-code:m-1")
+        assert mira.scope == "group:mira"
+        read = h.plane._lifecycles["group:mira"].spec.scopes.read
+        assert PROJECT_SCOPE in read and SHARED in read and "group:mira" in read
+        assert h.plane._lifecycles["group:mira"].spec.scopes.default_write == "group:mira"
+        # a project that appears later is readable from Mira's next use on
+        await h.send("SessionStart", source="startup", session="s-9", cwd="/w/other")
+        other = h.plane.registry.get("claude-code:s-9").scope
+        assert "group:mira" not in h.plane._lifecycles            # stale read set dropped
+        await h.send("SessionStart", source="startup", session="m-2", cwd="/w/mira")
+        assert other in h.plane._lifecycles["group:mira"].spec.scopes.read
+        # other projects stay isolated from Mira's and each other's scopes
+        assert h.plane._lifecycles[other].spec.scopes.read == [SHARED, other]
+
+    async def test_known_projects_survive_a_restart(self, tmp_path):
+        h = Harness(tmp_path, config=self.config())
+        self.bound(h)
+        await h.send("SessionStart", source="startup")
+        h2 = Harness(tmp_path, config=self.config())
+        self.bound(h2)
+        await h2.send("SessionStart", source="startup", session="m-1", cwd="/w/mira")
+        assert PROJECT_SCOPE in h2.plane._lifecycles["group:mira"].spec.scopes.read
+
+    def test_assign_scopes_read_all(self):
+        policy = ScopePolicy(shared_read=[SHARED])
+        binding = ProjectBinding(match="/w", scope="group:w", read_all_projects=True)
+        a = assign_scopes(policy, [binding], REPO, known_project_scopes=["group:p1", "group:w"])
+        assert a.read == [SHARED, "group:p1", "group:w"] and a.write == "group:w"
+        plain = ProjectBinding(match="/w", scope="group:w")
+        assert assign_scopes(policy, [plain], REPO, known_project_scopes=["group:p1"]).read == [
+            SHARED, "group:w"]

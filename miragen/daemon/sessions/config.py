@@ -43,6 +43,14 @@ class ProjectBinding(_Model):
         default_factory=list,
         description="Extra read scopes for sessions in this project.",
     )
+    read_all_projects: bool = Field(
+        default=False,
+        description=(
+            "Also read every project scope this plane has seen (a personal "
+            "assistant working across all of its owner's projects). The set "
+            "grows as new projects appear; nothing is written outside `scope`."
+        ),
+    )
 
 
 class ScopePolicy(_Model):
@@ -69,6 +77,15 @@ class ScopePolicy(_Model):
         default=None, pattern=_SCOPE_ID,
         description="Scope to use when a project scope cannot be provisioned "
                     "(auto without an operator token). None = degrade.",
+    )
+    worker_principal: Optional[str] = Field(
+        default=None,
+        description=(
+            "The extraction worker's Loimi principal (`miragen memory-worker`). "
+            "Every project scope this daemon provisions is also granted to it "
+            "with read/propose/maintain, so the worker can claim that scope's "
+            "consolidate jobs. Unset: no worker grants."
+        ),
     )
     adopt_by_name: bool = Field(
         default=True,
@@ -136,12 +153,95 @@ class SessionsRecall(MemoryRecallSpec):
                     "(one selector call per new prompt; cache hits are free).",
     )
     min_prompt_chars: int = Field(default=20, ge=0)
+    delivery: Literal["async", "sync"] = Field(
+        default="async",
+        description="async: search on the prompt, select in the background, deliver after a "
+                    "later tool result or at Stop (adapters that advertise `async-recall`); "
+                    "sync: select inside the prompt hook. Adapters without the capability "
+                    "always get sync.",
+    )
+    search_timeout_seconds: float = Field(default=4.0, gt=0)
+    stop_wait_seconds: float = Field(
+        default=8.0, ge=0, le=15,
+        description="How long a Stop may wait for a still-running selection before the "
+                    "turn ends without it (the adapter's Stop hook timeout must exceed it).",
+    )
+    judgment_retention_days: int = Field(default=30, ge=1)
+    judgment_max_mb: int = Field(default=64, ge=1)
+    # Selector endpoint knobs. Daemon-only on purpose: adding fields to the
+    # profile-level MemoryRecallSpec (extra=forbid) would change the agent-
+    # profile schema and need a profile-contract bump.
+    base_url: Optional[str] = Field(
+        default=None, min_length=1,
+        description="Point a pydantic-ai selector model at an OpenAI- or "
+                    "Anthropic-compatible endpoint (a local model server, a "
+                    "proxy). `model` must then be openai:, openai-chat:, "
+                    "openai-responses: or anthropic:<name>; not valid with "
+                    "claude-code:<model>.",
+    )
+    api_key_env: Optional[str] = Field(
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
+        description="NAME of the env var (or <NAME>_FILE) holding the base_url "
+                    "endpoint's key, never the value. Unset = a keyless endpoint; "
+                    "the provider's own OPENAI_API_KEY/ANTHROPIC_API_KEY is never "
+                    "sent to a custom base_url.",
+    )
+    timeout_s: Optional[float] = Field(
+        default=None, gt=0, le=600,
+        description="Bound on one selector call. Unset = the claude-code "
+                    "runner's own default; the plane's recall bound applies "
+                    "either way.",
+    )
+
+    @model_validator(mode="after")
+    def _selector_config(self) -> "SessionsRecall":
+        from miragen.memory.selection import validate_selector_config
+
+        validate_selector_config(self.model, self.base_url, self.api_key_env)
+        return self
+
+
+class SessionsNudge(_Model):
+    """The pushy end-of-work save (docs/design/memory-effectiveness.md P1a):
+    a Stop continuation asking the agent to memory_remember what a future
+    session would need — or to say `nothing durable`."""
+
+    enabled: bool = True
+    first_after_prompts: int = Field(default=5, ge=1)
+    every_prompts: int = Field(default=15, ge=1)
+    max_per_session: int = Field(default=3, ge=0)
 
 
 class Housekeeping(_Model):
     retention_hours: int = Field(default=24, ge=1)
     stale_after_minutes: int = Field(default=180, ge=1)
     sweep_interval_seconds: int = Field(default=60, ge=5)
+
+
+class HarnessSetup(_Model):
+    """The daemon writes Grok Build and Codex hook + MCP setup into the
+    harness homes on THIS machine (miragen_hook/harness_setup.py), at
+    startup and every `interval_s`. The URL is where harness sessions should
+    report — the hosted bridge, not necessarily this daemon. Environment
+    overrides: MIRAGEND_HARNESS_SETUP (on/off), MIRAGEND_HARNESS_SETUP_URL,
+    MIRAGEND_HARNESS_SETUP_TOKEN_PATH, MIRAGEND_HARNESS_SETUP_INTERVAL_S."""
+
+    enabled: bool | None = Field(
+        default=None,
+        description="None = on when a URL is configured and the daemon is not in a "
+                    "container; each harness is skipped while its home does not exist.",
+    )
+    url: str | None = Field(
+        default=None, pattern=r"^https?://[^\s$]+$",
+        description="Base URL harness sessions report to (hooks + MCP proxy). No default: "
+                    "never silently the loopback.",
+    )
+    token_file: Path | None = Field(
+        default=None,
+        description="0600 file with that daemon's bearer, baked into the hook commands "
+                    "(the token itself is never written into harness config).",
+    )
+    interval_s: int = Field(default=600, ge=30)
 
 
 class SessionsConfig(_Model):
@@ -164,9 +264,11 @@ class SessionsConfig(_Model):
     scopes: ScopePolicy = Field(default_factory=ScopePolicy)
     projects: list[ProjectBinding] = Field(default_factory=list)
     recall: SessionsRecall = Field(default_factory=SessionsRecall)
+    nudge: SessionsNudge = Field(default_factory=SessionsNudge)
     housekeeping: Housekeeping = Field(default_factory=Housekeeping)
     store: StorePolicy = Field(default_factory=StorePolicy)
     mcp: BridgeMcp = Field(default_factory=BridgeMcp)
+    harness_setup: HarnessSetup = Field(default_factory=HarnessSetup)
     state_dir: Optional[Path] = Field(
         default=None,
         description="Where sessions.json, the event journal and the memory "

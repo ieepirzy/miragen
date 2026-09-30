@@ -28,6 +28,29 @@ class ApprovalBroker:
     def __init__(self) -> None:
         self._pending: dict[str, PendingApproval] = {}
         self._futures: dict[str, asyncio.Future[ApprovalResponse]] = {}
+        # Long-poll support: `version` moves whenever the pending set does,
+        # and waiters are woken then (GET /approvals?since=&wait=).
+        self.version = 0
+        self._changed: asyncio.Event | None = None
+
+    def _bump(self) -> None:
+        self.version += 1
+        changed, self._changed = self._changed, None
+        if changed is not None:
+            changed.set()
+
+    async def wait_for_change(self, since: int, timeout_s: float) -> None:
+        """Return once the pending set has changed since `since`, or after
+        timeout_s, whichever comes first."""
+        if self.version != since or timeout_s <= 0:
+            return
+        if self._changed is None:
+            self._changed = asyncio.Event()
+        changed = self._changed
+        try:
+            await asyncio.wait_for(changed.wait(), timeout_s)
+        except TimeoutError:
+            pass
 
     def submit(self, request: ApprovalRequest, timeout_s: int) -> asyncio.Future[ApprovalResponse]:
         """Park a request and return a Future that resolves on POST /approvals/{id}
@@ -51,12 +74,14 @@ class ApprovalBroker:
 
         handle = loop.call_later(timeout_s, _expire)
         future.add_done_callback(lambda _: handle.cancel())
+        self._bump()
         return future
 
     def resolve(self, request_id: str, response: ApprovalResponse) -> bool:
         """Resolve a pending request. Returns False if unknown, already resolved, or expired."""
         future = self._futures.pop(request_id, None)
-        self._pending.pop(request_id, None)
+        if self._pending.pop(request_id, None) is not None:
+            self._bump()
         if future is None or future.done():
             return False
         future.set_result(response)

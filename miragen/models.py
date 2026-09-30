@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
-from typing import Annotated, Literal, Optional, Union
+from typing import Annotated, Any, Literal, Optional, Union
 
 from apscheduler.triggers.cron import CronTrigger as _APCronTrigger
 
@@ -37,6 +38,9 @@ class ToolCallRecord(BaseModel):
     tool_name: str
     args: str  # JSON-encoded, truncated to 2_000 chars
     ok: bool  # False if the call raised / was denied
+    # The result's own "status" field when it is a JSON object that has one
+    # (e.g. a memory write's "accepted"); never the result's content.
+    result_status: str | None = None
 
 
 # Instance names share the agent-name grammar: they key filesystem paths
@@ -446,6 +450,16 @@ class VoiceSpec(_ProfileModel):
         default=None,
         description="Cloud providers only: TTS model override (openai default: gpt-4o-mini-tts).",
     )
+    instructions_file: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Renderer guidance (e.g. a TTS engine's supported tags and language "
+            "handling), kept in its own file and appended to the agent's system "
+            "instructions under 'Speaking aloud' (base tier, every harness). A "
+            "relative path resolves against the profile file's directory."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_provider_fields(self) -> "VoiceSpec":
@@ -545,7 +559,10 @@ class MemoryRecallSpec(_ProfileModel):
             "Run the optional recall lane at the boundary: bounded hybrid "
             "search + a zero-or-more relevance selection (one model call on "
             "cache misses). Requires a resolvable model; without one the "
-            "lane reports itself unconfigured rather than degrading."
+            "lane reports itself unconfigured rather than degrading. Bridge "
+            "backend: false means no recalled memories with each prompt (the "
+            "session-start context and the memory tools remain; turns are "
+            "still captured)."
         ),
     )
     model: Optional[str] = Field(
@@ -572,13 +589,26 @@ class MemorySpec(_ProfileModel):
     lifecycle: working-state restore + guidance injection at the run
     boundary, durable event capture, and the agent memory tools."""
 
-    backend: Literal["loimi", "ephemeral"] = Field(
+    backend: Literal["loimi", "ephemeral", "bridge"] = Field(
         default="loimi",
         description=(
             "'loimi' (or any implementation of the memory backend protocol "
             "at endpoint_env) — durable, production. 'ephemeral' — the "
             "built-in in-process backend: full lifecycle, ZERO durability "
-            "(state dies with the process); dev/demo only."
+            "(state dies with the process); dev/demo only. 'bridge' — take "
+            "part in a hosted miragend session plane (endpoint_env = its URL, "
+            "credential_env = its bearer) like an external harness session: "
+            "the plane owns the Loimi principal, scopes and recall selector; "
+            "memory tools come from its MCP (an MCP capability with "
+            "bridge_session: true)."
+        ),
+    )
+    project: Optional[str] = Field(
+        default=None,
+        max_length=512,
+        description=(
+            "bridge backend: the project this agent's sessions belong to (a "
+            "repository remote such as 'github.com/ieepirzy/mira', or a name)."
         ),
     )
     endpoint_env: str = Field(
@@ -589,11 +619,25 @@ class MemorySpec(_ProfileModel):
         default="LOIMI_MEMORY_TOKEN",
         description="Env var NAME holding this agent's minted principal token — never the value.",
     )
-    scopes: MemoryScopesSpec
+    scopes: Optional[MemoryScopesSpec] = None
     hooks: MemoryHooksSpec = Field(default_factory=MemoryHooksSpec)
     guidance: MemoryGuidanceSpec = Field(default_factory=MemoryGuidanceSpec)
     extraction: MemoryExtractionSpec = Field(default_factory=MemoryExtractionSpec)
     recall: MemoryRecallSpec = Field(default_factory=MemoryRecallSpec)
+
+    @model_validator(mode="after")
+    def _backend_fields(self) -> "MemorySpec":
+        if self.backend == "bridge":
+            if self.scopes is not None:
+                raise ValueError("memory backend 'bridge': the session plane owns scopes; "
+                                 "remove `scopes`")
+            if not self.project:
+                raise ValueError("memory backend 'bridge' needs `project`")
+        elif self.scopes is None:
+            raise ValueError(f"memory backend '{self.backend}' needs `scopes`")
+        elif self.project is not None:
+            raise ValueError("`project` applies to the bridge backend only")
+        return self
 
 
 # ── PydanticAI spec (their layer) ───────────────────────────────────────────
@@ -608,9 +652,19 @@ class AgentSpec(_ProfileModel):
         description="Any pydantic-ai model string, e.g. 'anthropic:claude-sonnet-4-6'.",
         min_length=1,
     )
-    instructions: str = Field(
-        description="System prompt; supports YAML block scalar (|).",
+    instructions: Optional[str] = Field(
+        default=None,
+        description="System prompt; supports YAML block scalar (|). Or use instructions_file.",
         min_length=1,
+    )
+    instructions_file: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "System prompt read from a file (e.g. an identity markdown file kept "
+            "under version control). Resolved by the profile loader, relative to "
+            "the profile file; exclusive with `instructions`."
+        ),
     )
     model_settings: Optional[ModelSettings] = None
     capabilities: Optional[list[str | dict]] = Field(
@@ -625,6 +679,14 @@ class AgentSpec(_ProfileModel):
         ge=1,
         description="Maps to UsageLimits(request_limit=N) — caps model round-trips per run.",
     )
+
+    @model_validator(mode="after")
+    def one_instructions_source(self) -> "AgentSpec":
+        if self.instructions is None and self.instructions_file is None:
+            raise ValueError("spec needs `instructions` or `instructions_file`")
+        if self.instructions is not None and self.instructions_file is not None:
+            raise ValueError("set `instructions` or `instructions_file`, not both")
+        return self
 
 
 # ── Budgets ──────────────────────────────────────────────────────────────────
@@ -787,6 +849,25 @@ class LeashSpec(_ProfileModel):
         return {"network"} if mode == "autonomous" else {"write", "command", "network"}
 
 
+# grok-build fields that only the headless transport wires (argv flags or
+# the hermetic GROK_HOME it launches against). "Set" = not the default.
+_GROK_HEADLESS_ONLY_FIELDS = (
+    "grok_hermetic",
+    "grok_tools",
+    "grok_disallowed_tools",
+    "grok_permission_mode",
+    "grok_allow",
+    "grok_deny",
+    "grok_max_turns",
+)
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _grok_field_set(spec: "ExecutorSpec", name: str) -> bool:
+    value = getattr(spec, name)
+    return bool(value) if isinstance(value, (bool, list)) else value is not None
+
+
 class ExecutorSpec(_ProfileModel):
     executor: Literal["codex", "claude-code", "spawn", "kimi-code", "grok-build"] = Field(
         description=(
@@ -867,6 +948,85 @@ class ExecutorSpec(_ProfileModel):
         default=None,
         description="MCP servers injected into the executor's config at startup (e.g. Loimi via Origo).",
     )
+    grok_auth: Optional[Literal["auto", "subscription"]] = Field(
+        default=None,
+        description=(
+            "grok-build only (default 'auto' on grok-build). 'auto' keeps "
+            "grok's own precedence: the GROK_HOME subscription session wins, "
+            "XAI_API_KEY is the silent metered fallback when no session is "
+            "active. 'subscription' removes XAI_API_KEY / GROK_CODE_XAI_API_KEY "
+            "from the grok process env on every transport, so an expired or "
+            "missing login fails the turn instead of billing the API key."
+        ),
+    )
+    grok_hermetic: bool = Field(
+        default=False,
+        description=(
+            "grok-build headless only. miragen owns GROK_HOME's config.toml "
+            "and requirements.toml and rewrites both atomically at every "
+            "start: Claude/Cursor/Codex compat discovery, subagents, memory, "
+            "managed MCPs, remote managed config, the shared leader and trace "
+            "upload are off; the ONLY MCP servers are this spec's "
+            "`mcp_servers` (headers reference `${bearer_token_env}`, never "
+            "the value), pinned by a requirements.toml URL allowlist that "
+            "also blocks project `.grok/config.toml` / `.mcp.json` servers; "
+            "only managed hooks run. The grok process gets an empty HOME "
+            "(so ~/.claude plugins, ~/.agents skills and ~/.claude.json are "
+            "invisible) and no GROK_* env except GROK_HOME. Auth files in "
+            "GROK_HOME are never touched. The home must be dedicated to this "
+            "agent: prepare() refuses a home another agent owns. See "
+            "docs/design/kimi-and-grok-executors.md."
+        ),
+    )
+    grok_tools: Optional[list[str]] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "grok-build headless only: built-in tool allowlist (`--tools`), "
+            "e.g. ['search_tool', 'use_tool'] for MCP-only. None = grok's "
+            "default toolset."
+        ),
+    )
+    grok_disallowed_tools: Optional[list[str]] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "grok-build headless only: tools removed (`--disallowed-tools`); "
+            "'Agent' blocks every subagent. Wins over grok_tools."
+        ),
+    )
+    grok_permission_mode: Optional[
+        Literal["default", "acceptEdits", "auto", "dontAsk", "bypassPermissions", "plan"]
+    ] = Field(
+        default=None,
+        description=(
+            "grok-build headless only: `--permission-mode`. When set it "
+            "replaces the implicit `--always-approve` derived from "
+            "approval_policy='never'. 'dontAsk' denies everything not "
+            "pre-approved by grok_allow — but grok still auto-approves its "
+            "read-only tools (read_file, grep, list_dir, web_search, skills) "
+            "in every mode, so pair it with grok_tools and grok_deny."
+        ),
+    )
+    grok_allow: list[str] = Field(
+        default_factory=list,
+        description=(
+            "grok-build headless only: repeated `--allow` rules, e.g. "
+            "'MCPTool(loimi__store_search)'."
+        ),
+    )
+    grok_deny: list[str] = Field(
+        default_factory=list,
+        description=(
+            "grok-build headless only: repeated `--deny` rules, e.g. 'Bash', "
+            "'Read', 'MCPTool(loimi__*_delete)'. Deny wins over allow."
+        ),
+    )
+    grok_max_turns: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description="grok-build headless only: `--max-turns` cap on agentic turns per job turn.",
+    )
     turn_timeout_s: Optional[int] = Field(
         default=1800,
         gt=0,
@@ -936,13 +1096,46 @@ class ExecutorSpec(_ProfileModel):
                     "grok-build host leash requires grok_transport: acp "
                     "(headless has no pre-tool approval seam)"
                 )
-            if self.mcp_servers and self.grok_transport == "headless":
-                # Same dead-config rule as leash+headless: the headless
-                # transport has no injection seam, so declared servers would
-                # silently never reach the agent.
+            if self.grok_auth is None:
+                self.grok_auth = "auto"
+            if self.mcp_servers and self.grok_transport == "headless" and not self.grok_hermetic:
+                # Same dead-config rule as leash+headless: plain headless has
+                # no injection seam, so declared servers would silently never
+                # reach the agent. grok_hermetic IS the seam (it writes them
+                # into GROK_HOME/config.toml).
                 raise ValueError(
-                    "grok-build `mcp_servers` injection requires grok_transport: acp "
-                    "(headless reads MCP config only from GROK_HOME / project .grok/)"
+                    "grok-build `mcp_servers` with grok_transport: headless requires "
+                    "grok_hermetic: true (miragen then owns GROK_HOME/config.toml); "
+                    "otherwise use grok_transport: acp"
+                )
+            if self.grok_transport != "headless":
+                for field_name in _GROK_HEADLESS_ONLY_FIELDS:
+                    if _grok_field_set(self, field_name):
+                        raise ValueError(
+                            f"`{field_name}` requires grok_transport: headless "
+                            f"(not wired for '{self.grok_transport}')"
+                        )
+            if self.grok_hermetic:
+                for server in self.mcp_servers or []:
+                    env = server.bearer_token_env
+                    if env is not None and not _ENV_NAME_RE.fullmatch(env):
+                        raise ValueError(
+                            f"grok_hermetic: mcp_servers[{server.name}].bearer_token_env "
+                            f"{env!r} is not a plain env var name (it is written as "
+                            "a ${...} reference into config.toml)"
+                        )
+                    if "${" in server.url:
+                        raise ValueError(
+                            f"grok_hermetic: mcp_servers[{server.name}].url must be literal "
+                            "(grok would expand ${...} in it; the URL allowlist needs "
+                            "the exact value)"
+                        )
+            if self.web_search and self.grok_tools is not None and not (
+                {"web_search", "web_fetch"} & set(self.grok_tools)
+            ):
+                raise ValueError(
+                    "grok-build web_search: true is dead config with a grok_tools "
+                    "allowlist that lists neither web_search nor web_fetch"
                 )
         else:
             if self.grok_home is not None:
@@ -951,11 +1144,46 @@ class ExecutorSpec(_ProfileModel):
                 raise ValueError(
                     f"`grok_transport` only applies to the grok-build executor, not '{self.executor}'"
                 )
+            for field_name in ("grok_auth", *_GROK_HEADLESS_ONLY_FIELDS):
+                if _grok_field_set(self, field_name):
+                    raise ValueError(
+                        f"`{field_name}` only applies to the grok-build executor, "
+                        f"not '{self.executor}'"
+                    )
 
         return self
 
 
 # ── Top-level agent profile ──────────────────────────────────────────────────
+
+class WatchSource(BaseModel):
+    """One source the host polls outside turns, for the agent's inbox
+    (miragen/watch.py): a read-only gateway tool called with fixed arguments,
+    whose result is diffed against the previous poll."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(description="Source name shown in the inbox, e.g. 'email'.")
+    tool: str = Field(description=(
+        "Gateway tool name ('<capability>_<tool>', e.g. 'home_search_emails'). Must be an "
+        "upstream MCP tool annotated readOnlyHint and not matched by approval_required. "
+        "Call it as widely as the agent itself would, or the inbox can miss what the "
+        "tool shows."))
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    every_s: float = Field(default=300.0, ge=30.0, description="Poll interval (seconds).")
+    items: Optional[str] = Field(default=None, description=(
+        "Dotted path to the list of items in the tool's JSON result; omitted = the result "
+        "itself is the list."))
+    id: Optional[str] = Field(default=None, description=(
+        "Dotted path to a stable id inside an item. With it, an edited item is 'changed'; "
+        "without it, items are identified by their whole content (an edit reads as new)."))
+    show: list[str] = Field(default_factory=list, description=(
+        "Dotted paths shown for an entry (e.g. sender, subject); omitted = the item, cut short."))
+    compare: list[str] = Field(default_factory=list, description=(
+        "Dotted paths that make an item 'changed' (e.g. status, date). Omitted = the whole "
+        "item, so any field a background job touches (updated_at…) counts. A new item is "
+        "found by its id either way. A path missing from every item is a poll error."))
+
 
 class AgentProfile(_ProfileModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -982,10 +1210,28 @@ class AgentProfile(_ProfileModel):
     )
     mode: Literal["autonomous", "interactive", "hybrid"]
     triggers: list[Trigger] = Field(min_length=1)
+    watch: list[WatchSource] = Field(default_factory=list, description=(
+        "Sources the host polls between turns (read-only gateway tools) to keep an inbox of "
+        "what is new or changed; served at GET /inbox and acknowledged with POST /inbox/ack. "
+        "Lets a background check wake the model only when something changed."))
     approval_required: Optional[list[str]] = Field(
         default=None,
-        description="fnmatch glob patterns for human-in-the-loop gating, e.g. ['delete_*', 'execute_*'].",
+        description=(
+            "Human-in-the-loop gating rules: fnmatch tool globs ('delete_*'), optionally "
+            "with one argument condition — 'tool:arg=g1|g2' (gated when the argument "
+            "matches) or 'tool:arg!=g1|g2' (gated unless it matches; fail closed, e.g. "
+            "'crm_execute_tool:toolName!=find_*|get_*')."
+        ),
     )
+
+    @field_validator("approval_required")
+    @classmethod
+    def _approval_rules_parse(cls, rules: Optional[list[str]]) -> Optional[list[str]]:
+        from miragen.approval import parse_approval_rule
+
+        for rule in rules or []:
+            parse_approval_rule(rule)
+        return rules
     approval_webhook: Optional[HttpUrl] = Field(
         default=None,
         description="URL that receives ApprovalRequest POSTs and returns an ApprovalResponse.",
@@ -1007,6 +1253,26 @@ class AgentProfile(_ProfileModel):
         default=None,
         description="Whitelisted @register tool names; None/omitted = no local tools injected.",
     )
+    timezone: Optional[str] = Field(
+        default=None,
+        description=(
+            "IANA time zone of the agent's person, e.g. 'Europe/Helsinki'. When set, the "
+            "tool gateway prefixes every tool result with the local time to the minute, "
+            "so a long-lived session keeps track of when things happened."
+        ),
+    )
+
+    @field_validator("timezone")
+    @classmethod
+    def _timezone_known(cls, tz: Optional[str]) -> Optional[str]:
+        if tz is not None:
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+            try:
+                ZoneInfo(tz)
+            except (ZoneInfoNotFoundError, ValueError) as exc:
+                raise ValueError(f"unknown time zone '{tz}'") from exc
+        return tz
     voice: Optional[VoiceSpec] = Field(
         default=None,
         description=(

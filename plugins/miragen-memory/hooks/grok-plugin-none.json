@@ -1,0 +1,4 @@
+{
+  "description": "Intentionally empty. Grok Build 1.0.41 does not register plugin hooks at session start (only after a plugin reload), so the Grok hooks live in $GROK_HOME/hooks/miragen.json, written by the local miragend (harness_setup) or, where no daemon runs, by this plugin's MCP proxy. Declaring them here too would fire every event twice once Grok does load plugin hooks.",
+  "hooks": {}
+}

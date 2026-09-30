@@ -9,8 +9,9 @@ import os
 import re
 import shutil
 import uuid
+from types import SimpleNamespace
 from collections.abc import Callable
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -21,13 +22,14 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger as APIntervalTrigger
-from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
 
+from miragen import access_log
 from miragen import events as run_events
 from miragen.broker import PendingApproval, get_broker
 from miragen.edf import (
@@ -38,7 +40,11 @@ from miragen.edf import (
     resolve_edf,
 )
 from miragen.executor import ExecutorBackend, ExecutorResult, RepositoryCheckout, build_executor
-from miragen.factory import build_agent, registered_handlers
+from miragen.factory import build_agent, registered_handlers, registered_tools
+from miragen.harness import (
+    PYDANTIC_AI, Harness, HarnessTurn, InstanceBusyError, PydanticAIHarness, build_model_harness, profile_harness,
+    pydantic_ai_model,
+)
 from miragen.load import load_profile
 from miragen.profile_contract import SUPPORTED_PROFILE_CONTRACTS
 from miragen.models import (
@@ -70,7 +76,6 @@ from miragen.publication import (
 from miragen.runs import (
     AmbiguousRunIdError,
     RunStore,
-    extract_run_details,
     reserved_tokens_in_flight,
     run_retention_from_env,
     simplify_history_messages,
@@ -92,7 +97,9 @@ from miragen.runtime_tools.scheduling import (
 )
 from miragen.memory.tools import build_memory_tools
 from miragen.memory_mcp import build_memory_mcp
-from miragen.voice import SpeechAudio, VoiceBackend, build_voice_backend
+from miragen.voice import (
+    SpeechAudio, VoiceBackend, build_voice_backend, load_speak_guidance,
+)
 from miragen.voice_mcp import build_voice_mcp
 
 logger = logging.getLogger(__name__)
@@ -102,6 +109,21 @@ logger = logging.getLogger(__name__)
 _profile: AgentProfile | None = None
 _agent: Agent | None = None
 _limits: UsageLimits | None = None
+# A long-lived non-PydanticAI harness (e.g. Grok Build) for base-tier
+# profiles whose spec.model names one. None for pydantic-ai profiles: their
+# harness wraps the _agent/_limits globals above (see _model_harness).
+_harness: Harness | None = None
+# memory.backend: bridge — the hosted session plane this agent reports to.
+_bridge_memory = None
+# The tool gateway a non-PydanticAI harness acts through (served at
+# /mcp/gateway with its own per-instance credentials).
+_gateway = None
+# The inbox (profile `watch`): host-side polling of read-only tools, served
+# at /inbox. None when the profile watches nothing or has no gateway.
+_inbox = None
+# voice.instructions_file contents: renderer guidance appended to the
+# system instructions (base tier, every harness).
+_speak_guidance: str | None = None
 _scheduler: AsyncIOScheduler = AsyncIOScheduler()
 _run_store: RunStore | None = None
 _executor: "ExecutorBackend | None" = None
@@ -278,6 +300,54 @@ def _save_history_messages(instance: str, messages: list, run_id: str | None) ->
     _append_history_sidecar(instance, run_id, len(messages))
 
 
+def _guidance_kwargs() -> dict:
+    """build_agent's system_guidance, passed only when there is some."""
+    return {"system_guidance": _speak_guidance} if _speak_guidance else {}
+
+
+@contextmanager
+def _bind_run_context(run_id: str | None, instance: str | None):
+    """Run/instance context for a runtime tool called through the gateway
+    (the same contextvars run_agent sets around a PydanticAI run)."""
+    run_token = _current_run_id.set(run_id)
+    instance_token = _current_instance.set(instance)
+    try:
+        yield
+    finally:
+        _current_run_id.reset(run_token)
+        _current_instance.reset(instance_token)
+
+
+def _model_ready() -> bool:
+    """A base-tier harness is available for turns."""
+    return _harness is not None or _agent is not None
+
+
+def _model_harness() -> Harness:
+    """The harness running this profile's base-tier turns.
+
+    A dedicated harness (Grok Build, …) is long-lived and owns its own
+    state. The PydanticAI harness is a thin wrapper around the startup
+    agent, rebuilt on each call so it always sees the current `_agent`."""
+    if _harness is not None:
+        return _harness
+    assert _agent is not None, "Agent not initialized"
+    return PydanticAIHarness(
+        _agent,
+        _limits,
+        build_run_agent=lambda secret_env, extra_instructions: build_agent(
+            _profile,
+            telemetry=_telemetry,
+            secret_env=secret_env,
+            extra_tools=_runtime_extra_tools(),
+            extra_instructions=extra_instructions,
+            **_guidance_kwargs(),
+        ),
+        load_history=lambda instance: _cap_history(_load_history_messages(instance)),
+        save_history=_save_history_messages,
+    )
+
+
 def _sidecar_message_count(instance: str, run_id: str) -> int | None:
     """
     message_count recorded in the instance's sidecar the last time `run_id`
@@ -411,8 +481,8 @@ def _build_memory_lifecycle(profile: AgentProfile) -> "MemoryLifecycle | None":
     native seam (miragen owns every turn); executor-tier native hooks land
     with the hook-bridge PR, so a profile demanding them today must refuse
     to start."""
-    if profile.memory is None:
-        return None
+    if profile.memory is None or profile.memory.backend == "bridge":
+        return None  # the bridge backend is BridgeMemory, not a local lifecycle
     if profile.memory.hooks.mode == "native_required" and profile.is_executor:
         from miragen.memory.harness_hooks import executor_hook_support
 
@@ -430,7 +500,9 @@ def _build_memory_lifecycle(profile: AgentProfile) -> "MemoryLifecycle | None":
         selector_model = (
             profile.memory.recall.model
             or profile.memory.extraction.model
-            or (profile.spec.model if profile.spec else None)
+            # A harness model (grok-build:…) is not a PydanticAI model the
+            # selector could call: such profiles name memory.recall.model.
+            or pydantic_ai_model(profile)
         )
         if selector_model:
             from miragen.memory.selection import build_model_selector
@@ -535,7 +607,7 @@ async def run_agent(
             prompt, record, repositories=repositories, mcp_secret_env=mcp_secret_env
         )
 
-    assert _agent is not None, "Agent not initialized"
+    assert _model_ready(), "Agent not initialized"
 
     # Same rule as use_history above, in the other direction. Workspace
     # checkout is executor-tier machinery that the model tier does not have
@@ -565,24 +637,21 @@ async def run_agent(
             trigger=record.trigger if record is not None else "direct",
             prompt_hint=prompt,
         )
-
-    agent, limits = (_agent, _limits)
-    if mcp_secret_env or memory_packet is not None:
-        agent, limits = build_agent(
-            _profile,
-            telemetry=_telemetry,
-            secret_env=mcp_secret_env,
-            extra_tools=_runtime_extra_tools(),
-            extra_instructions=memory_packet.text if memory_packet else None,
-        )
+    elif _bridge_memory is not None:
+        memory_packet = SimpleNamespace(text=await _bridge_memory.prepare(
+            instance=instance, run_id=record.run_id if record is not None else None,
+            prompt=prompt))
 
     history_instance = instance or DEFAULT_INSTANCE
-    history = None
-    if use_history:
-        try:
-            history = _cap_history(_load_history_messages(history_instance)) or None
-        except Exception:
-            logger.warning("Failed to load history, starting fresh")
+    turn = HarnessTurn(
+        prompt=prompt,
+        instance=history_instance,
+        use_history=use_history,
+        run_id=record.run_id if record is not None else None,
+        secret_env=mcp_secret_env or None,
+        extra_instructions=memory_packet.text if memory_packet is not None else None,
+    )
+    harness = _model_harness()
 
     run_ctx = (
         _telemetry.run_span(
@@ -598,13 +667,12 @@ async def run_agent(
     instance_token = _current_instance.set(instance)
     try:
         with run_ctx as run_span:
-            result = await agent.run(prompt, usage_limits=limits, message_history=history)
-            if run_span is not None:
-                pai_usage = result.usage
-                if pai_usage.input_tokens:
-                    run_span.set_attribute("gen_ai.usage.input_tokens", pai_usage.input_tokens)
-                if pai_usage.output_tokens:
-                    run_span.set_attribute("gen_ai.usage.output_tokens", pai_usage.output_tokens)
+            result = await harness.run(turn)
+            if run_span is not None and result.usage is not None:
+                if result.usage.input_tokens:
+                    run_span.set_attribute("gen_ai.usage.input_tokens", result.usage.input_tokens)
+                if result.usage.output_tokens:
+                    run_span.set_attribute("gen_ai.usage.output_tokens", result.usage.output_tokens)
     except Exception as e:
         if record is not None and _run_store is not None:
             _run_store.finish(record, status="failed", error=str(e))
@@ -615,22 +683,18 @@ async def run_agent(
                     instance=instance, run_id=record.run_id, trigger=record.trigger,
                     status="failed", error=str(e),
                 )
+        if _bridge_memory is not None:
+            await _bridge_memory.finish(instance=instance, run_id=record.run_id if record else None,
+                                        output=None, status="failed")
         raise
     finally:
         _current_run_id.reset(run_id_token)
         _current_instance.reset(instance_token)
 
-    if use_history:
-        try:
-            messages = result.all_messages()
-            _save_history_messages(history_instance, messages, record.run_id if record else None)
-        except Exception:
-            logger.warning("Failed to save history")
-
-    output = str(result.output)
+    output = result.output
 
     if record is not None and _run_store is not None:
-        usage, tool_calls = extract_run_details(result)
+        usage, tool_calls = result.usage, result.tool_calls
         _run_store.finish(
             record,
             status="succeeded",
@@ -650,6 +714,9 @@ async def run_agent(
                 instance=instance, run_id=record.run_id, trigger=record.trigger,
                 status="succeeded", summary=output,
             )
+    if _bridge_memory is not None:
+        await _bridge_memory.finish(instance=instance, run_id=record.run_id if record else None,
+                                    output=output, status="succeeded")
 
     return output
 
@@ -1016,7 +1083,9 @@ async def _run_managed_schedule(name: str) -> None:
     if _schedule_store is None:
         return
     binding = _schedule_store.get(name)
-    if binding is None or not binding.enabled:
+    if binding is None or not binding.fires_here:
+        # Includes a binding handed to the control plane since this job was
+        # scheduled: firing it here too would launch the same fire twice.
         return
     prov = binding.provenance.model_dump() if binding.provenance is not None else {}
     prov["schedule_name"] = name
@@ -1045,8 +1114,9 @@ async def _run_managed_schedule(name: str) -> None:
 
 def _reconcile_managed_job(binding: ScheduleBinding) -> None:
     """Make the scheduler match one binding: enabled → (re)registered job,
-    disabled → no job. Raises on scheduler failure (callers roll back)."""
-    if binding.enabled:
+    disabled or externally fired → no job. Raises on scheduler failure
+    (callers roll back)."""
+    if binding.fires_here:
         _scheduler.add_job(
             _run_managed_schedule,
             _apscheduler_trigger(binding.schedule),
@@ -1073,7 +1143,7 @@ def _register_managed_schedules() -> int:
         # schedules volume could still carry bindings from a prior deployment.
         # Honor the mode contract on startup too: an interactive agent must not
         # self-activate. Bindings are left on disk (not deleted), just not run.
-        pending = [b.name for b in _schedule_store.list() if b.enabled]
+        pending = [b.name for b in _schedule_store.list() if b.fires_here]
         if pending:
             logger.warning(
                 f"[{_profile.name}] mode is interactive — not registering "
@@ -1085,7 +1155,7 @@ def _register_managed_schedules() -> int:
     for binding in _schedule_store.list():
         try:
             _reconcile_managed_job(binding)
-            count += binding.enabled
+            count += binding.fires_here
         except Exception as e:
             logger.error(f"failed to register managed schedule '{binding.name}': {e}", exc_info=True)
     return count
@@ -1208,7 +1278,7 @@ def _load_file_secrets() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _profile, _agent, _limits, _run_store, _executor, _schedule_store, \
+    global _profile, _agent, _limits, _harness, _gateway, _inbox, _bridge_memory, _speak_guidance, _run_store, _executor, _schedule_store, \
         _publication_store, _telemetry, _voice, _memory, _scheduling
 
     _load_file_secrets()
@@ -1244,6 +1314,12 @@ async def lifespan(app: FastAPI):
 
     # Built before the agent: the memory tools close over the lifecycle.
     _memory = _build_memory_lifecycle(_profile)
+    if _profile.memory is not None and _profile.memory.backend == "bridge":
+        from miragen.memory.bridge import BridgeMemory
+
+        _bridge_memory = BridgeMemory.from_env(_profile.memory, _profile.name, dict(os.environ))
+        logger.info(f"Memory through the session plane at {_bridge_memory.base_url} "
+                    f"(project {_profile.memory.project})")
     if _memory is not None:
         logger.info(f"Memory enabled (backend: {_profile.memory.backend})")
 
@@ -1252,6 +1328,9 @@ async def lifespan(app: FastAPI):
         build_voice_backend(_profile.voice, _profile.name)
         if _profile.voice is not None
         else None
+    )
+    _speak_guidance = (
+        load_speak_guidance(_profile.voice, profile_path) if _profile.voice is not None else None
     )
     if _voice is not None:
         logger.info(f"Voice enabled (provider: {_profile.voice.provider})")
@@ -1263,9 +1342,34 @@ async def lifespan(app: FastAPI):
         _executor.set_memory(_memory)
         _executor.prepare()
         logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode (executor tier: {_profile.executor.executor})")
+    elif profile_harness(_profile) != PYDANTIC_AI:
+        _harness, _gateway = build_model_harness(
+            _profile,
+            runs_root=_run_store.root,
+            runtime_tools=_runtime_extra_tools(),
+            registered_tools=registered_tools(),
+            bind_context=_bind_run_context,
+            system_guidance=_speak_guidance,
+            session_key_for=_bridge_memory.session_key if _bridge_memory is not None else None,
+        )
+        _gateway_mount.inner = _gateway.asgi
+        if _profile.watch:
+            from miragen.watch import Inbox
+            _inbox = Inbox(_profile.watch, _gateway.read_tool, _run_store.root / "inbox.json")
+            logger.info("Inbox watching %s", ", ".join(s.name for s in _profile.watch))
+        if _bridge_memory is not None and hasattr(_harness, "session_info"):
+            # Rotated sessions are separate plane sessions; compactions and
+            # rotations reach the plane as compacting / closed.
+            harness = _harness
+            _bridge_memory.session_seq = lambda name: (harness.session_info(name) or {}).get("seq", 1)
+            harness.on_lifecycle = _bridge_memory.lifecycle
+        logger.info(
+            f"Agent '{_profile.name}' built in {_profile.mode} mode (harness: {_harness.name})"
+        )
     else:
         _agent, _limits = build_agent(
-            _profile, telemetry=_telemetry, extra_tools=_runtime_extra_tools()
+            _profile, telemetry=_telemetry, extra_tools=_runtime_extra_tools(),
+            **_guidance_kwargs(),
         )
         logger.info(f"Agent '{_profile.name}' built in {_profile.mode} mode")
 
@@ -1335,10 +1439,20 @@ async def lifespan(app: FastAPI):
             voice_mcp.session_manager.run(),
             memory_mcp.session_manager.run(),
             schedule_mcp.session_manager.run(),
+            _gateway.running() if _gateway is not None else nullcontext(),
         ):
             _scheduler.start()
             logger.info("Scheduler started")
-            yield
+            inbox_stop = asyncio.Event()
+            inbox_task = (asyncio.create_task(_inbox.run(inbox_stop), name="inbox")
+                          if _inbox is not None else None)
+            try:
+                yield
+            finally:
+                inbox_stop.set()
+                if inbox_task is not None:
+                    with suppress(Exception):
+                        await asyncio.wait_for(inbox_task, timeout=10)
     finally:
         _ask_human_guard.inner = _mcp_not_ready
         _voice_mcp_guard.inner = _mcp_not_ready
@@ -1347,6 +1461,14 @@ async def lifespan(app: FastAPI):
 
     _scheduler.shutdown(wait=False)
     logger.info("Scheduler stopped")
+    if _harness is not None:
+        # Long-lived harnesses hold processes (e.g. one grok agent per
+        # instance); stop them with the container.
+        await _harness.aclose()
+        _harness = None
+    _gateway_mount.inner = _mcp_not_ready
+    _gateway = None
+    _inbox = None
 
     if _telemetry is not None:
         _telemetry.shutdown()
@@ -1357,6 +1479,9 @@ async def lifespan(app: FastAPI):
 # ── App ────────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(lifespan=lifespan)
+
+# Routine health / approval / run polling stays out of the access log.
+access_log.install()
 
 
 # ── ask_human MCP mount ──────────────────────────────────────────────────────
@@ -1434,6 +1559,21 @@ _schedule_mcp_guard = _TokenGuardASGI(_mcp_not_ready)
 app.mount("/mcp/schedule", _schedule_mcp_guard)
 
 
+class _SwappableASGI:
+    """A mount whose app is set by the lifespan. The tool gateway does its
+    own auth (per-instance credentials), so no internal-token guard here."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        await self.inner(scope, receive, send)
+
+
+_gateway_mount = _SwappableASGI(_mcp_not_ready)
+app.mount("/mcp/gateway", _gateway_mount)
+
+
 # ── HTTP trigger schemas ────────────────────────────────────────────────────────────────
 
 class RunRequest(BaseModel):
@@ -1508,6 +1648,7 @@ CONTRACT_CAPABILITIES = [
     "events-cursor/v1",                  # GET /runs/{id}/events?after=
     "run-events-unified/v1",             # /runs/{id}/events serves BOTH tiers
     "managed-schedules/v1",              # GET/PUT/DELETE /schedules (CAS reconciliation)
+    "managed-schedules-external-fire/v1",  # bindings with externally_fired: recorded, never fired here
     "interventions/v1",                  # structured question suspension + answered resume
     "ask-human-mcp/v1",                  # /mcp/ask-human MCP tool (writes the sentinel)
     "reviewed-publication/v1",           # POST /runs/{id}/publications (endpoint; backend config required)
@@ -1644,7 +1785,7 @@ async def run(request: RunRequest):
     HTTP trigger endpoint. Available for interactive and hybrid agents,
     and for manually triggering autonomous agents outside their cron schedule.
     """
-    if _agent is None and _executor is None:
+    if not _model_ready() and _executor is None:
         raise HTTPException(status_code=503, detail="Agent not ready")
     _reject_executor_use_history(request)
     _raise_if_daily_budget_exceeded()
@@ -1684,7 +1825,7 @@ async def run_async(request: RunRequest):
     Non-blocking variant of /run: starts the run in the background and returns
     immediately with a run_id. Poll GET /runs/{run_id} for the outcome.
     """
-    if _agent is None and _executor is None:
+    if not _model_ready() and _executor is None:
         raise HTTPException(status_code=503, detail="Agent not ready")
     if _run_store is None or _profile is None:
         raise HTTPException(status_code=503, detail="Run store not ready")
@@ -2112,6 +2253,12 @@ class ExecutorLaunchRequest(BaseModel):
         "control-plane concern.",
     )
     idempotency_key: str = Field(min_length=1, max_length=200)
+    # Base-tier launches only: the named instance the run converses with,
+    # and whether it continues that instance's conversation (instances/v1).
+    # A durable, idempotent launch *into a conversation* — what a control
+    # plane driving a persistent agent needs (Mira).
+    instance: Optional[str] = Field(default=None, pattern=INSTANCE_NAME_PATTERN)
+    use_history: bool = False
     edf: Optional[dict] = None
     context: Optional[ResolutionContext] = None
     expected_sha256: Optional[str] = Field(
@@ -2188,6 +2335,48 @@ async def resolve_profile(request: ResolveRequest):
     return body
 
 
+class TurnRequest(BaseModel):
+    """One turn in a conversation instance (base tier)."""
+
+    prompt: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    provenance: RunProvenance | None = None
+
+
+@app.post("/instances/{name}/turns", status_code=202, dependencies=[_internal_auth])
+async def start_turn(name: str, request: TurnRequest, response: Response):
+    """Start a turn in a conversation instance, with its history.
+
+    The base tier's name for what /executor-runs does for it: the same
+    durable, idempotent acceptance (a retried idempotency_key returns the
+    original turn with 200 and duplicate: true), the same admission, and the
+    turn's record is readable at GET /instances/{name}/turns/{turn_id} (or
+    /runs/{turn_id}). A turn is asynchronous: it can take minutes (tools,
+    approvals), so this answers at once with the turn's id."""
+    _check_instance_name(name)
+    if _executor is not None:
+        raise HTTPException(status_code=409, detail="an executor-tier agent has no "
+                            "conversation instances; use /executor-runs")
+    result = await launch_executor_run(
+        ExecutorLaunchRequest(prompt=request.prompt, idempotency_key=request.idempotency_key,
+                              provenance=request.provenance, instance=name, use_history=True),
+        response)
+    return {"turn_id": result["run_id"], "instance": name,
+            **{k: v for k, v in result.items() if k in ("status", "duplicate")}}
+
+
+@app.get("/instances/{name}/turns/{turn_id}", response_model=RunRecord, dependencies=[_internal_auth])
+async def get_turn(name: str, turn_id: str):
+    """A turn's record (status, output, tool calls, usage), if it belongs to
+    this instance."""
+    _check_instance_name(name)
+    record = await get_run(turn_id)
+    instance = record.get("instance") if isinstance(record, dict) else getattr(record, "instance", None)
+    if instance != name:
+        raise HTTPException(status_code=404, detail=f"no turn {turn_id} in instance '{name}'")
+    return record
+
+
 @app.post("/executor-runs", status_code=202, dependencies=[_internal_auth])
 async def launch_executor_run(request: ExecutorLaunchRequest, response: Response):
     """Idempotent, provenance-carrying executor launch.
@@ -2205,7 +2394,7 @@ async def launch_executor_run(request: ExecutorLaunchRequest, response: Response
     # name is executor-era and kept for compatibility; what it actually means
     # is "durable, idempotent, provenance-carrying launch", which is not
     # tier-specific. A profile with neither backend cannot run at all.
-    if _executor is None and _agent is None:
+    if _executor is None and not _model_ready():
         raise HTTPException(
             status_code=400,
             detail="this agent has no backend configured; /executor-runs requires "
@@ -2297,7 +2486,13 @@ async def launch_executor_run(request: ExecutorLaunchRequest, response: Response
     # synchronously so an over-capacity launch answers 429 BEFORE the durable
     # acceptance point — a 429 must never leave a record behind. Claimed after
     # validation on purpose: an invalid EDF deserves its 4xx even at capacity.
-    release = _admit_or_429(None)
+    if (request.instance is not None or request.use_history) and _executor is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="instance/use_history apply to base-tier launches; an executor run's "
+            "thread is its conversation state",
+        )
+    release = _admit_or_429(request.instance)
 
     # Durable acceptance point — no awaits between the idempotency lookup
     # above and this write, so a same-key race cannot slip between them
@@ -2313,6 +2508,8 @@ async def launch_executor_run(request: ExecutorLaunchRequest, response: Response
             model=_profile.executor.model if _profile.executor else None,
             snapshot_sha256=resolved.sha256 if resolved is not None else None,
             provenance=provenance,
+            use_history=request.use_history,
+            instance=request.instance,
             repositories=[
                 RepositoryRevision(
                     name=entry.name,
@@ -2357,6 +2554,8 @@ async def launch_executor_run(request: ExecutorLaunchRequest, response: Response
                 record=record,
                 repositories=checkouts,
                 mcp_secret_env=mcp_secret_env or None,
+                use_history=request.use_history,
+                instance=request.instance,
             )
         except Exception as e:
             # run_agent already wrote the failure to the record; this is just
@@ -2389,6 +2588,11 @@ class ScheduleBindingRequest(BaseModel):
     )
     provenance: Optional[RunProvenance] = None
     metadata: dict[str, str] = Field(default_factory=dict)
+    externally_fired: bool = Field(
+        default=False,
+        description="The control plane fires this binding; MiraGen records it "
+        "but registers no job (managed-schedules-external-fire/v1).",
+    )
     expected_version: Optional[int] = Field(
         default=None,
         ge=1,
@@ -2450,6 +2654,7 @@ async def put_schedule(name: str, request: ScheduleBindingRequest, response: Res
             instance=request.instance,
             provenance=request.provenance,
             metadata=request.metadata,
+            externally_fired=request.externally_fired,
             expected_version=request.expected_version,
         )
     except BindingConflictError as e:
@@ -2586,8 +2791,44 @@ async def list_instances():
     for name in sorted(_busy_instances):
         info(name)
 
+    session_info = getattr(_harness, "session_info", None)
+    if session_info is not None:
+        for entry in infos.values():
+            entry["session"] = session_info(entry["name"])
+
     instances = sorted(infos.values(), key=lambda entry: entry["name"])
     return {"count": len(instances), "instances": instances}
+
+
+@app.get("/instances/{name}/session", dependencies=[_internal_auth])
+async def instance_session(name: str):
+    """The harness's session state for an instance (Grok lifecycle): its
+    sequence, context size, and whether the next turn opens a rotated
+    session (`fresh`), so a client can add its own recent transcript."""
+    _check_instance_name(name)
+    session_info = getattr(_harness, "session_info", None)
+    info = session_info(name) if session_info is not None else None
+    if info is None:
+        raise HTTPException(status_code=404, detail=f"instance '{name}' has no harness session")
+    return {"instance": name, **info}
+
+
+@app.post("/instances/{name}/rotate", dependencies=[_internal_auth])
+async def rotate_instance(name: str):
+    """Start the instance's next session now (e.g. the user asked for a fresh
+    start): memory save + handoff note, then a new session. The instance
+    name, and so the client's conversation, stays the same."""
+    _check_instance_name(name)
+    rotate = getattr(_harness, "rotate", None)
+    if rotate is None:
+        raise HTTPException(status_code=409, detail="this agent's harness has no sessions to rotate")
+    if name in _busy_instances:
+        raise HTTPException(status_code=409, detail=f"instance '{name}' has a running turn")
+    try:
+        info = await rotate(name)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"instance '{name}' has no session") from None
+    return {"instance": name, **info}
 
 
 @app.delete("/instances/{name}", dependencies=[_internal_auth])
@@ -2600,33 +2841,69 @@ async def delete_instance(name: str):
             status_code=409,
             detail=f"instance '{name}' has a running turn; retry after it finishes",
         )
-    history = _history_file(name)
-    sidecar = _history_sidecar(name)
-    if not history.exists() and not sidecar.exists():
-        raise HTTPException(
-            status_code=404, detail=f"instance '{name}' has no persisted state"
-        )
     deleted = []
-    for path in (history, sidecar):
+    # A harness that owns its conversation natively (Grok Build) holds the
+    # real state: its process, session files and working directory.
+    forget = getattr(_harness, "forget", None)
+    if forget is not None:
+        try:
+            deleted += await forget(name)
+        except InstanceBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    for path in (_history_file(name), _history_sidecar(name)):
         if path.exists():
             path.unlink()
             deleted.append(path.name)
+    if not deleted:
+        raise HTTPException(
+            status_code=404, detail=f"instance '{name}' has no persisted state"
+        )
     return {"instance": name, "deleted": deleted}
 
 
 class ApprovalListResponse(BaseModel):
     count: int
     approvals: list[PendingApproval]
+    version: int = 0   # changes whenever the pending set does (long-poll `since`)
 
 
 class ResolveApprovalResponse(BaseModel):
     resolved: bool
 
 
+class InboxAckRequest(BaseModel):
+    through: int = Field(ge=0, description="Acknowledge entries with seq <= this.")
+
+
+@app.get("/inbox", dependencies=[_internal_auth])
+async def get_inbox():
+    """What is new or changed in the profile's watched sources (miragen/watch.py).
+    A source whose status isn't 'ok', or with overflow set, may hold more than
+    its entries show: treat it as 'look', never as 'nothing new'."""
+    if _inbox is None:
+        return {"enabled": False, "seq": 0, "sources": {}, "entries": []}
+    return _inbox.view()
+
+
+@app.post("/inbox/ack", dependencies=[_internal_auth])
+async def ack_inbox(body: InboxAckRequest):
+    if _inbox is None:
+        return {"acked": 0}
+    return {"acked": _inbox.ack(body.through)}
+
+
 @app.get("/approvals", response_model=ApprovalListResponse, dependencies=[_internal_auth])
-async def list_approvals():
-    pending = get_broker().pending()
-    return ApprovalListResponse(count=len(pending), approvals=pending)
+async def list_approvals(
+    since: Optional[int] = Query(default=None, description=(
+        "Long-poll: the `version` from your last answer. With `wait`, the call "
+        "returns as soon as the pending set changes, or after `wait` seconds.")),
+    wait: float = Query(default=0, ge=0, le=60),
+):
+    broker = get_broker()
+    if since is not None and wait > 0:
+        await broker.wait_for_change(since, wait)
+    pending = broker.pending()
+    return ApprovalListResponse(count=len(pending), approvals=pending, version=broker.version)
 
 
 @app.post("/approvals/{request_id}", response_model=ResolveApprovalResponse, dependencies=[_internal_auth])
@@ -2652,7 +2929,7 @@ async def run_stream(request: RunRequest):
             status_code=400,
             detail="executor-backed agents do not stream text; poll GET /runs/{run_id}/events instead",
         )
-    if _agent is None:
+    if not _model_ready():
         raise HTTPException(status_code=503, detail="Agent not ready")
 
     instance = request.effective_instance()
@@ -2663,13 +2940,6 @@ async def run_stream(request: RunRequest):
     try:
         prompt = _apply_trigger_prompt(request.prompt)
         history_instance = instance or DEFAULT_INSTANCE
-
-        history = None
-        if request.use_history:
-            try:
-                history = _cap_history(_load_history_messages(history_instance)) or None
-            except Exception:
-                logger.warning("Failed to load history for stream, starting fresh")
 
         record = (
             _run_store.start(
@@ -2683,7 +2953,7 @@ async def run_stream(request: RunRequest):
             else None
         )
 
-        stream_agent, stream_limits = _agent, _limits
+        memory_packet = None
         if _memory is not None:
             memory_packet = await _memory.prepare_context(
                 instance=instance,
@@ -2691,12 +2961,18 @@ async def run_stream(request: RunRequest):
                 trigger="http",
                 prompt_hint=prompt,
             )
-            stream_agent, stream_limits = build_agent(
-                _profile,
-                telemetry=_telemetry,
-                extra_tools=_runtime_extra_tools(),
-                extra_instructions=memory_packet.text,
-            )
+        elif _bridge_memory is not None:
+            memory_packet = SimpleNamespace(text=await _bridge_memory.prepare(
+                instance=instance, run_id=record.run_id if record is not None else None,
+                prompt=prompt))
+        turn = HarnessTurn(
+            prompt=prompt,
+            instance=history_instance,
+            use_history=request.use_history,
+            run_id=record.run_id if record is not None else None,
+            extra_instructions=memory_packet.text if memory_packet is not None else None,
+        )
+        harness = _model_harness()
     except Exception:
         release()
         raise
@@ -2719,18 +2995,11 @@ async def run_stream(request: RunRequest):
         try:
           with run_ctx as run_span:
             try:
-                async with stream_agent.run_stream(prompt, usage_limits=stream_limits, message_history=history) as stream:
-                    async for chunk in stream.stream_text(delta=True):
+                async with harness.stream(turn) as stream:
+                    async for chunk in stream:
                         chunks.append(chunk)
                         yield f"data: {chunk}\n\n"
-                    if request.use_history:
-                        try:
-                            messages = stream.all_messages()
-                            _save_history_messages(
-                                history_instance, messages, record.run_id if record else None
-                            )
-                        except Exception:
-                            logger.warning("Failed to save history after stream")
+                    stream_result = stream.result
             except Exception as e:
                 if record is not None and _run_store is not None:
                     _run_store.finish(record, status="failed", error=str(e), output="".join(chunks) or None)
@@ -2742,10 +3011,7 @@ async def run_stream(request: RunRequest):
                         )
                 raise
             if record is not None and _run_store is not None:
-                try:
-                    usage, tool_calls = extract_run_details(stream)
-                except Exception:
-                    usage, tool_calls = None, []
+                usage, tool_calls = stream_result.usage, stream_result.tool_calls
                 _run_store.finish(
                     record,
                     status="succeeded",
@@ -2763,6 +3029,9 @@ async def run_stream(request: RunRequest):
                         instance=instance, run_id=record.run_id,
                         trigger="http", status="succeeded", summary="".join(chunks),
                     )
+                if _bridge_memory is not None:
+                    await _bridge_memory.finish(instance=instance, run_id=record.run_id,
+                                                output="".join(chunks), status="succeeded")
                 if run_span is not None and usage is not None:
                     if usage.input_tokens:
                         run_span.set_attribute("gen_ai.usage.input_tokens", usage.input_tokens)

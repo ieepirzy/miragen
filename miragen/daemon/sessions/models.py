@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 HARNESS_PATTERN = r"^[a-z0-9][a-z0-9-]{0,31}$"
 EVENT_NAMES = (
@@ -56,11 +56,27 @@ class ClientInfo(_Tolerant):
     host: Optional[str] = Field(default=None, max_length=256)
     remote: Optional[bool] = None
     project_remote: Optional[str] = Field(default=None, max_length=1024)
+    # The user's home directory where the harness runs. A session sitting
+    # there is "no project yet" (tier 3), even if ~ happens to be a git
+    # repository (dotfiles) — it never outranks a real project binding.
+    home: Optional[str] = Field(default=None, max_length=4096)
+    # What this adapter can do beyond the baseline, e.g. "async-recall": it
+    # keeps a recall-pending marker and claims results on later hooks.
+    capabilities: list[str] = Field(default_factory=list, max_length=16)
     transcript_path: Optional[str] = Field(default=None, max_length=4096)
     project_dir: Optional[str] = Field(default=None, max_length=4096)
     parent_session: Optional[str] = Field(default=None, max_length=256)
     agent: Optional[str] = Field(default=None, max_length=256)
     adapter: Optional[str] = Field(default=None, max_length=64)
+    # "deferred": the harness discards start/prompt hook output, so context
+    # answered now reaches the model only with a later tool result (Grok
+    # Build). Free-form on purpose — a newer adapter's value must not 422.
+    context_delivery: Optional[str] = None
+
+    @field_validator("context_delivery", mode="before")
+    @classmethod
+    def _clip_delivery(cls, value: Any) -> Any:
+        return value[:32] if isinstance(value, str) else None
 
 
 class EventBody(_Tolerant):
@@ -115,8 +131,14 @@ class SessionCounters(_Tolerant):
     tool_failures: int = 0
     compactions: int = 0
     injections: int = 0
+    # Of `injections`, how many were queued for a later tool result rather
+    # than shown at once (harnesses that discard start/prompt output).
+    deferred_injections: int = 0
     captures: int = 0
     capture_failures: int = 0
+    # memory_remember / memory_checkpoint / memory_correct calls attributed
+    # to this session through the bridge (the end-of-work nudge reads it).
+    memory_writes: int = 0
 
 
 class ExternalSession(_Tolerant):
@@ -139,6 +161,25 @@ class ExternalSession(_Tolerant):
     adapter: Optional[str] = None
     project: Optional[ProjectIdentity] = None
     scope: Optional[str] = None
+    # Every project this session was bound to, in order (an agent launched
+    # from ~ that cd's through repositories); the episode lists them.
+    projects_seen: list[str] = Field(default_factory=list)
+    # The cwd/remote the binding was last resolved from: resolution is
+    # skipped while neither changed.
+    resolved_from: Optional[str] = None
+    # The binding changed since the model last got this project's context:
+    # the next prompt opens it.
+    reopen_pending: bool = False
+    # End-of-work save nudge (P1a): how many fired, where the clock was
+    # last reset, and whether one is awaiting an answer ("asked"/"reasked").
+    nudges_fired: int = 0
+    nudge_prompt_mark: int = 0
+    nudge_compaction_mark: int = 0
+    nudge_writes_mark: int = 0
+    nudge_state: Optional[str] = None
+    # Record/event ids already credited as memory writes (both the bridge
+    # and the adapter may report the same write).
+    credited_writes: list[str] = Field(default_factory=list)
     # Loimi artifact store participation: the run this session's
     # artifacts belong to, the namespace it was opened in, and which
     # episode occurrences already produced an artifact (the store has

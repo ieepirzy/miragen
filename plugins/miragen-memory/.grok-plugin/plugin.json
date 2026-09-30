@@ -1,0 +1,21 @@
+{
+  "name": "miragen-memory",
+  "version": "0.3.3",
+  "author": {
+    "name": "ieepirzy",
+    "url": "https://github.com/ieepirzy"
+  },
+  "homepage": "https://github.com/ieepirzy/miragen/tree/main/plugins/miragen-memory",
+  "repository": "https://github.com/ieepirzy/miragen",
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "loimi",
+    "miragen",
+    "hooks",
+    "mcp"
+  ],
+  "description": "miragen memory bridge for Grok Build: memory_* and store_* tools via a stdio MCP proxy bound to this session. Lifecycle hooks are a hook file the local miragend writes (harness_setup); without a daemon the proxy writes it on first start.",
+  "hooks": "./hooks/grok-plugin-none.json",
+  "mcpServers": "./grok.mcp.json"
+}

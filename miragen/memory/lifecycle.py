@@ -60,6 +60,37 @@ class MemoryPacket:
     items: list[dict[str, Any]] = field(default_factory=list)
     rendering: dict[str, Any] = field(default_factory=dict)
     delivery_status: str = "unconfirmed"
+    # The optional lane's outcome ("ok", "empty", "unconfigured", …) so the
+    # caller can say what happened instead of leaving silence to interpret.
+    optional_status: str | None = None
+
+
+@dataclass
+class RecallCandidates:
+    """Phase 1 of an asynchronous prompt recall (§17.7 steps 1-3): the
+    bounded search. Cheap and synchronous; `status` is "ok" only when there
+    are cards for the selector."""
+
+    status: str
+    instance: str = DEFAULT_INSTANCE
+    query: str = ""
+    cards: list[dict[str, Any]] = field(default_factory=list)
+    context: dict[str, Any] | None = None
+
+
+@dataclass
+class RecallSelection:
+    """Phase 2 (§17.7 steps 4-6): the selector's picks, re-rendered from
+    canonical state. `selected` is what the selector returned (clamped), in
+    order, with reasons — for the judgment log; `items` is what the section
+    actually emits — for the manifest, written only when delivered."""
+
+    status: str
+    section: str | None = None
+    items: list[dict[str, Any]] = field(default_factory=list)
+    selected: list[tuple[str, str]] = field(default_factory=list)
+    # Exact rendering accounting (budget, emitted and omitted units).
+    rendering: dict[str, Any] = field(default_factory=dict)
 
 
 class MemoryLifecycle:
@@ -169,6 +200,7 @@ class MemoryLifecycle:
         optional_status = await self._optional_lane(
             packet, effective_instance, context, prompt_hint, resources
         )
+        packet.optional_status = optional_status
         # The manifest records what was rendered for delivery (§8.6); its write
         # is best-effort — a manifest failure must not fail the turn.
         try:
@@ -220,8 +252,14 @@ class MemoryLifecycle:
         prompt_hint: str | None, resources: list[dict] | None = None,
         resource_reader=None,
     ) -> str:
-        """Exact resource joins and selected ordinary recall share one renderer."""
-        from miragen.memory.selection import clamp_selections, render_optional_section, canonical_record_text
+        """The optional recall lane (§17.7): exact resource joins and the
+        zero-or-more selector's picks, canonically re-rendered through one
+        budgeted renderer. Failure NEVER falls back to stuffing neighbors —
+        required state stands alone and the degradation is explicit in the
+        manifest."""
+        from miragen.memory.selection import (
+            canonical_record_text, clamp_selections, render_optional_section,
+        )
 
         if not self.spec.recall.enabled:
             return "disabled"
@@ -235,7 +273,7 @@ class MemoryLifecycle:
         entries, omitted = [], []
         retrieval_truncated = False
         try:
-            selected = []
+            selected: list[tuple[str, str]] = []
             if query and self.selector is not None:
                 query_digest = _stable_digest(query)
                 cached = self._selection_cache.get(instance)
@@ -252,18 +290,9 @@ class MemoryLifecycle:
                         selected = [(sel.record_id, sel.reason) for sel in
                                     clamp_selections(result, cards, self.spec.recall.max_selected)]
                     self._selection_cache[instance] = (context["state_revision"], query_digest, selected)
-            for record_id, reason in selected:
-                record = await self.client.get_record(record_id)
-                revision = record.get("revision") or {}
-                if (record.get("admission") != "accepted" or not record.get("roots_valid", False)
-                        or not revision or revision.get("lifecycle") != "active"
-                        or record.get("recall_eligible") is False or record.get("groundings")
-                        or record.get("scope_id") not in self.spec.scopes.read):
-                    omitted.append({"record_id": record_id, "revision_id": revision.get("id"), "reason": "canonical_ineligible"})
-                    continue
-                entries.append({"record_id": record_id, "revision_id": revision["id"],
-                                "type": record["type"], "text": canonical_record_text(record),
-                                "reason": reason})
+                    if not cards and not resources:
+                        return "empty"
+            entries, omitted = await self._canonical_entries(selected)
             if resources:
                 if resource_reader is not None:
                     resources = await resource_reader()
@@ -307,6 +336,143 @@ class MemoryLifecycle:
             self._degrade(f"relevance selection: {exc}")
             packet.text += "\n[optional recall degraded — relevance selection failed; memories were not injected]"
             return f"degraded: selector: {exc}"
+
+    async def _canonical_entries(
+        self, selected: list[tuple[str, str]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Canonical re-render (§17.7 step 5): fetch each selected id fresh —
+        the selector chose, canonical state speaks. Returns the renderable
+        entries and the selected ids that are no longer eligible."""
+        from miragen.memory.selection import canonical_record_text
+
+        entries: list[dict[str, Any]] = []
+        omitted: list[dict[str, Any]] = []
+        for record_id, reason in selected:
+            record = await self.client.get_record(record_id)
+            revision = record.get("revision") or {}
+            if (record.get("admission") != "accepted" or not record.get("roots_valid", False)
+                    or not revision or revision.get("lifecycle") != "active"
+                    or record.get("recall_eligible") is False or record.get("groundings")
+                    or record.get("scope_id") not in self.spec.scopes.read):
+                omitted.append({"record_id": record_id, "revision_id": revision.get("id"),
+                                "reason": "canonical_ineligible"})
+                continue
+            entries.append({"record_id": record_id, "revision_id": revision["id"],
+                            "type": record["type"], "text": canonical_record_text(record),
+                            "reason": reason})
+        return entries, omitted
+
+    async def _render_selected(
+        self, selected: list[tuple[str, str]],
+    ) -> tuple[str | None, list[dict[str, Any]], dict[str, Any]]:
+        """The selector's picks through the one renderer. Returns the section,
+        the items it actually emits (the manifest and the "cite these ids"
+        status line must not name anything else) and its accounting."""
+        from miragen.memory.selection import render_optional_section
+
+        entries, omitted = await self._canonical_entries(selected)
+        result = render_optional_section(entries, self.spec.recall.max_optional_chars)
+        rendering = result.accounting()
+        rendering["omitted"] = omitted + result.omitted
+        items = [{
+            "kind": "recalled",
+            "record_id": entry["record_id"],
+            "revision_id": entry["revision_id"],
+            "reason": entry["reason"],
+        } for entry in result.emitted]
+        return (result.text or None), items, rendering
+
+    # ── asynchronous prompt recall: search now, select in the background ──
+
+    async def recall_candidates(
+        self, *, instance: str | None, prompt_hint: str,
+    ) -> RecallCandidates:
+        """Phase 1: the bounded search, nothing more. Zero cards means there
+        is nothing to select from — no background work, no notice."""
+        effective_instance = instance or DEFAULT_INSTANCE
+        if not self.spec.recall.enabled:
+            return RecallCandidates("disabled", effective_instance)
+        if self.selector is None:
+            return RecallCandidates("unconfigured", effective_instance)
+        try:
+            context = await self._ensure_context(effective_instance)
+            state = context.get("state") or {}
+            goal = state.get("goal") if isinstance(state.get("goal"), str) else None
+            query = " ".join(part for part in (goal, prompt_hint) if part)[:2000].strip()
+            if not query:
+                return RecallCandidates("no_query", effective_instance, context=context)
+            found = await self.client.search_memory({
+                "scope_ids": self.spec.scopes.read,
+                "query_text": query,
+                "limit": self.spec.recall.max_candidates,
+            })
+        except MemoryUnavailable as exc:
+            return RecallCandidates(f"degraded: {self._degrade(f'recall: {exc}')}",
+                                    effective_instance)
+        except MemoryAPIError as exc:
+            return RecallCandidates(f"degraded: {self._degrade(f'recall refused: {exc}')}",
+                                    effective_instance)
+        cards = list(found.get("items") or [])
+        return RecallCandidates(
+            "ok" if cards else "empty", effective_instance, query, cards, context,
+        )
+
+    async def recall_select(self, candidates: RecallCandidates) -> RecallSelection:
+        """Phase 2, off the prompt path: the selector over the cards, then
+        the canonical re-render. Selector failure never falls back to the
+        nearest neighbours (§17.7): the status says degraded, nothing is
+        injected."""
+        from miragen.memory.selection import clamp_selections
+
+        if self.selector is None or not candidates.cards:
+            return RecallSelection("none_selected")
+        try:
+            result = await self.selector(candidates.query, candidates.cards)
+        except Exception as exc:  # noqa: BLE001 — any selector failure degrades
+            return RecallSelection(f"degraded: selector: {self._degrade(f'relevance selection: {exc}')}")
+        kept = clamp_selections(result, candidates.cards, self.spec.recall.max_selected)
+        selected = [(sel.record_id, sel.reason) for sel in kept]
+        if not selected:
+            return RecallSelection("none_selected")
+        try:
+            section, items, rendering = await self._render_selected(selected)
+        except (MemoryUnavailable, MemoryAPIError) as exc:
+            return RecallSelection(f"degraded: {self._degrade(f'optional recall: {exc}')}",
+                                   selected=selected)
+        if not section:
+            return RecallSelection("none_selected", selected=selected, rendering=rendering)
+        return RecallSelection("ok", section, items, selected, rendering)
+
+    async def record_recall_manifest(
+        self, candidates: RecallCandidates, selection: RecallSelection, *,
+        run_id: str | None, trigger: str,
+    ) -> None:
+        """The manifest of what was ACTUALLY injected — called when the
+        result is delivered, never when it was merely prepared."""
+        if not selection.items or candidates.context is None:
+            return
+        try:
+            await self.client.create_manifest({
+                "scope_id": self.spec.scopes.default_write,
+                "context_id": candidates.context["id"],
+                "run_ref": run_id,
+                "items": [
+                    {"revision_id": item["revision_id"], "reason": item["reason"]}
+                    for item in selection.items if item.get("revision_id")
+                ],
+                "policy": {
+                    "guidance_version": GUIDANCE_VERSION,
+                    "trigger": trigger,
+                    "lane": "optional",
+                    "delivery": "async",
+                    "state_revision": candidates.context["state_revision"],
+                    "optional_status": selection.status,
+                    "rendering": selection.rendering,
+                },
+                "degraded": None,
+            })
+        except (MemoryUnavailable, MemoryAPIError) as exc:
+            logger.warning(f"[{self.profile_name}] manifest write failed: {exc}")
 
     async def recall_section(
         self, *, instance: str | None, prompt_hint: str, run_id: str | None = None,
@@ -384,7 +550,21 @@ class MemoryLifecycle:
             )
             return {"status": "captured", "event_id": result["id"],
                     "created": result.get("created", True)}
-        except (MemoryUnavailable, MemoryAPIError) as exc:
+        except MemoryAPIError as exc:
+            error = exc.body.get("error", {}) if isinstance(exc.body, dict) else {}
+            if exc.status_code == 409 and error.get("code") == "illegal_transition" \
+                    and "idempotency_key" in str(error.get("message", "")):
+                # Episode keys are one per occurrence ON PURPOSE: the first
+                # digest filed for `end` / `compact-N` wins. A re-finalize
+                # (sweep after SessionEnd, journal replay rebuilding the
+                # digest from events that now capture) carries different
+                # content for an occurrence that is already filed — that is
+                # the dedupe working, not a lost write.
+                return {"status": "captured", "created": False, "already_filed": True,
+                        "event_id": (error.get("details") or {}).get("event_id")}
+            return {"status": "persistence_unavailable",
+                    "detail": self._degrade(f"episode capture: {exc}")}
+        except MemoryUnavailable as exc:
             return {"status": "persistence_unavailable",
                     "detail": self._degrade(f"episode capture: {exc}")}
 

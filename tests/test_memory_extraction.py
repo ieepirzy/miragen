@@ -242,6 +242,36 @@ class TestWorker:
         assert bad["status"] == "pending"  # re-queued for retry
         assert bad["last_error"].startswith("model exploded")
 
+    async def test_backlog_before_the_cutoff_is_completed_without_a_model_call(
+        self, client, service,
+    ):
+        from datetime import UTC, datetime
+
+        old = {**_event("an old episode"), "received_at": "2026-09-01T00:00:00+00:00"}
+        new = {**_event("the deploy failed on step 3"),
+               "received_at": "2026-09-24T00:00:00+00:00"}
+        old_job, new_job = self._seed_job(service, old), self._seed_job(service, new)
+        calls = []
+
+        async def extract(content, source_kind):
+            calls.append(content)
+            return ExtractionResult(proposals=[proposal()])
+
+        results = await run_worker_once(
+            client, extract=extract, check=_checker(True), limit=5,
+            skip_before=datetime(2026, 9, 23, tzinfo=UTC),
+        )
+        by_id = {r["job_id"]: r["status"] for r in results}
+        assert by_id == {old_job["id"]: "skipped_backlog", new_job["id"]: "done"}
+        assert calls == ["the deploy failed on step 3"]
+        assert old_job["status"] == "done", "completed, so it never comes back"
+        # Every result carries what a log line needs to place the job.
+        placed = {r["job_id"]: (r["event_at"], r["source_kind"], r["scope_id"]) for r in results}
+        assert placed == {
+            old_job["id"]: ("2026-09-01T00:00:00Z", "user_message", "profile:test-agent"),
+            new_job["id"]: ("2026-09-24T00:00:00Z", "user_message", "profile:test-agent"),
+        }
+
     async def test_unreachable_store_claims_nothing_quietly(self, client, service):
         service.fail_with = __import__("httpx").ConnectError("refused")
         assert await run_worker_once(

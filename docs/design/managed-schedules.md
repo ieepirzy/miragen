@@ -34,6 +34,7 @@ owned by the API rather than the profile:
   "enabled": true,                       // false = binding persists, job unregistered
   "provenance": { "routine_id": "…", "trigger_id": "…", "…": "…" },  // open, stored verbatim
   "metadata": { "…": "…" },              // typed-parameter escape hatch: recorded, never interpreted
+  "externally_fired": false,             // true = the control plane fires it; no job here (§5a)
   "version": 4                           // server-assigned, monotonic; CAS token
 }
 ```
@@ -99,6 +100,31 @@ same 409 semantics.
   carries `(schedule_name, fired_at)`; the control plane deduplicates via
   run records/events as it already must for cron.
 
+## 5a. Externally fired bindings (`managed-schedules-external-fire/v1`)
+
+A stopped agent container cannot hear its own alarm. When agents stop
+between runs (MiraRun ADR-026), the control plane that can start them has to
+hold firing authority, so a binding can be marked `externally_fired: true`:
+
+- MiraGen stores, lists, and compare-and-swaps it exactly like any other
+  binding, but registers **no** APScheduler job for it, at startup or on
+  PUT. `next_fire_at` is therefore `null`.
+- The control plane evaluates the cron itself and launches each fire through
+  `POST /executor-runs`, so those runs carry `trigger: "launch"`, not
+  `"managed"`.
+- A job registered before the binding was handed over re-reads the binding
+  when it fires and does nothing, so a hand-over can't cause a double fire.
+- PUT replaces the whole binding: omitting the flag on an update hands firing
+  back to MiraGen.
+- The flag is independent of `enabled`: a disabled binding never fires, and an
+  enabled externally fired one fires only from the control plane.
+
+This is the generic form of ADR-026's trigger-precedence rule, so any control
+plane can use it. Nothing in it is MiraRun-specific. A deployment predating
+the capability ignores the field on PUT and omits it from responses. A
+control plane must read the flag back from the response and fire a binding
+only when it comes back `true`.
+
 ## 6. Settled decisions (owner, 2026-07-19)
 
 1. **`on_complete` on managed fires — DISPATCH AS USUAL.** Managed fires go
@@ -125,7 +151,8 @@ same 409 semantics.
   claims a binding the scheduler doesn't hold.
 - Missed fires while the container was down are **not** replayed
   (`misfire_grace_time` stays default). Catch-up semantics are a routine
-  policy — MiraRun's, not MiraGen's.
+  policy — MiraRun's, not MiraGen's. For externally fired bindings (§5a)
+  MiraGen has no misfire behavior at all; the control plane owns it.
 
 ## 8. Testing plan
 

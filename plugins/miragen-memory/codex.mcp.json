@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "miragen-bridge": {
+      "command": "python3",
+      "args": [
+        "./miragen_hook/__main__.py",
+        "mcp-proxy",
+        "--harness",
+        "codex"
+      ],
+      "cwd": ".",
+      "env_vars": [
+        "MIRAGEND_URL",
+        "MIRAGEND_TOKEN",
+        "CODEX_HOME"
+      ],
+      "default_tools_approval_mode": "approve"
+    }
+  }
+}

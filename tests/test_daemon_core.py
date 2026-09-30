@@ -45,15 +45,31 @@ class FakeNotFound(Exception):
     pass
 
 
+FAKE_STARTED_AT = "2026-09-14T08:00:00.123456789Z"
+FAKE_FINISHED_AT = "2026-09-14T09:30:00.5Z"
+
+
 class FakeContainer:
     def __init__(self, name: str, registry: dict):
         self.name = name
         self.status = "running"
         self._registry = registry
         self.restarted = 0
+        # docker-py's container.attrs["State"] shape; FinishedAt is Docker's
+        # zero time until the container first stops.
+        self.attrs = {
+            "State": {
+                "StartedAt": FAKE_STARTED_AT,
+                "FinishedAt": "0001-01-01T00:00:00Z",
+                "ExitCode": 0,
+                "OOMKilled": False,
+            }
+        }
 
     def stop(self):
         self.status = "exited"
+        self.attrs["State"]["FinishedAt"] = FAKE_FINISHED_AT
+        self.attrs["State"]["ExitCode"] = 143
 
     def restart(self):
         self.restarted += 1
@@ -539,6 +555,54 @@ def test_list_agents_reports_status_and_endpoint(core, docker_client):
 
     docker_client.container_map["alpha"].stop()
     assert core.list_agents()[0]["status"] == "exited"
+
+
+def test_list_agents_reports_lifecycle_times_and_exit(core, docker_client):
+    core.create_agent("alpha", _yaml("alpha"))
+
+    running = core.list_agents()[0]
+    assert running["started_at"] == FAKE_STARTED_AT
+    assert running["finished_at"] is None  # Docker's zero time is "unknown"
+    assert running["exit_code"] == 0
+    assert running["oom_killed"] is False
+
+    docker_client.container_map["alpha"].stop()
+    stopped = core.list_agents()[0]
+    assert stopped["started_at"] == FAKE_STARTED_AT
+    assert stopped["finished_at"] == FAKE_FINISHED_AT
+    assert stopped["exit_code"] == 143
+    assert core.get_agent("alpha")["finished_at"] == FAKE_FINISHED_AT
+
+
+def test_lifecycle_is_unknown_for_a_missing_container_or_a_driver_without_it(
+    core, docker_client
+):
+    core.create_agent("alpha", _yaml("alpha"))
+    del docker_client.container_map["alpha"]
+    missing = core.list_agents()[0]
+    assert (
+        missing["started_at"],
+        missing["finished_at"],
+        missing["exit_code"],
+        missing["oom_killed"],
+    ) == (None, None, None, None)
+
+    class DriverWithoutLifecycle:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, attribute):
+            if attribute == "lifecycle":
+                raise AttributeError(attribute)
+            return getattr(self._inner, attribute)
+
+    core._spawn_driver = DriverWithoutLifecycle(core._spawn_driver)
+    assert core.container_lifecycle("alpha") == {
+        "started_at": None,
+        "finished_at": None,
+        "exit_code": None,
+        "oom_killed": None,
+    }
 
 
 def test_get_agent_detail(core):

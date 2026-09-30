@@ -48,3 +48,27 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  trufflehog:
+    name: Secret scan (TruffleHog)
+    # A diff gate: PRs scan base..head, pushes scan before..after. The weekly
+    # schedule would give the action no range and it would fall back to the
+    # whole history, which is Gitleaks' job above, not this one.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The PR base / push "before" commit must exist locally.
+          fetch-depth: 0
+      # Pinned by SHA (a tag can be moved); `version` pins the scanner image,
+      # which otherwise defaults to `latest` whatever the action ref.
+      # No base/head inputs: the action derives the range from the event.
+      - uses: trufflesecurity/trufflehog@a5f3de55cc2065ae4dde8fee24076f137fd62fcf # v3.97.8
+        with:
+          version: 3.97.8
+          # Fail on live credentials and on ones whose check errored: an
+          # unverifiable secret is treated as real until a human says not.
+          extra_args: --results=verified,unknown

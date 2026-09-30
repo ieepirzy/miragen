@@ -53,8 +53,40 @@ def register_session_routes(app: FastAPI, plane: SessionPlane, *, dependencies: 
             "state": result.state,
             "context": result.context,
             "detail": result.detail,
+            "recall_pending": result.recall_pending,
+            "continue_with": result.continue_with,
             "accepted": True,
         })
+
+    @app.post("/sessions/v1/memory-written", dependencies=dependencies)
+    async def memory_written(request: Request) -> JSONResponse:
+        """The session's adapter saw an accepted memory write in its own
+        tool results — the only attribution that works when the agent named
+        a repository (or nothing) instead of its session key."""
+        try:
+            body = await request.json()
+            key = session_key(str(body["harness"]), str(body["session_id"]))
+            ref = str(body["ref"]) if body.get("ref") else None
+        except (ValueError, KeyError, TypeError) as exc:
+            return JSONResponse(status_code=422,
+                                content={"detail": str(exc)[:500], "code": "malformed_write"})
+        return JSONResponse({"credited": plane.note_memory_write(key, ref=ref)})
+
+    @app.post("/sessions/v1/recall/claim", dependencies=dependencies)
+    async def claim_recall(request: Request) -> JSONResponse:
+        """A pending background recall, claimed by the adapter after a tool
+        result (wait 0) or at Stop (bounded wait). The first claim that
+        finds a result delivers it; the answer says which state it is in."""
+        try:
+            body = await request.json()
+            harness = str(body["harness"])
+            session_id = str(body["session_id"])
+            seq = int(body["seq"])
+            wait = max(0.0, min(float(body.get("wait") or 0.0), 15.0))
+        except (ValueError, KeyError, TypeError) as exc:
+            return JSONResponse(status_code=422,
+                                content={"detail": str(exc)[:500], "code": "malformed_claim"})
+        return JSONResponse(await plane.claim_recall(harness, session_id, seq, wait=wait))
 
     @app.post("/sessions/v1/hooks/{harness}", dependencies=dependencies)
     async def post_raw_hook(harness: str, request: Request) -> JSONResponse:
@@ -95,6 +127,7 @@ def register_session_routes(app: FastAPI, plane: SessionPlane, *, dependencies: 
             envelope = EventEnvelope.model_validate(build_envelope(
                 harness, payload, event, environ={}, pid=None, host=None, user=None,
                 remote=True, project_remote_url=None, cwd=payload.get("cwd") or None,
+                home=None,
             ))
         except ValidationError:
             # Counted (adapter/harness drift must show on /health) but an

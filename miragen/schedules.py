@@ -101,7 +101,22 @@ class ScheduleBinding(BaseModel):
         default_factory=dict,
         description="Typed-parameter escape hatch: recorded on fired runs, never interpreted.",
     )
+    externally_fired: bool = Field(
+        default=False,
+        description=(
+            "The control plane fires this binding itself (it launches through "
+            "/executor-runs), so MiraGen records and reconciles it but never "
+            "registers a job for it. A stopped agent cannot hear its own alarm; "
+            "a control plane that can start the agent can "
+            "(capability managed-schedules-external-fire/v1)."
+        ),
+    )
     version: int = Field(default=1, ge=1)
+
+    @property
+    def fires_here(self) -> bool:
+        """Whether MiraGen's scheduler should hold a job for this binding."""
+        return self.enabled and not self.externally_fired
 
 
 class BindingConflictError(Exception):
@@ -150,6 +165,7 @@ class ScheduleStore:
         instance: str | None = None,
         provenance: RunProvenance | None = None,
         metadata: dict[str, str] | None = None,
+        externally_fired: bool = False,
         expected_version: int | None = None,
     ) -> ScheduleBinding:
         """Create-or-update with compare-and-swap semantics:
@@ -191,6 +207,7 @@ class ScheduleStore:
             instance=instance,
             provenance=provenance,
             metadata=dict(metadata or {}),
+            externally_fired=externally_fired,
             version=version,
         )
         self.save(binding)
