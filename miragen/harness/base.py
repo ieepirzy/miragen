@@ -9,8 +9,8 @@ itself goes through this interface.
 
 Selection is by model prefix, mirroring the ``claude-code:<model>`` selector
 convention: ``spec.model: grok-build:grok-4.6`` picks the Grok Build
-harness, ``claude-code:sonnet`` the Claude Code harness; any other string is
-a pydantic-ai model string.
+harness, ``claude-code:sonnet`` the Claude Code harness, ``codex:gpt-5.5`` the
+Codex harness; any other string is a pydantic-ai model string.
 
 (The executor tier is a different thing: one-off worker jobs with a
 workspace, diff harvest and resumable threads. It does not go through here.)
@@ -32,6 +32,7 @@ PYDANTIC_AI = "pydantic-ai"
 HARNESS_PREFIXES: dict[str, str] = {
     "grok-build:": "grok-build",
     "claude-code:": "claude-code",
+    "codex:": "codex",
 }
 
 

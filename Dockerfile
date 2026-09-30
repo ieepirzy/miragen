@@ -49,6 +49,10 @@ RUN pip install --no-cache-dir \
 
 RUN pip install --no-cache-dir \
     "/build[codex,claude-code]"
+# `codex` (e.g. `codex login --device-auth` for the codex harness) is the
+# binary bundled with openai-codex, the same one the harness runs.
+RUN ln -sf "$(python -c 'import codex_cli_bin; print(codex_cli_bin.bundled_codex_path())')" \
+    /usr/local/bin/codex
 
 # State directories are created here, owned by agentuser: a named volume
 # mounted on a path that doesn't exist in the image comes up root-owned and
@@ -65,6 +69,8 @@ USER agentuser
 RUN grok --version
 # ...and the Claude Code CLI bundled with claude-agent-sdk (the claude-code harness).
 RUN python -c "import subprocess; from miragen.harness.claude_code import bundled_cli; subprocess.run([bundled_cli(), '--version'], check=True)"
+# ...and the codex binary bundled with openai-codex (the codex harness).
+RUN codex --version
 
 # Workspace (agent.yaml + tools.py) is mounted at runtime — nothing baked in.
 # Set AGENT_PROFILE to a path relative to /agent, e.g. agent.yaml (default).

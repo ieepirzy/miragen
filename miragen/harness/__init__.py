@@ -54,17 +54,19 @@ def build_model_harness(
     """A long-lived non-PydanticAI harness for this profile, plus the tool
     gateway it acts through: (harness, gateway)."""
     name = profile_harness(profile)
-    if name not in ("grok-build", "claude-code"):
+    if name not in ("grok-build", "claude-code", "codex"):
         raise ValueError(f"harness '{name}' is not available in this build")
     from miragen.harness.gateway import ToolGateway
     from miragen.harness.served import ServedLedger
 
     if name == "grok-build":
         from miragen.harness.grok import GrokHarness as cls, GrokSettings as settings_cls
-    else:
+    elif name == "claude-code":
         from miragen.harness.claude_code import (
             ClaudeCodeHarness as cls, ClaudeCodeSettings as settings_cls,
         )
+    else:
+        from miragen.harness.codex import CodexHarness as cls, CodexSettings as settings_cls
     gateway = ToolGateway(profile, runtime_tools=runtime_tools,
                           registered_tools=registered_tools, bind_context=bind_context,
                           native_capabilities=cls.native_capabilities,
