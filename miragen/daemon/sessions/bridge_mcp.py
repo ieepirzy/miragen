@@ -197,6 +197,7 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
         inspect: include labelled historical/stale evidence for revalidation only.
         project must be a local session key. Remote harness filesystems are unavailable.
         """
+        from miragen.memory.client import MemoryAPIError, MemoryUnavailable
         from miragen.memory.grounded import recall
         from miragen.memory.resources import snapshot
         from pathlib import Path
@@ -214,6 +215,15 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
             return _dump(await recall(lifecycle, identity.root, resources, query=query, inspect=inspect))
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             return _dump({"status": "unverified", "detail": str(exc)})
+        # The inspection lookup calls Loimi directly (the current-recall path
+        # degrades inside the lane): report an outage or a refusal as the
+        # other memory tools do, never as a protocol-level tool failure.
+        except MemoryUnavailable as exc:
+            return _dump({"status": "persistence_unavailable", "detail": str(exc),
+                          "project": identity.id})
+        except MemoryAPIError as exc:
+            return _dump({"status": "rejected", "detail": str(exc),
+                          "http_status": exc.status_code, "project": identity.id})
 
     @mcp.tool()
     async def memory_read(

@@ -269,3 +269,98 @@ async def test_grounded_write_refuses_ephemeral_before_any_write():
         support={"result": "inconclusive", "method": "none"},
     )
     assert result["status"] == "unsupported_backend"
+
+
+class _RecordingClient:
+    def __init__(self):
+        self.events = []
+
+    async def append_event(self, **kw):
+        self.events.append(kw)
+        return {"id": "ev-1"}
+
+    async def propose_record(self, body):
+        return {"record_id": "rec-1", "revision": {"id": "rev-1"}}
+
+    async def add_evidence(self, revision_id, body):
+        return {"id": "evid-1"}
+
+    async def create_grounding(self, record_id, body):
+        return {"id": "g-1"}
+
+
+def _loimi_lifecycle(client):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(client=client, spec=SimpleNamespace(
+        backend="loimi", scopes=SimpleNamespace(default_write="group:project.x")))
+
+
+def _commit_bytes(root, name, data: bytes):
+    (root / name).write_bytes(data)
+    git(root, "add", name)
+    git(root, "commit", "-m", name)
+
+
+@pytest.mark.parametrize("symbol", ["price", None])
+async def test_grounded_write_keeps_declared_encoding_source_exact(repository, symbol):
+    """A PEP 263 Latin-1 file: the stored event is the inspected source,
+    not a lossy UTF-8 approximation, and re-encodes to the digested bytes."""
+    from miragen.memory.grounded import remember
+    from miragen.memory.resources import digest
+
+    data = '# -*- coding: latin-1 -*-\ndef price():\n    return "café"\n'.encode("latin-1")
+    _commit_bytes(repository, "latin.py", data)
+    client = _RecordingClient()
+    locator = {"path": "latin.py", **({"symbol": symbol} if symbol else {})}
+    result = await remember(_loimi_lifecycle(client), str(repository), locator,
+                            payload={"text": "returns café"},
+                            support={"result": "supports", "method": "read"})
+    assert result["status"] == "accepted"
+    event = client.events[0]
+    assert "café" in event["content"] and "�" not in event["content"]
+    encoding = event["attributes"]["source_encoding"]
+    observed = event["attributes"]["resource_observation"]["content_digest"]
+    assert digest(event["content"].encode(encoding)) == observed
+
+
+async def test_grounded_write_refuses_bytes_invalid_in_the_declared_encoding(repository):
+    from miragen.memory.grounded import remember
+
+    # No declaration means UTF-8; \xff is not UTF-8.
+    _commit_bytes(repository, "notes.txt.py", b"# data\nX = 1  # \xff\n")
+    client = _RecordingClient()
+    result = await remember(_loimi_lifecycle(client), str(repository), {"path": "notes.txt.py"},
+                            payload={"text": "x"}, support={"result": "supports", "method": "read"})
+    assert result["status"] == "unverified"
+    assert client.events == []  # nothing written before the refusal
+
+
+@pytest.mark.parametrize("inspect_mode", [True, False])
+async def test_candidate_truncation_is_never_reported_as_exhaustive(
+    service, tmp_path, monkeypatch, inspect_mode
+):
+    """The backend stopped scanning candidates (candidate_truncated) while
+    every returned item fits: historical inspection and current recall must
+    both say the result is truncated, with the limit in the omissions."""
+    import miragen.memory.grounded as grounded
+
+    card = _card("grounded assertion") | {
+        "applicability": {"state": "historical"},
+        "matches": [{"resource": {"path": "pricing.py", "symbol": "price"}}]}
+    lifecycle = _lifecycle(service, tmp_path, None)
+
+    async def lookup(body):
+        return {"items": [card], "truncated": False,
+                "candidate_truncated": True, "candidate_limit": 50}
+
+    lifecycle.client.lookup_resources = lookup
+    monkeypatch.setattr(grounded, "inspect_resources",
+                        lambda checkout, locators: [{"explicit": "observation"}])
+    out = await grounded.recall(lifecycle, str(tmp_path), [{"path": "pricing.py"}],
+                                inspect=inspect_mode)
+    rendering = out["rendering"]
+    assert card["record_id"][:8] in out["text"]  # the item itself fit
+    assert rendering["truncated"] is True
+    assert {"reason": "candidate_limit", "limit": 50} in rendering["omitted"]
+    assert rendering["candidate_truncated"] is True

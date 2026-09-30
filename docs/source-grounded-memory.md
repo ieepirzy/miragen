@@ -29,8 +29,12 @@ unverified evidence. It cannot be treated as current operational guidance. A
 resource miss differs from an excluded record: `rendering.omitted` reports IDs
 and machine reasons such as `not_current_applicable`, `canonical_ineligible`,
 `duplicate_record`, and `budget_exceeded`. Database candidate/result truncation
-is reported separately by the lookup API. Explicit `memory_read` and existing
-revision reads retain complete records.
+is reported by the lookup API and carried into the rendering in both modes:
+`retrieval_truncated`, `candidate_truncated` (with a `candidate_limit` omission),
+and an aggregate `truncated` that is true if any of them is. A Loimi outage or
+refusal comes back as `persistence_unavailable` / `rejected` JSON, like the other
+bridge memory tools. Explicit `memory_read` and existing revision reads retain
+complete records.
 
 The same assembly path is available to hosted callers through
 `MemoryLifecycle.prepare_context(resources=...)`, with explicit observations.
@@ -92,6 +96,11 @@ Four facts stay distinct:
 Lookup applicability is relative to the supplied source observation; its timestamp
 is included. Loimi cannot independently inspect a caller's filesystem. Miragen
 performs a fresh local inspection for the supported tool/CLI workflow.
+
+The source event stores the inspected source decoded strictly with the file's
+PEP 263 declared encoding (recorded as `source_encoding`), so it re-encodes to the
+digested bytes; source that is not valid text in that encoding is refused
+(`unverified`) before anything is written.
 
 A content digest match proves only unchanged source. The support receipt must
 check `source_supports_assertion` for the particular memory revision, resource

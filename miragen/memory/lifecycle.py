@@ -271,7 +271,7 @@ class MemoryLifecycle:
         if not query and not resources:
             return "no_query"
         entries, omitted = [], []
-        retrieval_truncated = False
+        retrieval_truncated = candidate_truncated = False
         try:
             selected: list[tuple[str, str]] = []
             if query and self.selector is not None:
@@ -303,6 +303,7 @@ class MemoryLifecycle:
                 omitted.extend(found.get("omitted", []))
                 retrieval_truncated = found.get("truncated", False)
                 if found.get("candidate_truncated"):
+                    candidate_truncated = True
                     omitted.append({"reason": "candidate_limit", "limit": found.get("candidate_limit")})
                 resource_entries = []
                 for card in found["items"]:
@@ -318,7 +319,9 @@ class MemoryLifecycle:
             packet.rendering = result.accounting()
             packet.rendering["omitted"] = omitted + result.omitted
             packet.rendering["retrieval_truncated"] = retrieval_truncated
-            packet.rendering["truncated"] = result.truncated or retrieval_truncated
+            packet.rendering["candidate_truncated"] = candidate_truncated
+            packet.rendering["truncated"] = (result.truncated or retrieval_truncated
+                                             or candidate_truncated)
             if result.text:
                 packet.text += ("\n" if packet.text else "") + result.text
             packet.items.extend({"kind": "recalled", "record_id": entry["record_id"],

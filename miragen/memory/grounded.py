@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import tokenize
 import uuid
 from pathlib import Path
 
@@ -53,11 +55,17 @@ async def recall(
             entries, lifecycle.spec.recall.max_optional_chars
         )
         accounting = rendered.accounting()
-        accounting["omitted"] = found.get("omitted", []) + accounting["omitted"]
+        omitted = list(found.get("omitted", []))
+        candidate_truncated = bool(found.get("candidate_truncated"))
+        if candidate_truncated:
+            # The backend stopped scanning candidates: the inspection is not
+            # exhaustive even when every returned item was rendered.
+            omitted.append({"reason": "candidate_limit", "limit": found.get("candidate_limit")})
+        accounting["omitted"] = omitted + accounting["omitted"]
         accounting["retrieval_truncated"] = found.get("truncated", False)
-        accounting["truncated"] = accounting["truncated"] or found.get(
-            "truncated", False
-        )
+        accounting["candidate_truncated"] = candidate_truncated
+        accounting["truncated"] = (accounting["truncated"] or found.get("truncated", False)
+                                   or candidate_truncated)
         return {
             "text": rendered.text,
             "rendering": accounting,
@@ -179,6 +187,11 @@ async def remember(
         source = data
     if digest(source) != observation["content_digest"]:
         return {"status": "unverified", "detail": "source changed before capture"}
+    decoded = _decode_source(data, source)
+    if decoded is None:
+        return {"status": "unverified",
+                "detail": "source is not valid text in its declared (PEP 263) encoding"}
+    content, encoding = decoded
     client = lifecycle.client
     event = await client.append_event(
         scope_id=lifecycle.spec.scopes.default_write,
@@ -188,8 +201,9 @@ async def remember(
             "ref": resource_key(observation["resource"]),
             "revision": observation["snapshot"]["source_revision"],
         },
-        content=source.decode("utf-8", errors="replace"),
-        attributes={"resource_observation": observation},
+        content=content,
+        # content.encode(source_encoding) is exactly the digested bytes.
+        attributes={"resource_observation": observation, "source_encoding": encoding},
     )
     record = await client.propose_record(
         {
@@ -228,3 +242,22 @@ async def remember(
         "grounding": grounding,
         "assertion_support": support["result"],
     }
+
+
+def _decode_source(data: bytes, source: bytes) -> tuple[str, str] | None:
+    """Decode `source` (the whole file `data`, or a slice of it) with the
+    file's PEP 263 declared encoding, strictly: the stored event must be the
+    source that was inspected, re-encodable to the bytes behind
+    `content_digest`, never a lossy approximation. None when the file's
+    declaration is invalid or the bytes are not valid in it."""
+    try:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(data).readline)
+    except SyntaxError:
+        return None
+    if encoding == "utf-8-sig" and source is not data:
+        encoding = "utf-8"  # the BOM belongs to the file, not to a symbol slice
+    try:
+        text = source.decode(encoding)
+    except (UnicodeDecodeError, LookupError):
+        return None
+    return text, encoding
