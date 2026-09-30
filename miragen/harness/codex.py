@@ -55,6 +55,10 @@ from miragen.harness.base import (
     HarnessResult, HarnessTurn, InstanceBusyError, TaskStream, parse_harness_model,
 )
 from miragen.harness.gateway import ToolGateway, _capability_entries
+from miragen.harness.grok_lifecycle import (
+    Decision, Handoff, Ledger, LifecyclePolicy, SessionStats, ThresholdPolicy,
+    accepted_memory_writes, load_policy, memory_save_prompt, rotation_prompt,
+)
 from miragen.harness.served import ServedLedger
 from miragen.models import AgentProfile, RunUsage
 
@@ -108,9 +112,16 @@ class CodexSettings:
     idle_s: float = 900.0
     turn_timeout_s: float = 600.0
     effort: str | None = None
-    # Codex compacts on its own at this context size (config
-    # model_auto_compact_token_limit). None leaves the model's default.
+    # Codex's own auto-compaction (config model_auto_compact_token_limit):
+    # with the lifecycle on, a safety net ABOVE the policy's thresholds (it
+    # compacts mid-turn, with no memory save first). None leaves the
+    # model's default.
     auto_compact_tokens: int | None = None
+    # Session lifecycle (grok_lifecycle.py, shared with the Grok harness):
+    # a memory-save turn before each compaction, a handoff note on rotation.
+    lifecycle: bool = True
+    policy: LifecyclePolicy = field(default_factory=ThresholdPolicy)
+    handoff_max_chars: int = 4000
 
     @classmethod
     def from_env(cls, *, gateway_url: str) -> "CodexSettings":
@@ -127,6 +138,9 @@ class CodexSettings:
             effort=env.get("MIRAGEN_CODEX_EFFORT") or None,
             auto_compact_tokens=(int(env["MIRAGEN_CODEX_AUTO_COMPACT_TOKENS"])
                                  if env.get("MIRAGEN_CODEX_AUTO_COMPACT_TOKENS") else None),
+            lifecycle=env.get("MIRAGEN_CODEX_LIFECYCLE", "on").lower() not in ("off", "0", "false"),
+            policy=load_policy(dict(env), prefix="MIRAGEN_CODEX_"),
+            handoff_max_chars=int(env.get("MIRAGEN_CODEX_HANDOFF_MAX_CHARS", "4000")),
         )
 
 
@@ -268,6 +282,45 @@ class _Agent:
         return self.reserved > 0 or self.lock.locked()
 
 
+@dataclass
+class _Outcome:
+    """What one codex turn produced."""
+
+    final: list[str] = field(default_factory=list)
+    other: list[str] = field(default_factory=list)
+    compacted: int = 0
+    context: int | None = None
+    error: str | None = None
+    status: str | None = None
+    requests: int = 0
+    # tokenUsage.total is the THREAD's running total; this turn's usage is
+    # the final total minus the total before the turn (the first update's
+    # total less that call's own `last`). Codex can repeat an update, so
+    # totals, not a sum of `last`, are the source of truth.
+    before: dict | None = None
+    total: dict = field(default_factory=dict)
+
+    def usage_update(self, tu: dict) -> None:
+        last = tu.get("last") or {}
+        new_total = tu.get("total") or {}
+        if self.before is None and new_total:
+            self.before = {k: v - int(last.get(k) or 0) for k, v in new_total.items()
+                           if isinstance(v, int)}
+        if new_total and new_total != self.total:
+            self.requests += 1
+            self.total = new_total
+        if isinstance(last.get("inputTokens"), int):
+            self.context = last["inputTokens"]
+
+    def turn_usage(self) -> dict:
+        return {k: v - (self.before or {}).get(k, 0) for k, v in self.total.items()
+                if isinstance(v, int)}
+
+    @property
+    def text(self) -> str:
+        return "\n\n".join(self.final or self.other).strip()
+
+
 class CodexHarness:
     name = NAME
     native_capabilities = NATIVE_CAPABILITIES
@@ -295,6 +348,8 @@ class CodexHarness:
             settings.turn_timeout_s = self.tool_timeout_s + 60
         self._agents: dict[str, _Agent] = {}
         self._aliases: dict[str, str] = {}  # dynamic tool name -> gateway tool name
+        self._maintenance: dict[str, asyncio.Task] = {}
+        self.ledger = Ledger(settings.codex_home / "lifecycle")
         self._spawn_lock = asyncio.Lock()
         self._state_lock = asyncio.Lock()
         self._reaper: asyncio.Task | None = None
@@ -615,125 +670,121 @@ class CodexHarness:
         return f"run-{turn.run_id or os.urandom(6).hex()}", True
 
     @staticmethod
-    def _compose(turn: HarnessTurn) -> str:
+    def _compose(turn: HarnessTurn, *, handoff: Handoff | None = None) -> str:
+        parts = []
+        if handoff is not None:
+            parts.append(handoff.render())
         if turn.extra_instructions:
-            return (f"<context source=\"miragen\">\n{turn.extra_instructions}\n</context>\n\n"
-                    f"{turn.prompt}")
-        return turn.prompt
+            parts.append(f"<context source=\"miragen\">\n{turn.extra_instructions}\n</context>")
+        parts.append(turn.prompt)
+        return "\n\n".join(parts)
+
+    async def _drive(self, agent: _Agent, instance: str, method: str, params: dict,
+                     on_text: Callable[[str], None] | None = None) -> "_Outcome":
+        """Run one codex turn (``turn/start``, or ``thread/compact/start`` for a
+        manual compaction) on the agent's thread until it completes. The
+        caller holds the agent lock and the gateway turn."""
+        out = _Outcome()
+        queue = agent.server.subscribe(agent.thread_id)
+        turn_id = None
+        try:
+            async with asyncio.timeout(self.settings.turn_timeout_s):
+                started = await agent.server.request(method, params)
+                turn_id = ((started or {}).get("turn") or {}).get("id")
+                agent.active_turn = turn_id
+                while True:
+                    msg = await queue.get()
+                    kind, p = msg.get("method"), msg.get("params") or {}
+                    if kind == "_exited":
+                        raise CodexHarnessError(
+                            "codex app-server exited mid-turn; stderr: "
+                            + " | ".join(agent.server.stderr[-5:]))
+                    if turn_id is None and kind == "turn/started":
+                        # thread/compact/start answers before its turn exists.
+                        turn_id = ((p.get("turn") or {}).get("id")) or p.get("turnId")
+                        agent.active_turn = turn_id
+                        continue
+                    if p.get("turnId") not in (None, turn_id) and kind != "turn/completed":
+                        continue
+                    if kind == "thread/compacted" or (
+                            kind == "item/completed"
+                            and (p.get("item") or {}).get("type") == "contextCompaction"):
+                        # Auto-compaction arrives as a contextCompaction item
+                        # (observed); thread/compacted is the manual one.
+                        out.compacted += 1
+                    elif kind == "item/completed":
+                        item = p.get("item") or {}
+                        if item.get("type") == "agentMessage" and item.get("text"):
+                            if item.get("phase") == "final_answer":
+                                out.final.append(item["text"])
+                                if on_text:
+                                    on_text(item["text"])
+                            else:
+                                out.other.append(item["text"])
+                    elif kind == "thread/tokenUsage/updated":
+                        out.usage_update(p.get("tokenUsage") or {})
+                    elif kind == "error":
+                        out.error = json.dumps(p.get("error") or p)[:500]
+                    elif kind == "turn/completed":
+                        t = p.get("turn") or {}
+                        if turn_id is not None and t.get("id") not in (None, turn_id):
+                            continue
+                        out.status = t.get("status")
+                        if t.get("error"):
+                            out.error = json.dumps(t["error"])[:500]
+                        break
+        except TimeoutError:
+            if turn_id:
+                with contextlib.suppress(Exception):
+                    await agent.server.request("turn/interrupt", {
+                        "threadId": agent.thread_id, "turnId": turn_id}, timeout=10)
+            await agent.server.close()
+            raise CodexHarnessError(
+                f"turn exceeded {self.settings.turn_timeout_s:.0f}s; cancelled") from None
+        except asyncio.CancelledError:
+            # The caller went away: stop the turn in codex too, so it doesn't
+            # keep running (and calling tools) unattended.
+            if turn_id:
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(agent.server.request("turn/interrupt", {
+                        "threadId": agent.thread_id, "turnId": turn_id}, timeout=10))
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(agent.server.close())
+            raise
+        finally:
+            agent.active_turn = None
+            agent.server.unsubscribe(agent.thread_id)
+        return out
+
+    def _turn_params(self, agent: _Agent, text: str) -> dict:
+        params: dict[str, Any] = {"threadId": agent.thread_id,
+                                  "input": [{"type": "text", "text": text}]}
+        if self.settings.effort:
+            params["effort"] = self.settings.effort
+        return params
 
     async def _turn(self, turn: HarnessTurn, on_text: Callable[[str], None] | None) -> HarnessResult:
         if turn.secret_env:
             raise CodexHarnessError("per-launch MCP credentials are not supported by the codex "
                                     "harness (the gateway holds deployment-level credentials)")
         instance, ephemeral = self._key(turn)
+        # A compaction or rotation still running for this instance finishes
+        # first: the turn must land in the thread it leaves behind.
+        pending = None if ephemeral else self._maintenance.get(instance)
+        if pending is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(pending)
         # A `lost` the client could see before this turn is now consumed; one
         # raised while starting this turn must survive it (next turn: fresh).
         lost_before = bool((self._load_state().get(instance) or {}).get("lost"))
+        handoff = None if ephemeral else self._pending_handoff(instance)
         agent = await self._agent_for(instance, ephemeral=ephemeral)
-        final: list[str] = []
-        other: list[str] = []
-        # tokenUsage.total is the THREAD's running total; this turn's usage
-        # is the final total minus the total before the turn (the first
-        # update's total less that call's own `last`). Codex can repeat an
-        # update, so totals — not a sum of `last` — are the source of truth.
-        before: dict | None = None
-        total: dict = {}
-        requests = 0
-        context: int | None = None
-        compacted = 0
-        error: str | None = None
-        status = None
         try:
             async with agent.lock:
                 agent.last_used = time.monotonic()
-                queue = agent.server.subscribe(agent.thread_id)
                 with self.gateway.turn(instance, turn.run_id) as log:
-                    turn_id = None
-                    try:
-                        async with asyncio.timeout(self.settings.turn_timeout_s):
-                            params: dict[str, Any] = {
-                                "threadId": agent.thread_id,
-                                "input": [{"type": "text", "text": self._compose(turn)}]}
-                            if self.settings.effort:
-                                params["effort"] = self.settings.effort
-                            started = await agent.server.request("turn/start", params)
-                            turn_id = (started or {}).get("turn", {}).get("id")
-                            agent.active_turn = turn_id
-                            while True:
-                                msg = await queue.get()
-                                method, p = msg.get("method"), msg.get("params") or {}
-                                if method == "_exited":
-                                    raise CodexHarnessError(
-                                        "codex app-server exited mid-turn; stderr: "
-                                        + " | ".join(agent.server.stderr[-5:]))
-                                if p.get("turnId") not in (None, turn_id) and method != "turn/completed":
-                                    continue
-                                if method == "thread/compacted" or (
-                                        method == "item/completed"
-                                        and (p.get("item") or {}).get("type") == "contextCompaction"):
-                                    # Auto-compaction arrives as a contextCompaction
-                                    # item (observed); thread/compacted is the manual one.
-                                    compacted += 1
-                                    if self.on_lifecycle is not None:
-                                        with contextlib.suppress(Exception):
-                                            await self.on_lifecycle(instance, "compacting",
-                                                                    {"trigger": "codex"})
-                                elif method == "item/completed":
-                                    item = p.get("item") or {}
-                                    if item.get("type") == "agentMessage" and item.get("text"):
-                                        text = item["text"]
-                                        if item.get("phase") == "final_answer":
-                                            final.append(text)
-                                            if on_text:
-                                                on_text(text)
-                                        else:
-                                            other.append(text)
-                                elif method == "thread/tokenUsage/updated":
-                                    tu = p.get("tokenUsage") or {}
-                                    last = tu.get("last") or {}
-                                    new_total = tu.get("total") or {}
-                                    if before is None and new_total:
-                                        before = {k: v - int(last.get(k) or 0)
-                                                  for k, v in new_total.items()
-                                                  if isinstance(v, int)}
-                                    if new_total and new_total != total:
-                                        requests += 1
-                                        total = new_total
-                                    if isinstance(last.get("inputTokens"), int):
-                                        context = last["inputTokens"]
-                                elif method == "error":
-                                    error = json.dumps(p.get("error") or p)[:500]
-                                elif method == "turn/completed":
-                                    t = p.get("turn") or {}
-                                    if t.get("id") not in (None, turn_id):
-                                        continue
-                                    status = t.get("status")
-                                    if t.get("error"):
-                                        error = json.dumps(t["error"])[:500]
-                                    break
-                    except TimeoutError:
-                        if turn_id:
-                            with contextlib.suppress(Exception):
-                                await agent.server.request(
-                                    "turn/interrupt", {"threadId": agent.thread_id,
-                                                       "turnId": turn_id}, timeout=10)
-                        await agent.server.close()
-                        raise CodexHarnessError(
-                            f"turn exceeded {self.settings.turn_timeout_s:.0f}s; cancelled") from None
-                    except asyncio.CancelledError:
-                        # The caller went away: stop the turn in codex too, so it
-                        # doesn't keep running (and calling tools) unattended.
-                        if turn_id:
-                            with contextlib.suppress(BaseException):
-                                await asyncio.shield(agent.server.request(
-                                    "turn/interrupt", {"threadId": agent.thread_id,
-                                                       "turnId": turn_id}, timeout=10))
-                        with contextlib.suppress(BaseException):
-                            await asyncio.shield(agent.server.close())
-                        raise
-                    finally:
-                        agent.active_turn = None
-                        agent.server.unsubscribe(agent.thread_id)
+                    out = await self._drive(agent, instance, "turn/start", self._turn_params(
+                        agent, self._compose(turn, handoff=handoff)), on_text)
                     calls = list(log.calls)
                 agent.last_used = time.monotonic()
         finally:
@@ -747,32 +798,184 @@ class CodexHarness:
                 if path is not None:
                     path.unlink(missing_ok=True)
                 shutil.rmtree(self.settings.workdirs / instance, ignore_errors=True)
-        if not ephemeral and status == "completed":
-            await self._after_turn(instance, context, compacted, lost_before=lost_before)
-        if status != "completed":
-            raise CodexHarnessError(f"codex turn {status or 'ended'}: {error or 'no detail'}")
-        output = "\n\n".join(final) if final else "\n\n".join(other)
-        if not final and other and on_text:
+        if not ephemeral and out.status == "completed":
+            if out.compacted and self.on_lifecycle is not None:
+                with contextlib.suppress(Exception):
+                    await self.on_lifecycle(instance, "compacting", {"trigger": "codex"})
+            await self._after_turn(instance, out.context, out.compacted, calls,
+                                   lost_before=lost_before, handoff_delivered=handoff is not None)
+        if out.status != "completed":
+            raise CodexHarnessError(f"codex turn {out.status or 'ended'}: "
+                                    f"{out.error or 'no detail'}")
+        output = "\n\n".join(out.final) if out.final else "\n\n".join(out.other)
+        if not out.final and out.other and on_text:
             on_text(output)
-        turn_usage = {k: v - (before or {}).get(k, 0) for k, v in total.items()
-                      if isinstance(v, int)}
-        return HarnessResult(output=output, usage=_usage(turn_usage, requests=requests),
+        return HarnessResult(output=output, usage=_usage(out.turn_usage(), requests=out.requests),
                              tool_calls=calls)
 
-    async def _after_turn(self, instance: str, context: int | None, compacted: int, *,
-                          lost_before: bool = False) -> None:
+    async def _after_turn(self, instance: str, context: int | None, compacted: int,
+                          calls: list, *, lost_before: bool = False,
+                          handoff_delivered: bool = False) -> None:
         entry = self._load_state().get(instance) or {}
         seq = self._seq(instance, entry)
-        fields: dict[str, Any] = {}
+        writes = accepted_memory_writes(calls)
+        fields: dict[str, Any] = {
+            "turns": int(entry.get("turns") or 0) + 1,
+            "compactions": int(entry.get("compactions") or 0) + compacted,
+            "memory_writes": int(entry.get("memory_writes") or 0) + writes}
+        if writes:
+            fields["last_memory_write_at"] = time.time()
         if context is not None:
             fields["context_tokens"] = context
         if lost_before or not entry.get("lost"):
             fields["lost"] = False
-        await self._update_instance(
-            instance, seq=seq, turns=int(entry.get("turns") or 0) + 1, rotated=False,
-            compactions=int(entry.get("compactions") or 0) + compacted, **fields)
+        if handoff_delivered:
+            fields["handoff"] = None
+        entry = await self._update_instance(instance, seq=seq, rotated=False, **fields)
         if self.served is not None:
             self.served.mark(instance, NAME, seq)
+        stats = self._stats(entry)
+        self.ledger.write(instance, "turn", seq=stats.seq, context_tokens=stats.context_tokens,
+                          turns=stats.turns, compactions=stats.compactions, memory_writes=writes)
+        if compacted:
+            # codex compacted on its own (its safety net): no memory save first.
+            self.ledger.write(instance, "compaction", trigger="codex", seq=stats.seq)
+        if not self.settings.lifecycle:
+            return
+        decision = self.settings.policy.decide(stats)
+        if decision.action == "none":
+            return
+        if decision.action == "rotate":
+            # Visible at once: the next turn lands in a new thread.
+            await self._update_instance(instance, rotation_pending=True)
+        self._schedule(instance, decision)
+
+    # ── session lifecycle (compaction, rotation, handoff) ────────────────
+    def _stats(self, entry: dict) -> SessionStats:
+        return SessionStats(
+            context_tokens=int(entry.get("context_tokens") or 0),
+            compactions=int(entry.get("compactions") or 0),
+            turns=int(entry.get("turns") or 0),
+            age_s=time.time() - float(entry.get("session_started_at") or time.time()),
+            seq=int(entry.get("seq") or 1))
+
+    def _pending_handoff(self, instance: str) -> Handoff | None:
+        raw = (self._load_state().get(instance) or {}).get("handoff")
+        return Handoff(**raw) if raw else None
+
+    def _schedule(self, instance: str, decision: Decision) -> asyncio.Task:
+        task = asyncio.create_task(self._maintain(instance, decision),
+                                   name=f"codex-maintenance-{instance}")
+        self._maintenance[instance] = task
+        task.add_done_callback(lambda t: self._maintenance.pop(instance, None)
+                               if self._maintenance.get(instance) is t else None)
+        return task
+
+    async def _maintain(self, instance: str, decision: Decision) -> bool:
+        """Run a compaction or rotation after the user's turn returned; the
+        next turn waits for it. Returns whether it ran."""
+        try:
+            agent = await self._agent_for(instance, ephemeral=False)
+        except Exception as exc:  # noqa: BLE001 — retried by the next turn's policy
+            logger.warning("codex harness: maintenance of %s could not start: %s", instance, exc)
+            await self._update_instance(instance, rotation_pending=False)
+            return False
+        run_id = f"maintenance-{os.urandom(6).hex()}"
+        try:
+            async with agent.lock:
+                agent.last_used = time.monotonic()
+                if decision.action == "compact":
+                    await self._compact(agent, run_id, decision)
+                else:
+                    await self._rotate(agent, run_id, decision)
+                agent.last_used = time.monotonic()
+            return True
+        except Exception as exc:  # noqa: BLE001 — logged + ledgered; the thread stays usable
+            logger.warning("codex harness: %s of %s failed: %s", decision.action, instance, exc)
+            self.ledger.write(instance, "maintenance_failed", action=decision.action,
+                              reason=decision.reason, error=str(exc)[:300])
+            await self._update_instance(instance, rotation_pending=False)
+            return False
+        finally:
+            agent.reserved -= 1
+
+    async def _compact(self, agent: _Agent, run_id: str, decision: Decision) -> None:
+        instance = agent.instance
+        entry = self._load_state().get(instance) or {}
+        before = int(entry.get("context_tokens") or 0)
+        with self.gateway.turn(instance, run_id) as log:
+            await self._drive(agent, instance, "turn/start",
+                              self._turn_params(agent, memory_save_prompt(decision.reason)))
+            writes = accepted_memory_writes(log.calls)
+        if self.on_lifecycle is not None:
+            with contextlib.suppress(Exception):
+                await self.on_lifecycle(instance, "compacting", {"trigger": "miragen"})
+        with self.gateway.turn(instance, run_id):
+            out = await self._drive(agent, instance, "thread/compact/start",
+                                    {"threadId": agent.thread_id})
+        if out.status not in (None, "completed"):
+            raise CodexHarnessError(f"compaction {out.status}: {out.error or 'no detail'}")
+        fields: dict[str, Any] = {
+            "compactions": int(entry.get("compactions") or 0) + 1,
+            "memory_writes": int(entry.get("memory_writes") or 0) + writes}
+        if writes:
+            fields["last_memory_write_at"] = time.time()
+        if out.context is not None:
+            fields["context_tokens"] = out.context
+        await self._update_instance(instance, **fields)
+        self.ledger.write(instance, "compaction", trigger="miragen", reason=decision.reason,
+                          seq=entry.get("seq", 1), memory_writes=writes, tokens_before=before,
+                          tokens_after=out.context, observed=bool(out.compacted))
+
+    async def _rotate(self, agent: _Agent, run_id: str, decision: Decision) -> None:
+        instance = agent.instance
+        entry = self._load_state().get(instance) or {}
+        limit = self.settings.handoff_max_chars
+        text, error = "", None
+        with self.gateway.turn(instance, run_id) as log:
+            try:
+                out = await self._drive(agent, instance, "turn/start",
+                                        self._turn_params(agent, rotation_prompt(decision.reason,
+                                                                                 limit)))
+                text = out.text
+                if out.status != "completed":
+                    error = f"turn {out.status}: {out.error or 'no detail'}"[:200]
+            except Exception as exc:  # noqa: BLE001 — best-effort: rotate anyway, say the note is missing
+                error = f"{type(exc).__name__}: {exc}"[:200]
+            writes = accepted_memory_writes(log.calls)
+        rotated_at = time.time()
+        seq = int(entry.get("seq") or 1)
+        handoff = Handoff(
+            text=text[:limit], truncated=len(text) > limit, prev_seq=seq, reason=decision.reason,
+            started_at=float(entry.get("session_started_at") or rotated_at), rotated_at=rotated_at,
+            turns=int(entry.get("turns") or 0), compactions=int(entry.get("compactions") or 0),
+            context_tokens=int(entry.get("context_tokens") or 0),
+            memory_writes=int(entry.get("memory_writes") or 0) + writes,
+            last_memory_write_at=(rotated_at if writes else entry.get("last_memory_write_at")),
+            handoff_error=error or (None if text else "the note came back empty"))
+        if self.on_lifecycle is not None:
+            with contextlib.suppress(Exception):
+                await self.on_lifecycle(instance, "closed", {"reason": decision.reason})
+        # A new thread with the same declared tools; the old one's rollout stays
+        # (listed in `threads`, removed by forget).
+        old = agent.thread_id
+        params = await self._thread_params(self.settings.workdirs / instance)
+        declared = entry.get("tools")
+        if declared:
+            params["dynamicTools"] = list(declared.values())
+        result = await agent.server.request("thread/start", {**params, "ephemeral": False})
+        agent.thread_id = result["thread"]["id"]
+        await self._update_instance(
+            instance, thread_id=agent.thread_id,
+            threads=[*(entry.get("threads") or []), agent.thread_id],
+            tools=declared or {t["name"]: t for t in params["dynamicTools"]},
+            seq=seq + 1, session_started_at=rotated_at, turns=0, compactions=0,
+            context_tokens=0, memory_writes=0, last_memory_write_at=None,
+            rotation_pending=False, rotated=False, handoff=handoff.to_json())
+        self.ledger.write(instance, "rotation", reason=decision.reason, from_seq=seq,
+                          to_seq=seq + 1, from_thread=old, to_thread=agent.thread_id,
+                          memory_writes=writes, handoff_chars=len(text),
+                          handoff_truncated=handoff.truncated, handoff_error=handoff.handoff_error)
 
     async def run(self, turn: HarnessTurn) -> HarnessResult:
         return await self._turn(turn, None)
@@ -801,27 +1004,44 @@ class CodexHarness:
                 "turns": int(entry.get("turns") or 0),
                 "compactions": int(entry.get("compactions") or 0),
                 "context_tokens": int(entry.get("context_tokens") or 0),
-                "rotation_pending": False,
+                "rotation_pending": bool(entry.get("rotation_pending")),
+                # The next turn doesn't continue the thread the client saw
+                # last: new, rotated (with or without a handoff), lost, or
+                # served by another harness.
                 "fresh": (not entry.get("thread_id") or bool(entry.get("rotated"))
-                          or bool(entry.get("lost")) or switched),
-                "maintenance_running": False,
+                          or bool(entry.get("lost")) or switched
+                          or bool(entry.get("rotation_pending")) or bool(entry.get("handoff"))),
+                "maintenance_running": instance in self._maintenance,
                 "harness": NAME}
 
     async def rotate(self, instance: str, reason: str = "requested") -> dict:
-        if not self._load_state().get(instance):
+        """Start the instance's next thread now (Mira's /clear): memory save +
+        handoff note, then a new thread, as an automatic rotation. If the
+        maintenance can't run (e.g. no login), the thread is still dropped."""
+        entry = self._load_state().get(instance)
+        if not entry:
             raise KeyError(instance)
-        async with self._spawn_lock:
-            agent = self._agents.get(instance)
-            if agent is not None and agent.busy:
-                raise InstanceBusyError(f"instance '{instance}' has a running turn")
-            await self._drop(instance)
-        if self.on_lifecycle is not None:
+        pending = self._maintenance.get(instance)
+        if pending is not None:
             with contextlib.suppress(Exception):
-                await self.on_lifecycle(instance, "closed", {"reason": reason})
-        entry = self._load_state().get(instance) or {}
-        await self._update_instance(instance, thread_id=None, rotated=True, turns=0,
-                                    compactions=0, context_tokens=0,
-                                    seq=int(entry.get("seq") or 1) + 1)
+                await asyncio.shield(pending)
+        agent = self._agents.get(instance)
+        if agent is not None and agent.busy:
+            raise InstanceBusyError(f"instance '{instance}' has a running turn")
+        ran = False
+        if self.settings.lifecycle and entry.get("thread_id"):
+            await self._update_instance(instance, rotation_pending=True)
+            ran = await self._schedule(instance, Decision("rotate", reason))
+        if not ran:
+            async with self._spawn_lock:
+                await self._drop(instance)
+            if self.on_lifecycle is not None:
+                with contextlib.suppress(Exception):
+                    await self.on_lifecycle(instance, "closed", {"reason": reason})
+            entry = self._load_state().get(instance) or {}
+            await self._update_instance(instance, thread_id=None, rotated=True, turns=0,
+                                        compactions=0, context_tokens=0, rotation_pending=False,
+                                        seq=int(entry.get("seq") or 1) + 1)
         return self.session_info(instance) or {}
 
     async def forget(self, instance: str) -> list[str]:
@@ -853,6 +1073,9 @@ class CodexHarness:
         return removed
 
     async def aclose(self) -> None:
+        for task in list(self._maintenance.values()):
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(asyncio.shield(task), timeout=5)
         if self._reaper is not None:
             self._reaper.cancel()
         for instance in list(self._agents):

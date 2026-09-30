@@ -16,6 +16,7 @@ import pytest
 from miragen.harness import build_model_harness, parse_harness_model
 from miragen.harness.base import HarnessTurn
 from miragen.harness.codex import FEATURES_OFF, CodexHarness, CodexHarnessError, CodexSettings
+from miragen.harness.grok_lifecycle import ThresholdPolicy
 from miragen.harness.gateway import ToolGateway
 from miragen.harness.served import ServedLedger
 from miragen.models import AgentProfile
@@ -26,6 +27,11 @@ FAKE = Path(__file__).parent / "fixtures" / "fake_codex_app_server.py"
 def speak(text: str) -> str:
     """Say something."""
     return f"spoke:{text}"
+
+
+def memory_remember(text: str) -> str:
+    """Remember something (the plane's answer shape)."""
+    return '{"status": "accepted", "record_id": "r1"}'
 
 
 def profile(**extra) -> AgentProfile:
@@ -58,7 +64,7 @@ class Env:
 
     def harness(self, prof=None, **kw) -> CodexHarness:
         prof = prof or profile()
-        gateway = ToolGateway(prof, runtime_tools=[speak],
+        gateway = ToolGateway(prof, runtime_tools=[speak, memory_remember],
                               native_capabilities=CodexHarness.native_capabilities)
         h = CodexHarness(prof, gateway, CodexSettings(
             codex_home=self.home, workdirs=self.tmp_path / "work", gateway_url="unused",
@@ -124,7 +130,7 @@ async def test_turn_shape_and_hermetic_process(env, monkeypatch):
     assert params["sandbox"] == "read-only" and params["model"] == "gpt-5.5"
     assert params["baseInstructions"].startswith("You are Mira.")
     assert all(params["config"][f"features.{f}"] is False for f in FEATURES_OFF)
-    assert [t["name"] for t in params["dynamicTools"]] == ["speak"]
+    assert [t["name"] for t in params["dynamicTools"]] == ["speak", "memory_remember"]
     assert params["dynamicTools"][0]["deferLoading"] is False
     assert not any(k.startswith("mcp_servers") for k in params["config"])
 
@@ -154,7 +160,8 @@ async def test_restart_resumes_the_thread_and_a_lost_rollout_starts_fresh(env):
     res = await h2.run(turn("HISTORY", run_id="r2"))
     assert res.output == "turns=2 carried=0"
     resume = next(e for e in env.log() if "thread_resume" in e)["thread_resume"]
-    assert resume["threadId"] == tid and [t["name"] for t in resume["dynamicTools"]] == ["speak"]
+    assert resume["threadId"] == tid
+    assert {t["name"] for t in resume["dynamicTools"]} == {"speak", "memory_remember"}
     assert h2.session_info("chat")["fresh"] is False
     await h2.aclose()
     for f in (env.home / "sessions").rglob("*.jsonl"):
@@ -233,7 +240,7 @@ async def test_tool_names_the_model_api_rejects_get_aliases(env):
 
     h.gateway._add_local("home.odd", odd_tool, runtime=True)
     tools = await h._dynamic_tools()
-    assert [t["name"] for t in tools] == ["speak", "home_odd"]
+    assert [t["name"] for t in tools] == ["speak", "memory_remember", "home_odd"]
     res = await h.run(turn('CALL home_odd {"text": "x"}'))
     assert res.output == "tool[home_odd]=odd:x ok=True"
     assert [c.tool_name for c in res.tool_calls] == ["home.odd"]
@@ -255,7 +262,7 @@ async def test_new_tools_move_to_a_new_thread_carrying_the_history(env):
     h2.gateway._add_local("lamp", _odd, runtime=True)  # an upstream tool appeared
     res = await h2.run(turn("HISTORY", run_id="r4"))
     state = env.state()["chat"]
-    assert state["thread_id"] != old and set(state["tools"]) == {"speak", "lamp"}
+    assert state["thread_id"] != old and set(state["tools"]) == {"speak", "memory_remember", "lamp"}
     inject = next(e for e in env.log() if "inject_items" in e)["inject_items"]
     texts = [i.get("encrypted_content") or i["content"][0]["text"] for i in inject["items"]]
     # From the last compaction on: its summary + messages, then later turns.
@@ -274,7 +281,7 @@ async def test_a_vanished_tool_stays_declared_and_the_thread_resumes(env):
     await h2.run(turn("two", run_id="r2"))
     assert env.state()["chat"]["thread_id"] == tid
     resume = next(e for e in env.log() if "thread_resume" in e)["thread_resume"]
-    assert {t["name"] for t in resume["dynamicTools"]} == {"speak", "lamp"}
+    assert {t["name"] for t in resume["dynamicTools"]} == {"speak", "memory_remember", "lamp"}
 
 
 async def test_a_codex_that_does_not_honour_the_flags_is_refused(env):
@@ -339,3 +346,78 @@ async def test_usage_is_per_turn_not_the_threads_running_total(env):
     for res in (first, second):  # two calls per turn, a repeated update ignored
         assert (res.usage.input_tokens, res.usage.cached_input_tokens,
                 res.usage.output_tokens, res.usage.requests) == (900, 400, 20, 2)
+
+
+
+def ledger(env) -> list[dict]:
+    path = env.home / "lifecycle" / "chat.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+async def test_compaction_saves_memories_first_then_compacts(env):
+    events = []
+
+    async def lifecycle(instance, event, info):
+        events.append((event, info))
+
+    h = env.harness(policy=ThresholdPolicy(compact_at_tokens=400, rotate_at_tokens=10_000,
+                                           rotate_after_compactions=5))
+    h.on_lifecycle = lifecycle
+    await h.run(turn("one"))            # context 450 >= 400: compact after the turn
+    await h.run(turn("two", run_id="r2"))  # waits for the maintenance to finish
+    maint = [e for e in env.log() if "maintenance" in e or "compact" in e]
+    assert [("maintenance" in e and e["maintenance"]) or "compact" for e in maint][:2] == [
+        "save", "compact"]
+    assert maint[0]["memory"].startswith('{"status": "accepted"')
+    assert ("compacting", {"trigger": "miragen"}) in events
+    c = next(e for e in ledger(env) if e["event"] == "compaction")
+    assert c["trigger"] == "miragen" and c["memory_writes"] == 1 and c["tokens_after"] == 120
+    state = env.state()["chat"]
+    assert state["compactions"] >= 1 and state["memory_writes"] >= 1
+
+
+async def test_rotation_writes_a_handoff_the_next_thread_receives_once(env):
+    events = []
+
+    async def lifecycle(instance, event, info):
+        events.append(event)
+
+    h = env.harness(policy=ThresholdPolicy(compact_at_tokens=100, rotate_at_tokens=400))
+    h.on_lifecycle = lifecycle
+    await h.run(turn("one"))
+    first = env.state()["chat"]["thread_id"]
+    assert h.session_info("chat")["rotation_pending"] or h.session_info("chat")["fresh"]
+    await h._maintenance["chat"] if "chat" in h._maintenance else None
+    state = env.state()["chat"]
+    assert state["thread_id"] != first and state["seq"] == 2 and state["handoff"]["text"]
+    assert state["handoff"]["memory_writes"] == 1 and "closed" in events
+    assert h.session_info("chat")["fresh"] is True
+    h.settings.policy = ThresholdPolicy(compact_at_tokens=10**9, rotate_at_tokens=10**9)
+    res = await h.run(turn("two", run_id="r2"))
+    assert "<handoff" in res.output and "pelican plans" in res.output
+    assert env.state()["chat"]["handoff"] is None and h.session_info("chat")["fresh"] is False
+    res = await h.run(turn("three", run_id="r3"))
+    assert "<handoff" not in res.output
+    rot = next(e for e in ledger(env) if e["event"] == "rotation")
+    assert rot["from_seq"] == 1 and rot["to_seq"] == 2 and rot["handoff_error"] is None
+
+
+async def test_clear_rotates_with_memory_save_and_handoff(env):
+    h = env.harness(policy=ThresholdPolicy(compact_at_tokens=10**9, rotate_at_tokens=10**9))
+    await h.run(turn("one"))
+    first = env.state()["chat"]["thread_id"]
+    info = await h.rotate("chat")
+    state = env.state()["chat"]
+    assert info["fresh"] is True and info["seq"] == 2 and state["thread_id"] != first
+    assert state["handoff"]["text"].startswith("NOTE:")
+    assert any(e.get("maintenance") == "handoff" for e in env.log())
+
+
+async def test_clear_still_starts_over_when_maintenance_cannot_run(env):
+    h = env.harness()
+    await h.run(turn("one"))
+    await h.aclose()
+    (env.home / "auth.json").unlink()  # the next spawn fails: no login
+    h2 = env.harness()
+    info = await h2.rotate("chat")
+    assert info["fresh"] is True and env.state()["chat"]["thread_id"] is None

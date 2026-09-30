@@ -83,6 +83,16 @@ def run_turn(tid, turn, text):
     elif prompt == "WEIRD":
         out = ask("some/new/request", {"threadId": tid, "turnId": turn})
         message(tid, turn, f"weird={json.dumps(out)}")
+    elif "<session-maintenance" in text:
+        # The maintenance turns: save a memory first; a rotation also writes
+        # its handoff note as the reply.
+        out = ask("item/tool/call", {"threadId": tid, "turnId": turn, "callId": "m1",
+                                     "namespace": None, "tool": "memory_remember",
+                                     "arguments": {"text": "durable fact"}})
+        log({"maintenance": "handoff" if "handoff note" in text else "save",
+             "memory": out["contentItems"][0]["text"]})
+        message(tid, turn, "NOTE: pelican plans; he prefers terse replies"
+                if "handoff note" in text else "saved")
     elif prompt.startswith("SLOWCALL "):
         # A tool call that arrives after the client has given up on the turn.
         import time as _t
@@ -155,6 +165,18 @@ def main():
             log({"turn_start": params})
             send({"id": rid, "result": {"turn": {"id": turn, "status": "inProgress"}}})
             run_turn(params["threadId"], turn, text)
+        elif method == "thread/compact/start":
+            tid = params["threadId"]
+            log({"compact": tid})
+            send({"id": rid, "result": {}})
+            turn = str(uuid.uuid4())
+            note("turn/started", {"threadId": tid, "turn": {"id": turn}})
+            append(tid, {"type": "compacted", "payload": {"message": "", "replacement_history": [
+                {"type": "compaction", "id": "c", "encrypted_content": "ENC"}]}})
+            note("thread/compacted", {"threadId": tid, "turnId": turn})
+            note("thread/tokenUsage/updated", {"threadId": tid, "turnId": turn, "tokenUsage": {
+                "total": {"inputTokens": running["in"]}, "last": {"inputTokens": 120}}})
+            note("turn/completed", {"threadId": tid, "turn": {"id": turn, "status": "completed"}})
         elif method == "experimentalFeature/list":
             from miragen.harness.codex import FEATURES_OFF
 
