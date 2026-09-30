@@ -2918,7 +2918,8 @@ async def list_approvals(
     return ApprovalListResponse(count=len(pending), approvals=pending, version=broker.version)
 
 
-@app.post("/approvals/{request_id}", response_model=ResolveApprovalResponse, dependencies=[_internal_auth])
+@app.post("/approvals/{request_id}", response_model=ResolveApprovalResponse,
+          response_model_exclude_none=True, dependencies=[_internal_auth])
 async def resolve_approval(request_id: str, response: ApprovalResponse):
     """Answer a queued approval. A blocking one resumes the turn that waits
     on it. An async one (approval_delivery: async) runs now when approved —
