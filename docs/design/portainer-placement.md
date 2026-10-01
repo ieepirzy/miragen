@@ -7,8 +7,8 @@ at the end are Ilari's.
 
 Today one miragend creates agents on one Docker engine: its own. The fleet
 has more than one. The Muutto365 Portainer has three environments (the main
-VPS, the CRM host and the Odoo host), and the main VPS, where every agent
-runs, is the fullest of them.
+VPS, the CRM host and the Odoo host), and the main VPS is the fullest of
+them.
 
 The ask (Ilari, 2026-10-01): miragend should be able to pick the
 environment an agent is deployed into, the way miradeploy picks one for a
@@ -32,19 +32,21 @@ leave nothing behind that the Kubernetes move has to undo.
   is the daemon operator's, not the orchestrator's."
 - **`POST /agents` takes** `name`, `yaml_source`, `tools_source` and
   `labels`. Labels are opaque passthrough. There is no placement.
-- **The Compose driver assumes one host** in three places:
+- **The Compose driver assumes one host** in two places:
   - the unit's files are a bind mount, `./agents/{name}:/agent`, on the
     daemon's own disk. Run records, executor workspaces and the
     codex/grok/kimi homes all live under it;
   - the agent's address is its container name on `miragen-net`, a bridge
-    network that exists only on that host;
-  - image-contract validation inspects the image through the local Docker
-    socket.
+    network that exists only on that host.
+- **`LifecycleCore` assumes one host too**, whichever driver is active:
+  image-contract validation inspects the image through the daemon's local
+  Docker socket, and the Docker secrets a unit gets are derived from the
+  daemon's own `*_API_KEY_FILE` environment variables.
 - **Portainer** exposes each environment's Docker API through a proxy
   (`/api/endpoints/{id}/docker/...`), authenticated with an API key that is
   scoped to a Portainer user. miradeploy uses it for container listing and
-  logs. miradeploy's own stack calls are git-backed stacks only: no
-  stack-from-a-compose-string, no delete.
+  logs. miradeploy creates git-backed stacks only and cannot delete one; it
+  can update a stack that was created in Portainer's editor.
 
 ## 3. The shape proposed
 
@@ -60,9 +62,12 @@ leave nothing behind that the Kubernetes move has to undo.
   concerned. `GET /placements` lists the names, so a control plane can
   offer them.
 - The driver talks to the chosen environment's Docker API through
-  Portainer's proxy: create, start, stop, remove, inspect, logs. The same
-  operations the Compose driver makes through the SDK today, one container
-  per agent, no stack. Plain containers rather than Portainer stacks,
+  Portainer's proxy: create, start, stop, remove, inspect, logs, one
+  container per agent, no stack. The Compose driver does status, logs,
+  restart, stop and remove through the Docker SDK already; it creates and
+  starts by writing `compose.yml` and running `docker compose up -d`, which
+  has no remote equivalent, so this driver creates the container itself.
+  Plain containers rather than Portainer stacks,
   because a stack per agent would have to be created from a compose string,
   updated and deleted, and the stack is not the unit anyone manages here.
 - The agent's placement is recorded with the agent and is returned by
@@ -93,11 +98,13 @@ simply be pointed at another host.
    local bridge. On this fleet it would be the host's WireGuard address and
    a published port, which means allocating ports per host and binding them
    to the WireGuard interface only. The daemon's own calls to the agent
-   (`/health` while watching boot, schedules, the run-control proxy) take
-   the same path.
-3. **Secrets.** Docker secrets named in the profile must exist on the
+   (schedule fires and the run-control proxy) take the same path. Watching
+   a first boot reads the container's status from the driver and needs no
+   route to the agent.
+3. **Secrets.** The Docker secrets a unit gets come from the daemon's own
+   `*_API_KEY_FILE` variables, and they must exist as Docker secrets on the
    target host. Either they are provisioned per host out of band, or the
-   driver refuses a profile that needs one on a host that lacks it. The
+   driver refuses to place an agent on a host that lacks one. The
    Kubernetes driver has the same gap and says so.
 4. **Image contract.** The check inspects an image locally. For a remote
    placement it has to inspect on the target through the proxy, after a
