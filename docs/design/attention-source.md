@@ -117,7 +117,20 @@ and schedules are what this proposal leaves out.
 - **Kubernetes.** A stopped agent there has no state to resume: `/agent` is
   a ConfigMap and `stop` deletes the Pod. See `portainer-placement.md` §6.
 
-## 6. Decisions needed
+## 6. Decisions
+
+Decided by Ilari on 2026-10-02:
+
+- **Both may start a stopped agent.** mirarun for launches, schedules and
+  publications; the daemon to deliver an answer. "I don't see a reason why
+  both wouldn't be able to do it." What keeps them from working against
+  each other is proposed in mirarun's ADR-031 §5 (a proposal, like this document): whether an agent *should*
+  be running is the control plane's desired state, a start is allowed
+  whenever that state is running, and the daemon does not start an agent
+  an operator stopped on purpose.
+
+Still open: items 2 and 3 below. Item 1 is kept as it was written.
+
 
 1. **Who wakes a stopped agent.** This proposal has the daemon do it, for
    answers. mirarun's wake stack has mirarun do it, for launches,

@@ -147,7 +147,28 @@ picks one.
   agent (a wake, an answer to a question it asked) can work there until
   the agent's state is on a volume.
 
-## 7. Decisions needed
+## 7. Decisions
+
+Decided by Ilari on 2026-10-02:
+
+- **§3, with the control plane naming the place.** "mirarun is a
+  scheduler: it tells the resource controller where, what, and how many
+  things should happen. miragend then actually spins the containers up,
+  and reconciles mirarun's desired state with whatever deployment is
+  underneath." mirarun requests an agent at a placement; miragend spawns
+  it there. So `placement` on `POST /agents` and `GET /placements` are the
+  interface, and the Portainer driver is how the daemon honours it until
+  Kubernetes.
+- **How many is the control plane's too.** One container per profile, N
+  instances in it, with mirarun setting N. `instance-model.md` has no N
+  today: an instance appears the first time a run names it. What that
+  needs from miragen, and what an instance does and does not isolate, is
+  in mirarun's ADR-031 §3 and §4 (a proposal, like this document).
+- **On Kubernetes, do not duplicate the cluster.** Placement and
+  reconciliation are the cluster's job there.
+
+Still open: items 2 to 5 below. Item 1 is kept as it was written.
+
 
 1. **Driver or daemons.** §3 (a Portainer driver, miragend selects) or §5
    (one miragend per host, the control plane selects). §3 is what was asked
