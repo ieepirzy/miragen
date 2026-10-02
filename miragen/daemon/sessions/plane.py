@@ -1089,6 +1089,7 @@ class SessionPlane:
         else:
             self.stats.note_loimi(True)
         self._outage_announced.discard(session.key)
+        # Preparation counters only; external harness delivery has no acknowledgement.
         self._count_injection(session, envelope)
         detail = "; ".join(part for part in (scope_detail, packet.degraded) if part) or None
         status = self._status_line(packet, project_scope=lifecycle.spec.scopes.default_write)
@@ -1690,6 +1691,7 @@ class SessionPlane:
             "active_sessions": len(active),
             "active_by_harness": by_harness,
             "known_sessions": len(self.registry.list()),
+            "injection_accounting": "prepared_contexts; harness delivery unconfirmed",
             "loimi": {
                 "endpoint_configured": bool(self.environ.get(self.config.endpoint_env)),
                 "credential_configured": bool(self.environ.get(self.config.credential_env)),
