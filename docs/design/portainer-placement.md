@@ -163,7 +163,7 @@ Decided by Ilari on 2026-10-02:
   instances in it, with mirarun setting N. `instance-model.md` has no N
   today: an instance appears the first time a run names it. What that
   needs from miragen, and what an instance does and does not isolate, is
-  in mirarun's ADR-031 §3 and §4.
+  in mirarun's ADR-031 §3 and §4 (a proposal, like this document).
 - **On Kubernetes, do not duplicate the cluster.** Placement and
   reconciliation are the cluster's job there.
 

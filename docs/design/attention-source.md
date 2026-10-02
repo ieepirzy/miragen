@@ -124,7 +124,7 @@ Decided by Ilari on 2026-10-02:
 - **Both may start a stopped agent.** mirarun for launches, schedules and
   publications; the daemon to deliver an answer. "I don't see a reason why
   both wouldn't be able to do it." What keeps them from working against
-  each other is proposed in mirarun's ADR-031 §5: whether an agent *should*
+  each other is proposed in mirarun's ADR-031 §5 (a proposal, like this document): whether an agent *should*
   be running is the control plane's desired state, a start is allowed
   whenever that state is running, and the daemon does not start an agent
   an operator stopped on purpose.
