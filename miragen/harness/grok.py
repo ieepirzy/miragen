@@ -59,7 +59,7 @@ from miragen.harness.grok_lifecycle import (
     Decision, Handoff, Ledger, LifecyclePolicy, SessionStats, ThresholdPolicy,
     accepted_memory_writes, load_policy, memory_save_prompt, rotation_prompt,
 )
-from miragen.models import AgentProfile, RunUsage
+from miragen.models import AgentProfile, RunUsage, anthropic_usage_fields
 
 logger = logging.getLogger("miragen.harness.grok")
 
@@ -837,7 +837,14 @@ def _usage(raw: dict[str, Any]) -> RunUsage:
             if isinstance(raw.get(k), int):
                 return raw[k]
         return None
+    if "inputTokens" not in raw and "input_tokens" in raw:
+        # Anthropic-style snake_case: input_tokens is the UNCACHED part.
+        return RunUsage(requests=1, **anthropic_usage_fields(raw))
+    # ACP PromptUsage (`_meta.usage`): inputTokens is already the FULL prompt
+    # (grok docs, "token field policy"), cache buckets are subsets.
     return RunUsage(requests=1,
-                    input_tokens=pick("inputTokens", "input_tokens", "promptTokens"),
-                    output_tokens=pick("outputTokens", "output_tokens", "completionTokens"),
-                    cached_input_tokens=pick("cachedInputTokens", "cache_read_input_tokens"))
+                    input_tokens=pick("inputTokens", "promptTokens"),
+                    output_tokens=pick("outputTokens", "completionTokens"),
+                    cached_input_tokens=pick("cachedReadTokens", "cacheReadInputTokens",
+                                             "cachedInputTokens"),
+                    cache_write_tokens=pick("cachedWriteTokens", "cacheCreationInputTokens"))

@@ -243,7 +243,36 @@ resume_count number of reopen transitions
 
 `RunUsage` gains `cached_input_tokens` (normalized flat key or OpenAI-style
 `input_tokens_details.cached_tokens`), summed across turns like the other
-token fields. Tool-call summaries (`tool_call_count` / `tool_call_failures`)
+token fields.
+
+Token convention (every adapter, both tiers): `input_tokens` is ALL prompt
+tokens, INCLUDING cache reads and cache writes (OpenAI style). Adapters whose
+provider reports the uncached part separately (Anthropic Messages / Claude
+Code, Grok Build headless, Kimi Code) add the cache buckets back in. Cache
+fields are subsets of `input_tokens`:
+
+| field | meaning |
+| --- | --- |
+| `cached_input_tokens` | cache reads |
+| `cache_write_tokens` | cache writes; null = not reported |
+| `cache_write_1h_tokens` | the part of the writes at the 1-hour TTL (the rest are 5-minute); null = split unknown |
+| `calls` | one `CallUsage` per model request, in order, when the adapter sees individual requests; null otherwise |
+| `calls_truncated` | `calls` was capped at 1000 entries; the totals are still the whole run |
+
+`CallUsage` = `at` (UTC), `model`, `input_tokens` (inclusive),
+`cached_input_tokens`, `cache_write_tokens`, `cache_write_1h_tokens`,
+`output_tokens`, `speed`, `inference_geo`. Every field is set only when
+the provider reported it. Summing turns concatenates `calls`. If one side has
+no breakdown, the result has none: an incomplete breakdown counts as no
+breakdown.
+
+Which adapters fill `calls`: the pydantic-ai model tier (one entry per
+`ModelResponse` of the run) and the Claude Code harness (one per streamed
+API message, kept only when it reconciles with the result totals; its
+per-call `output_tokens` is null because the stream's figure is provisional).
+The executor tier and the Codex/Grok harnesses report totals only.
+
+Tool-call summaries (`tool_call_count` / `tool_call_failures`)
 come from normalized `item.completed` events: an adapter that emits no item
 events reports **null** (cannot report), while a run whose item stream simply
 contained no tool work reports **0** — nullability is preserved everywhere; a

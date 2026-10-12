@@ -391,11 +391,18 @@ def _usage_from_turn(turn: Any) -> dict[str, Any] | None:
     breakdown = getattr(usage, "last", None) if usage is not None else None
     if breakdown is None:
         return None
-    return {
+    # OpenAI convention: input_tokens already includes cached input.
+    usage = {
         "input_tokens": getattr(breakdown, "input_tokens", None),
         "output_tokens": getattr(breakdown, "output_tokens", None),
         "cached_input_tokens": getattr(breakdown, "cached_input_tokens", None),
     }
+    # cache_write_input_tokens defaults to 0 in the SDK model, so only a value
+    # the app-server actually sent counts as reported.
+    fields_set = getattr(breakdown, "model_fields_set", None)
+    if isinstance(fields_set, (set, frozenset)) and "cache_write_input_tokens" in fields_set:
+        usage["cache_write_tokens"] = getattr(breakdown, "cache_write_input_tokens", None)
+    return usage
 
 
 def _enum_value(value: Any) -> Any:

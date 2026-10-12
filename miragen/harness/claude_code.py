@@ -42,6 +42,7 @@ import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -51,7 +52,7 @@ from miragen.harness.base import (
 from miragen.harness.gateway import ToolGateway, _capability_entries
 from miragen.harness.served import ServedLedger
 from miragen.memory.claude_code import SCRUBBED_ENV, WORKER_ENV
-from miragen.models import AgentProfile, RunUsage
+from miragen.models import AgentProfile, CallUsage, RunUsage, anthropic_usage_fields
 
 logger = logging.getLogger("miragen.harness.claude_code")
 
@@ -479,6 +480,10 @@ class ClaudeCodeHarness:
         chunks: list[str] = []
         result: Any = None
         context: int | None = None
+        # Per model request: (first-seen time, model, usage, parent_tool_use_id),
+        # keyed by API message id (one response arrives as one message per
+        # content block, each repeating the response's usage).
+        responses: dict[str, tuple[datetime, str | None, dict, str | None]] = {}
         try:
             async with agent.lock:
                 agent.last_used = time.monotonic()
@@ -489,6 +494,7 @@ class ClaudeCodeHarness:
                             after_tool = False
                             async for message in agent.client.receive_response():
                                 if isinstance(message, AssistantMessage):
+                                    _note_response(responses, message)
                                     if message.parent_tool_use_id:
                                         continue
                                     if message.usage:
@@ -554,7 +560,8 @@ class ClaudeCodeHarness:
         if result.is_error:
             raise ClaudeCodeHarnessError(
                 f"claude: {result.subtype}: {(result.result or '').strip()[:500]}")
-        return HarnessResult(output="".join(chunks), usage=_usage(result.usage or {}),
+        return HarnessResult(output="".join(chunks),
+                             usage=_usage(result.usage or {}, responses=responses),
                              tool_calls=calls)
 
     async def _after_turn(self, instance: str, context: int | None, *,
@@ -663,12 +670,64 @@ def _context_tokens(usage: dict[str, Any]) -> int:
         "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
 
 
-def _usage(raw: dict[str, Any]) -> RunUsage:
-    def pick(*keys):
-        for k in keys:
-            if isinstance(raw.get(k), int):
-                return raw[k]
-        return None
-    return RunUsage(requests=1, input_tokens=pick("input_tokens"),
-                    output_tokens=pick("output_tokens"),
-                    cached_input_tokens=pick("cache_read_input_tokens"))
+def _usage(raw: dict[str, Any],
+           responses: dict[str, tuple[datetime, str | None, dict, str | None]] | None = None,
+           ) -> RunUsage:
+    # Claude Code reports Anthropic Messages usage: input_tokens is only the
+    # UNCACHED part; normalise to the inclusive RunUsage convention.
+    fields = anthropic_usage_fields(raw)
+    calls = _calls(fields, responses or {})
+    # requests agrees with calls when a breakdown reconciled (it may leave
+    # out subagent requests); otherwise every distinct response counts.
+    requests = len(calls) if calls else max(len(responses or {}), 1)
+    return RunUsage(requests=requests, **fields, calls=calls)
+
+
+def _note_response(responses: dict, message: Any) -> None:
+    message_id = getattr(message, "message_id", None)
+    usage = getattr(message, "usage", None)
+    if not message_id or not isinstance(usage, dict):
+        return
+    seen = responses.get(message_id)
+    at = seen[0] if seen else datetime.now(timezone.utc)
+    responses[message_id] = (at, getattr(message, "model", None), usage,
+                             getattr(message, "parent_tool_use_id", None))
+
+
+def _reported(value: Any) -> str | None:
+    # "not_available" is how the API says it has no value for the field.
+    return value if isinstance(value, str) and value and value != "not_available" else None
+
+
+_RECONCILED = ("input_tokens", "cached_input_tokens", "cache_write_tokens")
+
+
+def _calls(total: dict[str, Any], responses: dict) -> list[CallUsage] | None:
+    """Per-request usage from the streamed assistant messages, or None.
+
+    The stream's per-message usage carries the request's final prompt-side
+    counts but a provisional output_tokens (observed live: 5 and 1 against a
+    result total of 123), so each call reports output_tokens=None and the
+    true output total stays on RunUsage. The breakdown is kept only when its
+    prompt-side sums equal the result's totals (with or without subagent
+    requests): a partial list would misstate the run."""
+    def build(entries) -> list[CallUsage]:
+        out = []
+        for at, model, usage, _parent in entries:
+            fields = anthropic_usage_fields(usage)
+            fields["output_tokens"] = None
+            out.append(CallUsage(at=at, model=model, speed=_reported(usage.get("speed")),
+                                 inference_geo=_reported(usage.get("inference_geo")), **fields))
+        return out
+
+    def reconciles(calls: list[CallUsage]) -> bool:
+        if not calls or total.get("input_tokens") is None:
+            return False
+        return all(sum(getattr(c, k) or 0 for c in calls) == (total.get(k) or 0)
+                   for k in _RECONCILED)
+
+    everything = build(responses.values())
+    if reconciles(everything):
+        return everything
+    main = build(e for e in responses.values() if not e[3])
+    return main if reconciles(main) else None

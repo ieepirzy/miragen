@@ -26,7 +26,10 @@ baseline, events.jsonl persistence, payload parsing, budget check, and the
 diff harvest. Payload kinds the base parser understands:
 
     thread.started   {"thread_id": ...}          resume handle
-    turn.completed   {"usage": {input_tokens, output_tokens}}
+    turn.completed   {"usage": {input_tokens, output_tokens, cached_input_tokens?,
+                                cache_write_tokens?, cache_write_1h_tokens?}}
+                     input_tokens INCLUDES cache reads and writes (the
+                     RunUsage convention); adapters normalise before emitting
     turn.failed      {"error": ...}              -> failed (resumable crash)
     item.completed   {"item": {"type": "agent_message", "text": ...}} -> output
 
@@ -42,6 +45,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -50,14 +54,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-import threading
-
 from pydantic import ValidationError
 
 from miragen import events as _events
 from miragen.events import EVENT_SCHEMA, EventPage, EventWriter
 from miragen.executor.leash import GateDecision, GateOperation, LeashPolicy
-from miragen.models import AgentProfile, ExecutorSpec, InterventionRequest, RunUsage, sum_usage
+from miragen.models import (
+    AgentProfile,
+    ExecutorSpec,
+    InterventionRequest,
+    RunUsage,
+    budget_tokens,
+    sum_usage,
+)
 
 logger = logging.getLogger("miragen.executor")
 
@@ -758,8 +767,7 @@ class ExecutorBackend(ABC):
         limits = self.profile.limits
         if limits is None or limits.tokens_per_run is None or usage is None:
             return False
-        total = (usage.input_tokens or 0) + (usage.output_tokens or 0)
-        return total > limits.tokens_per_run
+        return budget_tokens(usage) > limits.tokens_per_run
 
 
 def event_payload(event: Any) -> dict[str, Any]:
@@ -786,11 +794,17 @@ def _usage_from_payload(raw: Any) -> RunUsage | None:
         details = raw.get("input_tokens_details")
         if isinstance(details, dict):
             cached = details.get("cached_tokens")
+    def count(key: str) -> int | None:
+        value = raw.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
     return RunUsage(
         requests=1,
         input_tokens=raw.get("input_tokens"),
         output_tokens=raw.get("output_tokens"),
         cached_input_tokens=cached,
+        cache_write_tokens=count("cache_write_tokens"),
+        cache_write_1h_tokens=count("cache_write_1h_tokens"),
     )
 
 

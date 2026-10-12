@@ -147,7 +147,8 @@ async def test_turns_reuse_one_process_and_one_session(env):
     assert client.options.system_prompt == "You are Mira."
     assert first.output == "echo: " + client.prompts[0]
     assert second.output == "echo: again"
-    assert first.usage.input_tokens == 7 and first.usage.cached_input_tokens == 100
+    # Anthropic input_tokens (7) excludes the cache read: inclusive total 107.
+    assert first.usage.input_tokens == 107 and first.usage.cached_input_tokens == 100
     assert env.state()["chat"]["session_id"] == client.options.session_id
     assert env.state()["chat"]["turns"] == 2
 
@@ -455,3 +456,74 @@ async def test_delete_purges_the_inactive_harnesses_state_too(env, monkeypatch):
         "spec": {"model": "grok-build:grok-4.7", "instructions": "x"}})
     g = GrokHarness(prof, ToolGateway(prof), gsettings, served=env.served)
     assert g.session_info("chat") is None
+
+
+def _block(t, message_id, usage, parent=None):
+    return sdk.AssistantMessage(content=[sdk.TextBlock(text=t)], model="haiku", usage=usage,
+                                message_id=message_id, parent_tool_use_id=parent)
+
+
+def _final(session_id, usage):
+    return sdk.ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+                             num_turns=1, session_id=session_id, result="ok", usage=usage)
+
+
+# Shapes observed live from Claude Code: each content block of one response
+# repeats that response's usage, whose output_tokens is still provisional.
+_CALL_1 = {"input_tokens": 2, "cache_read_input_tokens": 11447,
+           "cache_creation_input_tokens": 16500, "output_tokens": 5, "speed": None,
+           "inference_geo": "not_available",
+           "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 16500}}
+_CALL_2 = {"input_tokens": 2, "cache_read_input_tokens": 27947,
+           "cache_creation_input_tokens": 1553, "output_tokens": 1, "speed": "fast",
+           "inference_geo": "us",
+           "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 1553}}
+_TOTAL = {"input_tokens": 4, "cache_creation_input_tokens": 18053,
+          "cache_read_input_tokens": 39394, "output_tokens": 123, "speed": "standard",
+          "cache_creation": {"ephemeral_1h_input_tokens": 18053, "ephemeral_5m_input_tokens": 0}}
+
+
+async def test_usage_is_inclusive_with_one_call_per_response(env):
+    def script(client, prompt):
+        yield _block("thinking", "msg_1", _CALL_1)
+        yield _block("tool", "msg_1", _CALL_1)
+        yield _block("done", "msg_2", _CALL_2)
+        yield _final(client.session_id, _TOTAL)
+
+    env.script = script
+    usage = (await env.harness().run(turn("hi"))).usage
+    assert usage.input_tokens == 4 + 18053 + 39394
+    assert (usage.cached_input_tokens, usage.cache_write_tokens,
+            usage.cache_write_1h_tokens, usage.output_tokens) == (39394, 18053, 18053, 123)
+    assert usage.requests == 2 and len(usage.calls) == 2
+    first, second = usage.calls
+    assert (first.input_tokens, first.cached_input_tokens, first.cache_write_tokens,
+            first.cache_write_1h_tokens) == (2 + 11447 + 16500, 11447, 16500, 16500)
+    # The stream's output_tokens is provisional: never reported per call.
+    assert first.output_tokens is None and second.output_tokens is None
+    assert first.model == "haiku" and first.at is not None
+    # "not_available" / null are not values; reported ones pass through.
+    assert (first.speed, first.inference_geo) == (None, None)
+    assert (second.speed, second.inference_geo) == ("fast", "us")
+
+
+async def test_calls_dropped_when_they_do_not_add_up_to_the_result(env):
+    def script(client, prompt):
+        yield _block("done", "msg_2", _CALL_2)  # one of the two requests missing
+        yield _final(client.session_id, _TOTAL)
+
+    env.script = script
+    usage = (await env.harness().run(turn("hi"))).usage
+    assert usage.calls is None and usage.input_tokens == 4 + 18053 + 39394
+
+
+async def test_subagent_requests_count_when_the_result_includes_them(env):
+    def script(client, prompt):
+        yield _block("main", "msg_1", _CALL_1)
+        yield _block("sub", "msg_2", _CALL_2, parent="toolu_1")
+        yield _final(client.session_id, _TOTAL)
+
+    env.script = script
+    result = await env.harness().run(turn("hi"))
+    assert result.output == "main"  # subagent text is still not the reply
+    assert len(result.usage.calls) == 2

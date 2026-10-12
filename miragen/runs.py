@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from miragen.models import (
+    CallUsage,
     InterventionRequest,
     RepositoryRevision,
     RunProvenance,
@@ -16,6 +17,7 @@ from miragen.models import (
     RunSummary,
     RunUsage,
     ToolCallRecord,
+    budget_tokens,
 )
 
 _PROMPT_MAX = 20_000
@@ -304,7 +306,8 @@ class RunStore:
 
 def tokens_used_since(store: RunStore, since: datetime) -> int:
     """
-    Sum input+output tokens across `store`'s run records with started_at >= since.
+    Sum budget tokens (models.budget_tokens: fresh input + output, cache
+    reads excluded) across `store`'s run records with started_at >= since.
 
     Records with no usage (e.g. a run that failed before the model responded,
     or a fresh `running` record that hasn't finished a turn yet) contribute 0
@@ -318,7 +321,7 @@ def tokens_used_since(store: RunStore, since: datetime) -> int:
     for record in store._iter_records():
         if record.started_at < since or record.usage is None:
             continue
-        total += (record.usage.input_tokens or 0) + (record.usage.output_tokens or 0)
+        total += budget_tokens(record.usage)
     return total
 
 
@@ -350,9 +353,7 @@ def reserved_tokens_in_flight(
             continue
         if per_run_reserve is None:
             return max(remaining_budget, 0)
-        already_used = 0
-        if record.usage is not None:
-            already_used = (record.usage.input_tokens or 0) + (record.usage.output_tokens or 0)
+        already_used = budget_tokens(record.usage)
         total += max(per_run_reserve - already_used, 0)
     return total
 
@@ -368,20 +369,100 @@ def _read_record(path: Path) -> RunRecord | None:
         return None
 
 
+# Provider usage keys pydantic-ai copies into `details` that prove the
+# provider reported the cache bucket at all (so a 0 is a real zero).
+_READ_KEYS = ("cache_read_input_tokens", "prompt_cache_hit_tokens")
+_WRITE_KEYS = ("cache_creation_input_tokens",)
+
+
+def _pai_cache_reads(pai_usage: Any) -> int | None:
+    details = getattr(pai_usage, "details", None) or {}
+    reads = getattr(pai_usage, "cache_read_tokens", 0) or 0
+    if not reads:
+        # DeepSeek's own name for cache hits, which pydantic-ai's usage
+        # extractor only maps when the response also carries cached_tokens.
+        reads = details.get("prompt_cache_hit_tokens") or 0
+    # pydantic-ai defaults the counter to 0: a 0 with no provider key behind
+    # it is "not reported", not "no cache reads".
+    return reads if reads or any(k in details for k in _READ_KEYS) else None
+
+
+def _pai_cache_writes(pai_usage: Any) -> int | None:
+    details = getattr(pai_usage, "details", None) or {}
+    writes = getattr(pai_usage, "cache_write_tokens", 0) or 0
+    return writes if writes or any(k in details for k in _WRITE_KEYS) else None
+
+
+def _pai_cache_write_1h(pai_usage: Any) -> int | None:
+    """The 1-hour part of the cache writes, only when pydantic-ai passed it
+    through in `details` (it does not for Anthropic as of 1.106: its usage
+    details keep only the flat counters, so the split is unknown → None)."""
+    details = getattr(pai_usage, "details", None) or {}
+    for key in ("cache_write_1h_tokens", "ephemeral_1h_input_tokens"):
+        if isinstance(details.get(key), int):
+            return details[key]
+    return None
+
+
+def _pai_token_fields(pai_usage: Any) -> dict[str, int | None]:
+    """RunUsage/CallUsage token fields from a pydantic-ai usage object.
+
+    pydantic-ai (via its usage extractor) already follows our convention: its
+    input_tokens is the whole prompt including cache reads and writes, with
+    cache_read_tokens/cache_write_tokens as subsets. All-zero usage means the
+    provider's usage could not be extracted, so nothing is reported."""
+    input_tokens = getattr(pai_usage, "input_tokens", 0) or 0
+    output_tokens = getattr(pai_usage, "output_tokens", 0) or 0
+    if not input_tokens and not output_tokens:
+        return {}
+    writes = _pai_cache_writes(pai_usage)
+    return {
+        "input_tokens": input_tokens or None,
+        "output_tokens": output_tokens or None,
+        "cached_input_tokens": _pai_cache_reads(pai_usage),
+        "cache_write_tokens": writes,
+        "cache_write_1h_tokens": _pai_cache_write_1h(pai_usage) if writes else None,
+    }
+
+
+def _pai_calls(result: Any, requests: int) -> list[CallUsage] | None:
+    """One CallUsage per model response of THIS run (new_messages(): the
+    message history passed in carries earlier turns' responses). None when
+    the responses don't account for every request — a partial breakdown
+    would misstate the run."""
+    new_messages = getattr(result, "new_messages", None)
+    if new_messages is None:
+        return None
+    calls: list[CallUsage] = []
+    for message in new_messages():
+        if getattr(message, "kind", None) != "response":
+            continue
+        timestamp = getattr(message, "timestamp", None)
+        if isinstance(timestamp, datetime) and timestamp.tzinfo is not None:
+            timestamp = timestamp.astimezone(timezone.utc)
+        calls.append(CallUsage(
+            at=timestamp if isinstance(timestamp, datetime) else None,
+            model=getattr(message, "model_name", None),
+            **_pai_token_fields(getattr(message, "usage", None)),
+        ))
+    return calls if len(calls) == requests else None
+
+
 def extract_run_details(result: Any) -> tuple[RunUsage, list[ToolCallRecord]]:
     """
     Extract usage and a tool-call trace from a PydanticAI AgentRunResult.
 
     Usage comes from result.usage (a property since pydantic-ai's AgentRunResult
-    stopped exposing it as a callable); tool calls are recovered by walking
+    stopped exposing it as a callable), plus a per-request breakdown from each
+    ModelResponse's own usage; tool calls are recovered by walking
     result.all_messages() for tool-call parts and pairing them with their
     return/retry parts via tool_call_id.
     """
     pai_usage = result.usage
     usage = RunUsage(
         requests=pai_usage.requests,
-        input_tokens=pai_usage.input_tokens or None,
-        output_tokens=pai_usage.output_tokens or None,
+        **_pai_token_fields(pai_usage),
+        calls=_pai_calls(result, pai_usage.requests),
     )
 
     calls: dict[str, dict[str, str]] = {}

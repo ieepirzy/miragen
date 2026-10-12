@@ -33,7 +33,7 @@ from miragen.executor.grok_hermetic import (
     write_hermetic_home,
 )
 from miragen.executor.leash import GateOperation
-from miragen.models import AgentProfile
+from miragen.models import AgentProfile, anthropic_usage_fields
 
 logger = logging.getLogger("miragen.executor")
 
@@ -485,14 +485,23 @@ def _to_base_payload(event: dict[str, Any]) -> list[dict[str, Any]]:
 def _usage_from_client(raw: dict[str, Any]) -> dict[str, Any]:
     if not raw:
         return {}
-    # Headless snake_case or ACP camelCase
+    if "input_tokens" in raw:
+        # Headless snake_case (grok docs, "token field policy"): input_tokens
+        # is UNCACHED only, cache reads/creation are separate buckets — the
+        # Anthropic Messages shape.
+        return {k: v for k, v in anthropic_usage_fields(raw).items() if v is not None
+                or k in ("input_tokens", "output_tokens")}
+    # ACP camelCase PromptUsage: inputTokens is already the FULL prompt.
     usage: dict[str, Any] = {
-        "input_tokens": raw.get("input_tokens", raw.get("inputTokens")),
-        "output_tokens": raw.get("output_tokens", raw.get("outputTokens")),
+        "input_tokens": raw.get("inputTokens"),
+        "output_tokens": raw.get("outputTokens"),
     }
-    cached = raw.get("cache_read_input_tokens", raw.get("cacheReadInputTokens"))
+    cached = raw.get("cacheReadInputTokens", raw.get("cachedReadTokens"))
     if cached is not None:
         usage["cached_input_tokens"] = cached
+    written = raw.get("cacheCreationInputTokens", raw.get("cachedWriteTokens"))
+    if written is not None:
+        usage["cache_write_tokens"] = written
     return usage
 
 
