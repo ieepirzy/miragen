@@ -391,27 +391,47 @@ Profiles are validated **strictly**: unknown keys are rejected with an error nam
 | `external` | The public, e.g. a customer-facing chat without account backing. |
 | `hybrid` | Both. Held to the same rules as `external`. |
 
-An `external` or `hybrid` profile is refused at load (`miragen run`, `miragen validate`, miragend's `/validate` and create) unless:
+An `external` or `hybrid` profile is refused at load (`miragen run`, `miragen validate`, miragend's `/validate`, create, config update and import) unless it meets all of the rules below.
 
-- the deployment sets `MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS`, a comma-separated list of pydantic-ai provider names such as `anthropic,openai` (trimmed, case-insensitive). **Unset or empty refuses every external/hybrid profile** (fail closed);
-- it is base tier (`spec:`), not an `executor:` profile;
-- `spec.model` is a pydantic-ai `provider:model` string whose provider is in the list. The provider is the text before the first `:` and must match a list entry exactly, so `openai` does not admit `openai-responses`; list each one you allow. Subscription harness models (`claude-code:`, `codex:`, `grok-build:`) are refused: they run on a personal login;
-- every other model it names uses an allowed provider too: the `ImageGeneration` capability's `fallback_model`, and a cloud `voice.provider` (e.g. `openai`, checked by name; the self-hosted `http` provider is the deployment's own endpoint and is not checked);
-- no model is written with `${VAR}` interpolation, since the value cannot be checked until it is resolved;
-- it has no `memory:` block: a public-facing agent keeps no long-term memory of the people it talks to.
+**Providers.** The deployment sets `MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS`, a comma-separated list of pydantic-ai provider names such as `anthropic,openai`. **Unset or empty refuses every external/hybrid profile** (fail closed).
+- `spec.model` is a pydantic-ai `provider:model` string whose provider (the text before the first `:`) is in the list. The list entries are trimmed and lowercased; the profile's provider is compared exactly as written, so `ANTHROPIC:…` or ` anthropic :…` is refused.
+- Provider families need one entry each: `openai` does not admit `openai-chat` or `openai-responses`, and `google-gla` is not `google-vertex`. List every one you allow.
+- Listing a router or gateway provider (for example `openrouter` or `litellm`), or pointing a provider at a custom base URL through its environment, admits whatever upstream model that router or URL serves. The allowlist only sees the provider name.
+- Subscription harness models (`claude-code:`, `codex:`, `grok-build:`) are refused even if listed: they run on a personal login.
+- Every other model the profile names uses an allowed provider too: the `ImageGeneration` capability's `fallback_model`, and a cloud `voice.provider` (e.g. `openai`, checked by name).
+
+**Hosts.** Every MCP capability's `url` and an `http` voice provider's `url` must have its host in `MIRAGEN_EXTERNAL_ALLOWED_HOSTS`: comma-separated hostnames, matched exactly (no wildcards, so `mcp.example.com` does not admit `sub.mcp.example.com`). Unset or empty refuses any MCP server or http voice endpoint on an external/hybrid profile; a profile with neither needs no host list.
+
+**Tier, capabilities and code.**
+- Base tier (`spec:`) only; an `executor:` profile is refused.
+- Capabilities are an allowlist: `Thinking`, `ImageGeneration`, `MCP` (host-checked), and `WebFetch` with `local: false` (the provider's native fetch). Refused: `WebSearch` (it falls back to a local DuckDuckGo search when the model has no native search, and the profile cannot turn that off), `WebFetch` with its local fetcher (it would request any URL from inside the deployment), `Peer` (it forwards the public user's text to an agent that is not held to these rules), and every custom `register_capability` entry.
+- No local `tools:`. miragend also refuses a `tools_source` at create and live tool injection (`register_tool`/`edit_tool`) for these agents.
+
+**Interpolation.** No model, MCP `url`, voice `provider` or voice `url` may use `${VAR}` interpolation: the value cannot be checked until it is resolved. `agent_type` itself may never be interpolated, on any profile.
+
+**Memory.** No `memory:` block: a public-facing agent keeps no long-term memory of the people it talks to. Per-instance conversation history, which a chat needs, is not long-term memory, but it is still what the public typed: bound it with `history_max_messages` and discard the instance (its `/agent/histories/<instance>.json`) when the conversation ends.
 
 ```yaml
 name: support-chat
 mode: interactive
 agent_type: external
+history_max_messages: 40
 triggers:
   - type: http
 spec:
-  model: anthropic:claude-sonnet-4-6     # provider "anthropic" must be allowed
+  model: anthropic:claude-sonnet-4-6     # "anthropic" must be in MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS
   instructions: You answer questions about our public documentation.
+  capabilities:
+    - MCP:
+        url: https://docs-mcp.example.com/mcp   # host must be in MIRAGEN_EXTERNAL_ALLOWED_HOSTS
+        name: docs
 ```
 
-miragend forwards `MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS` from its own environment into every agent it creates, so its `/validate` and the spawned container apply the same list. Declaring `agent_type` at all implies profile contract v3 ([miragen/profile_contract.py](miragen/profile_contract.py)): a control plane can tell a runtime enforces it when `/health` → `profile_contracts`, the image label `io.miragen.profile-contracts`, or `miragen contract` include `3`, and miragend refuses to spawn such a profile onto an older image. Serialized profiles (`model_dump`, an EDF's `resolved_profile`) omit `agent_type: internal`, so a profile that never declared a public type dumps back to its original contract.
+`miragen validate --allowed-providers … --allowed-hosts …` checks a profile against lists other than the current environment, and prints the profile's `agent_type`.
+
+miragend reads both lists from its own environment and forwards them into every agent it creates, so its `/validate` and the spawned container apply the same lists. **Narrowing a list does not reach agents that already exist** until they are re-checked: miragend checks against its current lists on create, config update and import, and a container keeps the lists it was created with until its service is regenerated (delete and re-create, import, or a config update that recreates the container). A plain restart re-checks the profile only against the container's own, older lists. After narrowing, re-create or re-import your external/hybrid agents.
+
+Declaring `agent_type` at all implies profile contract v3 ([miragen/profile_contract.py](miragen/profile_contract.py)): a control plane can tell a runtime enforces it when `/health` → `profile_contracts`, the image label `io.miragen.profile-contracts`, or `miragen contract` include `3`, and miragend refuses to spawn such a profile onto an older image. Serialized profiles (`model_dump`, an EDF's `resolved_profile`) omit `agent_type: internal`, so a profile that never declared a public type dumps back to its original contract.
 
 ### Environment interpolation
 

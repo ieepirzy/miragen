@@ -1228,8 +1228,11 @@ class AgentProfile(_ProfileModel):
             "every model (and a cloud voice.provider) names a provider in the "
             "deployment's MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS list (unset = refused), no "
             "model is a subscription harness (claude-code:, codex:, "
-            "grok-build:) or a ${VAR} interpolation, and there is no "
-            "`memory:` block. Declaring the field implies profile contract v3."
+            "grok-build:) or a ${VAR} interpolation, MCP and http voice URLs "
+            "have their host in MIRAGEN_EXTERNAL_ALLOWED_HOSTS, only safe "
+            "built-in capabilities are used (no Peer, WebSearch, local "
+            "WebFetch or custom ones), and there is no `tools:` or `memory:` "
+            "block. Declaring the field implies profile contract v3."
         ),
     )
     triggers: list[Trigger] = Field(min_length=1)
