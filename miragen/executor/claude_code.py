@@ -23,7 +23,7 @@ from typing import Any, AsyncIterator, Callable
 
 from miragen.executor.base import ExecutorBackend
 from miragen.executor.leash import GateOperation
-from miragen.models import AgentProfile
+from miragen.models import AgentProfile, anthropic_usage_fields
 
 logger = logging.getLogger("miragen.executor")
 
@@ -231,13 +231,9 @@ def _normalize(message: Any) -> list[dict[str, Any]]:
                 "type": "turn.failed",
                 "error": {"message": getattr(message, "result", None) or "executor reported error"},
             }]
+        # Anthropic Messages usage (input_tokens excludes cache) → the
+        # inclusive normalized payload the base parser reads.
         raw_usage = getattr(message, "usage", None) or {}
-        return prefix + [{
-            "type": "turn.completed",
-            "usage": {
-                "input_tokens": raw_usage.get("input_tokens"),
-                "output_tokens": raw_usage.get("output_tokens"),
-            },
-        }]
+        return prefix + [{"type": "turn.completed", "usage": anthropic_usage_fields(raw_usage)}]
 
     return []  # UserMessage (tool results echoed back) and anything unknown

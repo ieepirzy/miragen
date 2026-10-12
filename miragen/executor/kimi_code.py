@@ -23,7 +23,7 @@ from typing import Any, AsyncIterator, Callable
 
 from miragen.executor.base import ExecutorBackend
 from miragen.executor.leash import GateOperation
-from miragen.models import AgentProfile
+from miragen.models import AgentProfile, inclusive_input
 
 logger = logging.getLogger("miragen.executor")
 
@@ -294,22 +294,30 @@ def _usage_from_status(message: Any) -> dict[str, Any] | None:
     raw = getattr(message, "token_usage", None)
     if raw is None:
         return None
-    # TokenUsage: input_other / output / input_cache_read
-    input_tokens = getattr(raw, "input_other", None)
-    if input_tokens is None and isinstance(raw, dict):
-        input_tokens = raw.get("input_other") or raw.get("input_tokens")
-    output_tokens = getattr(raw, "output", None)
-    if output_tokens is None and isinstance(raw, dict):
-        output_tokens = raw.get("output") or raw.get("output_tokens")
-    cached = getattr(raw, "input_cache_read", None)
-    if cached is None and isinstance(raw, dict):
-        cached = raw.get("input_cache_read") or raw.get("cached_input_tokens")
-    if input_tokens is None and output_tokens is None:
+
+    def field(attr: str, *fallbacks: str) -> Any:
+        value = getattr(raw, attr, None)
+        if value is None and isinstance(raw, dict):
+            for key in (attr, *fallbacks):
+                if raw.get(key) is not None:
+                    return raw[key]
+        return value
+
+    # TokenUsage: input_other / output / input_cache_read / input_cache_creation.
+    # input_other is the UNCACHED part (kimi's own total is other + cache read
+    # + cache creation), so the normalized input_tokens adds them back.
+    input_other = field("input_other", "input_tokens")
+    output_tokens = field("output", "output_tokens")
+    cached = field("input_cache_read", "cached_input_tokens")
+    written = field("input_cache_creation", "cache_write_tokens")
+    if input_other is None and output_tokens is None:
         return None
     usage: dict[str, Any] = {
-        "input_tokens": input_tokens,
+        "input_tokens": inclusive_input(input_other, cached, written),
         "output_tokens": output_tokens,
     }
     if cached is not None:
         usage["cached_input_tokens"] = cached
+    if written is not None:
+        usage["cache_write_tokens"] = written
     return usage

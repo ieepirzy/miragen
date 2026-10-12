@@ -202,11 +202,7 @@ def write_model_turn_events(
         else:
             sink.write({
                 "type": "turn.completed",
-                "usage": {
-                    "input_tokens": usage.input_tokens if usage else None,
-                    "output_tokens": usage.output_tokens if usage else None,
-                    "cached_input_tokens": usage.cached_input_tokens if usage else None,
-                }
-                if usage
-                else None,
+                # The RunUsage fields (inclusive input_tokens, cache reads and
+                # writes, per-request calls) minus `requests`.
+                "usage": usage.model_dump(mode="json", exclude={"requests"}) if usage else None,
             })

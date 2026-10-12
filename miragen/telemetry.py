@@ -338,6 +338,11 @@ class MiragenTelemetry:
                     root.set_attribute(
                         "gen_ai.usage.cached_input_tokens", usage.cached_input_tokens
                     )
+                # pydantic-ai's name for cache writes on the model tier.
+                if usage.cache_write_tokens is not None:
+                    root.set_attribute(
+                        "gen_ai.usage.cache_creation.input_tokens", usage.cache_write_tokens
+                    )
             if status == "failed":
                 root.set_status(Status(StatusCode.ERROR, exit_reason or "failed"))
 

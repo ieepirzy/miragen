@@ -51,13 +51,72 @@ INSTANCE_NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,62}$"
 DEFAULT_INSTANCE = "default"
 
 
+# Upper bound on RunUsage.calls: a run record stays a bounded size however
+# many model requests the run made. Past it the first CALLS_CAP entries are
+# kept and calls_truncated is set; the RunUsage totals stay the true totals.
+CALLS_CAP = 1000
+
+
+class CallUsage(BaseModel):
+    """Usage of ONE model request, as the provider reported it.
+
+    Same token convention as RunUsage (input_tokens includes cache reads and
+    cache writes). Every field is optional and None means "not reported":
+    adapters never invent a value (e.g. speed/inference_geo are set only when
+    the provider response itself carries them)."""
+
+    at: Optional[datetime] = None  # UTC time the response was received
+    model: Optional[str] = None
+    input_tokens: Optional[int] = None
+    cached_input_tokens: Optional[int] = None
+    cache_write_tokens: Optional[int] = None
+    cache_write_1h_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    speed: Optional[str] = None  # e.g. "fast" / "standard", when reported
+    inference_geo: Optional[str] = None  # when reported
+
+
 class RunUsage(BaseModel):
+    """Token usage of a run (or one turn of it), one convention for every
+    adapter (OpenAI style):
+
+    - input_tokens: ALL prompt tokens, INCLUDING cache reads and cache writes.
+      Uncached input = input_tokens - cached_input_tokens - cache_write_tokens.
+    - cached_input_tokens: prompt-cache reads (a subset of input_tokens).
+    - cache_write_tokens: prompt-cache writes (a subset of input_tokens).
+    - cache_write_1h_tokens: the part of cache_write_tokens written with the
+      1-hour TTL; the rest are 5-minute writes. None = split unknown.
+    - calls: one entry per model request, in order, when the adapter can see
+      individual requests; None when it cannot. Capped at CALLS_CAP entries
+      (calls_truncated=True then); the totals above are always the full run.
+
+    None on any metric = the adapter cannot report it; never coerced to 0.
+    """
+
     requests: int
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
     # Prompt-cache reads, where the adapter reports them (issue #33 Phase E).
     # None = the executor cannot report this metric; never coerced to 0.
     cached_input_tokens: Optional[int] = None
+    cache_write_tokens: Optional[int] = None
+    cache_write_1h_tokens: Optional[int] = None
+    calls: Optional[list[CallUsage]] = None
+    calls_truncated: bool = False
+
+    @model_validator(mode="after")
+    def _cap_calls(self) -> "RunUsage":
+        if self.calls is not None and len(self.calls) > CALLS_CAP:
+            self.calls = self.calls[:CALLS_CAP]
+            self.calls_truncated = True
+        return self
+
+
+def _add_optional(a: Optional[int], b: Optional[int]) -> Optional[int]:
+    """None only when neither side reported the metric; a reported 0 stays 0."""
+    if a is None and b is None:
+        return None
+    return (a or 0) + (b or 0)
 
 
 def sum_usage(a: Optional[RunUsage], b: Optional[RunUsage]) -> Optional[RunUsage]:
@@ -68,12 +127,65 @@ def sum_usage(a: Optional[RunUsage], b: Optional[RunUsage]) -> Optional[RunUsage
         return b
     if b is None:
         return a
+    # The 1h split is only known when every side that wrote cache knows it:
+    # summing a known split with an unknown one would pass for a full split.
+    split_known = all(
+        u.cache_write_1h_tokens is not None or not u.cache_write_tokens for u in (a, b)
+    )
+    # An incomplete per-request breakdown is no breakdown.
+    calls = a.calls + b.calls if a.calls is not None and b.calls is not None else None
     return RunUsage(
         requests=a.requests + b.requests,
         input_tokens=(a.input_tokens or 0) + (b.input_tokens or 0) or None,
         output_tokens=(a.output_tokens or 0) + (b.output_tokens or 0) or None,
         cached_input_tokens=(a.cached_input_tokens or 0) + (b.cached_input_tokens or 0) or None,
+        cache_write_tokens=_add_optional(a.cache_write_tokens, b.cache_write_tokens),
+        cache_write_1h_tokens=(
+            _add_optional(a.cache_write_1h_tokens, b.cache_write_1h_tokens) if split_known else None
+        ),
+        calls=calls,
+        calls_truncated=calls is not None and (a.calls_truncated or b.calls_truncated),
     )
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def inclusive_input(
+    uncached: Optional[int], cache_read: Optional[int], cache_write: Optional[int]
+) -> Optional[int]:
+    """Total prompt tokens from a provider that reports the uncached part
+    separately (Anthropic Messages style). None when the uncached part is
+    unknown — a cache-only figure is not a total."""
+    if uncached is None:
+        return None
+    return uncached + (cache_read or 0) + (cache_write or 0)
+
+
+def anthropic_usage_fields(raw: Any) -> dict[str, Optional[int]]:
+    """Token fields (RunUsage/CallUsage kwargs, inclusive convention) from an
+    Anthropic Messages `usage` object, where `input_tokens` EXCLUDES cache
+    reads (`cache_read_input_tokens`) and writes (`cache_creation_input_tokens`,
+    split by TTL under `cache_creation.ephemeral_{5m,1h}_input_tokens`)."""
+    if not isinstance(raw, dict):
+        return {}
+    read = _int_or_none(raw.get("cache_read_input_tokens"))
+    write = _int_or_none(raw.get("cache_creation_input_tokens"))
+    split = raw.get("cache_creation")
+    one_hour = None
+    if isinstance(split, dict):
+        one_hour = _int_or_none(split.get("ephemeral_1h_input_tokens"))
+        five_min = _int_or_none(split.get("ephemeral_5m_input_tokens"))
+        if write is None and one_hour is not None and five_min is not None:
+            write = one_hour + five_min
+    return {
+        "input_tokens": inclusive_input(_int_or_none(raw.get("input_tokens")), read, write),
+        "output_tokens": _int_or_none(raw.get("output_tokens")),
+        "cached_input_tokens": read,
+        "cache_write_tokens": write,
+        "cache_write_1h_tokens": one_hour if write is not None else None,
+    }
 
 
 RunStatus = Literal[

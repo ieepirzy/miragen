@@ -26,7 +26,10 @@ baseline, events.jsonl persistence, payload parsing, budget check, and the
 diff harvest. Payload kinds the base parser understands:
 
     thread.started   {"thread_id": ...}          resume handle
-    turn.completed   {"usage": {input_tokens, output_tokens}}
+    turn.completed   {"usage": {input_tokens, output_tokens, cached_input_tokens?,
+                                cache_write_tokens?, cache_write_1h_tokens?}}
+                     input_tokens INCLUDES cache reads and writes (the
+                     RunUsage convention); adapters normalise before emitting
     turn.failed      {"error": ...}              -> failed (resumable crash)
     item.completed   {"item": {"type": "agent_message", "text": ...}} -> output
 
@@ -786,11 +789,17 @@ def _usage_from_payload(raw: Any) -> RunUsage | None:
         details = raw.get("input_tokens_details")
         if isinstance(details, dict):
             cached = details.get("cached_tokens")
+    def count(key: str) -> int | None:
+        value = raw.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
     return RunUsage(
         requests=1,
         input_tokens=raw.get("input_tokens"),
         output_tokens=raw.get("output_tokens"),
         cached_input_tokens=cached,
+        cache_write_tokens=count("cache_write_tokens"),
+        cache_write_1h_tokens=count("cache_write_1h_tokens"),
     )
 
 

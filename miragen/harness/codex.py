@@ -1114,6 +1114,8 @@ def _tool_output(result: Any) -> dict:
 def _usage(raw: dict[str, Any], *, requests: int = 1) -> RunUsage:
     def pick(key):
         return raw.get(key) if isinstance(raw.get(key), int) else None
+    # OpenAI convention: inputTokens already includes cachedInputTokens.
     return RunUsage(requests=max(requests, 1), input_tokens=pick("inputTokens"),
                     output_tokens=pick("outputTokens"),
-                    cached_input_tokens=pick("cachedInputTokens"))
+                    cached_input_tokens=pick("cachedInputTokens"),
+                    cache_write_tokens=pick("cacheWriteInputTokens"))

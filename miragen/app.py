@@ -674,6 +674,12 @@ async def run_agent(
                     run_span.set_attribute("gen_ai.usage.input_tokens", result.usage.input_tokens)
                 if result.usage.output_tokens:
                     run_span.set_attribute("gen_ai.usage.output_tokens", result.usage.output_tokens)
+                if result.usage.cached_input_tokens is not None:
+                    run_span.set_attribute("gen_ai.usage.cached_input_tokens",
+                                           result.usage.cached_input_tokens)
+                if result.usage.cache_write_tokens is not None:
+                    run_span.set_attribute("gen_ai.usage.cache_creation.input_tokens",
+                                           result.usage.cache_write_tokens)
     except Exception as e:
         if record is not None and _run_store is not None:
             _run_store.finish(record, status="failed", error=str(e))

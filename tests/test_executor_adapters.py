@@ -530,9 +530,10 @@ def test_normalize_kimi_text_and_tool_and_usage():
     assert _normalize(ToolCall("Shell")) == [
         {"type": "item.completed", "item": {"type": "tool_use", "name": "Shell"}}
     ]
+    # input_other excludes the cache read: the normalized input is inclusive.
     assert _normalize(StatusUpdate(_TokenUsage(1, 2, 3))) == [
         {"type": "turn.completed", "usage": {
-            "input_tokens": 1, "output_tokens": 2, "cached_input_tokens": 3,
+            "input_tokens": 4, "output_tokens": 2, "cached_input_tokens": 3,
         }}
     ]
     assert _normalize(TurnEnd()) == []
@@ -700,8 +701,9 @@ def test_normalize_grok_streaming_events():
     })
     assert end[0] == {"type": "thread.started", "thread_id": "s1"}
     assert end[1]["type"] == "turn.completed"
+    # Headless input_tokens is uncached only: normalized to inclusive.
     assert end[1]["usage"] == {
-        "input_tokens": 1, "output_tokens": 2, "cached_input_tokens": 3,
+        "input_tokens": 4, "output_tokens": 2, "cached_input_tokens": 3,
     }
     assert _normalize_event({"type": "error", "message": "boom"}) == [
         {"type": "turn.failed", "error": {"message": "boom"}}
@@ -742,7 +744,8 @@ async def test_grok_build_success_harvests_diff(tmp_path):
     assert result.status == "succeeded"
     assert result.thread_id is not None  # minted UUID
     assert result.output == "patched the bug"
-    assert result.usage.input_tokens == 100 and result.usage.output_tokens == 40
+    # 100 uncached + 20 cache reads: input_tokens is the whole prompt.
+    assert result.usage.input_tokens == 120 and result.usage.output_tokens == 40
     assert result.usage.cached_input_tokens == 20
     assert "+print('fixed')" in Path(result.diff_path).read_text()
 
