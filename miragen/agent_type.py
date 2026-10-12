@@ -126,6 +126,12 @@ def check_agent_type(
             "executor profile runs its own loop on its own credentials"
         )
 
+    if profile.tools:
+        raise ValueError(
+            f"tools: {who} profiles may not list local tools (custom code "
+            "with whatever access the container has)"
+        )
+
     if profile.memory is not None:
         raise ValueError(
             f"memory: {who} profiles may not have a `memory:` block; a "
@@ -178,14 +184,43 @@ def _capability_entries(profile: AgentProfile) -> list[tuple[int, str, dict]]:
     return out
 
 
+# Built-in capabilities a public-facing profile may use. An allowlist, not a
+# denylist: custom @register_capability entries (arbitrary code) and any
+# capability added later are refused until someone decides they are safe.
+#   Thinking         — model-side only.
+#   ImageGeneration  — native (the allowed provider) or a fallback_model,
+#                      which is checked against the provider list.
+#   MCP              — url host checked against the host allowlist.
+#   WebFetch         — only `local: false` (the provider's native fetch);
+#                      the local default fetches any URL from inside the
+#                      deployment's network on the public user's say-so.
+# Refused: WebSearch (falls back to a local DuckDuckGo search, a third party,
+# when the model has no native search, and the profile cannot turn that off)
+# and Peer (forwards the public user's text to an unchecked agent).
+PUBLIC_CAPABILITIES = frozenset({"Thinking", "ImageGeneration", "MCP", "WebFetch"})
+
+
 def _check_capabilities(profile: AgentProfile, who: str) -> None:
-    for i, name, _cfg in _capability_entries(profile):
+    for i, name, cfg in _capability_entries(profile):
         where = f"spec.capabilities[{i}].{name}"
         if name == "Peer":
             raise ValueError(
                 f"{where}: {who} profiles may not use the Peer capability; "
                 "call_agent would forward the public user's text to another "
                 "agent that is not held to these rules"
+            )
+        if name not in PUBLIC_CAPABILITIES:
+            raise ValueError(
+                f"{where}: {who} profiles may not use the {name} capability "
+                f"(allowed: {', '.join(sorted(PUBLIC_CAPABILITIES))}); custom "
+                "capabilities and ones that reach the network on their own "
+                "are refused"
+            )
+        if name == "WebFetch" and cfg.get("local", True) is not False:
+            raise ValueError(
+                f"{where}.local: {who} profiles may use WebFetch only with "
+                "`local: false` (the provider's native fetch); the local "
+                "fetcher would request any URL from inside this deployment"
             )
 
 

@@ -189,6 +189,40 @@ def test_peer_capability_fails(tmp_path, public):
         _load(tmp_path, doc)
 
 
+def test_safe_builtin_capabilities_pass(tmp_path, public):
+    doc = _profile(public, capabilities=[
+        "Thinking", "ImageGeneration", {"WebFetch": {"local": False}},
+    ])
+    assert _load(tmp_path, doc).agent_type == public
+
+
+@pytest.mark.parametrize("cap", ["WebSearch", "WebFetch", {"WebFetch": {"local": True}}])
+def test_network_reaching_capabilities_fail(tmp_path, public, cap):
+    with pytest.raises(ValueError, match=r"spec\.capabilities\[0\]\.Web"):
+        _load(tmp_path, _profile(public, capabilities=[cap]))
+
+
+def test_custom_capability_fails(tmp_path, public):
+    from miragen.load import _CAPABILITY_REGISTRY, register_capability
+
+    register_capability("CustomThing")(lambda cfg: None)
+    try:
+        doc = _profile(public, capabilities=[{"CustomThing": {}}])
+        with pytest.raises(ValueError, match=r"capabilities\[0\]\.CustomThing: .*CustomThing capability"):
+            _load(tmp_path, doc)
+        # The same capability on an internal profile is fine.
+        assert _load(tmp_path, _profile("internal", capabilities=[{"CustomThing": {}}]))
+    finally:
+        _CAPABILITY_REGISTRY.pop("CustomThing", None)
+
+
+def test_local_tools_fail(tmp_path, public):
+    doc = _profile(public)
+    doc["tools"] = ["lookup_order"]
+    with pytest.raises(ValueError, match=r"tools: .*local tools"):
+        _load(tmp_path, doc)
+
+
 @pytest.mark.parametrize("allowed", [None, "", " , ,"])
 def test_unset_or_empty_allowlist_fails_closed(tmp_path, public, allowed):
     # None = read the environment, which the autouse fixture cleared.
