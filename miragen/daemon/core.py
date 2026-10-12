@@ -46,6 +46,7 @@ from miragen.agent_type import (
     PUBLIC_AGENT_TYPES,
     allowed_hosts_from_env,
     allowed_providers_from_env,
+    code_violations,
     is_code_path,
 )
 from miragen.load import load_profile
@@ -1616,6 +1617,13 @@ class LifecycleCore:
             yaml_src.write_text(rewritten)
 
             summary = validate_profile_text(rewritten, environ=self._environ)
+            if summary.get("agent_type") in PUBLIC_AGENT_TYPES:
+                offending = code_violations(src_root)
+                if offending:
+                    raise PublicAgentRefused(
+                        f"archive profile is agent_type: {summary['agent_type']} but "
+                        f"carries code the runtime would load: {offending}"
+                    )
 
             # An import is a create by another door: the archive's profile
             # meets the same contract gate, or it lands as the crash loop

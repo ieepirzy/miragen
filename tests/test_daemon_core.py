@@ -491,6 +491,56 @@ def test_internal_agent_write_file_unaffected(tmp_path):
     core.write_file("alpha", "agent.yaml", _yaml("alpha"))
 
 
+def _archive(tmp_path, files):
+    """An export-shaped archive: alpha/<files> under exports/."""
+    exports = tmp_path / "exports"
+    exports.mkdir(parents=True, exist_ok=True)
+    src = tmp_path / "archive-src" / "alpha"
+    src.mkdir(parents=True)
+    for rel, text in files.items():
+        (src / rel).parent.mkdir(parents=True, exist_ok=True)
+        (src / rel).write_text(text)
+    archive = exports / "alpha.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(src, arcname="alpha")
+    return str(archive)
+
+
+@pytest.mark.parametrize("extra", [
+    {"tools.py": "@register\nasync def greet(ctx) -> str:\n    return \"hi\"\n"},
+    {"tools.py": PLACEHOLDER_TOOLS, "helper.py": "import os\n"},
+    {"tools.py": PLACEHOLDER_TOOLS, "lib/httpx.pyc": "x"},
+])
+def test_import_refuses_public_archive_with_code(tmp_path, extra):
+    from miragen.daemon.core import PublicAgentRefused
+
+    core = _contract3_external_core(tmp_path)
+    archive = _archive(tmp_path, {"agent.yaml": EXTERNAL_YAML.format(name="alpha"), **extra})
+    with pytest.raises(PublicAgentRefused, match="carries code"):
+        core.import_agent("beta", archive)
+    assert not (tmp_path / "agents" / "beta").exists()
+
+
+def test_import_accepts_public_archive_with_placeholder_tools(tmp_path):
+    core = _contract3_external_core(tmp_path)
+    archive = _archive(tmp_path, {
+        "agent.yaml": EXTERNAL_YAML.format(name="alpha"),
+        "tools.py": PLACEHOLDER_TOOLS,
+        "data/faq.md": "public answers",
+    })
+    core.import_agent("beta", archive)
+    assert core.read_file("beta", "data/faq.md") == "public answers"
+
+
+def test_import_revalidates_against_the_daemon_allowlist(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS", "test")
+    core = _external_core(tmp_path, {})
+    archive = _archive(tmp_path, {"agent.yaml": EXTERNAL_YAML.format(name="alpha")})
+    with pytest.raises(ValidationFailed, match="MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS"):
+        core.import_agent("beta", archive)
+    assert not (tmp_path / "agents" / "beta").exists()
+
+
 def test_validate_profile_text_reads_hosts_from_the_given_environ(monkeypatch):
     monkeypatch.setenv("MIRAGEN_EXTERNAL_ALLOWED_HOSTS", "mcp.example.com")
     text = EXTERNAL_YAML.format(name="alpha") + (
