@@ -275,7 +275,7 @@ def grok_login(grok_home: str | None) -> None:
 
 
 @cli.command()
-@click.argument("profile", envvar="AGENT_PROFILE", default="agent.yaml")
+@click.argument("profiles", nargs=-1)
 @click.option("--tools", default="tools", envvar="TOOLS",
               help="Tools module to import before validating")
 @click.option("--allowed-providers", default=None, envvar="MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS",
@@ -284,18 +284,30 @@ def grok_login(grok_home: str | None) -> None:
 @click.option("--allowed-hosts", default=None, envvar="MIRAGEN_EXTERNAL_ALLOWED_HOSTS",
               help="Hosts their MCP servers / http voice endpoint may live on, comma-separated "
                    "(default: $MIRAGEN_EXTERNAL_ALLOWED_HOSTS)")
-def validate(profile: str, tools: str, allowed_providers: str | None,
+def validate(profiles: tuple[str, ...], tools: str, allowed_providers: str | None,
              allowed_hosts: str | None) -> None:
     """
-    Validate an agent profile YAML without starting the server.
+    Validate agent profile YAMLs without starting the server.
     Useful in CI or when authoring a new agent.
+
+    PROFILES defaults to $AGENT_PROFILE, else agent.yaml. Every profile is
+    checked; the exit code is 1 if any of them is invalid.
     """
     _import_tools(tools)
 
-    try:
-        # "" (not None) when unset: the flags already fell back to the env.
-        p = load_profile(profile, allowed_providers=allowed_providers or "",
-                         allowed_hosts=allowed_hosts or "")
+    paths = profiles or (os.environ.get("AGENT_PROFILE", "agent.yaml"),)
+    failed = 0
+    for i, path in enumerate(paths):
+        if len(paths) > 1:
+            click.echo(("\n" if i else "") + f"{path}:")
+        try:
+            # "" (not None) when unset: the flags already fell back to the env.
+            p = load_profile(path, allowed_providers=allowed_providers or "",
+                             allowed_hosts=allowed_hosts or "")
+        except Exception as e:
+            _echo_profile_error(e)
+            failed += 1
+            continue
         click.echo(click.style(f"✓ '{p.name}' is valid", fg="green"))
         click.echo(f"  mode:         {p.mode}")
         click.echo(f"  agent_type:   {p.agent_type}")
@@ -305,12 +317,28 @@ def validate(profile: str, tools: str, allowed_providers: str | None,
             click.echo(f"  mcp servers:  {[s.name for s in p.executor.mcp_servers or []]}")
         else:
             click.echo(f"  model:        {p.spec.model}")
-            click.echo(f"  capabilities: {p.spec.capabilities or []}")
+            click.echo(f"  capabilities: {_capability_labels(p.spec.capabilities)}")
         click.echo(f"  triggers:     {[t.type for t in p.triggers]}")
         click.echo(f"  tools:        {p.tools or []}")
-    except Exception as e:
-        _echo_profile_error(e)
+    if len(paths) > 1:
+        click.echo(f"\n{len(paths) - failed}/{len(paths)} profile(s) valid")
+    if failed:
         raise SystemExit(1)
+
+
+def _capability_labels(capabilities) -> list[str]:
+    """Capability names only (an MCP's by its tool prefix): a config holds
+    interpolated URLs and headers, which may carry secrets into a CI log."""
+    labels = []
+    for cap in capabilities or []:
+        if isinstance(cap, dict):
+            for kind, cfg in cap.items():
+                name = cfg.get("name") if isinstance(cfg, dict) else None
+                labels.append(f"{kind}({name})" if name else str(kind))
+        else:
+            labels.append(str(cap))
+    return labels
+
 
 @cli.command(name="memory-hook")
 @click.argument("harness", type=click.Choice(["claude-code", "codex"]))

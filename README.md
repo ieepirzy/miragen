@@ -666,9 +666,28 @@ miragen run                              # start the agent server
 miragen run --tools my_tools             # custom tools module
 miragen run --port 9000                  # custom port
 miragen validate agents/morning.yaml    # validate a profile without starting
+miragen validate agents/*.yaml           # validate several; exit 1 if any is invalid
 ```
 
 Environment variables: `AGENT_PROFILE`, `TOOLS`, `HOST`, `PORT`.
+
+### Validating profiles in CI
+
+`miragen validate` runs the same loader as `miragen run` (schema, strict keys, `agent_type` rules, `${VAR}` interpolation) without starting a server or reaching any upstream. Pin the miragen version you deploy so CI checks against the schema that will run:
+
+```yaml
+# .github/workflows/profiles.yml
+- uses: actions/setup-python@v5
+  with: { python-version: "3.12" }
+- run: pip install "miragen==${{ env.MIRAGEN_VERSION }}"   # the version your image runs
+- run: miragen validate agents/*/agent.yaml
+  env:
+    # A profile's ${VAR} must be defined, as at runtime. Placeholders are
+    # enough for validation; no real credentials are needed.
+    WEBHOOK_URL: https://example.invalid/hook
+```
+
+Capabilities are printed by name only (`MCP(github)`), never with their interpolated URLs or headers.
 
 ---
 
