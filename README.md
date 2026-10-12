@@ -310,6 +310,8 @@ never guarded and advertises `capabilities` for version-skew detection):
 name: my-agent                    # unique ID, used as container name
                                   # (lowercase letters, digits, - and _; max 63 chars)
 mode: autonomous                  # autonomous | interactive | hybrid
+agent_type: internal              # optional — internal (default) | external | hybrid;
+                                  # who the agent serves, see "Agent type" below
 
 triggers:
   - type: cron
@@ -378,6 +380,38 @@ spec:
 ```
 
 Profiles are validated **strictly**: unknown keys are rejected with an error naming the offending field, so typos like `aproval_required:` fail at `miragen validate` time instead of silently disabling the feature.
+
+### Agent type: internal, external, hybrid
+
+`agent_type` declares who the agent serves. It is independent of `mode`, which is about how the agent is activated.
+
+| Value | Serves |
+|---|---|
+| `internal` (default) | The deployment's own people and systems. No extra rules. |
+| `external` | The public, e.g. a customer-facing chat without account backing. |
+| `hybrid` | Both. Held to the same rules as `external`. |
+
+An `external` or `hybrid` profile is refused at load (`miragen run`, `miragen validate`, miragend's `/validate` and create) unless:
+
+- the deployment sets `MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS`, a comma-separated list of pydantic-ai provider names such as `anthropic,openai` (trimmed, case-insensitive). **Unset or empty refuses every external/hybrid profile** (fail closed);
+- it is base tier (`spec:`), not an `executor:` profile;
+- `spec.model` is a pydantic-ai `provider:model` string whose provider is in the list. The provider is the text before the first `:` and must match a list entry exactly, so `openai` does not admit `openai-responses`; list each one you allow. Subscription harness models (`claude-code:`, `codex:`, `grok-build:`) are refused: they run on a personal login;
+- every other model it names uses an allowed provider too: the `ImageGeneration` capability's `fallback_model`;
+- no model is written with `${VAR}` interpolation, since the value cannot be checked until it is resolved;
+- it has no `memory:` block: a public-facing agent keeps no long-term memory of the people it talks to.
+
+```yaml
+name: support-chat
+mode: interactive
+agent_type: external
+triggers:
+  - type: http
+spec:
+  model: anthropic:claude-sonnet-4-6     # provider "anthropic" must be allowed
+  instructions: You answer questions about our public documentation.
+```
+
+miragend forwards `MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS` from its own environment into every agent it creates, so its `/validate` and the spawned container apply the same list. Declaring `agent_type` at all implies profile contract v3 (see `apiVersion`): a control plane can tell a runtime enforces it when `/health` → `profile_contracts`, the image label `io.miragen.profile-contracts`, or `miragen contract` include `3`, and miragend refuses to spawn such a profile onto an older image.
 
 ### Environment interpolation
 
