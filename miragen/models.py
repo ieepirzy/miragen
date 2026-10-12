@@ -1209,6 +1209,21 @@ class AgentProfile(_ProfileModel):
         pattern=r"^[a-z0-9][a-z0-9_-]{0,62}$",
     )
     mode: Literal["autonomous", "interactive", "hybrid"]
+    agent_type: Literal["internal", "external", "hybrid"] = Field(
+        default="internal",
+        description=(
+            "Who the agent serves (independent of `mode`, which is about how it "
+            "is activated). 'internal' (default): the deployment's own people "
+            "and systems. 'external': the public, e.g. a customer-facing chat "
+            "without account backing. 'hybrid': both. external and hybrid "
+            "profiles are refused at load unless they are base tier (`spec`), "
+            "every model names a provider in the deployment's "
+            "MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS list (unset = refused), no "
+            "model is a subscription harness (claude-code:, codex:, "
+            "grok-build:) or a ${VAR} interpolation, and there is no "
+            "`memory:` block. Declaring the field implies profile contract v3."
+        ),
+    )
     triggers: list[Trigger] = Field(min_length=1)
     watch: list[WatchSource] = Field(default_factory=list, description=(
         "Sources the host polls between turns (read-only gateway tools) to keep an inbox of "
