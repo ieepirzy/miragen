@@ -152,6 +152,13 @@ def check_agent_type(
     parsed, or the raw comma-separated strings); None or empty refuses. `uninterpolated`: the profile document as
     written, before ``${VAR}`` expansion — the only place an interpolated
     model is still visible."""
+    # Every profile, internal included: `${AT:-internal}` would otherwise
+    # decide at load time whether any rule applies.
+    if uninterpolated is not None and _is_interpolated(uninterpolated.get("agent_type")):
+        raise ValueError(
+            "agent_type: may not use ${VAR} interpolation; who a profile serves "
+            "decides which rules apply, so write it literally"
+        )
     if profile.agent_type not in PUBLIC_AGENT_TYPES:
         return
     who = f"agent_type: {profile.agent_type}"

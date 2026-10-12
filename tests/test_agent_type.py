@@ -75,6 +75,15 @@ def test_internal_is_unaffected_by_any_rule(tmp_path):
     assert load_profile(_write(tmp_path, EXECUTOR)).agent_type == "internal"
 
 
+@pytest.mark.parametrize("raw", ["${AT:-internal}", "${AT}", "inter${X:-}nal"])
+def test_interpolated_agent_type_fails_for_every_profile(tmp_path, monkeypatch, raw):
+    monkeypatch.setenv("AT", "internal")
+    doc = _profile()
+    doc["agent_type"] = raw
+    with pytest.raises(ValueError, match=r"agent_type: may not use \$\{VAR\} interpolation"):
+        _load(tmp_path, doc, allowed=None)
+
+
 # ── external / hybrid ────────────────────────────────────────────────────────
 
 
