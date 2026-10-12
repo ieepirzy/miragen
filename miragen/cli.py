@@ -43,6 +43,29 @@ def _echo_profile_error(e: Exception) -> None:
         click.echo(click.style(f"✗ Invalid profile: {e}", fg="red"))
 
 
+def _refuse_tools_for_public_profile(tools: str) -> None:
+    """tools.py is imported (run) before the profile is validated, because
+    an internal profile may name capabilities it registers. A public-facing
+    profile takes no custom code, so check that first, from the profile as
+    written (an interpolated agent_type is refused at load anyway)."""
+    import yaml
+
+    from miragen.agent_type import PUBLIC_AGENT_TYPES, is_code_free_python
+
+    try:
+        with open(os.environ.get("AGENT_PROFILE", "agent.yaml")) as f:
+            agent_type = (yaml.safe_load(f) or {}).get("agent_type")
+    except Exception:
+        return  # unreadable: the profile load reports it
+    tools_path = Path(f"{tools}.py")
+    if agent_type in PUBLIC_AGENT_TYPES and tools_path.exists() \
+            and not is_code_free_python(tools_path.read_text()):
+        click.echo(click.style(
+            f"✗ Invalid profile: agent_type: {agent_type} takes no custom code, but "
+            f"{tools_path} defines some; refusing to import it", fg="red"))
+        raise SystemExit(1)
+
+
 def _preload_profile() -> None:
     """Validate the profile before uvicorn starts, so a refused profile
     exits with its message instead of an application-startup traceback.
@@ -74,6 +97,7 @@ def cli():
               help="Enable auto-reload (development only)")
 def run(tools: str, host: str, port: int, reload: bool) -> None:
     """Start the agent container server."""
+    _refuse_tools_for_public_profile(tools)
     _import_tools(tools)
     _preload_profile()
     uvicorn.run(

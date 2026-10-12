@@ -395,3 +395,23 @@ def test_validate_flags_and_agent_type_output(tmp_path, monkeypatch):
         ALLOWED_PROVIDERS_ENV: "anthropic", ALLOWED_HOSTS_ENV: "mcp.example.com",
     })
     assert from_env.exit_code == 0, from_env.output
+
+
+def test_run_refuses_public_profile_tools_before_importing_them(tmp_path, monkeypatch):
+    # The tools file would leave a marker if it were imported.
+    marker = tmp_path / "imported"
+    (tmp_path / "tools.py").write_text(f"open({str(marker)!r}, 'w').close()\n")
+    result, started = _cli(tmp_path, monkeypatch, ["run"], _profile("external"),
+                           env={ALLOWED_PROVIDERS_ENV: "anthropic"})
+    assert result.exit_code == 1
+    assert "takes no custom code" in result.output
+    assert not marker.exists()
+    assert started == []
+
+
+def test_run_accepts_placeholder_tools_for_public_profile(tmp_path, monkeypatch):
+    (tmp_path / "tools.py").write_text("from miragen import register\n\n# Tools for x\n")
+    result, started = _cli(tmp_path, monkeypatch, ["run"], _profile("external"),
+                           env={ALLOWED_PROVIDERS_ENV: "anthropic"})
+    assert result.exit_code == 0, result.output
+    assert len(started) == 1
