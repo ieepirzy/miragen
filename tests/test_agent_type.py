@@ -96,9 +96,28 @@ def test_allowed_provider_passes(tmp_path, public):
     assert _load(tmp_path, _profile(public)).agent_type == public
 
 
-def test_provider_match_is_case_and_space_insensitive(tmp_path, public):
-    doc = _profile(public, model="Anthropic:claude-sonnet-4-6")
-    assert _load(tmp_path, doc, allowed=" OpenAI , anthropic ,").agent_type == public
+def test_allowlist_entries_are_normalized(tmp_path, public):
+    assert _load(tmp_path, _profile(public), allowed=" OpenAI , ANTHROPIC ,").agent_type == public
+
+
+@pytest.mark.parametrize("model", [
+    "ANTHROPIC:claude-sonnet-4-6",
+    "Anthropic:claude-sonnet-4-6",
+    " anthropic :claude-sonnet-4-6",
+    "anthropic :claude-sonnet-4-6",
+])
+def test_profile_provider_is_compared_exactly_as_written(tmp_path, public, model):
+    # pydantic-ai would fail on these at build; refuse them at validation.
+    with pytest.raises(ValueError, match=r"spec\.model: provider .* is not in"):
+        _load(tmp_path, _profile(public, model=model))
+
+
+@pytest.mark.parametrize("model", ["CLAUDE-CODE:sonnet", " codex:gpt-5"])
+def test_harness_lookalikes_are_not_providers_either(tmp_path, public, model):
+    # Not the harness prefix as written, so not a harness — and not an
+    # allowed provider either, even with the harness names listed.
+    with pytest.raises(ValueError, match=r"spec\.model: provider .* is not in"):
+        _load(tmp_path, _profile(public, model=model), allowed="anthropic,claude-code,codex")
 
 
 def test_disallowed_provider_fails(tmp_path, public):

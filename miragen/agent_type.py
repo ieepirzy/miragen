@@ -207,11 +207,12 @@ def check_agent_type(
                     f"model {value!r}; use a pydantic-ai provider:model string"
                 )
         provider, sep, _ = value.partition(":")
-        if not sep or not provider.strip():
+        if not sep or not provider:
             raise ValueError(
                 f"{display}: {who} needs a pydantic-ai 'provider:model' string, got {value!r}"
             )
-        if provider.strip().lower() not in allowed:
+        # Exactly as written: only the allowlist entries are normalized.
+        if provider not in allowed:
             raise ValueError(
                 f"{display}: provider {provider!r} is not in {ALLOWED_PROVIDERS_ENV} "
                 f"({', '.join(sorted(allowed))}); {who} profiles may only use "
@@ -311,7 +312,7 @@ def _check_voice(
     if voice.provider == "http":
         _check_url_host("voice.url", voice.url, _lookup(uninterpolated, ("voice", "url")),
                         hosts, who)
-    elif voice.provider.lower() not in allowed:
+    elif voice.provider not in allowed:
         raise ValueError(
             f"voice.provider: speech provider {voice.provider!r} is not in "
             f"{ALLOWED_PROVIDERS_ENV} ({', '.join(sorted(allowed))}); {who} "
