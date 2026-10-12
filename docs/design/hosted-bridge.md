@@ -93,6 +93,10 @@ memory_checkpoint` (scoped by `project`) and `store_put_artifact /
 store_search / store_get_artifact / store_lineage / store_open_run /
 store_close_run / store_run_tree / store_list_namespaces` (against the
 session's run or an explicit one), plus `bridge_status / bridge_sessions`.
+The `store_*` subset is for filing the session's own work trail. The bridge is
+agent memory. Operating organizational knowledge (recording and superseding
+decisions and other org artifacts) belongs to Loimi core's own MCP server, so
+the bridge deliberately has no `store_supersede_artifact`.
 Two credential classes open it: the daemon bearer (automation, the plugin's
 `.mcp.json`, `claude mcp add --header`) and an origo OAuth token
 (claude.ai custom connector; `MCP_BASE_URL` / `MCP_CLIENT_ID` /
