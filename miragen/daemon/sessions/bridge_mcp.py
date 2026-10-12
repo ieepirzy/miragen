@@ -210,11 +210,13 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
         Args:
             content: The observation — specific, self-contained, one thing.
             project: Repository remote/name or session key; omit for the default project.
-            session: Session key to attribute the note to (its run ref).
+            session: Session key to attribute the note to (its run ref). Names
+                the scope only when `project` is omitted.
         """
         if not session and not project:
             session = _connection_session(ctx)
-        plane, identity, lifecycle, write, detail = await _lifecycle(session or project)
+        # `project` names the scope; `session` only attributes the note.
+        plane, identity, lifecycle, write, detail = await _lifecycle(project or session)
         result = await lifecycle.remember(
             instance=identity.slug, run_id=session, content=content,
         )
