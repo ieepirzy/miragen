@@ -45,7 +45,7 @@ dependencies = [
     # the extras we actually use. `anthropic` is the provider for
     # `anthropic:*` model strings; without it such a profile fails at load
     # with an ImportError.
-    "pydantic-ai-slim[web-fetch,duckduckgo,mcp,openai,anthropic]==1.106.0",
+    "pydantic-ai-slim[web-fetch,duckduckgo,mcp,openai,anthropic]==1.107.7",
     # anthropic 1.x moved to httpx2, and pydantic-ai-slim 1.106 hands the
     # SDK an httpx client ("Invalid `http_client` argument"). Hold 0.x until
     # pydantic-ai supports the 1.x SDK.
