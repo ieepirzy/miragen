@@ -43,10 +43,10 @@ class TestGate:
         assert off.enabled is False
 
     def test_the_token_path_survives_the_secret_file_loader(self, tmp_path):
-        """main() runs load_file_secrets first, which turns every *_FILE
+        """main() runs load_file_secrets first, which turns a *_FILE
         variable into its plain name and deletes it — the override must not
         be one of those."""
-        from miragen.daemon.sessions.config import load_file_secrets
+        from miragen.file_secrets import load_file_secrets
         token = tmp_path / "bridge.token"
         token.write_text("t0k")
         env = {"MIRAGEND_HARNESS_SETUP_URL": "https://m.example",

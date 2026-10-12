@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 import miragen.app as app_module
@@ -12,3 +14,15 @@ def _reset_admission_state():
     app_module._active_runs = 0
     app_module._busy_instances.clear()
     yield
+
+
+@pytest.fixture(autouse=True)
+def _restore_environ():
+    """CLI and lifespan tests run the *_FILE secrets loader against the real
+    os.environ. Restore it after each test so one test's resolved (or
+    deleted) variables never reach the next one's subprocesses."""
+    saved = dict(os.environ)
+    yield
+    if os.environ != saved:
+        os.environ.clear()
+        os.environ.update(saved)

@@ -282,7 +282,7 @@ def test_file_secrets_resolve_before_use(tmp_path):
     """The daemon reads MIRAGEND_TOKEN and the Loimi credentials from
     *_FILE variables the way the systemd unit delivers them; an empty
     (defined) value must stay empty, never fall back to a default."""
-    from miragen.daemon.sessions.config import load_file_secrets
+    from miragen.file_secrets import load_file_secrets
 
     secret = tmp_path / "token"
     secret.write_text("s3cret\n")

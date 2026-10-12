@@ -41,6 +41,7 @@ from miragen.edf import (
 )
 from miragen.executor import ExecutorBackend, ExecutorResult, RepositoryCheckout, build_executor
 from miragen.factory import build_agent, registered_handlers, registered_tools
+from miragen.file_secrets import load_file_secrets
 from miragen.harness import (
     PYDANTIC_AI, Harness, HarnessTurn, InstanceBusyError, PydanticAIHarness, build_model_harness,
     forget_inactive_harnesses, profile_harness,
@@ -1259,26 +1260,14 @@ def _load_file_secrets() -> None:
     """
     Resolve *_FILE env vars into their plain counterparts.
 
-    For every var named FOO_FILE whose value is a readable path, reads that
-    file and sets FOO to its contents (stripped). The _FILE var is then
-    removed so it is not visible to the agent process going forward.
-
     Example: ANTHROPIC_API_KEY_FILE=/run/secrets/anthropic_key
              → os.environ["ANTHROPIC_API_KEY"] = <file contents>
+
+    The _FILE var is removed so it is not visible to the agent process going
+    forward. Standard path variables (SSL_CERT_FILE, …) and files too large
+    to be a secret are left alone; see miragen.file_secrets.
     """
-    file_vars = {k: v for k, v in os.environ.items() if k.endswith("_FILE")}
-    for file_var, path in file_vars.items():
-        secret_path = Path(path)
-        if not secret_path.exists():
-            logger.warning(f"Secret file referenced by {file_var} not found: {path}")
-            continue
-        target_var = file_var[: -len("_FILE")]
-        try:
-            os.environ[target_var] = secret_path.read_text().strip()
-            del os.environ[file_var]
-            logger.info(f"Loaded secret {target_var} from {file_var}")
-        except OSError as e:
-            logger.error(f"Failed to read secret file {path} for {file_var}: {e}")
+    load_file_secrets()
 
 
 # ── Lifespan ────────────────────────────────────────────────────────────────────────────
