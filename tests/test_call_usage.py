@@ -167,7 +167,8 @@ async def test_api_path_fills_cache_fields_and_one_call_per_response():
          "cache_write_tokens": 300, "cache_write_1h_tokens": None, "output_tokens": 20,
          "speed": None, "inference_geo": None},
         {"at": t2, "model": "scripted", "input_tokens": 1100, "cached_input_tokens": 900,
-         "cache_write_tokens": 0, "cache_write_1h_tokens": None, "output_tokens": 5,
+         # No writes and no provider write key: not reported, not a claimed 0.
+         "cache_write_tokens": None, "cache_write_1h_tokens": None, "output_tokens": 5,
          "speed": None, "inference_geo": None},
     ]
     assert usage.calls_truncated is False
@@ -304,3 +305,19 @@ def test_model_turn_event_carries_the_full_usage(tmp_path):
     assert completed["usage"]["cache_write_tokens"] == 2
     assert completed["usage"]["calls"][0]["input_tokens"] == 10
     assert completed["usage"]["calls_truncated"] is False
+
+
+def test_api_path_reports_cache_zero_only_when_the_provider_sent_the_key():
+    from pydantic_ai.usage import RunUsage as PaiRunUsage
+
+    def run(**kw):
+        pai = PaiRunUsage(requests=1, input_tokens=100, output_tokens=5, **kw)
+        response = ModelResponse(parts=[TextPart("x")], usage=RequestUsage(
+            input_tokens=100, output_tokens=5, details=kw.get("details", {})))
+        return extract_run_details(_FakeResult(pai, [response]))[0]
+
+    silent = run()  # e.g. an OpenAI-compatible provider sending no cache counts
+    assert silent.cached_input_tokens is None and silent.cache_write_tokens is None
+    anthropic_zero = run(details={"cache_read_input_tokens": 0, "cache_creation_input_tokens": 0})
+    assert anthropic_zero.cached_input_tokens == 0 and anthropic_zero.cache_write_tokens == 0
+    assert anthropic_zero.calls[0].cache_write_tokens == 0

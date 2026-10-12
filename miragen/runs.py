@@ -369,13 +369,28 @@ def _read_record(path: Path) -> RunRecord | None:
         return None
 
 
-def _pai_cache_reads(pai_usage: Any) -> int:
+# Provider usage keys pydantic-ai copies into `details` that prove the
+# provider reported the cache bucket at all (so a 0 is a real zero).
+_READ_KEYS = ("cache_read_input_tokens", "prompt_cache_hit_tokens")
+_WRITE_KEYS = ("cache_creation_input_tokens",)
+
+
+def _pai_cache_reads(pai_usage: Any) -> int | None:
+    details = getattr(pai_usage, "details", None) or {}
     reads = getattr(pai_usage, "cache_read_tokens", 0) or 0
     if not reads:
-        # DeepSeek's own name for cache hits, which pydantic-ai's usage extractor only maps
-        # when the response also carries the OpenAI-style cached_tokens.
-        reads = (getattr(pai_usage, "details", None) or {}).get("prompt_cache_hit_tokens") or 0
-    return reads
+        # DeepSeek's own name for cache hits, which pydantic-ai's usage
+        # extractor only maps when the response also carries cached_tokens.
+        reads = details.get("prompt_cache_hit_tokens") or 0
+    # pydantic-ai defaults the counter to 0: a 0 with no provider key behind
+    # it is "not reported", not "no cache reads".
+    return reads if reads or any(k in details for k in _READ_KEYS) else None
+
+
+def _pai_cache_writes(pai_usage: Any) -> int | None:
+    details = getattr(pai_usage, "details", None) or {}
+    writes = getattr(pai_usage, "cache_write_tokens", 0) or 0
+    return writes if writes or any(k in details for k in _WRITE_KEYS) else None
 
 
 def _pai_cache_write_1h(pai_usage: Any) -> int | None:
@@ -400,7 +415,7 @@ def _pai_token_fields(pai_usage: Any) -> dict[str, int | None]:
     output_tokens = getattr(pai_usage, "output_tokens", 0) or 0
     if not input_tokens and not output_tokens:
         return {}
-    writes = getattr(pai_usage, "cache_write_tokens", 0) or 0
+    writes = _pai_cache_writes(pai_usage)
     return {
         "input_tokens": input_tokens or None,
         "output_tokens": output_tokens or None,
