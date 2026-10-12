@@ -14,6 +14,11 @@ Prompt directives (one per line) script the "model":
   SLEEP                     block until session/cancel
   HISTORY                   answer with the session's turn count and rules
 anything else is echoed back.
+
+$GROK_HOME/fake-window.txt (a token count): a prompt that would take the
+session past it is refused the way grok 1.0.41 does (an "Internal error"
+answer, the input_too_large detail on stderr only). $GROK_HOME/fake-crash.txt:
+print it to stderr and exit before answering anything.
 """
 
 from __future__ import annotations
@@ -161,9 +166,22 @@ def handle_prompt(rid, params):
         update(sid, {"sessionUpdate": "turn_completed", "stop_reason": "end_turn"})
         send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
         return
+    window = HOME / "fake-window.txt"
+    needed = data.get("context", 0) + len(text) // 4 + 10
+    if window.exists() and needed > int(window.read_text()):
+        # Refused before sampling: nothing is recorded (observed live, 2026-10-05).
+        sys.stderr.write(
+            "ERROR error=Internal error: {\n"
+            '  "message": "API error (status 400 Bad Request): invalid-argument: Failed to start '
+            "sampling: [input_too_large] The prompt is too long for this model's context window "
+            f'({needed} tokens > {int(window.read_text())} tokens)",\n'
+            '  "http_status": 400\n}\n')
+        sys.stderr.flush()
+        send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": "Internal error"}})
+        return
     data["turns"].append(text)
     # Context grows with what is sent; GROW <n> adds n tokens (a big tool result).
-    data["context"] = data.get("context", 0) + len(text) // 4 + 10
+    data["context"] = needed
     if "<session-maintenance" in text:
         # Maintenance turns follow a script the test writes (same directives).
         script = HOME / "fake-maintenance.txt"
@@ -218,6 +236,11 @@ def handle_prompt(rid, params):
 
 def main():
     global _authed
+    crash = HOME / "fake-crash.txt"
+    if crash.exists():
+        sys.stderr.write(crash.read_text())
+        sys.stderr.flush()
+        sys.exit(3)
     log({"argv": sys.argv[1:], "env": sorted(os.environ), "home": os.environ.get("HOME"),
          "cwd": os.getcwd(), "has_gateway_token": bool(os.environ.get("MIRAGEN_GATEWAY_TOKEN"))})
     for raw in sys.stdin:

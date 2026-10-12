@@ -74,10 +74,30 @@ ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR"
 # Tool names that are dispatchers, not tools: allowed only when they carry a
 # gateway tool (checked via the call's content).
 DISPATCHERS = ("use_tool", "search_tool")
+# How grok says a session no longer fits the model (observed live on
+# 2026-10-05: "[input_too_large] The prompt is too long for this model's
+# context window (1379801 tokens > 500000 tokens)"). It is on stderr only:
+# the ACP error itself just says "Internal error".
+CONTEXT_OVERFLOW_MARKERS = ("input_too_large", "too long for this model's context window")
 
 
 class GrokHarnessError(RuntimeError):
     pass
+
+
+class GrokContextOverflowError(GrokHarnessError):
+    """The session has outgrown the model's context window: every turn in it
+    fails before sampling, so the lifecycle policy (which runs after a turn
+    that succeeded) never gets to compact or rotate it."""
+
+
+def _new_lines(before: list[str], after: list[str]) -> list[str]:
+    """The lines of a bounded stderr tail that arrived after `before` was
+    taken (the tail may have scrolled in between)."""
+    for k in range(min(len(before), len(after)), 0, -1):
+        if before[-k:] == after[:k]:
+            return after[k:]
+    return after
 
 
 @dataclass
@@ -342,10 +362,27 @@ class GrokHarness:
         try:
             await acp.start()
             session_id = await self._open_session(acp, instance, str(workdir), ephemeral=ephemeral)
+        except ConnectionError as exc:
+            # The process exited before answering (it crashed, or could not
+            # start at all): its stderr is the only account of why.
+            tail = await self._stderr_after_exit(acp)
+            await acp.close()
+            raise GrokHarnessError(
+                f"grok exited during startup ({exc}); stderr: "
+                f"{' | '.join(tail[-8:]) or '(empty)'}") from exc
         except BaseException:
             await acp.close()  # never leave a half-started agent running
             raise
         return _Agent(instance=instance, acp=acp, session_id=session_id, ephemeral=ephemeral)
+
+    @staticmethod
+    async def _stderr_after_exit(acp: AcpSession) -> list[str]:
+        # stdout's EOF can beat the last stderr lines: let the drain finish.
+        drain = getattr(acp, "_stderr_task", None)
+        if drain is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(asyncio.shield(drain), timeout=2)
+        return acp.stderr_tail()
 
     async def _open_session(self, acp: AcpSession, instance: str, cwd: str, *,
                             ephemeral: bool) -> str:
@@ -450,6 +487,38 @@ class GrokHarness:
         return "\n\n".join(parts)
 
     async def _turn(self, turn: HarnessTurn, on_text: Callable[[str], None] | None) -> HarnessResult:
+        try:
+            return await self._turn_once(turn, on_text)
+        except GrokContextOverflowError:
+            instance, ephemeral = self._key(turn)
+            if ephemeral or not self.settings.lifecycle:
+                raise
+            # Nothing can run in that session any more, a memory save
+            # included: open a new one without asking it for a note, then
+            # give the turn one more try there.
+            logger.warning("grok harness: %s outgrew the model's context window; "
+                           "starting a new session", instance)
+            await self._recover_overflow(instance)
+        return await self._turn_once(turn, on_text)
+
+    @staticmethod
+    async def _overflowed(agent: _Agent, stderr_before: list[str],
+                          message: str) -> tuple[bool, list[str]]:
+        """Did this turn fail because the session outgrew the model? Looks at
+        the error and the stderr lines the turn produced (stderr is drained
+        separately, so it can lag the error by a moment)."""
+        tail: list[str] = []
+        for attempt in range(3):
+            if attempt:
+                await asyncio.sleep(0.1)
+            tail = agent.acp.stderr_tail()
+            seen = " ".join([message, *_new_lines(stderr_before, tail)])
+            if any(m in seen for m in CONTEXT_OVERFLOW_MARKERS):
+                return True, tail
+        return False, tail
+
+    async def _turn_once(self, turn: HarnessTurn,
+                         on_text: Callable[[str], None] | None) -> HarnessResult:
         if turn.secret_env:
             raise GrokHarnessError(
                 "per-launch MCP credentials are not supported by the grok-build harness "
@@ -471,6 +540,7 @@ class GrokHarness:
         try:
             async with agent.lock:
                 agent.last_used = time.monotonic()
+                stderr_before = agent.acp.stderr_tail()
                 with self.gateway.turn(instance, turn.run_id) as log:
                     try:
                         async with asyncio.timeout(self.settings.turn_timeout_s):
@@ -497,9 +567,12 @@ class GrokHarness:
                                     if on_text:
                                         on_text(text)
                                 elif kind == "error":
-                                    raise GrokHarnessError(
+                                    overflow, tail = await self._overflowed(
+                                        agent, stderr_before, str(update.get("message")))
+                                    raise (GrokContextOverflowError if overflow
+                                           else GrokHarnessError)(
                                         f"grok: {update.get('message')}; "
-                                        f"stderr: {' | '.join(agent.acp.stderr_tail()[-5:])}")
+                                        f"stderr: {' | '.join(tail[-5:])}")
                                 elif kind == "end":
                                     end = update
                     except TimeoutError:
@@ -689,18 +762,38 @@ class GrokHarness:
                           tokens_before=done.get("tokens_before"), tokens_after=after,
                           observed=bool(compacted))
 
-    async def _rotate(self, agent: _Agent, run_id: str, decision: Decision) -> None:
+    async def _recover_overflow(self, instance: str) -> None:
+        pending = self._maintenance.get(instance)
+        if pending is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(pending)
+        agent = await self._agent_for(instance, ephemeral=False)
+        try:
+            async with agent.lock:
+                await self._rotate(
+                    agent, f"maintenance-{os.urandom(6).hex()}",
+                    Decision("rotate", "context_overflow"),
+                    no_note="the session had outgrown the model's context window, "
+                            "so it could not write one")
+        finally:
+            agent.reserved -= 1
+
+    async def _rotate(self, agent: _Agent, run_id: str, decision: Decision, *,
+                      no_note: str | None = None) -> None:
+        """Memory save + handoff note, then a new session. `no_note`: skip
+        the note (the old session can't take a turn) and say why instead."""
         instance = agent.instance
         entry = self._load_state().get(instance) or {}
         limit = self.settings.handoff_max_chars
-        text, error = "", None
-        with self.gateway.turn(instance, run_id) as log:
-            try:
-                text, _ctx, _c = await self._prompt_text(
-                    agent, rotation_prompt(decision.reason, limit))
-            except Exception as exc:  # noqa: BLE001 — best-effort: rotate anyway, say the note is missing
-                error = f"{type(exc).__name__}: {exc}"[:200]
-            writes = accepted_memory_writes(log.calls)
+        text, error, writes = "", no_note, 0
+        if no_note is None:
+            with self.gateway.turn(instance, run_id) as log:
+                try:
+                    text, _ctx, _c = await self._prompt_text(
+                        agent, rotation_prompt(decision.reason, limit))
+                except Exception as exc:  # noqa: BLE001 — best-effort: rotate anyway, say the note is missing
+                    error = f"{type(exc).__name__}: {exc}"[:200]
+                writes = accepted_memory_writes(log.calls)
         text = text.strip()
         rotated_at = time.time()
         memory_writes = int(entry.get("memory_writes") or 0) + writes
