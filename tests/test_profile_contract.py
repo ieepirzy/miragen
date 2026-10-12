@@ -193,6 +193,15 @@ class TestAgentTypeSerialization:
         assert "agent_type" not in dumped
         assert again.required_contract() == 2
 
+    def test_serialization_schema_stays_intact(self):
+        # A model-level serializer would collapse this schema to an opaque
+        # object; the field-level exclusion keeps every property.
+        schema = AgentProfile.model_json_schema(mode="serialization")
+        props = schema["properties"]
+        assert {"name", "mode", "spec", "executor", "agent_type"} <= set(props)
+        assert props["agent_type"]["enum"] == ["internal", "external", "hybrid"]
+        assert set(props) == set(AgentProfile.model_json_schema()["properties"])
+
     @pytest.mark.parametrize("fixture, contract", [
         ("tests.test_edf_model_tier:model_tier_edf", 1),
         ("tests.test_edf:minimal_edf", 2),

@@ -7,16 +7,7 @@ from typing import Annotated, Any, Literal, Optional, Union
 from apscheduler.triggers.cron import CronTrigger as _APCronTrigger
 
 from miragen.profile_contract import format_api_version, parse_api_version
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
-    HttpUrl,
-    SerializerFunctionWrapHandler,
-    field_validator,
-    model_serializer,
-    model_validator,
-)
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 
 # ── Approval flow ────────────────────────────────────────────────────────────
@@ -1221,6 +1212,13 @@ class AgentProfile(_ProfileModel):
     mode: Literal["autonomous", "interactive", "hybrid"]
     agent_type: Literal["internal", "external", "hybrid"] = Field(
         default="internal",
+        # Serialized profiles leave out the default. Declaring the field
+        # implies contract v3 (a v1/v2 runtime rejects the key), so dumping
+        # `internal` would make every re-submitted profile — an EDF
+        # resolved_profile, a control plane's round trip — demand a newer
+        # runtime than it needs. Needs pydantic >= 2.12 (older versions
+        # silently ignore exclude_if).
+        exclude_if=lambda v: v == "internal",
         description=(
             "Who the agent serves (independent of `mode`, which is about how it "
             "is activated). 'internal' (default): the deployment's own people "
@@ -1357,18 +1355,6 @@ class AgentProfile(_ProfileModel):
     def is_executor(self) -> bool:
         return self.executor is not None
 
-    @model_serializer(mode="wrap")
-    def _omit_default_agent_type(self, handler: SerializerFunctionWrapHandler) -> dict:
-        """Serialized profiles leave out `agent_type: internal`. Declaring
-        the field implies contract v3 (a v1/v2 runtime rejects the key), so
-        dumping the default would make every re-submitted profile — an EDF
-        `resolved_profile`, a control plane's round trip — demand a newer
-        runtime than it needs. external/hybrid are kept: they matter."""
-        data = handler(self)
-        if isinstance(data, dict) and data.get("agent_type") == "internal":
-            del data["agent_type"]
-        return data
-
     # -- profile contract (#75) --------------------------------------------
 
     def inferred_contract(self) -> int:
@@ -1379,7 +1365,7 @@ class AgentProfile(_ProfileModel):
         Keyed off the field being present in the source, not off its value:
         miragend spawns the profile text as written, and a v1/v2 runtime
         rejects even `agent_type: internal` as an unknown key. Serialization
-        drops the default (see _omit_default_agent_type), so a profile that
+        drops the default (exclude_if on the field), so a profile that
         never declared it, or declared `internal`, dumps back to contract 1."""
         if "agent_type" in self.model_fields_set:
             return 3
