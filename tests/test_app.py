@@ -1299,3 +1299,19 @@ class TestOnCompleteHandlerValidation:
         with patch.object(app_module, "registered_handlers", return_value={}):
             self._assert(_make_profile(
                 on_complete=OnComplete(post_to="https://example.invalid/hook")))
+
+
+class TestRunsWireCarriesCallUsage:
+    async def test_list_and_detail_serve_cache_fields_and_calls(self, store_client):
+        from miragen.models import CallUsage, RunUsage
+
+        store = app_module._run_store
+        record = store.start(agent_name="test-agent", trigger="http", prompt="p")
+        store.finish(record, status="succeeded", output="ok", usage=RunUsage(
+            requests=1, input_tokens=10, cached_input_tokens=4, cache_write_tokens=2,
+            cache_write_1h_tokens=1, calls=[CallUsage(model="m", input_tokens=10)]))
+        listed = (await store_client.get("/runs")).json()["runs"][0]["usage"]
+        detail = (await store_client.get(f"/runs/{record.run_id}")).json()["usage"]
+        for usage in (listed, detail):
+            assert usage["cache_write_tokens"] == 2 and usage["cache_write_1h_tokens"] == 1
+            assert usage["calls"][0]["model"] == "m" and usage["calls_truncated"] is False
