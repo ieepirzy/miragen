@@ -23,11 +23,11 @@ def _make_core(tmp_path, **kw):
     docker_client = FakeDocker()
     runner = RecordingRunner()
     runner.on_up = lambda name: docker_client.add(name)
+    kw.setdefault("environ", {})
     core = LifecycleCore(
         tmp_path,
         docker_client,
         base_image="ghcr.io/example/miragen:test",
-        environ={},
         runner=runner,
         not_found=FakeNotFound,
         sleep=lambda _s: None,
@@ -280,6 +280,33 @@ def test_validate_endpoint(client):
 
     bad = client.post("/validate", json={"yaml_source": "nope: 1\n"})
     assert bad.status_code == 422
+
+
+def test_validate_endpoint_surfaces_agent_type_refusal(tmp_path, monkeypatch):
+    from tests.test_daemon_core import EXTERNAL_YAML
+
+    # The process holds a list; the daemon's core mapping decides.
+    monkeypatch.setenv("MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS", "test")
+    external = {"yaml_source": EXTERNAL_YAML.format(name="alpha")}
+
+    refused = TestClient(create_app(_make_core(tmp_path / "a", environ={}))).post(
+        "/validate", json=external
+    )
+    assert refused.status_code == 422
+    assert refused.json()["code"] == "validation_failed"
+    assert "MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS" in refused.json()["detail"]
+
+    disallowed = TestClient(create_app(_make_core(
+        tmp_path / "b", environ={"MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS": "anthropic"}
+    ))).post("/validate", json=external)
+    assert disallowed.status_code == 422
+    assert "spec.model: provider 'test' is not in" in disallowed.json()["detail"]
+
+    allowed = TestClient(create_app(_make_core(
+        tmp_path / "c", environ={"MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS": "test"}
+    ))).post("/validate", json=external)
+    assert allowed.status_code == 200
+    assert allowed.json()["profile"]["agent_type"] == "external"
 
 
 def test_tools_and_files_over_http(client):

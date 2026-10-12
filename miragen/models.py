@@ -1195,8 +1195,9 @@ class AgentProfile(_ProfileModel):
             "Profile contract this profile is written against, e.g. "
             "'miragen/v2'. Optional: the effective requirement is the "
             "greater of this declaration and what the profile's features "
-            "imply (an executor block implies v2), so a profile can pin "
-            "forward but never understate what it uses. miragend refuses "
+            "imply (an executor block implies v2, declaring agent_type "
+            "v3), so a profile can pin forward but never understate what "
+            "it uses. miragend refuses "
             "to spawn a profile onto a runtime image that does not "
             "declare support for the required contract (#75)."
         ),
@@ -1209,6 +1210,31 @@ class AgentProfile(_ProfileModel):
         pattern=r"^[a-z0-9][a-z0-9_-]{0,62}$",
     )
     mode: Literal["autonomous", "interactive", "hybrid"]
+    agent_type: Literal["internal", "external", "hybrid"] = Field(
+        default="internal",
+        # Serialized profiles leave out the default. Declaring the field
+        # implies contract v3 (a v1/v2 runtime rejects the key), so dumping
+        # `internal` would make every re-submitted profile — an EDF
+        # resolved_profile, a control plane's round trip — demand a newer
+        # runtime than it needs. Needs pydantic >= 2.12 (older versions
+        # silently ignore exclude_if).
+        exclude_if=lambda v: v == "internal",
+        description=(
+            "Who the agent serves (independent of `mode`, which is about how it "
+            "is activated). 'internal' (default): the deployment's own people "
+            "and systems. 'external': the public, e.g. a customer-facing chat "
+            "without account backing. 'hybrid': both. external and hybrid "
+            "profiles are refused at load unless they are base tier (`spec`), "
+            "every model (and a cloud voice.provider) names a provider in the "
+            "deployment's MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS list (unset = refused), no "
+            "model is a subscription harness (claude-code:, codex:, "
+            "grok-build:) or a ${VAR} interpolation, MCP and http voice URLs "
+            "have their host in MIRAGEN_EXTERNAL_ALLOWED_HOSTS, only safe "
+            "built-in capabilities are used (no Peer, WebSearch, local "
+            "WebFetch or custom ones), and there is no `tools:` or `memory:` "
+            "block. Declaring the field implies profile contract v3."
+        ),
+    )
     triggers: list[Trigger] = Field(min_length=1)
     watch: list[WatchSource] = Field(default_factory=list, description=(
         "Sources the host polls between turns (read-only gateway tools) to keep an inbox of "
@@ -1336,8 +1362,16 @@ class AgentProfile(_ProfileModel):
 
     def inferred_contract(self) -> int:
         """The contract level this profile's FEATURES require, regardless
-        of what it declares. The executor tier is the v2 surface; everything
-        the model tier ever supported is v1."""
+        of what it declares. The executor tier is the v2 surface; declaring
+        `agent_type` is v3; everything the model tier ever supported is v1.
+
+        Keyed off the field being present in the source, not off its value:
+        miragend spawns the profile text as written, and a v1/v2 runtime
+        rejects even `agent_type: internal` as an unknown key. Serialization
+        drops the default (exclude_if on the field), so a profile that
+        never declared it, or declared `internal`, dumps back to contract 1."""
+        if "agent_type" in self.model_fields_set:
+            return 3
         return 2 if self.executor is not None else 1
 
     def required_contract(self) -> int:
@@ -1366,8 +1400,8 @@ class AgentProfile(_ProfileModel):
             raise ValueError(
                 f"profile declares apiVersion {self.api_version} but uses "
                 f"features requiring {format_api_version(inferred)} "
-                "(the executor tier is a v2 surface) — a profile must not "
-                "understate its runtime requirement"
+                "(the executor tier is a v2 surface, agent_type a v3 one) — "
+                "a profile must not understate its runtime requirement"
             )
         return self
 

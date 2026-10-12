@@ -40,6 +40,15 @@ from miragen.daemon.spawn.base import (
     SpawnUnitNotFound,
 )
 from miragen.daemon.spawn.docker_compose import DockerComposeSpawnDriver
+from miragen.agent_type import (
+    ALLOWED_HOSTS_ENV,
+    ALLOWED_PROVIDERS_ENV,
+    PUBLIC_AGENT_TYPES,
+    allowed_hosts_from_env,
+    allowed_providers_from_env,
+    code_violations,
+    is_code_path,
+)
 from miragen.load import load_profile
 from miragen.profile_contract import (
     PROFILE_CONTRACTS_LABEL,
@@ -206,6 +215,13 @@ class ToolSourceInvalid(DaemonError):
     code = "tool_source_invalid"
 
 
+class PublicAgentRefused(DaemonError):
+    """Custom code offered to an agent_type: external | hybrid agent."""
+
+    status = 422
+    code = "public_agent_refused"
+
+
 class ArchiveInvalid(DaemonError):
     status = 422
     code = "archive_invalid"
@@ -266,8 +282,14 @@ def format_validation_error(exc: ValidationError) -> str:
     return "\n".join(lines)
 
 
-def validate_profile_text(source: str) -> dict:
+def validate_profile_text(source: str, *, environ: Mapping[str, str] | None = None) -> dict:
     """Validate an agent profile YAML string without touching any agent.
+
+    `environ` is where deployment config such as
+    MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS is read (None = os.environ). The
+    lifecycle core passes its own mapping — the same one it forwards into
+    agent containers — so a profile /validate accepts is one the spawned
+    runtime accepts too.
 
     Returns a summary dict on success; raises ValidationFailed with the
     formatted error text otherwise. Runs load_profile in-process — the same
@@ -278,7 +300,11 @@ def validate_profile_text(source: str) -> dict:
         f.write(source)
         tmp = Path(f.name)
     try:
-        profile = load_profile(tmp)
+        profile = load_profile(
+            tmp,
+            allowed_providers=allowed_providers_from_env(environ),
+            allowed_hosts=allowed_hosts_from_env(environ),
+        )
     except ValidationError as exc:
         raise ValidationFailed(format_validation_error(exc)) from exc
     except Exception as exc:
@@ -289,6 +315,7 @@ def validate_profile_text(source: str) -> dict:
     summary: dict = {
         "name": profile.name,
         "mode": profile.mode,
+        "agent_type": profile.agent_type,
         "triggers": [t.type for t in profile.triggers],
         "tools": list(profile.tools or []),
         # Named @register_handler targets this profile depends on. post_to is
@@ -874,7 +901,7 @@ class LifecycleCore:
         auto-forwarded credential."""
         try:
             text = (self._agent_dir(name) / "agent.yaml").read_text()
-            return str(validate_profile_text(text).get("executor") or "")
+            return str(validate_profile_text(text, environ=self._environ).get("executor") or "")
         except Exception:
             return ""
 
@@ -915,6 +942,13 @@ class LifecycleCore:
         # hand-run containers.
         if self._environ.get("MIRAGEN_MAX_CONCURRENT"):
             env["MIRAGEN_MAX_CONCURRENT"] = self._environ["MIRAGEN_MAX_CONCURRENT"]
+        # The provider and host allowlists for agent_type: external | hybrid
+        # profiles, forwarded for the same reason: /validate and create check
+        # a profile against this daemon's values, and the container's own load must see
+        # the same one or a profile validated here fails closed at boot.
+        for key in (ALLOWED_PROVIDERS_ENV, ALLOWED_HOSTS_ENV):
+            if self._environ.get(key):
+                env[key] = self._environ[key]
         # Operator-named passthrough for credentials the suffix filter above
         # cannot see — subscription OAuth env tokens foremost (e.g. the
         # long-lived token Claude Code mints via `claude setup-token`, which
@@ -1053,7 +1087,7 @@ class LifecycleCore:
         validated_labels = self._validate_labels(labels or {})
         profile_name = None
         try:
-            summary = validate_profile_text(yaml_source)
+            summary = validate_profile_text(yaml_source, environ=self._environ)
             profile_name = summary.get("name")
         except ValidationFailed:
             raise
@@ -1063,6 +1097,11 @@ class LifecycleCore:
                 f"created as '{name}' — set 'name: {name}' in the YAML"
             )
 
+        if tools_source is not None and summary.get("agent_type") in PUBLIC_AGENT_TYPES:
+            raise PublicAgentRefused(
+                f"agent_type: {summary['agent_type']} agents take no tools_source: "
+                "custom code runs with whatever access the container has"
+            )
         _assert_profile_satisfied_by_tools(summary, tools_source)
 
         # The contract is judged against the image that will actually run
@@ -1124,12 +1163,19 @@ class LifecycleCore:
         if not yaml_path.exists():
             raise AgentNotFound(f"agent '{name}' has no agent.yaml")
 
-        summary = validate_profile_text(yaml_source)
+        summary = validate_profile_text(yaml_source, environ=self._environ)
         if summary.get("name") != name:
             raise NameMismatch(
                 f"profile 'name' field is '{summary.get('name')}' but the agent "
                 f"being updated is '{name}' — set 'name: {name}' in the YAML"
             )
+        if summary.get("agent_type") in PUBLIC_AGENT_TYPES:
+            offending = code_violations(d)
+            if offending:
+                raise PublicAgentRefused(
+                    f"agent '{name}' has code the runtime would load ({offending}); "
+                    f"remove its tools before making it agent_type: {summary['agent_type']}"
+                )
 
         old_kind_for_contract = self._agent_executor_kind(name)
         will_recreate = str(summary.get("executor") or "") != old_kind_for_contract
@@ -1280,8 +1326,49 @@ class LifecycleCore:
         lines = source.splitlines(keepends=True)
         return "".join(lines[span[0] : span[1]])
 
+    def _public_agent_type(self, d: Path) -> str | None:
+        """'external'/'hybrid' when the stored profile is public-facing, else
+        None. Read as written: the loader refuses an interpolated
+        agent_type, so the raw value is the real one."""
+        try:
+            agent_type = self._read_yaml(d / "agent.yaml").get("agent_type")
+        except Exception:
+            return None
+        return agent_type if agent_type in PUBLIC_AGENT_TYPES else None
+
+    def _refuse_code_write_on_public_agent(self, agent: str, full: Path) -> None:
+        """write_file/edit_file is a side door around both the tool refusal
+        and profile validation: a public agent takes no code file, and its
+        agent.yaml changes only through update_agent_config (validated)."""
+        d = self._agent_dir(agent)
+        agent_type = self._public_agent_type(d)
+        if agent_type is None:
+            return
+        rel = full.relative_to(d.resolve()).as_posix()
+        if rel == "agent.yaml":
+            why = "profile changes go through config update, which validates them"
+        elif is_code_path(rel):
+            why = "a public agent takes no code files"
+        else:
+            return
+        raise PublicAgentRefused(
+            f"agent '{agent}' is agent_type: {agent_type}; refusing to write '{rel}' ({why})"
+        )
+
+    def _refuse_tools_on_public_agent(self, agent: str, d: Path) -> None:
+        """Live tool injection is custom code; a public-facing agent takes
+        none."""
+        agent_type = self._public_agent_type(d)
+        if agent_type is not None:
+            raise PublicAgentRefused(
+                f"agent '{agent}' is agent_type: {agent_type}; it takes no "
+                "local tools (custom code runs with whatever access the "
+                "container has)"
+            )
+
     def register_tool(self, agent: str, tool_name: str, source: str) -> None:
         d = self._require_agent(agent)
+        self._refuse_tools_on_public_agent(agent, d)
         tools_path = d / "tools.py"
         yaml_path = d / "agent.yaml"
         if not tools_path.exists():
@@ -1328,6 +1415,7 @@ class LifecycleCore:
 
     def edit_tool(self, agent: str, tool_name: str, old_str: str, new_str: str) -> None:
         d = self._require_agent(agent)
+        self._refuse_tools_on_public_agent(agent, d)
         tools_path = d / "tools.py"
         if not tools_path.exists():
             raise WorkspaceFileNotFound(f"tools.py not found for agent '{agent}'")
@@ -1390,12 +1478,14 @@ class LifecycleCore:
     def write_file(self, agent: str, path: str, content: str) -> None:
         self._require_agent(agent)
         full = self._safe_path(agent, path)
+        self._refuse_code_write_on_public_agent(agent, full)
         full.parent.mkdir(parents=True, exist_ok=True)
         full.write_text(content)
 
     def edit_file(self, agent: str, path: str, old_str: str, new_str: str) -> None:
         self._require_agent(agent)
         full = self._safe_path(agent, path)
+        self._refuse_code_write_on_public_agent(agent, full)
         try:
             content = full.read_text()
         except FileNotFoundError:
@@ -1533,7 +1623,14 @@ class LifecycleCore:
                 rewritten = f"name: {name}\n" + original_text
             yaml_src.write_text(rewritten)
 
-            summary = validate_profile_text(rewritten)
+            summary = validate_profile_text(rewritten, environ=self._environ)
+            if summary.get("agent_type") in PUBLIC_AGENT_TYPES:
+                offending = code_violations(src_root)
+                if offending:
+                    raise PublicAgentRefused(
+                        f"archive profile is agent_type: {summary['agent_type']} but "
+                        f"carries code the runtime would load: {offending}"
+                    )
 
             # An import is a create by another door: the archive's profile
             # meets the same contract gate, or it lands as the crash loop

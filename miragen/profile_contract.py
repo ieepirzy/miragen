@@ -25,6 +25,11 @@ Contract levels:
     1  the original model-tier profile (spec, triggers, approvals, tools)
     2  the executor tier (executor block: codex/claude-code/…, leash,
        injected MCP servers, artifact sink)
+    3  `agent_type` (internal | external | hybrid), with the external/hybrid
+       load-time rules (miragen/agent_type.py). Implied by declaring the
+       field at all: a v1/v2 runtime rejects it as an unknown key, so a
+       profile carrying it must not be spawned there. A runtime advertising
+       3 enforces the rules — this is how a control plane detects it.
 
 A new level is added when a profile feature requires runtime support that
 older runtimes would reject or — worse — silently ignore.
@@ -36,14 +41,14 @@ import re
 
 # Every contract level this build of the runtime can execute. Extend when a
 # new level is introduced; drop old levels only with a major version.
-SUPPORTED_PROFILE_CONTRACTS: tuple[int, ...] = (1, 2)
+SUPPORTED_PROFILE_CONTRACTS: tuple[int, ...] = (1, 2, 3)
 
 # The newest contract this build serves — what freshly authored profiles
 # may declare.
 CURRENT_PROFILE_CONTRACT: int = max(SUPPORTED_PROFILE_CONTRACTS)
 
 # OCI image label carrying the supported levels, space-separated (e.g.
-# "1 2"). The Dockerfile bakes it in; a drift test pins the Dockerfile to
+# "1 2 3"). The Dockerfile bakes it in; a drift test pins the Dockerfile to
 # these constants. An image WITHOUT this label predates contract labeling
 # and is treated as supporting contract 1 only — the conservative reading,
 # and the correct one for every pre-executor-tier image in the wild.

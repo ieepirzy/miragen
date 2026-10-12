@@ -12,6 +12,16 @@ mode: autonomous                        # autonomous | interactive | hybrid
                                         # interactive = request-response, streaming
                                         # hybrid      = long autonomous task + live HTTP query endpoint mid-run
 
+#optional
+# agent_type: internal                  # internal (default) | external | hybrid — who the agent serves
+                                        # internal = the deployment's own people and systems
+                                        # external = the public (e.g. customer-facing chat without accounts)
+                                        # hybrid   = both; held to the external rules:
+                                        #   spec tier only, spec.model provider in MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS
+                                        #   (unset = refused), MCP/http-voice hosts in MIRAGEN_EXTERNAL_ALLOWED_HOSTS,
+                                        #   no harness or ${VAR} models, no memory: block, no tools:,
+                                        #   capabilities limited to Thinking, ImageGeneration, MCP, WebFetch(local: false)
+
 triggers:
   - type: cron
     schedule: "0 9 * * 1-5"            # standard cron expression (weekdays at 09:00)

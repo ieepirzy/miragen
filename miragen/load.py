@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import copy
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,11 @@ from pydantic_ai.capabilities import (
     MCP,
 )
 
+from miragen.agent_type import (
+    allowed_hosts_from_env,
+    allowed_providers_from_env,
+    check_agent_type,
+)
 from miragen.models import AgentProfile
 from miragen.peer import build_peer_capability
 
@@ -238,12 +244,23 @@ def _resolve_instructions_file(raw: dict, profile_path: Path) -> None:
     del spec["instructions_file"]
 
 
-def load_profile(path: str | Path) -> AgentProfile:
+def load_profile(
+    path: str | Path,
+    *,
+    allowed_providers: Iterable[str] | str | None = None,
+    allowed_hosts: Iterable[str] | str | None = None,
+) -> AgentProfile:
     """
     Load and validate an agent profile YAML file.
 
     Returns a fully validated AgentProfile. Raises on any schema violation
     or unknown capability.
+
+    `allowed_providers`: the deployment's provider list for `agent_type:
+    external | hybrid` profiles (miragen.agent_type). None reads
+    MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS from the process environment.
+    `allowed_hosts`: likewise, MIRAGEN_EXTERNAL_ALLOWED_HOSTS — the hosts such
+    a profile's MCP servers and http voice endpoint may live on.
     """
     path = Path(path)
 
@@ -256,6 +273,8 @@ def load_profile(path: str | Path) -> AgentProfile:
     if not isinstance(raw, dict):
         raise ValueError(f"Agent profile must be a YAML mapping, got: {type(raw).__name__}")
 
+    # Kept as written: an interpolated model is only visible before expansion.
+    uninterpolated = copy.deepcopy(raw)
     raw = interpolate_env(raw)
     _resolve_instructions_file(raw, path)
 
@@ -279,5 +298,12 @@ def load_profile(path: str | Path) -> AgentProfile:
             "approval_delivery: async works on tool-gateway harnesses (grok-build:, "
             "claude-code:, codex: models) only: there miragen answers the tool call itself "
             "and can run it later; a PydanticAI or executor-tier call can't be deferred")
+
+    if allowed_providers is None:
+        allowed_providers = allowed_providers_from_env()
+    if allowed_hosts is None:
+        allowed_hosts = allowed_hosts_from_env()
+    check_agent_type(profile, allowed_providers, allowed_hosts=allowed_hosts,
+                     uninterpolated=uninterpolated)
 
     return profile

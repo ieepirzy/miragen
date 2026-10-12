@@ -337,7 +337,10 @@ def create_app(
 
     @app.post("/validate", dependencies=guarded)
     def validate(body: YamlBody) -> dict:
-        return {"valid": True, "profile": validate_profile_text(body.yaml_source)}
+        # Against the lifecycle core's environment when there is one — the
+        # mapping create checks against and forwards into containers.
+        environ = core._environ if core is not None else None
+        return {"valid": True, "profile": validate_profile_text(body.yaml_source, environ=environ)}
 
     # -- schedules ----------------------------------------------------------
 
