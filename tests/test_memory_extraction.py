@@ -272,6 +272,50 @@ class TestWorker:
             new_job["id"]: ("2026-09-24T00:00:00Z", "user_message", "profile:test-agent"),
         }
 
+    async def test_a_job_that_always_fails_is_abandoned_at_the_cap(self, client, service):
+        """#130: Loimi re-queues a failed job with no cap, so a poison job
+        would spend a model call on every sweep forever."""
+        job = self._seed_job(service, _event("boom source"))
+
+        async def exploding_extract(content, source_kind):
+            raise RuntimeError("model exploded")
+
+        statuses = []
+        for _ in range(4):
+            statuses += [r["status"] for r in await run_worker_once(
+                client, extract=exploding_extract, check=_checker(True), max_attempts=3)]
+        assert statuses == ["failed", "failed", "abandoned"]  # 4th sweep: nothing to claim
+        assert job["status"] == "failed" and job["attempts"] == 3
+
+    async def test_a_usage_limit_never_counts_and_stops_the_sweep(self, client, service):
+        from miragen.memory.claude_code import ClaudeCodeLimited
+
+        first = self._seed_job(service, _event("first"))
+        second = self._seed_job(service, _event("second"))
+        calls = []
+        mode = {"limit": True}
+
+        async def extract(content, source_kind):
+            calls.append(content)
+            if mode["limit"]:
+                raise ClaudeCodeLimited("You've hit your session limit")
+            raise RuntimeError("model exploded")
+
+        limited: dict[str, int] = {}
+        for _ in range(5):
+            results = await run_worker_once(client, extract=extract, check=_checker(True),
+                                            limit=5, max_attempts=2, limited=limited)
+            assert [r["status"] for r in results] == ["limited", "limited"]
+        # One model call per sweep: the rest of the sweep is released untried.
+        assert calls == ["first"] * 5
+        assert first["status"] == second["status"] == "pending"
+        # Five limited claims later, a real failure is still only attempt 1.
+        mode["limit"] = False
+        results = await run_worker_once(client, extract=extract, check=_checker(True),
+                                        limit=5, max_attempts=2, limited=limited)
+        assert {r["job_id"]: (r["status"], r["attempts"]) for r in results} == {
+            first["id"]: ("failed", 1), second["id"]: ("failed", 1)}
+
     async def test_unreachable_store_claims_nothing_quietly(self, client, service):
         service.fail_with = __import__("httpx").ConnectError("refused")
         assert await run_worker_once(

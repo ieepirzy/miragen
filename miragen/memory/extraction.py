@@ -285,6 +285,10 @@ def _payload_for(proposal: ProposedMemory) -> dict[str, Any]:
     return payload
 
 
+# Failures (usage limits excluded) after which a job is failed for good.
+DEFAULT_MAX_ATTEMPTS = 5
+
+
 async def run_worker_once(
     client: MemoryClient,
     *,
@@ -294,11 +298,22 @@ async def run_worker_once(
     limit: int = 5,
     lease_seconds: int = 120,
     skip_before: datetime | None = None,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    limited: dict[str, int] | None = None,
 ) -> list[dict]:
     """One worker sweep: claim consolidate jobs in this principal's
     jurisdiction, process, complete — or fail-for-retry on error. Model
     and store failures never poison the queue: the lease expires or the
-    job returns to pending with its error recorded."""
+    job returns to pending with its error recorded.
+
+    A job that has failed `max_attempts` times is failed for good
+    (status ``abandoned``) instead of re-queued: Loimi has no attempt cap,
+    so a job that always fails would otherwise run, and spend model quota,
+    on every sweep forever. A usage or rate limit is not the job's fault:
+    it never counts toward the cap, and the rest of the sweep is released
+    without a model call (status ``limited``). Loimi counts an attempt per
+    claim, so the claims a limit cost are tallied in `limited` (job id →
+    count; pass the same dict on every sweep) and subtracted."""
     kinds = ["consolidate"] + (["index"] if embed is not None else [])
     try:
         jobs = await client.claim_jobs(
@@ -308,8 +323,15 @@ async def run_worker_once(
         logger.warning(f"job claim failed: {exc}")
         return []
 
+    limited = {} if limited is None else limited
     results = []
+    hit_limit = False
     for job in jobs:
+        if hit_limit:
+            limited[job["id"]] = limited.get(job["id"], 0) + 1
+            await _release(client, job, "not attempted: the model's usage limit was hit this sweep")
+            results.append({"job_id": job["id"], "status": "limited"})
+            continue
         try:
             if job["kind"] == "index":
                 summary = await _process_index_job(client, job, embed)
@@ -326,15 +348,51 @@ async def run_worker_once(
                 summary = await process_event(client, event, extract=extract, check=check)
                 summary |= context
             await client.complete_job(job["id"])
+            limited.pop(job["id"], None)
             results.append(summary | {"job_id": job["id"], "status": "done"})
         except Exception as exc:  # noqa: BLE001 — worker isolation per job
-            logger.warning(f"consolidation job {job['id']} failed: {exc}")
+            if is_rate_limit(exc):
+                hit_limit = True
+                limited[job["id"]] = limited.get(job["id"], 0) + 1
+                logger.warning(f"consolidation job {job['id']} hit the usage limit: {exc}")
+                await _release(client, job, str(exc))
+                results.append({"job_id": job["id"], "status": "limited", "error": str(exc)})
+                continue
+            attempts = job.get("attempts")
+            counted = attempts - limited.get(job["id"], 0) if isinstance(attempts, int) else None
+            final = counted is not None and counted >= max_attempts
+            logger.warning(f"consolidation job {job['id']} failed"
+                           + (f" for good after {counted} attempts" if final else "")
+                           + f": {exc}")
             try:
-                await client.fail_job(job["id"], error=str(exc)[:500], retry=True)
+                await client.fail_job(job["id"], error=str(exc)[:500], retry=not final)
             except (MemoryUnavailable, MemoryAPIError):
                 pass  # lease expiry re-queues it regardless
-            results.append({"job_id": job["id"], "status": "failed", "error": str(exc)})
+            if final:
+                limited.pop(job["id"], None)
+            results.append({"job_id": job["id"], "status": "abandoned" if final else "failed",
+                            "error": str(exc)}
+                           | ({"attempts": counted} if counted is not None else {}))
     return results
+
+
+async def _release(client: MemoryClient, job: dict, error: str) -> None:
+    """Back to pending, for a later sweep."""
+    try:
+        await client.fail_job(job["id"], error=error[:500], retry=True)
+    except (MemoryUnavailable, MemoryAPIError):
+        pass  # lease expiry re-queues it regardless
+
+
+def is_rate_limit(exc: BaseException) -> bool:
+    """A usage or rate limit refused the model call: transient, and not the
+    job's fault. Claude Code's subscription limit, or an HTTP 429 from a
+    PydanticAI provider."""
+    from miragen.memory.claude_code import ClaudeCodeLimited
+
+    if isinstance(exc, ClaudeCodeLimited):
+        return True
+    return getattr(exc, "status_code", None) == 429
 
 
 def event_context(event: dict) -> dict:

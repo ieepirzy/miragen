@@ -273,6 +273,10 @@ def test_worker_backs_off_only_while_every_job_fails():
     assert next_backoff(30, failed, interval=30, ceiling=900) == 60
     assert next_backoff(600, failed, interval=30, ceiling=900) == 900
     assert next_backoff(900, failed + [{"status": "done"}], interval=30, ceiling=900) == 0
+    # A sweep released for a usage limit, or ending in an abandoned job, is
+    # still a sweep that got nothing done.
+    assert next_backoff(30, [{"status": "limited"}], interval=30, ceiling=900) == 60
+    assert next_backoff(30, [{"status": "abandoned"}], interval=30, ceiling=900) == 60
 
 
 def test_a_usage_limit_says_so(fake, monkeypatch):

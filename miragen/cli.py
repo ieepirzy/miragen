@@ -376,6 +376,9 @@ def memory_hook(harness: str) -> None:
                    "plus its checks can take a minute).")
 @click.option("--max-backoff", default=900, show_default=True,
               help="Upper bound (seconds) of the pause after sweeps where every job failed.")
+@click.option("--max-attempts", default=5, show_default=True,
+              help="Failures after which a job is failed for good instead of re-queued. "
+                   "Usage and rate limits don't count.")
 @click.option("--skip-before", envvar="MIRAGEN_WORKER_SKIP_BEFORE", default=None,
               help="ISO timestamp: jobs for events received earlier are completed without "
                    "a model call. Every captured event queues a job, so a first deployment "
@@ -387,7 +390,7 @@ def memory_hook(harness: str) -> None:
 @click.option("--token-file", envvar="MIRAGEN_WORKER_TOKEN_FILE", default=None,
               help="Where the worker's own principal token is kept (0600).")
 def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None,
-                  lease_seconds: int, max_backoff: int, skip_before: str | None,
+                  lease_seconds: int, max_backoff: int, max_attempts: int, skip_before: str | None,
                   principal: str | None, token_file: str | None) -> None:
     """The bounded extraction worker (memory pass PR 3, §17.5): claims
     consolidate jobs through /memory/v1 as its own maintain-capable
@@ -450,10 +453,12 @@ def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None,
     click.echo(f"{utc_stamp()} worker started: model {model}, limit {limit}, interval {interval}s"
                + (f", skipping events received before {skip_before}" if cutoff else ""))
     backoff = 0
+    limited: dict[str, int] = {}  # job id → claims a usage limit cost (never counted)
     while True:
         results = asyncio.run(
             run_worker_once(client, extract=extract, check=check, embed=embed,
-                            limit=limit, lease_seconds=lease_seconds, skip_before=cutoff)
+                            limit=limit, lease_seconds=lease_seconds, skip_before=cutoff,
+                            max_attempts=max_attempts, limited=limited)
         )
         for line in sweep_lines(results):
             click.echo(f"{utc_stamp()} {line}")
@@ -545,12 +550,16 @@ async def ensure_worker_token(
     return how
 
 
+_FAILED_STATUSES = frozenset({"failed", "limited", "abandoned"})
+
+
 def next_backoff(current: int, results: list[dict], *, interval: int, ceiling: int) -> int:
     """Failed jobs go straight back to pending (Loimi has no retry delay), so
     a model outage — a subscription rate limit above all — would otherwise
-    re-run every job each sweep. A sweep where every job failed doubles the
-    pause (from `interval`, up to `ceiling`); any success resets it."""
-    if not results or any(r.get("status") != "failed" for r in results):
+    re-run every job each sweep. A sweep where every job failed (including
+    jobs released for a usage limit, or failed for good) doubles the pause
+    (from `interval`, up to `ceiling`); any success resets it."""
+    if not results or any(r.get("status") not in _FAILED_STATUSES for r in results):
         return 0
     return min(ceiling, max(interval, current * 2))
 
