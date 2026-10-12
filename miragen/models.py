@@ -103,6 +103,10 @@ class RunUsage(BaseModel):
     cache_write_1h_tokens: Optional[int] = None
     calls: Optional[list[CallUsage]] = None
     calls_truncated: bool = False
+    # Written on every record since the inclusive convention. A stored record
+    # without it predates the change: RunRecord normalises it on load
+    # (legacy_usage) so old and new rows add up the same way.
+    input_convention: Literal["inclusive"] = "inclusive"
 
     @model_validator(mode="after")
     def _cap_calls(self) -> "RunUsage":
@@ -131,6 +135,33 @@ def budget_tokens(usage: Optional[RunUsage]) -> int:
     return fresh_input + (usage.output_tokens or 0)
 
 
+# Adapters whose stored input_tokens excluded cache reads before the
+# inclusive convention: the Claude Code / Grok Build / Kimi executors and the
+# Claude Code harness (`claude-code:<model>`).
+_LEGACY_UNCACHED_EXECUTORS = frozenset({"claude-code", "grok-build", "kimi-code"})
+
+
+def legacy_usage(usage: dict[str, Any], *, executor: Any, model: Any) -> dict[str, Any]:
+    """A stored usage dict written before the inclusive convention, made
+    inclusive. Those adapters stored only the uncached part in input_tokens,
+    so cache reads are added back. Any row whose cache reads exceed its input
+    is uncached by construction, whichever adapter wrote it. Without this a
+    legacy row's surplus of cache reads would cancel a resumed turn's fresh
+    input in sum_usage and the budget would fail open."""
+    usage = dict(usage)
+    usage["input_convention"] = "inclusive"
+    input_tokens = _int_or_none(usage.get("input_tokens"))
+    cached = _int_or_none(usage.get("cached_input_tokens"))
+    if input_tokens is None or not cached:
+        return usage
+    uncached_adapter = executor in _LEGACY_UNCACHED_EXECUTORS or (
+        isinstance(model, str) and model.startswith("claude-code:")
+    )
+    if uncached_adapter or cached > input_tokens:
+        usage["input_tokens"] = input_tokens + cached
+    return usage
+
+
 def sum_usage(a: Optional[RunUsage], b: Optional[RunUsage]) -> Optional[RunUsage]:
     """Combine usage across turns of the same run (resumed executor turns,
     or any other multi-turn accounting) — sums so each side's true total is
@@ -148,9 +179,9 @@ def sum_usage(a: Optional[RunUsage], b: Optional[RunUsage]) -> Optional[RunUsage
     calls = a.calls + b.calls if a.calls is not None and b.calls is not None else None
     return RunUsage(
         requests=a.requests + b.requests,
-        input_tokens=(a.input_tokens or 0) + (b.input_tokens or 0) or None,
-        output_tokens=(a.output_tokens or 0) + (b.output_tokens or 0) or None,
-        cached_input_tokens=(a.cached_input_tokens or 0) + (b.cached_input_tokens or 0) or None,
+        input_tokens=_add_optional(a.input_tokens, b.input_tokens),
+        output_tokens=_add_optional(a.output_tokens, b.output_tokens),
+        cached_input_tokens=_add_optional(a.cached_input_tokens, b.cached_input_tokens),
         cache_write_tokens=_add_optional(a.cache_write_tokens, b.cache_write_tokens),
         cache_write_1h_tokens=(
             _add_optional(a.cache_write_1h_tokens, b.cache_write_1h_tokens) if split_known else None
@@ -310,6 +341,19 @@ class TargetOperationProvenance(BaseModel):
 
 
 class RunRecord(BaseModel):
+    @model_validator(mode="before")
+    @classmethod
+    def _normalise_legacy_usage(cls, data: Any) -> Any:
+        # A stored record from before the inclusive token convention
+        # (miragen#189): see legacy_usage. Records built in code carry a
+        # RunUsage object and pass through untouched.
+        if isinstance(data, dict):
+            usage = data.get("usage")
+            if isinstance(usage, dict) and "input_convention" not in usage:
+                data = {**data, "usage": legacy_usage(
+                    usage, executor=data.get("executor"), model=data.get("model"))}
+        return data
+
     run_id: str  # uuid4 hex
     agent_name: str
     trigger: RunTrigger
@@ -819,7 +863,11 @@ class Limits(_ProfileModel):
     tokens_per_run: Optional[int] = Field(
         default=None,
         ge=1,
-        description="Per-run token cap, enforced by PydanticAI (UsageLimits.total_tokens_limit).",
+        description=(
+            "Per-run token cap. Executors and the in-flight reserve count budget_tokens "
+            "(fresh input + output, cache reads excluded); the model tier also hands it to "
+            "PydanticAI as UsageLimits.total_tokens_limit, whose total includes cache reads."
+        ),
     )
     tokens_per_day: Optional[int] = Field(
         default=None,

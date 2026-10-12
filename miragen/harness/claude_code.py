@@ -676,8 +676,11 @@ def _usage(raw: dict[str, Any],
     # Claude Code reports Anthropic Messages usage: input_tokens is only the
     # UNCACHED part; normalise to the inclusive RunUsage convention.
     fields = anthropic_usage_fields(raw)
-    return RunUsage(requests=max(len(responses or {}), 1), **fields,
-                    calls=_calls(fields, responses or {}))
+    calls = _calls(fields, responses or {})
+    # requests agrees with calls when a breakdown reconciled (it may leave
+    # out subagent requests); otherwise every distinct response counts.
+    requests = len(calls) if calls else max(len(responses or {}), 1)
+    return RunUsage(requests=requests, **fields, calls=calls)
 
 
 def _note_response(responses: dict, message: Any) -> None:
