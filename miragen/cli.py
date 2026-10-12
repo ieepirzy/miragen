@@ -30,6 +30,35 @@ def _import_tools(tools: str) -> None:
         click.echo(f"No tools file found at {path}, starting without local tools")
 
 
+def _echo_profile_error(e: Exception) -> None:
+    if isinstance(e, ValidationError):
+        click.echo(click.style(f"✗ Invalid profile — {e.error_count()} error(s):", fg="red"))
+        for err in e.errors():
+            loc = ".".join(str(part) for part in err["loc"]) or "<root>"
+            msg = err["msg"]
+            if err["type"] == "extra_forbidden":
+                msg = "unknown field — check spelling against the profile reference in the README"
+            click.echo(f"  {loc}: {msg}")
+    else:
+        click.echo(click.style(f"✗ Invalid profile: {e}", fg="red"))
+
+
+def _preload_profile() -> None:
+    """Validate the profile before uvicorn starts, so a refused profile
+    exits with its message instead of an application-startup traceback.
+    The lifespan loads it again (same env, same result); secret files are
+    resolved first because interpolation may depend on them, exactly as the
+    lifespan orders it."""
+    from miragen.app import _load_file_secrets
+
+    _load_file_secrets()
+    try:
+        load_profile(os.environ.get("AGENT_PROFILE", "agent.yaml"))
+    except Exception as e:
+        _echo_profile_error(e)
+        raise SystemExit(1)
+
+
 @click.group()
 def cli():
     """Agent runner."""
@@ -46,6 +75,7 @@ def cli():
 def run(tools: str, host: str, port: int, reload: bool) -> None:
     """Start the agent container server."""
     _import_tools(tools)
+    _preload_profile()
     uvicorn.run(
         "miragen.app:app",
         host=host,
@@ -224,7 +254,14 @@ def grok_login(grok_home: str | None) -> None:
 @click.argument("profile", envvar="AGENT_PROFILE", default="agent.yaml")
 @click.option("--tools", default="tools", envvar="TOOLS",
               help="Tools module to import before validating")
-def validate(profile: str, tools: str) -> None:
+@click.option("--allowed-providers", default=None, envvar="MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS",
+              help="Providers agent_type: external/hybrid profiles may use, comma-separated "
+                   "(default: $MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS)")
+@click.option("--allowed-hosts", default=None, envvar="MIRAGEN_EXTERNAL_ALLOWED_HOSTS",
+              help="Hosts their MCP servers / http voice endpoint may live on, comma-separated "
+                   "(default: $MIRAGEN_EXTERNAL_ALLOWED_HOSTS)")
+def validate(profile: str, tools: str, allowed_providers: str | None,
+             allowed_hosts: str | None) -> None:
     """
     Validate an agent profile YAML without starting the server.
     Useful in CI or when authoring a new agent.
@@ -232,9 +269,12 @@ def validate(profile: str, tools: str) -> None:
     _import_tools(tools)
 
     try:
-        p = load_profile(profile)
+        # "" (not None) when unset: the flags already fell back to the env.
+        p = load_profile(profile, allowed_providers=allowed_providers or "",
+                         allowed_hosts=allowed_hosts or "")
         click.echo(click.style(f"✓ '{p.name}' is valid", fg="green"))
         click.echo(f"  mode:         {p.mode}")
+        click.echo(f"  agent_type:   {p.agent_type}")
         if p.is_executor:
             click.echo(f"  executor:     {p.executor.executor} (sandbox: {p.executor.sandbox_mode}, "
                        f"approval: {p.executor.approval_policy})")
@@ -244,17 +284,8 @@ def validate(profile: str, tools: str) -> None:
             click.echo(f"  capabilities: {p.spec.capabilities or []}")
         click.echo(f"  triggers:     {[t.type for t in p.triggers]}")
         click.echo(f"  tools:        {p.tools or []}")
-    except ValidationError as e:
-        click.echo(click.style(f"✗ Invalid profile — {e.error_count()} error(s):", fg="red"))
-        for err in e.errors():
-            loc = ".".join(str(part) for part in err["loc"]) or "<root>"
-            msg = err["msg"]
-            if err["type"] == "extra_forbidden":
-                msg = "unknown field — check spelling against the profile reference in the README"
-            click.echo(f"  {loc}: {msg}")
-        raise SystemExit(1)
     except Exception as e:
-        click.echo(click.style(f"✗ Invalid profile: {e}", fg="red"))
+        _echo_profile_error(e)
         raise SystemExit(1)
 
 @cli.command(name="memory-hook")

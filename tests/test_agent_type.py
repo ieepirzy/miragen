@@ -338,3 +338,60 @@ def test_parse_allowed_providers():
     assert parse_allowed_providers(" Anthropic, openai ,,") == {"anthropic", "openai"}
     assert parse_allowed_providers(None) == frozenset()
     assert parse_allowed_providers(["OpenAI "]) == {"openai"}
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+
+def _cli(tmp_path, monkeypatch, args, doc, env=None):
+    from click.testing import CliRunner
+
+    import miragen.cli as cli_module
+
+    started = []
+    monkeypatch.setattr(cli_module.uvicorn, "run", lambda *a, **k: started.append(a))
+    monkeypatch.chdir(tmp_path)
+    path = _write(tmp_path, doc)
+    result = CliRunner().invoke(
+        cli_module.cli, args, env={"AGENT_PROFILE": str(path), **(env or {})},
+        catch_exceptions=False,
+    )
+    return result, started
+
+
+def test_run_refuses_before_the_server_starts(tmp_path, monkeypatch):
+    result, started = _cli(tmp_path, monkeypatch, ["run"], _profile("external"))
+    assert result.exit_code == 1
+    assert "✗ Invalid profile: agent_type: external needs" in result.output
+    assert ALLOWED_PROVIDERS_ENV in result.output
+    assert "Traceback" not in result.output
+    assert started == []
+
+
+def test_run_starts_the_server_for_a_valid_profile(tmp_path, monkeypatch):
+    result, started = _cli(tmp_path, monkeypatch, ["run"], _profile("external"),
+                           env={ALLOWED_PROVIDERS_ENV: "anthropic"})
+    assert result.exit_code == 0, result.output
+    assert len(started) == 1
+
+
+def test_validate_flags_and_agent_type_output(tmp_path, monkeypatch):
+    doc = _profile("external", capabilities=[_mcp("https://mcp.example.com/mcp")])
+    ok, _ = _cli(tmp_path, monkeypatch, [
+        "validate", "--allowed-providers", "anthropic", "--allowed-hosts", "mcp.example.com",
+    ], doc)
+    assert ok.exit_code == 0, ok.output
+    assert "agent_type:   external" in ok.output
+
+    # Flags win over the environment.
+    refused, _ = _cli(tmp_path, monkeypatch, [
+        "validate", "--allowed-providers", "openai", "--allowed-hosts", "mcp.example.com",
+    ], doc, env={ALLOWED_PROVIDERS_ENV: "anthropic"})
+    assert refused.exit_code == 1
+    assert "provider 'anthropic' is not in" in refused.output
+
+    # Without flags, the environment is the fallback.
+    from_env, _ = _cli(tmp_path, monkeypatch, ["validate"], doc, env={
+        ALLOWED_PROVIDERS_ENV: "anthropic", ALLOWED_HOSTS_ENV: "mcp.example.com",
+    })
+    assert from_env.exit_code == 0, from_env.output
