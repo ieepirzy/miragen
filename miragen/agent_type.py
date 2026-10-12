@@ -7,7 +7,8 @@ account backing — and `hybrid` serves both, so it is held to the same rules:
 - base tier only (`spec:`): an executor runs its own loop on its own
   credentials, outside anything checked here;
 - every model it names is a pydantic-ai ``provider:model`` string whose
-  provider is in the deployment's allowed list, read from
+  provider is in the deployment's allowed list (a cloud ``voice.provider``
+  too, by name), read from
   ``MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS``. An unset or empty list refuses
   every external/hybrid profile: no list is not "anything goes";
 - subscription harness models (``claude-code:``, ``codex:``,
@@ -158,3 +159,32 @@ def check_agent_type(
                 f"({', '.join(sorted(allowed))}); {who} profiles may only use "
                 "allowed providers"
             )
+
+    _check_voice(profile, allowed, who, uninterpolated)
+
+
+def _check_voice(
+    profile: AgentProfile,
+    allowed: frozenset[str],
+    who: str,
+    uninterpolated: Mapping[str, Any] | None,
+) -> None:
+    """A cloud speech provider receives everything the agent says aloud, so
+    it is held to the same list (by its provider name, e.g. 'openai'). The
+    'http' provider is the deployment's own endpoint and is not checked."""
+    voice = profile.voice
+    if voice is None:
+        return
+    if uninterpolated is not None and _is_interpolated(
+        _lookup(uninterpolated, ("voice", "provider"))
+    ):
+        raise ValueError(
+            f"voice.provider: {who} profiles may not set the speech provider with "
+            "${VAR} interpolation; write it literally"
+        )
+    if voice.provider != "http" and voice.provider.lower() not in allowed:
+        raise ValueError(
+            f"voice.provider: speech provider {voice.provider!r} is not in "
+            f"{ALLOWED_PROVIDERS_ENV} ({', '.join(sorted(allowed))}); {who} "
+            "profiles may only use allowed providers"
+        )

@@ -161,6 +161,28 @@ def test_image_generation_fallback_model_interpolation_fails(tmp_path, public, m
         _load(tmp_path, doc)
 
 
+def test_cloud_voice_provider_must_be_allowed(tmp_path, public):
+    doc = _profile(public)
+    doc["voice"] = {"provider": "openai"}
+    assert _load(tmp_path, doc, allowed="anthropic,openai").agent_type == public
+    with pytest.raises(ValueError, match=r"voice\.provider: speech provider 'openai' is not in"):
+        _load(tmp_path, doc, allowed="anthropic")
+
+
+def test_self_hosted_voice_endpoint_is_not_a_provider(tmp_path, public):
+    doc = _profile(public)
+    doc["voice"] = {"provider": "http", "url": "https://tts.example.com/speak"}
+    assert _load(tmp_path, doc, allowed="anthropic").agent_type == public
+
+
+def test_interpolated_voice_provider_fails(tmp_path, public, monkeypatch):
+    monkeypatch.setenv("TTS_PROVIDER", "openai")
+    doc = _profile(public)
+    doc["voice"] = {"provider": "${TTS_PROVIDER}"}
+    with pytest.raises(ValueError, match=r"voice\.provider: .*interpolation"):
+        _load(tmp_path, doc, allowed="anthropic,openai")
+
+
 @pytest.mark.parametrize("allowed", [None, "", " , ,"])
 def test_unset_or_empty_allowlist_fails_closed(tmp_path, public, allowed):
     # None = read the environment, which the autouse fixture cleared.

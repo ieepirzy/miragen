@@ -396,7 +396,7 @@ An `external` or `hybrid` profile is refused at load (`miragen run`, `miragen va
 - the deployment sets `MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS`, a comma-separated list of pydantic-ai provider names such as `anthropic,openai` (trimmed, case-insensitive). **Unset or empty refuses every external/hybrid profile** (fail closed);
 - it is base tier (`spec:`), not an `executor:` profile;
 - `spec.model` is a pydantic-ai `provider:model` string whose provider is in the list. The provider is the text before the first `:` and must match a list entry exactly, so `openai` does not admit `openai-responses`; list each one you allow. Subscription harness models (`claude-code:`, `codex:`, `grok-build:`) are refused: they run on a personal login;
-- every other model it names uses an allowed provider too: the `ImageGeneration` capability's `fallback_model`;
+- every other model it names uses an allowed provider too: the `ImageGeneration` capability's `fallback_model`, and a cloud `voice.provider` (e.g. `openai`, checked by name; the self-hosted `http` provider is the deployment's own endpoint and is not checked);
 - no model is written with `${VAR}` interpolation, since the value cannot be checked until it is resolved;
 - it has no `memory:` block: a public-facing agent keeps no long-term memory of the people it talks to.
 
@@ -411,7 +411,7 @@ spec:
   instructions: You answer questions about our public documentation.
 ```
 
-miragend forwards `MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS` from its own environment into every agent it creates, so its `/validate` and the spawned container apply the same list. Declaring `agent_type` at all implies profile contract v3 (see `apiVersion`): a control plane can tell a runtime enforces it when `/health` → `profile_contracts`, the image label `io.miragen.profile-contracts`, or `miragen contract` include `3`, and miragend refuses to spawn such a profile onto an older image.
+miragend forwards `MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS` from its own environment into every agent it creates, so its `/validate` and the spawned container apply the same list. Declaring `agent_type` at all implies profile contract v3 ([miragen/profile_contract.py](miragen/profile_contract.py)): a control plane can tell a runtime enforces it when `/health` → `profile_contracts`, the image label `io.miragen.profile-contracts`, or `miragen contract` include `3`, and miragend refuses to spawn such a profile onto an older image.
 
 ### Environment interpolation
 
