@@ -42,8 +42,14 @@ dependencies = [
     # bundle (including "fastmcp", which nothing in miragen imports) that
     # requires fastmcp>=3.3.0, conflicting with kimi-cli's fastmcp==2.12.5
     # pin (the kimi-code executor backend). pydantic-ai-slim gives us only
-    # the extras we actually use.
-    "pydantic-ai-slim[web-fetch,duckduckgo,mcp,openai]==1.106.0",
+    # the extras we actually use. `anthropic` is the provider for
+    # `anthropic:*` model strings; without it such a profile fails at load
+    # with an ImportError.
+    "pydantic-ai-slim[web-fetch,duckduckgo,mcp,openai,anthropic]==1.106.0",
+    # anthropic 1.x moved to httpx2, and pydantic-ai-slim 1.106 hands the
+    # SDK an httpx client ("Invalid `http_client` argument"). Hold 0.x until
+    # pydantic-ai supports the 1.x SDK.
+    "anthropic>=0.105.0,<1",
     # mcp 2.x (PyPI since 2026-07-28) renamed FastMCP to MCPServer and
     # changed other APIs; miragen/intervention_mcp.py imports the v1
     # `mcp.server.fastmcp.FastMCP` directly. pydantic-ai-slim's `mcp` extra
