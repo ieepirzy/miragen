@@ -334,14 +334,24 @@ class ToolGateway:
                 logger.warning("gateway: listing %s failed: %s", up.name, type(exc).__name__)
                 continue
             for t in tools:
-                out.append(t.model_copy(update={"name": f"{up.name}_{t.name}"}))
+                name = f"{up.name}_{t.name}"
+                if self._resolve(name)[1] is not up:
+                    # Shadowed: a local tool or a longer upstream prefix owns
+                    # this name, so a call would never reach this tool.
+                    logger.warning("gateway: %s's tool '%s' is shadowed as '%s'; not listed",
+                                   up.name, t.name, name)
+                    continue
+                out.append(t.model_copy(update={"name": name}))
         return out
 
     def _resolve(self, name: str) -> tuple[str, Any, str]:
         """(kind, target, raw_name) for a gateway tool name."""
         if name in self._local:
             return "local", self._local[name], name
-        for up in self._upstreams.values():
+        # Longest prefix first: with upstreams 'github' and 'github_issues',
+        # 'github_issues_add_comment' belongs to 'github_issues', whatever
+        # order the capabilities were declared in.
+        for up in sorted(self._upstreams.values(), key=lambda u: len(u.name), reverse=True):
             prefix = f"{up.name}_"
             if name.startswith(prefix):
                 raw = name[len(prefix):]

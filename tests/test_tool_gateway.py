@@ -319,3 +319,58 @@ async def test_no_timezone_no_stamp(seen):
 def test_unknown_timezone_fails_profile_validation():
     with pytest.raises(ValueError, match="unknown time zone"):
         profile(timezone="Europe/Hesa")
+
+
+def _prefix_pair_gateway(seen):
+    """Upstreams 'github' and 'github_issues', declared shortest first (#170).
+    'github' also serves a tool its prefix makes collide with github_issues'."""
+    github = FastMCP("github")
+
+    @github.tool()
+    def get_me() -> str:
+        """Who am I."""
+        return "me"
+
+    @github.tool()
+    def issues_add_comment() -> str:
+        """Collides with github_issues' add_comment once prefixed."""
+        return "wrong-upstream"
+
+    issues = FastMCP("github_issues")
+
+    @issues.tool()
+    def add_comment(body: str) -> str:
+        """Comment on an issue."""
+        return f"commented:{body}"
+
+    servers = {"http://gh/mcp": github, "http://ghi/mcp": issues}
+
+    @contextlib.asynccontextmanager
+    async def factory(url, headers=None):
+        seen.append((url, headers))
+        async with memory_client_factory(servers[url], [])(url, headers) as streams:
+            yield streams
+
+    p = profile(spec={"model": "grok-build:x", "instructions": "i", "capabilities": [
+        {"MCP": {"url": "http://gh/mcp", "name": "github"}},
+        {"MCP": {"url": "http://ghi/mcp", "name": "github_issues"}},
+    ]})
+    return ToolGateway(p, env={}, upstream_client=factory)
+
+
+async def test_tool_names_resolve_by_the_longest_upstream_prefix(seen):
+    gw = _prefix_pair_gateway(seen)
+    with gw.turn("inst", "r"):
+        res = await gw.call_tool("github_issues_add_comment", {"body": "hi"}, instance="inst")
+        me = await gw.call_tool("github_get_me", {}, instance="inst")
+    assert text(res) == "commented:hi" and not res.isError
+    assert text(me) == "me"
+
+
+async def test_a_shadowed_upstream_tool_is_not_listed(seen):
+    gw = _prefix_pair_gateway(seen)
+    names = [t.name for t in await gw._list_tools()]
+    # github's issues_add_comment would be called as github_issues_add_comment,
+    # which reaches github_issues: listing it twice would advertise a tool
+    # that can't be called.
+    assert sorted(names) == ["github_get_me", "github_issues_add_comment"]
