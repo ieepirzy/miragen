@@ -1131,6 +1131,34 @@ def test_create_refused_when_image_lacks_required_contract(
     assert "alpha" not in docker_client.container_map
 
 
+def test_agent_type_profile_refused_on_an_image_without_contract_3(tmp_path):
+    # A pre-agent_type runtime rejects the field as unknown, so it would
+    # crash-loop; the image check refuses the spawn up front instead.
+    core = _external_core(tmp_path, {"MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS": "test"})
+    core._docker.image_map[DEFAULT_IMAGE] = FakeImage(
+        labels={"io.miragen.profile-contracts": "1 2"}, repo_digests=[DEFAULT_DIGEST]
+    )
+    from miragen.daemon.core import ImageContractUnsupported
+
+    with pytest.raises(ImageContractUnsupported, match="requires contract 3"):
+        core.create_agent("alpha", EXTERNAL_YAML.format(name="alpha"))
+    assert not (tmp_path / "agents" / "alpha").exists()
+
+
+def test_agent_type_profile_created_on_a_contract_3_image(tmp_path):
+    import yaml as pyyaml
+
+    core = _external_core(tmp_path, {"MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS": "test"})
+    core._docker.image_map[DEFAULT_IMAGE] = FakeImage(
+        labels={"io.miragen.profile-contracts": "1 2 3"}, repo_digests=[DEFAULT_DIGEST]
+    )
+    core.create_agent("alpha", EXTERNAL_YAML.format(name="alpha"))
+    env = pyyaml.safe_load((tmp_path / "compose.yml").read_text())["services"]["alpha"][
+        "environment"
+    ]
+    assert env["MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS"] == "test"
+
+
 def test_unlabeled_image_reads_as_contract_1_only(core, docker_client):
     # An image that predates contract labeling is a pre-executor-tier
     # runtime: model-tier profiles pass, executor-tier profiles are refused.

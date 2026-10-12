@@ -88,6 +88,24 @@ class TestProfileRequirement:
         with pytest.raises(ValidationError, match="understate"):
             AgentProfile.model_validate({**EXECUTOR_TIER, "apiVersion": "miragen/v1"})
 
+    def test_declaring_agent_type_requires_contract_3(self):
+        # Any declared value, internal included: a v1/v2 runtime rejects the
+        # unknown key, so the profile must not be spawned there.
+        for value in ("internal", "external", "hybrid"):
+            profile = AgentProfile.model_validate({**MODEL_TIER, "agent_type": value})
+            assert profile.required_contract() == 3
+
+    def test_omitted_agent_type_keeps_contract_1(self):
+        profile = AgentProfile.model_validate(MODEL_TIER)
+        assert profile.agent_type == "internal"
+        assert profile.required_contract() == 1
+
+    def test_agent_type_cannot_understate(self):
+        with pytest.raises(ValidationError, match="understate"):
+            AgentProfile.model_validate(
+                {**MODEL_TIER, "agent_type": "external", "apiVersion": "miragen/v2"}
+            )
+
     def test_malformed_api_version_rejected(self):
         with pytest.raises(ValidationError):
             AgentProfile.model_validate({**MODEL_TIER, "apiVersion": "v2"})

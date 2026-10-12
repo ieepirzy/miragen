@@ -1195,7 +1195,7 @@ class AgentProfile(_ProfileModel):
             "Profile contract this profile is written against, e.g. "
             "'miragen/v2'. Optional: the effective requirement is the "
             "greater of this declaration and what the profile's features "
-            "imply (an executor block implies v2), so a profile can pin "
+            "imply (an executor block implies v2, declaring agent_type v3), so a profile can pin "
             "forward but never understate what it uses. miragend refuses "
             "to spawn a profile onto a runtime image that does not "
             "declare support for the required contract (#75)."
@@ -1351,8 +1351,11 @@ class AgentProfile(_ProfileModel):
 
     def inferred_contract(self) -> int:
         """The contract level this profile's FEATURES require, regardless
-        of what it declares. The executor tier is the v2 surface; everything
-        the model tier ever supported is v1."""
+        of what it declares. The executor tier is the v2 surface; declaring
+        `agent_type` (any value — an older runtime rejects the unknown field
+        outright) is v3; everything the model tier ever supported is v1."""
+        if "agent_type" in self.model_fields_set:
+            return 3
         return 2 if self.executor is not None else 1
 
     def required_contract(self) -> int:
@@ -1381,8 +1384,8 @@ class AgentProfile(_ProfileModel):
             raise ValueError(
                 f"profile declares apiVersion {self.api_version} but uses "
                 f"features requiring {format_api_version(inferred)} "
-                "(the executor tier is a v2 surface) — a profile must not "
-                "understate its runtime requirement"
+                "(the executor tier is a v2 surface, agent_type a v3 one) — "
+                "a profile must not understate its runtime requirement"
             )
         return self
 
