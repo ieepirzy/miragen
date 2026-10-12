@@ -17,6 +17,7 @@ from miragen.models import (
     RunSummary,
     RunUsage,
     ToolCallRecord,
+    budget_tokens,
 )
 
 _PROMPT_MAX = 20_000
@@ -305,7 +306,8 @@ class RunStore:
 
 def tokens_used_since(store: RunStore, since: datetime) -> int:
     """
-    Sum input+output tokens across `store`'s run records with started_at >= since.
+    Sum budget tokens (models.budget_tokens: fresh input + output, cache
+    reads excluded) across `store`'s run records with started_at >= since.
 
     Records with no usage (e.g. a run that failed before the model responded,
     or a fresh `running` record that hasn't finished a turn yet) contribute 0
@@ -319,7 +321,7 @@ def tokens_used_since(store: RunStore, since: datetime) -> int:
     for record in store._iter_records():
         if record.started_at < since or record.usage is None:
             continue
-        total += (record.usage.input_tokens or 0) + (record.usage.output_tokens or 0)
+        total += budget_tokens(record.usage)
     return total
 
 
@@ -351,9 +353,7 @@ def reserved_tokens_in_flight(
             continue
         if per_run_reserve is None:
             return max(remaining_budget, 0)
-        already_used = 0
-        if record.usage is not None:
-            already_used = (record.usage.input_tokens or 0) + (record.usage.output_tokens or 0)
+        already_used = budget_tokens(record.usage)
         total += max(per_run_reserve - already_used, 0)
     return total
 

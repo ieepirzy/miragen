@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -53,14 +54,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-import threading
-
 from pydantic import ValidationError
 
 from miragen import events as _events
 from miragen.events import EVENT_SCHEMA, EventPage, EventWriter
 from miragen.executor.leash import GateDecision, GateOperation, LeashPolicy
-from miragen.models import AgentProfile, ExecutorSpec, InterventionRequest, RunUsage, sum_usage
+from miragen.models import (
+    AgentProfile,
+    ExecutorSpec,
+    InterventionRequest,
+    RunUsage,
+    budget_tokens,
+    sum_usage,
+)
 
 logger = logging.getLogger("miragen.executor")
 
@@ -761,8 +767,7 @@ class ExecutorBackend(ABC):
         limits = self.profile.limits
         if limits is None or limits.tokens_per_run is None or usage is None:
             return False
-        total = (usage.input_tokens or 0) + (usage.output_tokens or 0)
-        return total > limits.tokens_per_run
+        return budget_tokens(usage) > limits.tokens_per_run
 
 
 def event_payload(event: Any) -> dict[str, Any]:

@@ -119,6 +119,18 @@ def _add_optional(a: Optional[int], b: Optional[int]) -> Optional[int]:
     return (a or 0) + (b or 0)
 
 
+def budget_tokens(usage: Optional[RunUsage]) -> int:
+    """Tokens a run spends against `limits.tokens_per_run` and the daily
+    budget: fresh input (uncached input and cache writes) plus output. Cache
+    reads are left out. They cost about a tenth of fresh input, and counting
+    them would make a long cached session exhaust its budget on reuse alone
+    (input_tokens includes them since the inclusive convention)."""
+    if usage is None:
+        return 0
+    fresh_input = max((usage.input_tokens or 0) - (usage.cached_input_tokens or 0), 0)
+    return fresh_input + (usage.output_tokens or 0)
+
+
 def sum_usage(a: Optional[RunUsage], b: Optional[RunUsage]) -> Optional[RunUsage]:
     """Combine usage across turns of the same run (resumed executor turns,
     or any other multi-turn accounting) — sums so each side's true total is
