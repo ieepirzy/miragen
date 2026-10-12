@@ -273,3 +273,52 @@ async def test_gateway_records_result_status_never_content(env):
     assert rec.result_status == "accepted"
     assert "record_id" not in rec.model_dump_json()
     await asyncio.sleep(0)
+
+
+async def test_a_session_past_the_models_window_is_replaced_and_the_turn_retried(env):
+    # Nothing but the window in play: the policy would never act on its own.
+    h = env.harness(policy=ThresholdPolicy(10**6, 10**7, 3))
+    await h.run(turn("x\nGROW 5000", run_id="r1"))
+    old_sid = state(env)["session_id"]
+    (env.home / "fake-window.txt").write_text("4000")      # the session no longer fits
+    res = await h.run(turn("hello", run_id="r2"))
+    assert res.output.rstrip().endswith("echo: hello")
+    st = state(env)
+    assert st["seq"] == 2 and st["session_id"] != old_sid and st["turns"] == 1
+    # the old session was never asked for a memory save or a note: it can't take a turn
+    assert json.loads(fake_session(env, old_sid).read_text())["turns"] == ["x\nGROW 5000"]
+    rot = [e for e in ledger(h) if e["event"] == "rotation"]
+    assert len(rot) == 1 and rot[0]["reason"] == "context_overflow"
+    assert "outgrown the model's context window" in rot[0]["handoff_error"]
+    opener = json.loads(fake_session(env, st["session_id"]).read_text())["turns"][0]
+    assert opener.startswith("<handoff source=\"miragen\">")
+    assert "rotated because: context_overflow" in opener and opener.rstrip().endswith("hello")
+
+
+async def test_overflow_in_a_fresh_session_is_not_retried_again(env):
+    from miragen.harness.grok import GrokContextOverflowError
+    h = env.harness(policy=ThresholdPolicy(10**6, 10**7, 3))
+    await h.run(turn("x", run_id="r1"))
+    (env.home / "fake-window.txt").write_text("1")          # nothing fits, ever
+    try:
+        await h.run(turn("hello", run_id="r2"))
+    except GrokContextOverflowError as exc:
+        assert "input_too_large" in str(exc)
+    else:
+        raise AssertionError("expected GrokContextOverflowError")
+    assert len([e for e in ledger(h) if e["event"] == "rotation"]) == 1
+
+
+async def test_overflow_with_lifecycle_off_is_reported_not_handled(env):
+    from miragen.harness.grok import GrokContextOverflowError
+    h = env.harness(lifecycle=False)
+    await h.run(turn("x\nGROW 5000", run_id="r1"))
+    sid = state(env)["session_id"]
+    (env.home / "fake-window.txt").write_text("4000")
+    try:
+        await h.run(turn("hello", run_id="r2"))
+    except GrokContextOverflowError:
+        pass
+    else:
+        raise AssertionError("expected GrokContextOverflowError")
+    assert state(env)["session_id"] == sid and not h.ledger.read("chat")

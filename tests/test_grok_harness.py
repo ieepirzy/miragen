@@ -469,3 +469,15 @@ async def test_http_delete_instance_discards_the_grok_conversation(app_with_grok
         r2 = await c.post("/run", json={"prompt": "HISTORY", "use_history": True, "instance": "chat"})
         assert r2.json()["output"].startswith("turns=1 ")  # a fresh conversation
         assert (await c.delete("/instances/nope")).status_code == 404
+
+
+async def test_a_grok_that_dies_at_startup_says_why(env):
+    (env.home / "fake-crash.txt").write_text(
+        "thread 'main' panicked: failed to spawn thread: Resource temporarily unavailable\n")
+    h = env.harness()
+    with pytest.raises(GrokHarnessError) as err:
+        await h.run(turn("hi"))
+    msg = str(err.value)
+    assert "exited during startup" in msg
+    assert "Resource temporarily unavailable" in msg
+    assert h.status()["processes"] == []
