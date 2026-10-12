@@ -1,0 +1,30 @@
+name: Mirror to private repo
+
+# Keeps Muutto365/miragen-private in sync for Claude plugin marketplace sync
+# (the Teams plugin store won't add public repos as marketplaces).
+on:
+  push:
+    branches: ["**"]
+    tags: ["**"]
+  delete:
+  workflow_dispatch:
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    if: github.repository == 'ieepirzy/miragen'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror branches and tags
+        env:
+          MIRROR_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+        run: |
+          git clone --bare "https://github.com/${GITHUB_REPOSITORY}.git" src.git
+          cd src.git
+          git push --mirror "https://x-access-token:${MIRROR_TOKEN}@github.com/Muutto365/miragen-private.git"
