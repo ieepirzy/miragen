@@ -1169,6 +1169,13 @@ class LifecycleCore:
                 f"profile 'name' field is '{summary.get('name')}' but the agent "
                 f"being updated is '{name}' — set 'name: {name}' in the YAML"
             )
+        if summary.get("agent_type") in PUBLIC_AGENT_TYPES:
+            offending = code_violations(d)
+            if offending:
+                raise PublicAgentRefused(
+                    f"agent '{name}' has code the runtime would load ({offending}); "
+                    f"remove its tools before making it agent_type: {summary['agent_type']}"
+                )
 
         old_kind_for_contract = self._agent_executor_kind(name)
         will_recreate = str(summary.get("executor") or "") != old_kind_for_contract

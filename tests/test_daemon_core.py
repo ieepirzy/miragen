@@ -541,6 +541,23 @@ def test_import_revalidates_against_the_daemon_allowlist(tmp_path, monkeypatch):
     assert not (tmp_path / "agents" / "beta").exists()
 
 
+def test_update_to_public_refused_while_the_agent_has_tools(tmp_path):
+    from miragen.daemon.core import PublicAgentRefused
+
+    core = _contract3_external_core(tmp_path)
+    core.create_agent("alpha", _yaml("alpha"), tools_source=TOOL_SRC)
+    agent_dir = tmp_path / "agents" / "alpha"
+    # tools.py holds code but the profile lists no tools: only the code
+    # check can refuse this.
+    with pytest.raises(PublicAgentRefused, match="remove its tools"):
+        core.update_agent_config("alpha", EXTERNAL_YAML.format(name="alpha"))
+    assert "agent_type" not in (agent_dir / "agent.yaml").read_text()
+
+    (agent_dir / "tools.py").write_text(PLACEHOLDER_TOOLS)
+    core.update_agent_config("alpha", EXTERNAL_YAML.format(name="alpha"))
+    assert "agent_type: external" in (agent_dir / "agent.yaml").read_text()
+
+
 def test_validate_profile_text_reads_hosts_from_the_given_environ(monkeypatch):
     monkeypatch.setenv("MIRAGEN_EXTERNAL_ALLOWED_HOSTS", "mcp.example.com")
     text = EXTERNAL_YAML.format(name="alpha") + (
