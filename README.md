@@ -411,7 +411,7 @@ spec:
   instructions: You answer questions about our public documentation.
 ```
 
-miragend forwards `MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS` from its own environment into every agent it creates, so its `/validate` and the spawned container apply the same list. Declaring `agent_type` at all implies profile contract v3 ([miragen/profile_contract.py](miragen/profile_contract.py)): a control plane can tell a runtime enforces it when `/health` → `profile_contracts`, the image label `io.miragen.profile-contracts`, or `miragen contract` include `3`, and miragend refuses to spawn such a profile onto an older image.
+miragend forwards `MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS` from its own environment into every agent it creates, so its `/validate` and the spawned container apply the same list. Declaring `agent_type` at all implies profile contract v3 ([miragen/profile_contract.py](miragen/profile_contract.py)): a control plane can tell a runtime enforces it when `/health` → `profile_contracts`, the image label `io.miragen.profile-contracts`, or `miragen contract` include `3`, and miragend refuses to spawn such a profile onto an older image. Serialized profiles (`model_dump`, an EDF's `resolved_profile`) omit `agent_type: internal`, so a profile that never declared a public type dumps back to its original contract.
 
 ### Environment interpolation
 
