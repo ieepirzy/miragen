@@ -405,7 +405,7 @@ An `external` or `hybrid` profile is refused at load (`miragen run`, `miragen va
 **Tier, capabilities and code.**
 - Base tier (`spec:`) only; an `executor:` profile is refused.
 - Capabilities are an allowlist: `Thinking`, `ImageGeneration`, `MCP` (host-checked), and `WebFetch` with `local: false` (the provider's native fetch). Refused: `WebSearch` (it falls back to a local DuckDuckGo search when the model has no native search, and the profile cannot turn that off), `WebFetch` with its local fetcher (it would request any URL from inside the deployment), `Peer` (it forwards the public user's text to an agent that is not held to these rules), and every custom `register_capability` entry.
-- No local `tools:`. miragend also refuses a `tools_source` at create and live tool injection (`register_tool`/`edit_tool`) for these agents.
+- No local `tools:` and no custom code. miragend refuses, for these agents, a `tools_source` at create, live tool injection (`register_tool`/`edit_tool`), `write_file`/`edit_file` on any code file (`.py`, `.pyc`, `.so`, `.pyd`) or on `agent.yaml` (profile changes go through the validated config update), an import whose archive carries code, and a config update that makes an agent with tools external/hybrid. A code-free `tools.py` (the placeholder a new agent gets) is fine. `miragen run` checks this before it imports `tools.py`.
 
 **Interpolation.** No model, MCP `url`, voice `provider` or voice `url` may use `${VAR}` interpolation: the value cannot be checked until it is resolved. `agent_type` itself may never be interpolated, on any profile.
 
