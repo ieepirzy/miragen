@@ -183,6 +183,12 @@ def test_interpolated_voice_provider_fails(tmp_path, public, monkeypatch):
         _load(tmp_path, doc, allowed="anthropic,openai")
 
 
+def test_peer_capability_fails(tmp_path, public):
+    doc = _profile(public, capabilities=["Thinking", {"Peer": {"agents": ["researcher"]}}])
+    with pytest.raises(ValueError, match=r"spec\.capabilities\[1\]\.Peer: .*Peer capability"):
+        _load(tmp_path, doc)
+
+
 @pytest.mark.parametrize("allowed", [None, "", " , ,"])
 def test_unset_or_empty_allowlist_fails_closed(tmp_path, public, allowed):
     # None = read the environment, which the autouse fixture cleared.

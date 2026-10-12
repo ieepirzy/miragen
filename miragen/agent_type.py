@@ -160,7 +160,33 @@ def check_agent_type(
                 "allowed providers"
             )
 
+    _check_capabilities(profile, who)
     _check_voice(profile, allowed, who, uninterpolated)
+
+
+def _capability_entries(profile: AgentProfile) -> list[tuple[int, str, dict]]:
+    """(index, name, config) for each spec capability, in both YAML forms.
+    Malformed entries are skipped here: the loader's own capability
+    resolution already refused them."""
+    out = []
+    for i, entry in enumerate(profile.spec.capabilities or []):
+        if isinstance(entry, str):
+            out.append((i, entry, {}))
+        elif isinstance(entry, dict) and len(entry) == 1:
+            name, cfg = next(iter(entry.items()))
+            out.append((i, name, cfg if isinstance(cfg, dict) else {}))
+    return out
+
+
+def _check_capabilities(profile: AgentProfile, who: str) -> None:
+    for i, name, _cfg in _capability_entries(profile):
+        where = f"spec.capabilities[{i}].{name}"
+        if name == "Peer":
+            raise ValueError(
+                f"{where}: {who} profiles may not use the Peer capability; "
+                "call_agent would forward the public user's text to another "
+                "agent that is not held to these rules"
+            )
 
 
 def _check_voice(
