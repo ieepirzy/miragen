@@ -20,6 +20,14 @@ store_close_run / store_run_tree / store_list_namespaces`, and
 `bridge_status / bridge_sessions`. The skill `memory-bridge` tells the model
 when to use them.
 
+**Agent memory, not organizational memory.** The bridge is the agents'
+memory: working state, recall, episodes and each session's own work trail.
+Organizational knowledge (decisions, findings, conventions, ingested papers)
+is Loimi core, operated through Loimi's own MCP server and its `loimi` skill
+(ieepirzy/Loimi `integrations/`). That surface is where org artifacts are
+superseded. The bridge's `store_*` tools are a deliberate subset for filing a
+session's own work, so there is no `store_supersede_artifact` here.
+
 ## Install
 
 ```shell

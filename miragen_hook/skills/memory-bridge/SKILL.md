@@ -13,6 +13,18 @@ as an immutable artifact, to the Loimi artifact store under this session's run.
 The injected `[session context …]` header names the project, the memory scope,
 and (when the store is reachable) `store_run=<id>` and `namespace=<ns>`.
 
+**This bridge is agent memory, not organizational memory.** It holds your
+working state, recall, episodes and the trail of your own sessions. Correct
+your own memories with `memory_correct`. The organization's knowledge
+(decisions, findings, conventions, ingested papers and patents) lives in Loimi
+core and is operated through **Loimi's own MCP server** (the Loimi connector,
+with its `loimi` skill). That is where organizational artifacts are recorded,
+and where stale ones are superseded with `store_supersede_artifact`. This
+bridge's `store_*` tools are a subset for filing this session's own work, and
+intentionally have no supersede tool. If you're asked to correct organizational
+knowledge and only have this bridge, say it needs the Loimi connector. Never
+work around it with a fresh `store_put_artifact`.
+
 ## Memory tools (MCP server `miragen-bridge`)
 
 Everything is scoped by the daemon from the `project` you name — the repository
