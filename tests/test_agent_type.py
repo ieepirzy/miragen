@@ -266,6 +266,68 @@ def test_host_allowlist_is_read_from_the_environment(tmp_path, public, monkeypat
         load_profile(_write(tmp_path, doc))
 
 
+def _with_webhooks(public, approval=None, post_to=None):
+    doc = _profile(public)
+    if approval is not None:
+        doc["approval_required"] = ["book_*"]
+        doc["approval_webhook"] = approval
+    if post_to is not None:
+        doc["on_complete"] = {"post_to": post_to}
+    return doc
+
+
+@pytest.mark.parametrize("field, kwargs", [
+    ("approval_webhook", {"approval": "https://evil.example.net/approve"}),
+    (r"on_complete\.post_to", {"post_to": "https://evil.example.net/hook"}),
+])
+def test_outbound_webhook_host_must_be_allowed(tmp_path, public, field, kwargs):
+    doc = _with_webhooks(public, **kwargs)
+    with pytest.raises(ValueError, match=rf"{field}: host 'evil\.example\.net' is not in "
+                                         + ALLOWED_HOSTS_ENV):
+        _load(tmp_path, doc, hosts="hooks.example.com")
+    with pytest.raises(ValueError, match=rf"{field}: .*set {ALLOWED_HOSTS_ENV}"):
+        _load(tmp_path, doc, hosts=None)
+    assert _load(tmp_path, doc, hosts="evil.example.net").agent_type == public
+
+
+def test_interpolated_webhook_fails(tmp_path, public, monkeypatch):
+    monkeypatch.setenv("APPROVAL_URL", "https://hooks.example.com/approve")
+    monkeypatch.setenv("POST_URL", "https://hooks.example.com/done")
+    with pytest.raises(ValueError, match=r"approval_webhook: .*interpolation"):
+        _load(tmp_path, _with_webhooks(public, approval="${APPROVAL_URL}"),
+              hosts="hooks.example.com")
+    with pytest.raises(ValueError, match=r"on_complete\.post_to: .*interpolation"):
+        _load(tmp_path, _with_webhooks(public, post_to="${POST_URL}"), hosts="hooks.example.com")
+
+
+def test_internal_webhooks_need_no_host_allowlist(tmp_path):
+    doc = _with_webhooks("internal", approval="https://evil.example.net/a",
+                         post_to="https://evil.example.net/b")
+    assert _load(tmp_path, doc, allowed=None, hosts=None).agent_type == "internal"
+
+
+@pytest.mark.parametrize("memory", [
+    MEMORY,
+    {"backend": "bridge", "project": "example/docs"},
+])
+def test_any_valid_memory_block_fails(tmp_path, public, memory):
+    doc = _profile(public)
+    doc["memory"] = memory
+    with pytest.raises(ValueError, match=r"memory: .*`memory:` block"):
+        _load(tmp_path, doc)
+
+
+def test_empty_memory_block_fails_and_null_is_absent(tmp_path, public):
+    # {} never validates as a memory block (the default backend needs
+    # scopes); null is the same as leaving the key out.
+    doc = _profile(public)
+    doc["memory"] = {}
+    with pytest.raises(ValueError, match="memory"):
+        _load(tmp_path, doc)
+    doc["memory"] = None
+    assert _load(tmp_path, doc).memory is None
+
+
 def test_internal_mcp_needs_no_host_allowlist(tmp_path):
     doc = _profile("internal", capabilities=[_mcp("https://internal.example.net/mcp")])
     assert _load(tmp_path, doc, allowed=None, hosts=None).agent_type == "internal"

@@ -400,16 +400,16 @@ An `external` or `hybrid` profile is refused at load (`miragen run`, `miragen va
 - Subscription harness models (`claude-code:`, `codex:`, `grok-build:`) are refused even if listed: they run on a personal login.
 - Every other model the profile names uses an allowed provider too: the `ImageGeneration` capability's `fallback_model`, and a cloud `voice.provider` (e.g. `openai`, checked by name).
 
-**Hosts.** Every MCP capability's `url` and an `http` voice provider's `url` must have its host in `MIRAGEN_EXTERNAL_ALLOWED_HOSTS`: comma-separated hostnames, matched exactly (no wildcards, so `mcp.example.com` does not admit `sub.mcp.example.com`). Unset or empty refuses any MCP server or http voice endpoint on an external/hybrid profile; a profile with neither needs no host list.
+**Hosts.** Every outbound URL must have its host in `MIRAGEN_EXTERNAL_ALLOWED_HOSTS`: each MCP capability's `url`, an `http` voice provider's `url`, `approval_webhook` (it receives every gated tool call with its arguments, i.e. the public user's details) and `on_complete.post_to` (every run's output). Hostnames are comma-separated and matched exactly (no wildcards, so `mcp.example.com` does not admit `sub.mcp.example.com`). Unset or empty refuses a profile that has any of these URLs; a profile with none needs no host list.
 
 **Tier, capabilities and code.**
 - Base tier (`spec:`) only; an `executor:` profile is refused.
 - Capabilities are an allowlist: `Thinking`, `ImageGeneration`, `MCP` (host-checked), and `WebFetch` with `local: false` (the provider's native fetch). Refused: `WebSearch` (it falls back to a local DuckDuckGo search when the model has no native search, and the profile cannot turn that off), `WebFetch` with its local fetcher (it would request any URL from inside the deployment), `Peer` (it forwards the public user's text to an agent that is not held to these rules), and every custom `register_capability` entry.
 - No local `tools:` and no custom code. miragend refuses, for these agents, a `tools_source` at create, live tool injection (`register_tool`/`edit_tool`), `write_file`/`edit_file` on any code file (`.py`, `.pyc`, `.so`, `.pyd`) or on `agent.yaml` (profile changes go through the validated config update), an import whose archive carries code, and a config update that makes an agent with tools external/hybrid. A code-free `tools.py` (the placeholder a new agent gets) is fine. `miragen run` checks this before it imports `tools.py`.
 
-**Interpolation.** No model, MCP `url`, voice `provider` or voice `url` may use `${VAR}` interpolation: the value cannot be checked until it is resolved. `agent_type` itself may never be interpolated, on any profile.
+**Interpolation.** No model, MCP `url`, voice `provider`, voice `url`, `approval_webhook` or `on_complete.post_to` may use `${VAR}` interpolation: the value cannot be checked until it is resolved. `agent_type` itself may never be interpolated, on any profile.
 
-**Memory.** No `memory:` block: a public-facing agent keeps no long-term memory of the people it talks to. Per-instance conversation history, which a chat needs, is not long-term memory, but it is still what the public typed: bound it with `history_max_messages` and discard the instance (its `/agent/histories/<instance>.json`) when the conversation ends.
+**Memory.** No `memory:` block: a present, non-null `memory` key is refused, whatever it contains (`memory: {}` included; `memory: null` is the same as leaving it out). A public-facing agent keeps no long-term memory of the people it talks to. Per-instance conversation history, which a chat needs, is not long-term memory, but it is still what the public typed: bound it with `history_max_messages` and discard the instance (its `/agent/histories/<instance>.json`) when the conversation ends.
 
 ```yaml
 name: support-chat

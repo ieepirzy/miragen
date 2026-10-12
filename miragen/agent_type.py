@@ -18,7 +18,8 @@ account backing — and `hybrid` serves both, so it is held to the same rules:
   once the environment is, so it cannot be checked at validation time;
 - no ``memory:`` block: a public-facing agent keeps no long-term memory of
   the people it talks to;
-- every MCP server URL and an http voice endpoint URL has its host in
+- every outbound URL (MCP servers, an http voice endpoint,
+  ``approval_webhook``, ``on_complete.post_to``) has its host in
   ``MIRAGEN_EXTERNAL_ALLOWED_HOSTS`` (exact hostnames; unset refuses any);
 - only safe built-in capabilities (see PUBLIC_CAPABILITIES), no Peer, no
   custom capabilities and no local ``tools:``.
@@ -276,6 +277,7 @@ def check_agent_type(
 
     hosts = parse_allowed_providers(allowed_hosts)
     _check_capabilities(profile, who, hosts, uninterpolated or {})
+    _check_outbound_urls(profile, who, hosts, uninterpolated or {})
     _check_voice(profile, allowed, hosts, who, uninterpolated or {})
 
 
@@ -342,6 +344,28 @@ def _check_capabilities(
                 "`local: false` (the provider's native fetch); the local "
                 "fetcher would request any URL from inside this deployment"
             )
+
+
+def _check_outbound_urls(
+    profile: AgentProfile,
+    who: str,
+    hosts: frozenset[str],
+    uninterpolated: Mapping[str, Any],
+) -> None:
+    """Profile-level delivery targets miragen POSTs to on its own: the
+    approval webhook receives every gated tool call with its arguments (the
+    public user's details), on_complete.post_to every run's output. Held to
+    the host list like an MCP server. (Executor-tier URLs never get here:
+    executor profiles are refused first; voice is checked separately.)"""
+    targets = [
+        ("approval_webhook", ("approval_webhook",), profile.approval_webhook),
+        ("on_complete.post_to", ("on_complete", "post_to"),
+         profile.on_complete.post_to if profile.on_complete else None),
+    ]
+    for where, raw_path, value in targets:
+        if value is None:
+            continue
+        _check_url_host(where, str(value), _lookup(uninterpolated, raw_path), hosts, who)
 
 
 def _check_voice(
