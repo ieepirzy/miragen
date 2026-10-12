@@ -359,6 +359,63 @@ def test_max_concurrent_forwarded_into_agent_env(tmp_path):
     assert env["MIRAGEN_MAX_CONCURRENT"] == "8"
 
 
+
+EXTERNAL_YAML = VALID_YAML.replace("mode: interactive\n", "mode: interactive\nagent_type: external\n")
+
+
+def _external_core(tmp_path, environ):
+    docker_client = FakeDocker()
+    runner = RecordingRunner()
+    runner.on_up = lambda name: docker_client.add(name)
+    return LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        environ=environ,
+        runner=runner,
+        not_found=FakeNotFound,
+        sleep=lambda _s: None,
+    )
+
+
+def test_external_allowlist_forwarded_into_agent_env(tmp_path):
+    """MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS reaches every managed agent, so
+    the container's own profile load applies the list the daemon validated
+    against — without it a validated external profile fails closed at boot."""
+    core = _external_core(tmp_path, {"MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS": "anthropic,test"})
+    core.create_agent("alpha", _yaml("alpha"))
+
+    import yaml as pyyaml
+
+    env = pyyaml.safe_load((tmp_path / "compose.yml").read_text())["services"]["alpha"][
+        "environment"
+    ]
+    assert env["MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS"] == "anthropic,test"
+
+
+def test_external_profile_refused_at_create_without_daemon_allowlist(tmp_path, monkeypatch):
+    # The process environment holds a list, the daemon's own mapping does
+    # not: create must judge by the mapping it forwards into containers.
+    monkeypatch.setenv("MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS", "test")
+    core = _external_core(tmp_path, {})
+    with pytest.raises(ValidationFailed, match="MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS"):
+        core.create_agent("alpha", EXTERNAL_YAML.format(name="alpha"))
+    assert not (tmp_path / "agents" / "alpha").exists()
+
+
+def test_validate_profile_text_reads_the_given_environ(monkeypatch):
+    monkeypatch.delenv("MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS", raising=False)
+    text = EXTERNAL_YAML.format(name="alpha")
+    with pytest.raises(ValidationFailed, match="MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS"):
+        validate_profile_text(text)
+    summary = validate_profile_text(
+        text, environ={"MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS": "test"}
+    )
+    assert summary["agent_type"] == "external"
+    with pytest.raises(ValidationFailed, match="provider 'test' is not in"):
+        validate_profile_text(text, environ={"MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS": "anthropic"})
+
+
 EXECUTOR_CLAUDE_YAML = """\
 name: {name}
 mode: interactive
