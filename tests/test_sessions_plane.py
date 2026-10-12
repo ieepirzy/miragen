@@ -82,6 +82,7 @@ class FakeStore:
         self.namespaces = {n: {"id": n, "description": n} for n in namespaces}
         self.runs: dict[str, dict] = {}
         self.artifacts: dict[str, dict] = {}
+        self.supersedes: dict[str, str] = {}  # successor id -> superseded id
         self.requests: list[tuple[str, str]] = []
 
     def transport(self) -> httpx.MockTransport:
@@ -116,6 +117,27 @@ class FakeStore:
             return httpx.Response(200, json={"run": self.runs.get(run_id), "artifacts": [
                 a for a in self.artifacts.values() if a["producer"]["run_id"] == run_id
             ], "children": []})
+        if request.method == "POST" and path.startswith("/v0/artifacts/") and path.endswith("/supersede"):
+            # Loimi's SupersedeBody: extra="forbid", no sources/suggested_namespaces.
+            allowed = {"kind", "content", "content_ref", "properties", "run_id", "as_of", "skip_provenance"}
+            if set(body) - allowed:
+                return httpx.Response(422, json={"detail": f"extra fields {sorted(set(body) - allowed)}",
+                                                 "code": "invalid_request"})
+            superseded = path.split("/")[3]
+            if superseded not in self.artifacts:
+                return httpx.Response(404, json={"detail": "no artifact", "code": "not_found"})
+            run = self.runs.get(str(body["run_id"]))
+            if run is None or run["status"] != "running":
+                return httpx.Response(409, json={"detail": "run not open", "code": "illegal_transition"})
+            artifact = {"id": str(uuid.uuid4()), "kind": body["kind"], "content": body.get("content"),
+                        "properties": body.get("properties", {}),
+                        "producer": {"agent_id": run["agent_id"], "run_id": run["id"]},
+                        "sources": [superseded],
+                        "namespaces": [{"namespace": run["namespace"], "tier": "provenance",
+                                        "status": "confirmed", "source": "run"}]}
+            self.artifacts[artifact["id"]] = artifact
+            self.supersedes[artifact["id"]] = superseded
+            return httpx.Response(201, json=artifact)
         if request.method == "POST" and path == "/v0/artifacts":
             run = self.runs.get(str(body["run_id"]))
             if run is None or run["status"] != "running":
@@ -136,8 +158,13 @@ class FakeStore:
             if path.endswith("/lineage"):
                 return httpx.Response(200, json={"id": artifact["id"], "children": [
                     {"id": s, "children": []} for s in artifact["sources"]]})
-            return httpx.Response(200, json={**artifact, "edges": [
-                {"other_id": s, "edge_type": "derived_from", "direction": "out"} for s in artifact["sources"]]})
+            edges = [{"other_id": s, "edge_type": "derived_from", "direction": "out"}
+                     for s in artifact["sources"]]
+            edges += [{"other_id": old, "edge_type": "supersedes", "direction": "out"}
+                      for new, old in self.supersedes.items() if new == artifact["id"]]
+            edges += [{"other_id": new, "edge_type": "supersedes", "direction": "in"}
+                      for new, old in self.supersedes.items() if old == artifact["id"]]
+            return httpx.Response(200, json={**artifact, "edges": edges})
         if request.method == "POST" and path == "/v0/search":
             q = (body.get("q") or "").lower()
             items = [{"id": a["id"], "kind": a["kind"], "preview": (a["content"] or "")[:200],

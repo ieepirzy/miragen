@@ -394,7 +394,8 @@ class TestBridgeMcp:
         assert names == {
             "bridge_status", "bridge_sessions",
             "memory_recall", "memory_read", "memory_remember", "memory_correct", "memory_checkpoint",
-            "store_open_run", "store_close_run", "store_put_artifact", "store_get_artifact",
+            "store_open_run", "store_close_run", "store_put_artifact", "store_supersede_artifact",
+            "store_get_artifact",
             "store_lineage", "store_search", "store_list_namespaces", "store_run_tree",
         }
 
@@ -458,6 +459,36 @@ class TestBridgeMcp:
         assert {n["id"] for n in namespaces} == {"mira", "infra", "muutto365"}
         no_run = _text(await mcp.call_tool("store_put_artifact", {"kind": "x", "content": "y"}))
         assert no_run["status"] == "rejected" and "store_open_run" in no_run["detail"]
+
+    async def test_supersede_corrects_a_stale_artifact(self, tmp_path):
+        h, mcp = self._mcp(tmp_path)
+        await h.send("SessionStart", source="startup")
+        session = h.plane.registry.get("claude-code:s-1")
+        stale = _text(await mcp.call_tool("store_put_artifact", {
+            "kind": "decision", "content": "Deploy on Fridays.", "session": "claude-code:s-1"}))["artifact"]
+        fixed = _text(await mcp.call_tool("store_supersede_artifact", {
+            "superseded_id": stale["id"], "kind": "decision", "content": "Never deploy on Fridays.",
+            "session": "claude-code:s-1", "properties": {"title": "deploy days"}}))
+        assert fixed["status"] == "accepted" and fixed["superseded_id"] == stale["id"]
+        successor = fixed["artifact"]
+        assert successor["producer"]["run_id"] == session.run_id
+        assert f"tool:{successor['id']}" in session.artifacts_written
+        assert h.fake_store.supersedes == {successor["id"]: stale["id"]}
+        # The stale one now points at its successor; the request body passed
+        # Loimi's extra="forbid" SupersedeBody (no sources/suggested_namespaces).
+        old = _text(await mcp.call_tool("store_get_artifact", {"artifact_id": stale["id"]}))
+        assert {"other_id": successor["id"], "edge_type": "supersedes", "direction": "in"} in old["edges"]
+        # Explicit run_id works too; no run and an unknown predecessor are refused.
+        again = _text(await mcp.call_tool("store_supersede_artifact", {
+            "superseded_id": successor["id"], "kind": "decision", "content": "Deploy Mon-Thu.",
+            "run_id": session.run_id}))
+        assert again["status"] == "accepted"
+        no_run = _text(await mcp.call_tool("store_supersede_artifact", {
+            "superseded_id": stale["id"], "kind": "decision", "content": "x"}))
+        assert no_run["status"] == "rejected" and "store_open_run" in no_run["detail"]
+        missing = _text(await mcp.call_tool("store_supersede_artifact", {
+            "superseded_id": "nope", "kind": "decision", "content": "x", "run_id": session.run_id}))
+        assert missing["status"] == "rejected" and missing["http_status"] == 404
 
     async def test_own_run_lifecycle_and_refusals(self, tmp_path):
         h, mcp = self._mcp(tmp_path)

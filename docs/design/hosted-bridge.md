@@ -90,7 +90,7 @@ model can file its own artifacts against the same run with the tools.
 **The MCP surface is the daemon's, scoped by name.** `/mcp` serves
 `memory_recall / memory_read / memory_remember / memory_correct /
 memory_checkpoint` (scoped by `project`) and `store_put_artifact /
-store_search / store_get_artifact / store_lineage / store_open_run /
+store_supersede_artifact / store_search / store_get_artifact / store_lineage / store_open_run /
 store_close_run / store_run_tree / store_list_namespaces` (against the
 session's run or an explicit one), plus `bridge_status / bridge_sessions`.
 Two credential classes open it: the daemon bearer (automation, the plugin's

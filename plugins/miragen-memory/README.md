@@ -15,7 +15,7 @@ What you get, automatically, per session:
 
 Plus the `miragen-bridge` MCP server: `memory_recall / memory_read /
 memory_remember / memory_correct / memory_checkpoint` and `store_put_artifact /
-store_search / store_get_artifact / store_lineage / store_open_run /
+store_supersede_artifact / store_search / store_get_artifact / store_lineage / store_open_run /
 store_close_run / store_run_tree / store_list_namespaces`, and
 `bridge_status / bridge_sessions`. The skill `memory-bridge` tells the model
 when to use them.

@@ -1042,7 +1042,8 @@ class SessionPlane:
                 f"(or session={session.key!r}); store_put_artifact files an immutable artifact "
                 + (f"under this session's Loimi run {session.run_id} (pass run_id or session) "
                    if session.run_id else "under a Loimi run (store_open_run first) ")
-                + "with honest direct `sources`; store_search / store_get_artifact / "
+                + "with honest direct `sources`; store_supersede_artifact corrects a stale one "
+                "(never a fresh put); store_search / store_get_artifact / "
                 "store_lineage read the artifact store. A write counts only when the tool "
                 "answers accepted."
             )

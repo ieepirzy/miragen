@@ -37,12 +37,14 @@ INSTRUCTIONS = (
     "key from the injected session header); omit it for the default project. "
     "store_put_artifact needs a run: pass this session's `run_id` (from the "
     "session header's store_run=…) or `session`, or open one with "
-    "store_open_run. Provenance is one hop: list only DIRECT sources. A write "
+    "store_open_run. Provenance is one hop: list only DIRECT sources. To "
+    "correct a stale artifact use store_supersede_artifact (same run "
+    "arguments), never a fresh store_put_artifact. A write "
     "is saved only when the result says accepted/captured; pending or "
     "persistence_unavailable is not saved. Harnesses that cannot show you "
     "the session header (Grok Build) identify the session on the connection: "
-    "there, omitting `project`/`session` in the memory_* tools, store_open_run "
-    "and store_put_artifact means this session's project/run."
+    "there, omitting `project`/`session` in the memory_* tools, store_open_run, "
+    "store_put_artifact and store_supersede_artifact means this session's project/run."
 )
 
 # Sent by harnesses whose model never sees the injected session header
@@ -365,6 +367,59 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
             if found is not None:
                 found.artifacts_written.append(f"tool:{result['id']}")
             return _dump({"status": "accepted", "artifact": result})
+        return _dump(result)
+
+    @mcp.tool()
+    async def store_supersede_artifact(
+        superseded_id: str,
+        kind: str,
+        content: str | None = None,
+        run_id: str | None = None,
+        session: str | None = None,
+        content_ref: str | None = None,
+        properties: dict | None = None,
+        as_of: str | None = None,
+        ctx: Context | None = None,
+    ) -> str:
+        """Supersede a stale artifact: write its successor, linked to it by a
+        `supersedes` and a `derived_from` edge. The only way to correct a
+        stored claim — artifacts are never edited, and the chain keeps the
+        history visible. Supersede the head of the chain (check
+        store_get_artifact for an incoming `supersedes` edge first), and write
+        the successor so it stands on its own. There is no `sources`
+        argument: the predecessor's provenance flows in through the edge.
+        Never use store_put_artifact for a correction — that leaves two
+        contradicting artifacts with nothing saying which is current.
+
+        Args:
+            superseded_id: The stale artifact's id.
+            kind: Usually the predecessor's kind.
+            content: Inline text (or give content_ref).
+            run_id: An open run's id.
+            session: Session key whose run to use when run_id is omitted.
+            content_ref: URI to a large/binary payload instead of content.
+            properties: Kind-specific bag, e.g. {"title": "..."}.
+            as_of: RFC3339 — when the corrected claim became true, if that differs from now.
+        """
+        plane = get_plane()
+        store = _store(plane)
+        if not run_id and not session:
+            session = _connection_session(ctx)
+        resolved = _resolve_run(plane, run_id, session)
+        if not resolved:
+            return _dump({"status": "rejected", "detail": (
+                "no run: pass run_id, or session=<session key> for a session with a store run, "
+                "or open one with store_open_run")})
+        result = await _store_call(plane, store.supersede_artifact(
+            superseded_id, run_id=resolved, kind=kind, content=content,
+            content_ref=content_ref, properties=properties, as_of=as_of or None,
+        ))
+        if isinstance(result, dict) and result.get("id"):
+            plane.stats.artifacts_written += 1
+            found = plane.find_session(session) if session else None
+            if found is not None:
+                found.artifacts_written.append(f"tool:{result['id']}")
+            return _dump({"status": "accepted", "artifact": result, "superseded_id": superseded_id})
         return _dump(result)
 
     @mcp.tool()

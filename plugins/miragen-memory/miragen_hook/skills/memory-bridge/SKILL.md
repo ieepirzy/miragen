@@ -55,6 +55,12 @@ reviews, decisions, reports, diffs — with deterministic provenance.
   opened your own run. Provenance is **one hop**: in `sources` list only the
   artifact ids this was DIRECTLY derived from, never everything you read.
   `suggested_namespaces` records extra relevance as unconfirmed suggestions.
+- `store_supersede_artifact(superseded_id, kind, content, session=...)` is
+  the only way to correct a stale artifact: it writes the successor linked by
+  a `supersedes` edge, so the history stays visible. Artifacts are never
+  edited; never correct one with a fresh `store_put_artifact`. Supersede the
+  head of the chain (an incoming `supersedes` edge on `store_get_artifact`
+  means it was already superseded) and make the successor stand on its own.
 - `store_search(q, namespaces, kinds)`, `store_get_artifact(id)`,
   `store_lineage(id, direction)` read the store; `store_run_tree(run_id)` shows
   everything a run produced.
