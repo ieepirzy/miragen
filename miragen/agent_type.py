@@ -31,8 +31,10 @@ and tests pass it in; `None` reads the process environment.
 
 from __future__ import annotations
 
+import ast
 import os
 from collections.abc import Iterable, Mapping
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -43,6 +45,59 @@ ALLOWED_PROVIDERS_ENV = "MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS"
 ALLOWED_HOSTS_ENV = "MIRAGEN_EXTERNAL_ALLOWED_HOSTS"
 
 PUBLIC_AGENT_TYPES = frozenset({"external", "hybrid"})
+
+
+# Files the runtime (or a Python started in the agent directory, which is the
+# container's working directory) can load as code: tools.py is imported at
+# boot, and a module file in the working directory shadows an import for
+# `python -c` (e.g. the image healthcheck).
+CODE_SUFFIXES = frozenset({".py", ".pyc", ".so", ".pyd"})
+
+# What a code-free tools.py may contain: docstrings/comments and the
+# placeholder import miragend writes for a new agent.
+_PLACEHOLDER_IMPORTS = frozenset({"register", "register_handler", "register_approval_handler"})
+
+
+def is_code_free_python(source: str) -> bool:
+    """True when `source` defines nothing: only string expressions and
+    `from miragen import register` (the placeholder a new agent gets)."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    for node in tree.body:
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) \
+                and isinstance(node.value.value, str):
+            continue
+        if isinstance(node, ast.ImportFrom) and node.module == "miragen" and node.level == 0 \
+                and all(a.name in _PLACEHOLDER_IMPORTS and a.asname is None for a in node.names):
+            continue
+        return False
+    return True
+
+
+def is_code_path(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in CODE_SUFFIXES
+
+
+def code_violations(root: Path) -> list[str]:
+    """Relative paths under an agent directory that would give a public
+    agent custom code: any code file except a code-free top-level tools.py."""
+    found = []
+    for dirpath, _dirs, files in os.walk(root):
+        for fname in files:
+            full = Path(dirpath) / fname
+            if not is_code_path(full):
+                continue
+            rel = full.relative_to(root).as_posix()
+            if rel == "tools.py":
+                try:
+                    if is_code_free_python(full.read_text()):
+                        continue
+                except (OSError, UnicodeDecodeError):
+                    pass
+            found.append(rel)
+    return sorted(found)
 
 
 def parse_allowed_providers(raw: str | Iterable[str] | None) -> frozenset[str]:

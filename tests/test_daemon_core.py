@@ -412,6 +412,10 @@ def _contract3_external_core(tmp_path):
     core._docker.image_map[DEFAULT_IMAGE] = FakeImage(
         labels={"io.miragen.profile-contracts": "1 2 3"}, repo_digests=[DEFAULT_DIGEST]
     )
+    # The pinned digest a restart-in-place update is checked against.
+    core._docker.image_map[DEFAULT_DIGEST] = FakeImage(
+        labels={"io.miragen.profile-contracts": "1 2 3"}, repo_digests=[DEFAULT_DIGEST]
+    )
     return core
 
 
@@ -442,6 +446,49 @@ def test_public_agent_create_refuses_tools_source(tmp_path):
     with pytest.raises(PublicAgentRefused, match="tools_source"):
         core.create_agent("alpha", EXTERNAL_YAML.format(name="alpha"), tools_source=TOOL_SRC)
     assert not (tmp_path / "agents" / "alpha").exists()
+
+
+PLACEHOLDER_TOOLS = "from miragen import register\n\n# Tools for alpha\n"
+
+
+@pytest.mark.parametrize("path", [
+    "tools.py", "helper.py", "pkg/__init__.py", "httpx.pyc", "native.so", "agent.yaml", "./agent.yaml",
+])
+def test_public_agent_write_file_refuses_code_and_profile(tmp_path, path):
+    from miragen.daemon.core import PublicAgentRefused
+
+    core = _contract3_external_core(tmp_path)
+    core.create_agent("alpha", EXTERNAL_YAML.format(name="alpha"))
+    with pytest.raises(PublicAgentRefused, match="agent_type: external"):
+        core.write_file("alpha", path, "import os\n")
+    agent_dir = tmp_path / "agents" / "alpha"
+    assert (agent_dir / "tools.py").read_text() == PLACEHOLDER_TOOLS
+    assert "agent_type: external" in (agent_dir / "agent.yaml").read_text()
+
+
+def test_public_agent_edit_file_refuses_profile_and_tools(tmp_path):
+    from miragen.daemon.core import PublicAgentRefused
+
+    core = _contract3_external_core(tmp_path)
+    core.create_agent("alpha", EXTERNAL_YAML.format(name="alpha"))
+    with pytest.raises(PublicAgentRefused):
+        core.edit_file("alpha", "agent.yaml", "agent_type: external", "agent_type: internal")
+    with pytest.raises(PublicAgentRefused):
+        core.edit_file("alpha", "tools.py", "# Tools", "import os  # Tools")
+
+
+def test_public_agent_still_takes_data_files(tmp_path):
+    core = _contract3_external_core(tmp_path)
+    core.create_agent("alpha", EXTERNAL_YAML.format(name="alpha"))
+    core.write_file("alpha", "data/faq.md", "public answers")
+    assert core.read_file("alpha", "data/faq.md") == "public answers"
+
+
+def test_internal_agent_write_file_unaffected(tmp_path):
+    core = _contract3_external_core(tmp_path)
+    core.create_agent("alpha", _yaml("alpha"))
+    core.write_file("alpha", "tools.py", "import os\n")
+    core.write_file("alpha", "agent.yaml", _yaml("alpha"))
 
 
 def test_validate_profile_text_reads_hosts_from_the_given_environ(monkeypatch):

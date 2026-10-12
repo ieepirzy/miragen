@@ -46,6 +46,7 @@ from miragen.agent_type import (
     PUBLIC_AGENT_TYPES,
     allowed_hosts_from_env,
     allowed_providers_from_env,
+    is_code_path,
 )
 from miragen.load import load_profile
 from miragen.profile_contract import (
@@ -1317,16 +1318,40 @@ class LifecycleCore:
         lines = source.splitlines(keepends=True)
         return "".join(lines[span[0] : span[1]])
 
+    def _public_agent_type(self, d: Path) -> str | None:
+        """'external'/'hybrid' when the stored profile is public-facing, else
+        None. Read as written: the loader refuses an interpolated
+        agent_type, so the raw value is the real one."""
+        try:
+            agent_type = self._read_yaml(d / "agent.yaml").get("agent_type")
+        except Exception:
+            return None
+        return agent_type if agent_type in PUBLIC_AGENT_TYPES else None
+
+    def _refuse_code_write_on_public_agent(self, agent: str, full: Path) -> None:
+        """write_file/edit_file is a side door around both the tool refusal
+        and profile validation: a public agent takes no code file, and its
+        agent.yaml changes only through update_agent_config (validated)."""
+        d = self._agent_dir(agent)
+        agent_type = self._public_agent_type(d)
+        if agent_type is None:
+            return
+        rel = full.relative_to(d.resolve()).as_posix()
+        if rel == "agent.yaml":
+            why = "profile changes go through config update, which validates them"
+        elif is_code_path(rel):
+            why = "a public agent takes no code files"
+        else:
+            return
+        raise PublicAgentRefused(
+            f"agent '{agent}' is agent_type: {agent_type}; refusing to write '{rel}' ({why})"
+        )
+
     def _refuse_tools_on_public_agent(self, agent: str, d: Path) -> None:
         """Live tool injection is custom code; a public-facing agent takes
-        none. Read from the stored profile as written: the loader refuses
-        an interpolated agent_type, so the raw value is the real one."""
-        yaml_path = d / "agent.yaml"
-        try:
-            agent_type = self._read_yaml(yaml_path).get("agent_type")
-        except Exception:
-            agent_type = None
-        if agent_type in PUBLIC_AGENT_TYPES:
+        none."""
+        agent_type = self._public_agent_type(d)
+        if agent_type is not None:
             raise PublicAgentRefused(
                 f"agent '{agent}' is agent_type: {agent_type}; it takes no "
                 "local tools (custom code runs with whatever access the "
@@ -1445,12 +1470,14 @@ class LifecycleCore:
     def write_file(self, agent: str, path: str, content: str) -> None:
         self._require_agent(agent)
         full = self._safe_path(agent, path)
+        self._refuse_code_write_on_public_agent(agent, full)
         full.parent.mkdir(parents=True, exist_ok=True)
         full.write_text(content)
 
     def edit_file(self, agent: str, path: str, old_str: str, new_str: str) -> None:
         self._require_agent(agent)
         full = self._safe_path(agent, path)
+        self._refuse_code_write_on_public_agent(agent, full)
         try:
             content = full.read_text()
         except FileNotFoundError:
