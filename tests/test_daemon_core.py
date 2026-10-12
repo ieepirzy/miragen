@@ -403,6 +403,43 @@ def test_external_profile_refused_at_create_without_daemon_allowlist(tmp_path, m
     assert not (tmp_path / "agents" / "alpha").exists()
 
 
+def _contract3_external_core(tmp_path):
+    core = _external_core(tmp_path, {"MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS": "test"})
+    core._docker.image_map[DEFAULT_IMAGE] = FakeImage(
+        labels={"io.miragen.profile-contracts": "1 2 3"}, repo_digests=[DEFAULT_DIGEST]
+    )
+    return core
+
+
+def test_public_agent_refuses_live_tool_injection(tmp_path):
+    from miragen.daemon.core import PublicAgentRefused
+
+    core = _contract3_external_core(tmp_path)
+    core.create_agent("alpha", EXTERNAL_YAML.format(name="alpha"))
+    tools_before = (tmp_path / "agents" / "alpha" / "tools.py").read_text()
+    with pytest.raises(PublicAgentRefused, match="agent_type: external"):
+        core.register_tool("alpha", "greet", TOOL_SRC)
+    with pytest.raises(PublicAgentRefused):
+        core.edit_tool("alpha", "greet", "hello", "bye")
+    assert (tmp_path / "agents" / "alpha" / "tools.py").read_text() == tools_before
+    assert "tools" not in (tmp_path / "agents" / "alpha" / "agent.yaml").read_text()
+
+
+def test_internal_agent_still_takes_live_tools(tmp_path):
+    core = _contract3_external_core(tmp_path)
+    core.create_agent("alpha", _yaml("alpha"))
+    core.register_tool("alpha", "greet", TOOL_SRC)
+
+
+def test_public_agent_create_refuses_tools_source(tmp_path):
+    from miragen.daemon.core import PublicAgentRefused
+
+    core = _contract3_external_core(tmp_path)
+    with pytest.raises(PublicAgentRefused, match="tools_source"):
+        core.create_agent("alpha", EXTERNAL_YAML.format(name="alpha"), tools_source=TOOL_SRC)
+    assert not (tmp_path / "agents" / "alpha").exists()
+
+
 def test_validate_profile_text_reads_the_given_environ(monkeypatch):
     monkeypatch.delenv("MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS", raising=False)
     text = EXTERNAL_YAML.format(name="alpha")

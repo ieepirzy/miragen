@@ -40,7 +40,11 @@ from miragen.daemon.spawn.base import (
     SpawnUnitNotFound,
 )
 from miragen.daemon.spawn.docker_compose import DockerComposeSpawnDriver
-from miragen.agent_type import ALLOWED_PROVIDERS_ENV, allowed_providers_from_env
+from miragen.agent_type import (
+    ALLOWED_PROVIDERS_ENV,
+    PUBLIC_AGENT_TYPES,
+    allowed_providers_from_env,
+)
 from miragen.load import load_profile
 from miragen.profile_contract import (
     PROFILE_CONTRACTS_LABEL,
@@ -205,6 +209,13 @@ class ValidationFailed(DaemonError):
 class ToolSourceInvalid(DaemonError):
     status = 422
     code = "tool_source_invalid"
+
+
+class PublicAgentRefused(DaemonError):
+    """Custom code offered to an agent_type: external | hybrid agent."""
+
+    status = 422
+    code = "public_agent_refused"
 
 
 class ArchiveInvalid(DaemonError):
@@ -1077,6 +1088,11 @@ class LifecycleCore:
                 f"created as '{name}' — set 'name: {name}' in the YAML"
             )
 
+        if tools_source is not None and summary.get("agent_type") in PUBLIC_AGENT_TYPES:
+            raise PublicAgentRefused(
+                f"agent_type: {summary['agent_type']} agents take no tools_source: "
+                "custom code runs with whatever access the container has"
+            )
         _assert_profile_satisfied_by_tools(summary, tools_source)
 
         # The contract is judged against the image that will actually run
@@ -1294,8 +1310,25 @@ class LifecycleCore:
         lines = source.splitlines(keepends=True)
         return "".join(lines[span[0] : span[1]])
 
+    def _refuse_tools_on_public_agent(self, agent: str, d: Path) -> None:
+        """Live tool injection is custom code; a public-facing agent takes
+        none. Read from the stored profile as written: the loader refuses
+        an interpolated agent_type, so the raw value is the real one."""
+        yaml_path = d / "agent.yaml"
+        try:
+            agent_type = self._read_yaml(yaml_path).get("agent_type")
+        except Exception:
+            agent_type = None
+        if agent_type in PUBLIC_AGENT_TYPES:
+            raise PublicAgentRefused(
+                f"agent '{agent}' is agent_type: {agent_type}; it takes no "
+                "local tools (custom code runs with whatever access the "
+                "container has)"
+            )
+
     def register_tool(self, agent: str, tool_name: str, source: str) -> None:
         d = self._require_agent(agent)
+        self._refuse_tools_on_public_agent(agent, d)
         tools_path = d / "tools.py"
         yaml_path = d / "agent.yaml"
         if not tools_path.exists():
@@ -1342,6 +1375,7 @@ class LifecycleCore:
 
     def edit_tool(self, agent: str, tool_name: str, old_str: str, new_str: str) -> None:
         d = self._require_agent(agent)
+        self._refuse_tools_on_public_agent(agent, d)
         tools_path = d / "tools.py"
         if not tools_path.exists():
             raise WorkspaceFileNotFound(f"tools.py not found for agent '{agent}'")
