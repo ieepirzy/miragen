@@ -382,7 +382,10 @@ def test_external_allowlist_forwarded_into_agent_env(tmp_path):
     """MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS reaches every managed agent, so
     the container's own profile load applies the list the daemon validated
     against — without it a validated external profile fails closed at boot."""
-    core = _external_core(tmp_path, {"MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS": "anthropic,test"})
+    core = _external_core(tmp_path, {
+        "MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS": "anthropic,test",
+        "MIRAGEN_EXTERNAL_ALLOWED_HOSTS": "mcp.example.com",
+    })
     core.create_agent("alpha", _yaml("alpha"))
 
     import yaml as pyyaml
@@ -391,6 +394,7 @@ def test_external_allowlist_forwarded_into_agent_env(tmp_path):
         "environment"
     ]
     assert env["MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS"] == "anthropic,test"
+    assert env["MIRAGEN_EXTERNAL_ALLOWED_HOSTS"] == "mcp.example.com"
 
 
 def test_external_profile_refused_at_create_without_daemon_allowlist(tmp_path, monkeypatch):
@@ -438,6 +442,22 @@ def test_public_agent_create_refuses_tools_source(tmp_path):
     with pytest.raises(PublicAgentRefused, match="tools_source"):
         core.create_agent("alpha", EXTERNAL_YAML.format(name="alpha"), tools_source=TOOL_SRC)
     assert not (tmp_path / "agents" / "alpha").exists()
+
+
+def test_validate_profile_text_reads_hosts_from_the_given_environ(monkeypatch):
+    monkeypatch.setenv("MIRAGEN_EXTERNAL_ALLOWED_HOSTS", "mcp.example.com")
+    text = EXTERNAL_YAML.format(name="alpha") + (
+        "  capabilities:\n    - MCP:\n        url: https://mcp.example.com/mcp\n"
+        "        name: docs\n"
+    )
+    providers = {"MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS": "test"}
+    # The process holds the host; the given mapping does not, so refused.
+    with pytest.raises(ValidationFailed, match="MIRAGEN_EXTERNAL_ALLOWED_HOSTS"):
+        validate_profile_text(text, environ=providers)
+    summary = validate_profile_text(
+        text, environ={**providers, "MIRAGEN_EXTERNAL_ALLOWED_HOSTS": "mcp.example.com"}
+    )
+    assert summary["agent_type"] == "external"
 
 
 def test_validate_profile_text_reads_the_given_environ(monkeypatch):

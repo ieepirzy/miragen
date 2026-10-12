@@ -41,8 +41,10 @@ from miragen.daemon.spawn.base import (
 )
 from miragen.daemon.spawn.docker_compose import DockerComposeSpawnDriver
 from miragen.agent_type import (
+    ALLOWED_HOSTS_ENV,
     ALLOWED_PROVIDERS_ENV,
     PUBLIC_AGENT_TYPES,
+    allowed_hosts_from_env,
     allowed_providers_from_env,
 )
 from miragen.load import load_profile
@@ -296,7 +298,11 @@ def validate_profile_text(source: str, *, environ: Mapping[str, str] | None = No
         f.write(source)
         tmp = Path(f.name)
     try:
-        profile = load_profile(tmp, allowed_providers=allowed_providers_from_env(environ))
+        profile = load_profile(
+            tmp,
+            allowed_providers=allowed_providers_from_env(environ),
+            allowed_hosts=allowed_hosts_from_env(environ),
+        )
     except ValidationError as exc:
         raise ValidationFailed(format_validation_error(exc)) from exc
     except Exception as exc:
@@ -934,12 +940,13 @@ class LifecycleCore:
         # hand-run containers.
         if self._environ.get("MIRAGEN_MAX_CONCURRENT"):
             env["MIRAGEN_MAX_CONCURRENT"] = self._environ["MIRAGEN_MAX_CONCURRENT"]
-        # The provider allowlist for agent_type: external | hybrid profiles,
-        # forwarded for the same reason: /validate and create check a profile
-        # against this daemon's value, and the container's own load must see
+        # The provider and host allowlists for agent_type: external | hybrid
+        # profiles, forwarded for the same reason: /validate and create check
+        # a profile against this daemon's values, and the container's own load must see
         # the same one or a profile validated here fails closed at boot.
-        if self._environ.get(ALLOWED_PROVIDERS_ENV):
-            env[ALLOWED_PROVIDERS_ENV] = self._environ[ALLOWED_PROVIDERS_ENV]
+        for key in (ALLOWED_PROVIDERS_ENV, ALLOWED_HOSTS_ENV):
+            if self._environ.get(key):
+                env[key] = self._environ[key]
         # Operator-named passthrough for credentials the suffix filter above
         # cannot see — subscription OAuth env tokens foremost (e.g. the
         # long-lived token Claude Code mints via `claude setup-token`, which

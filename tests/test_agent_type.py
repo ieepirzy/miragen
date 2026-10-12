@@ -9,7 +9,7 @@ tests/test_daemon_core.py and tests/test_daemon_api.py.
 import pytest
 import yaml
 
-from miragen.agent_type import ALLOWED_PROVIDERS_ENV, parse_allowed_providers
+from miragen.agent_type import ALLOWED_HOSTS_ENV, ALLOWED_PROVIDERS_ENV, parse_allowed_providers
 from miragen.load import load_profile
 
 
@@ -17,6 +17,7 @@ from miragen.load import load_profile
 def _no_ambient_allowlist(monkeypatch):
     # The developer's or CI's own environment must not decide a test.
     monkeypatch.delenv(ALLOWED_PROVIDERS_ENV, raising=False)
+    monkeypatch.delenv(ALLOWED_HOSTS_ENV, raising=False)
 
 
 def _profile(agent_type=None, **spec_overrides):
@@ -54,8 +55,8 @@ def _write(tmp_path, doc):
     return path
 
 
-def _load(tmp_path, doc, allowed="anthropic,openai"):
-    return load_profile(_write(tmp_path, doc), allowed_providers=allowed)
+def _load(tmp_path, doc, allowed="anthropic,openai", hosts=None):
+    return load_profile(_write(tmp_path, doc), allowed_providers=allowed, allowed_hosts=hosts)
 
 
 # ── internal (default) ───────────────────────────────────────────────────────
@@ -169,10 +170,77 @@ def test_cloud_voice_provider_must_be_allowed(tmp_path, public):
         _load(tmp_path, doc, allowed="anthropic")
 
 
-def test_self_hosted_voice_endpoint_is_not_a_provider(tmp_path, public):
+def test_http_voice_endpoint_host_must_be_allowed(tmp_path, public):
     doc = _profile(public)
     doc["voice"] = {"provider": "http", "url": "https://tts.example.com/speak"}
-    assert _load(tmp_path, doc, allowed="anthropic").agent_type == public
+    # Not a provider: only the host list matters.
+    assert _load(tmp_path, doc, allowed="anthropic", hosts="tts.example.com").agent_type == public
+    with pytest.raises(ValueError, match=r"voice\.url: host 'tts\.example\.com' is not in "
+                                         + ALLOWED_HOSTS_ENV):
+        _load(tmp_path, doc, hosts="mcp.example.com")
+    with pytest.raises(ValueError, match=rf"voice\.url: .*set {ALLOWED_HOSTS_ENV}"):
+        _load(tmp_path, doc, hosts=None)
+
+
+def test_interpolated_voice_url_fails(tmp_path, public, monkeypatch):
+    monkeypatch.setenv("TTS_URL", "https://tts.example.com/speak")
+    doc = _profile(public)
+    doc["voice"] = {"provider": "http", "url": "${TTS_URL}"}
+    with pytest.raises(ValueError, match=r"voice\.url: .*interpolation"):
+        _load(tmp_path, doc, hosts="tts.example.com")
+
+
+def _mcp(url):
+    return {"MCP": {"url": url, "name": "docs"}}
+
+
+def test_mcp_host_on_the_allowlist_passes(tmp_path, public):
+    doc = _profile(public, capabilities=[_mcp("https://mcp.example.com/mcp")])
+    assert _load(tmp_path, doc, hosts="MCP.example.com, other.example.org").agent_type == public
+
+
+@pytest.mark.parametrize("url, host", [
+    ("https://internal.example.net/mcp", "internal.example.net"),
+    ("https://sub.mcp.example.com/mcp", "sub.mcp.example.com"),       # no implied wildcard
+    ("https://mcp.example.com@evil.example.net/mcp", "evil.example.net"),  # userinfo trick
+])
+def test_mcp_host_not_on_the_allowlist_fails(tmp_path, public, url, host):
+    doc = _profile(public, capabilities=["Thinking", _mcp(url)])
+    with pytest.raises(ValueError, match=rf"spec\.capabilities\[1\]\.MCP\.url: host '{host}' is not in"):
+        _load(tmp_path, doc, hosts="mcp.example.com")
+
+
+@pytest.mark.parametrize("hosts", [None, "", " , "])
+def test_mcp_without_a_host_allowlist_fails_closed(tmp_path, public, hosts):
+    doc = _profile(public, capabilities=[_mcp("https://mcp.example.com/mcp")])
+    with pytest.raises(ValueError, match=rf"MCP\.url: .*set {ALLOWED_HOSTS_ENV}"):
+        _load(tmp_path, doc, hosts=hosts)
+
+
+def test_no_mcp_needs_no_host_allowlist(tmp_path, public):
+    assert _load(tmp_path, _profile(public), hosts=None).agent_type == public
+
+
+def test_interpolated_mcp_url_fails(tmp_path, public, monkeypatch):
+    monkeypatch.setenv("DOCS_MCP_URL", "https://mcp.example.com/mcp")
+    doc = _profile(public, capabilities=[_mcp("${DOCS_MCP_URL}")])
+    with pytest.raises(ValueError, match=r"MCP\.url: .*interpolation"):
+        _load(tmp_path, doc, hosts="mcp.example.com")
+
+
+def test_host_allowlist_is_read_from_the_environment(tmp_path, public, monkeypatch):
+    doc = _profile(public, capabilities=[_mcp("https://mcp.example.com/mcp")])
+    monkeypatch.setenv(ALLOWED_PROVIDERS_ENV, "anthropic")
+    monkeypatch.setenv(ALLOWED_HOSTS_ENV, "mcp.example.com")
+    assert load_profile(_write(tmp_path, doc)).agent_type == public
+    monkeypatch.setenv(ALLOWED_HOSTS_ENV, "other.example.com")
+    with pytest.raises(ValueError, match="'mcp.example.com' is not in"):
+        load_profile(_write(tmp_path, doc))
+
+
+def test_internal_mcp_needs_no_host_allowlist(tmp_path):
+    doc = _profile("internal", capabilities=[_mcp("https://internal.example.net/mcp")])
+    assert _load(tmp_path, doc, allowed=None, hosts=None).agent_type == "internal"
 
 
 def test_interpolated_voice_provider_fails(tmp_path, public, monkeypatch):

@@ -17,7 +17,11 @@ account backing — and `hybrid` serves both, so it is held to the same rules:
 - no model is written as a ``${VAR}`` interpolation: the value is only known
   once the environment is, so it cannot be checked at validation time;
 - no ``memory:`` block: a public-facing agent keeps no long-term memory of
-  the people it talks to.
+  the people it talks to;
+- every MCP server URL and an http voice endpoint URL has its host in
+  ``MIRAGEN_EXTERNAL_ALLOWED_HOSTS`` (exact hostnames; unset refuses any);
+- only safe built-in capabilities (see PUBLIC_CAPABILITIES), no Peer, no
+  custom capabilities and no local ``tools:``.
 
 The rules run in the loader (`miragen.load.load_profile`), so `miragen run`
 refuses to start and miragend's `/validate` returns the error. The allowed
@@ -30,11 +34,13 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Mapping
 from typing import Any
+from urllib.parse import urlsplit
 
 from miragen.harness.base import HARNESS_PREFIXES
 from miragen.models import AgentProfile
 
 ALLOWED_PROVIDERS_ENV = "MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS"
+ALLOWED_HOSTS_ENV = "MIRAGEN_EXTERNAL_ALLOWED_HOSTS"
 
 PUBLIC_AGENT_TYPES = frozenset({"external", "hybrid"})
 
@@ -51,6 +57,44 @@ def parse_allowed_providers(raw: str | Iterable[str] | None) -> frozenset[str]:
 def allowed_providers_from_env(environ: Mapping[str, str] | None = None) -> frozenset[str]:
     env = os.environ if environ is None else environ
     return parse_allowed_providers(env.get(ALLOWED_PROVIDERS_ENV))
+
+
+def allowed_hosts_from_env(environ: Mapping[str, str] | None = None) -> frozenset[str]:
+    """Hostnames an external/hybrid profile's MCP servers and http voice
+    endpoint may live on: exact names, no wildcards."""
+    env = os.environ if environ is None else environ
+    return parse_allowed_providers(env.get(ALLOWED_HOSTS_ENV))
+
+
+def _check_url_host(
+    where: str,
+    url: Any,
+    raw_url: Any,
+    allowed_hosts: frozenset[str],
+    who: str,
+) -> None:
+    if _is_interpolated(raw_url):
+        raise ValueError(
+            f"{where}: {who} profiles may not set a URL with ${{VAR}} interpolation; "
+            f"its host cannot be checked against {ALLOWED_HOSTS_ENV} until it is "
+            "resolved — write it literally"
+        )
+    if not allowed_hosts:
+        raise ValueError(
+            f"{where}: {who} profiles reach other hosts only through the "
+            f"deployment's host list: set {ALLOWED_HOSTS_ENV} to comma-separated "
+            "hostnames. Unset or empty refuses every MCP server and http voice "
+            "endpoint on an external/hybrid profile."
+        )
+    parts = urlsplit(url) if isinstance(url, str) else None
+    if parts is None or parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError(f"{where}: {who} needs an http(s) URL with a host, got {url!r}")
+    if parts.hostname not in allowed_hosts:
+        raise ValueError(
+            f"{where}: host {parts.hostname!r} is not in {ALLOWED_HOSTS_ENV} "
+            f"({', '.join(sorted(allowed_hosts))}); {who} profiles may only reach "
+            "allowed hosts"
+        )
 
 
 def _model_fields(profile: AgentProfile) -> list[tuple[str, tuple, Any]]:
@@ -98,13 +142,14 @@ def check_agent_type(
     profile: AgentProfile,
     allowed_providers: Iterable[str] | str | None,
     *,
+    allowed_hosts: Iterable[str] | str | None = None,
     uninterpolated: Mapping[str, Any] | None = None,
 ) -> None:
     """Raise ValueError if a public-facing profile breaks a rule; return
     otherwise. Internal profiles are never checked.
 
-    `allowed_providers`: the deployment's list (already parsed, or the raw
-    comma-separated string). `uninterpolated`: the profile document as
+    `allowed_providers` / `allowed_hosts`: the deployment's lists (already
+    parsed, or the raw comma-separated strings); None or empty refuses. `uninterpolated`: the profile document as
     written, before ``${VAR}`` expansion — the only place an interpolated
     model is still visible."""
     if profile.agent_type not in PUBLIC_AGENT_TYPES:
@@ -166,8 +211,9 @@ def check_agent_type(
                 "allowed providers"
             )
 
-    _check_capabilities(profile, who)
-    _check_voice(profile, allowed, who, uninterpolated)
+    hosts = parse_allowed_providers(allowed_hosts)
+    _check_capabilities(profile, who, hosts, uninterpolated or {})
+    _check_voice(profile, allowed, hosts, who, uninterpolated or {})
 
 
 def _capability_entries(profile: AgentProfile) -> list[tuple[int, str, dict]]:
@@ -200,7 +246,12 @@ def _capability_entries(profile: AgentProfile) -> list[tuple[int, str, dict]]:
 PUBLIC_CAPABILITIES = frozenset({"Thinking", "ImageGeneration", "MCP", "WebFetch"})
 
 
-def _check_capabilities(profile: AgentProfile, who: str) -> None:
+def _check_capabilities(
+    profile: AgentProfile,
+    who: str,
+    hosts: frozenset[str],
+    uninterpolated: Mapping[str, Any],
+) -> None:
     for i, name, cfg in _capability_entries(profile):
         where = f"spec.capabilities[{i}].{name}"
         if name == "Peer":
@@ -216,6 +267,12 @@ def _check_capabilities(profile: AgentProfile, who: str) -> None:
                 "capabilities and ones that reach the network on their own "
                 "are refused"
             )
+        if name == "MCP":
+            _check_url_host(
+                f"{where}.url", cfg.get("url"),
+                _lookup(uninterpolated, ("spec", "capabilities", i, name, "url")),
+                hosts, who,
+            )
         if name == "WebFetch" and cfg.get("local", True) is not False:
             raise ValueError(
                 f"{where}.local: {who} profiles may use WebFetch only with "
@@ -227,23 +284,27 @@ def _check_capabilities(profile: AgentProfile, who: str) -> None:
 def _check_voice(
     profile: AgentProfile,
     allowed: frozenset[str],
+    hosts: frozenset[str],
     who: str,
-    uninterpolated: Mapping[str, Any] | None,
+    uninterpolated: Mapping[str, Any],
 ) -> None:
     """A cloud speech provider receives everything the agent says aloud, so
-    it is held to the same list (by its provider name, e.g. 'openai'). The
-    'http' provider is the deployment's own endpoint and is not checked."""
+    it is held to the provider list (by its name, e.g. 'openai'); an 'http'
+    endpoint's host is held to the host list."""
     voice = profile.voice
     if voice is None:
         return
-    if uninterpolated is not None and _is_interpolated(
+    if _is_interpolated(
         _lookup(uninterpolated, ("voice", "provider"))
     ):
         raise ValueError(
             f"voice.provider: {who} profiles may not set the speech provider with "
             "${VAR} interpolation; write it literally"
         )
-    if voice.provider != "http" and voice.provider.lower() not in allowed:
+    if voice.provider == "http":
+        _check_url_host("voice.url", voice.url, _lookup(uninterpolated, ("voice", "url")),
+                        hosts, who)
+    elif voice.provider.lower() not in allowed:
         raise ValueError(
             f"voice.provider: speech provider {voice.provider!r} is not in "
             f"{ALLOWED_PROVIDERS_ENV} ({', '.join(sorted(allowed))}); {who} "

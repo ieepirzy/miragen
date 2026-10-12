@@ -17,7 +17,11 @@ from pydantic_ai.capabilities import (
     MCP,
 )
 
-from miragen.agent_type import allowed_providers_from_env, check_agent_type
+from miragen.agent_type import (
+    allowed_hosts_from_env,
+    allowed_providers_from_env,
+    check_agent_type,
+)
 from miragen.models import AgentProfile
 from miragen.peer import build_peer_capability
 
@@ -244,6 +248,7 @@ def load_profile(
     path: str | Path,
     *,
     allowed_providers: Iterable[str] | str | None = None,
+    allowed_hosts: Iterable[str] | str | None = None,
 ) -> AgentProfile:
     """
     Load and validate an agent profile YAML file.
@@ -254,6 +259,8 @@ def load_profile(
     `allowed_providers`: the deployment's provider list for `agent_type:
     external | hybrid` profiles (miragen.agent_type). None reads
     MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS from the process environment.
+    `allowed_hosts`: likewise, MIRAGEN_EXTERNAL_ALLOWED_HOSTS — the hosts such
+    a profile's MCP servers and http voice endpoint may live on.
     """
     path = Path(path)
 
@@ -294,6 +301,9 @@ def load_profile(
 
     if allowed_providers is None:
         allowed_providers = allowed_providers_from_env()
-    check_agent_type(profile, allowed_providers, uninterpolated=uninterpolated)
+    if allowed_hosts is None:
+        allowed_hosts = allowed_hosts_from_env()
+    check_agent_type(profile, allowed_providers, allowed_hosts=allowed_hosts,
+                     uninterpolated=uninterpolated)
 
     return profile
