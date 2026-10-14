@@ -4,7 +4,7 @@ FROM python:3.12-slim
 # label off the image it will spawn and refuses profiles the runtime cannot
 # run. Kept in lockstep with miragen/profile_contract.py by
 # tests/test_profile_contract.py::test_dockerfile_label_matches_source.
-LABEL io.miragen.profile-contracts="1 2 3"
+LABEL io.miragen.profile-contracts="1 2 3 4"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
@@ -30,6 +30,18 @@ COPY . /build/
 # attributable to that specific step instead of one opaque mega-layer.
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# git + gh for the Claude Code harness's engineer posture (per-instance
+# worktrees, broker-wired git/gh; docs/design/harnesses.md). Own layer, so a
+# GitHub CLI repository failure is attributable to it.
+RUN set -o pipefail \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+       -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+       > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends git gh \
+    && rm -rf /var/lib/apt/lists/* \
+    && git --version && gh --version
 
 # The installer links /usr/local/bin/grok (and `agent`) into /root/.grok/,
 # which agentuser can't traverse ("grok CLI not found on PATH" at runtime):

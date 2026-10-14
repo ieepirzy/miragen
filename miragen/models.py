@@ -815,6 +815,243 @@ class ModelSettings(_ProfileModel):
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
 
 
+# ── Claude Code harness posture (docs/design/harnesses.md, "Engineer posture") ──
+
+# Environment names a profile may never pass through to a harness child.
+# Prefixes: credentials that outrank the subscription token or switch
+# provider (ANTHROPIC_*, CLAUDE_*; a superset of miragen/memory/claude_code.py's
+# SCRUBBED_ENV, which models.py cannot import without a cycle; a test pins
+# the two), miragen's own secrets and switches (MIRAGEN_*), anything that
+# reconfigures git, gh or TLS trust (GIT_* can add a credential helper for
+# any host, GIT_ASKPASS; GH_*; SSL_*), and the dynamic loader (LD_*).
+# Suffixes: secrets by naming convention. Passthrough is for non-secret
+# plugin configuration; plugin credentials belong in the deployment-written
+# <CLAUDE_CONFIG_DIR>/settings.json or a file the plugin reads.
+_NEVER_PASSTHROUGH_PREFIXES = ("ANTHROPIC_", "CLAUDE_", "MIRAGEN_", "GIT_", "GH_", "SSL_",
+                               "LD_")
+_NEVER_PASSTHROUGH_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIALS")
+_NEVER_PASSTHROUGH = frozenset({
+    # Set by the harness itself, or able to run code in every child.
+    "HOME", "PATH", "NODE_OPTIONS", "PYTHONPATH", "PYTHONSTARTUP",
+    # The MiraDesign plugin's actor name: per instance, set by the harness.
+    "MIRADESIGN_AGENT",
+    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
+    "ALL_PROXY", "all_proxy", "NODE_EXTRA_CA_CERTS", "BASH_ENV", "ENV",
+})
+
+
+def passthrough_refused(name: str) -> bool:
+    upper = name.upper()
+    return (name in _NEVER_PASSTHROUGH or upper.startswith(_NEVER_PASSTHROUGH_PREFIXES)
+            or upper.endswith(_NEVER_PASSTHROUGH_SUFFIXES))
+
+
+# A worktree / shared-clone directory name: no path separators, no leading
+# dot (so never '.', '..' or a hidden name), never empty.
+_DIR_NAME_PATTERN = r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$"
+
+
+class EngineerRepository(_ProfileModel):
+    url: str = Field(
+        min_length=1,
+        description=(
+            "Clone URL, normally through the GitHub broker "
+            "(https://<broker>/<owner>/<repo>.git); https://github.com/… URLs are "
+            "rewritten to the broker when `git_broker` is set. Never carries "
+            "credentials (the broker credential comes from a credential helper)."
+        ),
+    )
+    name: Optional[str] = Field(
+        default=None,
+        pattern=_DIR_NAME_PATTERN,
+        description="Directory name of the worktree (default: the URL's last path segment).",
+    )
+
+    @field_validator("url")
+    @classmethod
+    def _no_credentials_in_url(cls, url: str) -> str:
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(url)
+        if parts.scheme not in ("https", "file"):
+            raise ValueError("repository urls are https:// (through the broker) or file://")
+        if parts.username or parts.password:
+            raise ValueError("repository urls must not carry credentials")
+        if parts.query or parts.fragment:
+            raise ValueError("repository urls carry no query or fragment")
+        return url
+
+    @property
+    def dir_name(self) -> str:
+        if self.name:
+            return self.name
+        from urllib.parse import unquote, urlsplit
+
+        last = unquote(urlsplit(self.url).path).rstrip("/").rsplit("/", 1)[-1]
+        return last.removesuffix(".git")
+
+    @model_validator(mode="after")
+    def _dir_name_is_safe(self) -> "EngineerRepository":
+        # The derived name becomes a directory under the instance's workdir
+        # (and the shared clone's name): '..', '.' or '' would point the
+        # worktree, and its cleanup, at a parent directory.
+        if not re.fullmatch(_DIR_NAME_PATTERN, self.dir_name):
+            raise ValueError(
+                f"repository url {self.url!r} gives the directory name {self.dir_name!r}, "
+                "which is not a plain name; set `name`")
+        return self
+
+
+class GitBrokerSpec(_ProfileModel):
+    host: str = Field(
+        pattern=r"^[A-Za-z0-9.-]+(:\d{1,5})?$",
+        description="The GitHub broker's host[:port] (mirarun ADR-041 §7); GH_HOST for gh.",
+    )
+    credential_file: str = Field(
+        min_length=1,
+        description=(
+            "File holding the broker credential (v1: one per container, a mounted "
+            "secret). Read at call time by the git credential helper and at process "
+            "start for GH_ENTERPRISE_TOKEN; never written into a repository's config."
+        ),
+    )
+    ca_bundle: Optional[str] = Field(
+        default=None,
+        description=(
+            "CA bundle trusting the broker (GIT_SSL_CAINFO and SSL_CERT_FILE). Must be "
+            "a COMBINED bundle (system roots + broker CA): SSL_CERT_FILE replaces the "
+            "system roots for Python and Go tools. Leave unset when the broker's CA "
+            "is already in the image's trust store."
+        ),
+    )
+    commit_name: Optional[str] = Field(default=None, min_length=1,
+                                       description="git user.name (default: the agent name).")
+    commit_email: Optional[str] = Field(
+        default=None, min_length=3,
+        description="git user.email (default: <agent>@agents.miragen.invalid).")
+
+
+class AskHumanMiraDesignSpec(_ProfileModel):
+    url: HttpUrl = Field(description="MiraDesign base URL (its MCP endpoint is <url>/mcp/).")
+    project: str = Field(min_length=1, description=(
+        "MiraDesign project key: new question threads and bare work item numbers resolve here."))
+    token_env: Optional[str] = Field(
+        default=None, pattern=r"^[A-Z_][A-Z0-9_]*$",
+        description=("Container env var holding a MiraDesign MCP bearer (a MIRADESIGN_MCP_TOKENS "
+                     "entry). miragen reads it from its own environment and does not pass it "
+                     "to the claude child, but the child runs as the same uid and can read "
+                     "miragen's /proc/<pid>/environ: treat it as visible to the agent."))
+    token_file: Optional[str] = Field(
+        default=None, min_length=1,
+        description="File holding a MiraDesign MCP bearer (a MIRADESIGN_MCP_TOKENS entry).")
+    to: list[str] = Field(
+        default_factory=lambda: ["ilari"], min_length=1,
+        description="Handles (or actor keys) a question is directed at.")
+
+    @model_validator(mode="after")
+    def _one_token_source(self) -> "AskHumanMiraDesignSpec":
+        if (self.token_env is None) == (self.token_file is None):
+            raise ValueError("ask_human needs exactly one of token_env / token_file")
+        return self
+
+
+class HarnessSpec(_ProfileModel):
+    posture: Literal["locked", "engineer"] = Field(
+        default="locked",
+        description=(
+            "'locked' (default): the gateway-only Claude Code session — no built-in "
+            "tools, settings, plugins or skills. 'engineer': an unattended software "
+            "engineer (mirarun ADR-041 §4) — built-in tools with bypassPermissions "
+            "(the container is the boundary), user settings (not the repository's) and plugins, a "
+            "git worktree per instance, broker-wired git/gh, subagent depth limit, "
+            "and the ask_human gateway tool."
+        ),
+    )
+    subagent_depth: int = Field(
+        default=1, ge=0, le=5,
+        description=(
+            "engineer: how deep Agent/Task subagents may nest (0 = no subagents, "
+            "1 = the session's own subagents may not spawn more)."
+        ),
+    )
+    plugin_dirs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "engineer: local plugin directories loaded into every session (in "
+            "addition to plugins enabled in <CLAUDE_CONFIG_DIR>/settings.json)."
+        ),
+    )
+    env_passthrough: list[str] = Field(
+        default_factory=list,
+        description=(
+            "engineer: container env var NAMES passed to the claude process (and so "
+            "to plugin hooks and MCP servers), for non-secret configuration such as "
+            "MIRADESIGN_URL. Never overrides a variable the harness sets. Refused: "
+            "ANTHROPIC_*, CLAUDE_*, MIRAGEN_*, GIT_*, GH_*, SSL_*, LD_*, *_API_KEY, "
+            "*_KEY, *_TOKEN, *_SECRET, *_PASSWORD, *_CREDENTIALS, NODE_OPTIONS, "
+            "NODE_EXTRA_CA_CERTS, BASH_ENV, proxies."
+        ),
+    )
+    repositories: list[EngineerRepository] = Field(
+        default_factory=list,
+        description=(
+            "engineer: the lane's repositories. One shared bare clone each under "
+            "<claude_home>/repos/, and one detached worktree per instance at the "
+            "default branch."
+        ),
+    )
+    git_broker: Optional[GitBrokerSpec] = Field(
+        default=None, description="engineer: git/gh reach GitHub only through this broker.")
+    miradesign_agent_per_instance: bool = Field(
+        default=True,
+        description=(
+            "engineer: set MIRADESIGN_AGENT=<instance name> in each instance's claude "
+            "process, so the MiraDesign plugin registers the session as the durable "
+            "actor agent:claude-code/<instance> (MiraRun maps lane instances by it). "
+            "false = the plugin's default per-session actor. Not for one-off runs."
+        ),
+    )
+    ask_human: Optional[AskHumanMiraDesignSpec] = Field(
+        default=None,
+        description=(
+            "engineer: grants the `ask_human` gateway tool, which files a MiraDesign "
+            "question and returns at once (the answer arrives as a later turn)."
+        ),
+    )
+
+    @field_validator("env_passthrough")
+    @classmethod
+    def _passthrough_allowed(cls, names: list[str]) -> list[str]:
+        for name in names:
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                raise ValueError(f"env_passthrough: '{name}' is not an environment variable name")
+            if passthrough_refused(name):
+                raise ValueError(
+                    f"env_passthrough: '{name}' may not be passed to the harness: secrets, "
+                    "provider/billing switches and git/gh/TLS/loader configuration are refused "
+                    "(plugin credentials go in <CLAUDE_CONFIG_DIR>/settings.json)")
+        return names
+
+    @model_validator(mode="after")
+    def _engineer_fields_need_engineer(self) -> "HarnessSpec":
+        if self.posture == "engineer":
+            names = [r.dir_name for r in self.repositories]
+            if len(set(names)) != len(names):
+                raise ValueError("repositories: two entries share a directory name; set `name`")
+            return self
+        # By value, not by presence: a serialized locked block carries every
+        # default and must validate again (EDF resolved_profile round trips).
+        dead = [name for name, value in (
+            ("plugin_dirs", self.plugin_dirs), ("env_passthrough", self.env_passthrough),
+            ("repositories", self.repositories), ("git_broker", self.git_broker),
+            ("ask_human", self.ask_human), ("subagent_depth", self.subagent_depth != 1),
+            ("miradesign_agent_per_instance", not self.miradesign_agent_per_instance),
+        ) if value]
+        if dead:
+            raise ValueError(f"harness fields {dead} only apply to posture: engineer")
+        return self
+
+
 class AgentSpec(_ProfileModel):
     model: str = Field(
         description="Any pydantic-ai model string, e.g. 'anthropic:claude-sonnet-4-6'.",
@@ -846,6 +1083,17 @@ class AgentSpec(_ProfileModel):
         default=None,
         ge=1,
         description="Maps to UsageLimits(request_limit=N) — caps model round-trips per run.",
+    )
+    harness: Optional[HarnessSpec] = Field(
+        default=None,
+        # Declaring the block implies profile contract v4 (older runtimes
+        # reject the key); serialization drops an absent block so a profile
+        # without one dumps back to its original contract.
+        exclude_if=lambda v: v is None,
+        description=(
+            "Harness configuration (claude-code: models only): the session posture. "
+            "Declaring the block implies profile contract v4."
+        ),
     )
 
     @model_validator(mode="after")
@@ -1542,6 +1790,8 @@ class AgentProfile(_ProfileModel):
         rejects even `agent_type: internal` as an unknown key. Serialization
         drops the default (exclude_if on the field), so a profile that
         never declared it, or declared `internal`, dumps back to contract 1."""
+        if self.spec is not None and "harness" in self.spec.model_fields_set:
+            return 4
         if "agent_type" in self.model_fields_set:
             return 3
         return 2 if self.executor is not None else 1
@@ -1572,9 +1822,25 @@ class AgentProfile(_ProfileModel):
             raise ValueError(
                 f"profile declares apiVersion {self.api_version} but uses "
                 f"features requiring {format_api_version(inferred)} "
-                "(the executor tier is a v2 surface, agent_type a v3 one) — "
+                "(the executor tier is a v2 surface, agent_type a v3 one, "
+                "spec.harness a v4 one) — "
                 "a profile must not understate its runtime requirement"
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_harness_block(self) -> AgentProfile:
+        harness = self.spec.harness if self.spec is not None else None
+        if harness is None:
+            return self
+        if not self.spec.model.startswith("claude-code:"):
+            raise ValueError(
+                "spec.harness configures the Claude Code harness; it needs a "
+                "claude-code:<model> spec.model (dead config otherwise)")
+        if harness.posture == "engineer" and self.agent_type != "internal":
+            raise ValueError(
+                "posture: engineer runs built-in tools with bypassPermissions; it is "
+                "refused on external/hybrid agents")
         return self
 
     @model_validator(mode="after")
