@@ -33,6 +33,10 @@ Contract levels:
     4  `spec.harness` (the Claude Code harness posture: `locked` |
        `engineer`, docs/design/harnesses.md). Implied by declaring the
        block: older runtimes reject the key.
+    5  `spec.harness.subagent_model: pin` (CLAUDE_CODE_SUBAGENT_MODEL +
+       _FORCE for engineer subagents). Implied by the value `pin` only: the
+       default `inherit` is left out of serialized profiles, so a dumped
+       profile that never pins still runs on a v4 runtime.
 
 A new level is added when a profile feature requires runtime support that
 older runtimes would reject or — worse — silently ignore.
@@ -44,14 +48,14 @@ import re
 
 # Every contract level this build of the runtime can execute. Extend when a
 # new level is introduced; drop old levels only with a major version.
-SUPPORTED_PROFILE_CONTRACTS: tuple[int, ...] = (1, 2, 3, 4)
+SUPPORTED_PROFILE_CONTRACTS: tuple[int, ...] = (1, 2, 3, 4, 5)
 
 # The newest contract this build serves — what freshly authored profiles
 # may declare.
 CURRENT_PROFILE_CONTRACT: int = max(SUPPORTED_PROFILE_CONTRACTS)
 
 # OCI image label carrying the supported levels, space-separated (e.g.
-# "1 2 3 4"). The Dockerfile bakes it in; a drift test pins the Dockerfile to
+# "1 2 3 4 5"). The Dockerfile bakes it in; a drift test pins the Dockerfile to
 # these constants. An image WITHOUT this label predates contract labeling
 # and is treated as supporting contract 1 only — the conservative reading,
 # and the correct one for every pre-executor-tier image in the wild.

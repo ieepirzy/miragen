@@ -1,0 +1,362 @@
+{
+ "base": {
+  "mode": "interactive",
+  "name": "lane",
+  "spec": {
+   "instructions": "You are an engineer.",
+   "model": "claude-code:claude-opus-4-8"
+  },
+  "triggers": [
+   {
+    "type": "http"
+   }
+  ]
+ },
+ "dumps": {
+  "engineer_full": {
+   "json": {
+    "apiVersion": null,
+    "approval_delivery": "blocking",
+    "approval_mode": "open",
+    "approval_required": null,
+    "approval_timeout_s": 300,
+    "approval_webhook": null,
+    "executor": null,
+    "history_max_messages": null,
+    "inject_timestamp": true,
+    "limits": null,
+    "memory": null,
+    "mode": "interactive",
+    "name": "lane",
+    "on_complete": null,
+    "runtime_tools": {
+     "schedule": true
+    },
+    "spec": {
+     "capabilities": null,
+     "harness": {
+      "ask_human": null,
+      "env_passthrough": [
+       "MIRADESIGN_URL"
+      ],
+      "git_broker": {
+       "ca_bundle": null,
+       "commit_email": null,
+       "commit_name": null,
+       "credential_file": "/run/secrets/broker",
+       "host": "gh-broker.internal:8443"
+      },
+      "miradesign_agent_per_instance": true,
+      "plugin_dirs": [
+       "/agent/plugins/x"
+      ],
+      "posture": "engineer",
+      "repositories": [
+       {
+        "name": null,
+        "url": "https://gh-broker.internal:8443/o/r.git"
+       }
+      ],
+      "subagent_depth": 2
+     },
+     "instructions": "You are an engineer.",
+     "instructions_file": null,
+     "max_steps": null,
+     "model": "claude-code:claude-opus-4-8",
+     "model_settings": null
+    },
+    "timezone": null,
+    "tools": null,
+    "triggers": [
+     {
+      "header_prompt": null,
+      "type": "http"
+     }
+    ],
+    "voice": null,
+    "watch": []
+   },
+   "python": {
+    "apiVersion": null,
+    "approval_delivery": "blocking",
+    "approval_mode": "open",
+    "approval_required": null,
+    "approval_timeout_s": 300,
+    "approval_webhook": null,
+    "executor": null,
+    "history_max_messages": null,
+    "inject_timestamp": true,
+    "limits": null,
+    "memory": null,
+    "mode": "interactive",
+    "name": "lane",
+    "on_complete": null,
+    "runtime_tools": {
+     "schedule": true
+    },
+    "spec": {
+     "capabilities": null,
+     "harness": {
+      "ask_human": null,
+      "env_passthrough": [
+       "MIRADESIGN_URL"
+      ],
+      "git_broker": {
+       "ca_bundle": null,
+       "commit_email": null,
+       "commit_name": null,
+       "credential_file": "/run/secrets/broker",
+       "host": "gh-broker.internal:8443"
+      },
+      "miradesign_agent_per_instance": true,
+      "plugin_dirs": [
+       "/agent/plugins/x"
+      ],
+      "posture": "engineer",
+      "repositories": [
+       {
+        "name": null,
+        "url": "https://gh-broker.internal:8443/o/r.git"
+       }
+      ],
+      "subagent_depth": 2
+     },
+     "instructions": "You are an engineer.",
+     "instructions_file": null,
+     "max_steps": null,
+     "model": "claude-code:claude-opus-4-8",
+     "model_settings": null
+    },
+    "timezone": null,
+    "tools": null,
+    "triggers": [
+     {
+      "header_prompt": null,
+      "type": "http"
+     }
+    ],
+    "voice": null,
+    "watch": []
+   }
+  },
+  "engineer_minimal": {
+   "json": {
+    "apiVersion": null,
+    "approval_delivery": "blocking",
+    "approval_mode": "open",
+    "approval_required": null,
+    "approval_timeout_s": 300,
+    "approval_webhook": null,
+    "executor": null,
+    "history_max_messages": null,
+    "inject_timestamp": true,
+    "limits": null,
+    "memory": null,
+    "mode": "interactive",
+    "name": "lane",
+    "on_complete": null,
+    "runtime_tools": {
+     "schedule": true
+    },
+    "spec": {
+     "capabilities": null,
+     "harness": {
+      "ask_human": null,
+      "env_passthrough": [],
+      "git_broker": null,
+      "miradesign_agent_per_instance": true,
+      "plugin_dirs": [],
+      "posture": "engineer",
+      "repositories": [],
+      "subagent_depth": 1
+     },
+     "instructions": "You are an engineer.",
+     "instructions_file": null,
+     "max_steps": null,
+     "model": "claude-code:claude-opus-4-8",
+     "model_settings": null
+    },
+    "timezone": null,
+    "tools": null,
+    "triggers": [
+     {
+      "header_prompt": null,
+      "type": "http"
+     }
+    ],
+    "voice": null,
+    "watch": []
+   },
+   "python": {
+    "apiVersion": null,
+    "approval_delivery": "blocking",
+    "approval_mode": "open",
+    "approval_required": null,
+    "approval_timeout_s": 300,
+    "approval_webhook": null,
+    "executor": null,
+    "history_max_messages": null,
+    "inject_timestamp": true,
+    "limits": null,
+    "memory": null,
+    "mode": "interactive",
+    "name": "lane",
+    "on_complete": null,
+    "runtime_tools": {
+     "schedule": true
+    },
+    "spec": {
+     "capabilities": null,
+     "harness": {
+      "ask_human": null,
+      "env_passthrough": [],
+      "git_broker": null,
+      "miradesign_agent_per_instance": true,
+      "plugin_dirs": [],
+      "posture": "engineer",
+      "repositories": [],
+      "subagent_depth": 1
+     },
+     "instructions": "You are an engineer.",
+     "instructions_file": null,
+     "max_steps": null,
+     "model": "claude-code:claude-opus-4-8",
+     "model_settings": null
+    },
+    "timezone": null,
+    "tools": null,
+    "triggers": [
+     {
+      "header_prompt": null,
+      "type": "http"
+     }
+    ],
+    "voice": null,
+    "watch": []
+   }
+  },
+  "locked_block": {
+   "json": {
+    "apiVersion": null,
+    "approval_delivery": "blocking",
+    "approval_mode": "open",
+    "approval_required": null,
+    "approval_timeout_s": 300,
+    "approval_webhook": null,
+    "executor": null,
+    "history_max_messages": null,
+    "inject_timestamp": true,
+    "limits": null,
+    "memory": null,
+    "mode": "interactive",
+    "name": "lane",
+    "on_complete": null,
+    "runtime_tools": {
+     "schedule": true
+    },
+    "spec": {
+     "capabilities": null,
+     "harness": {
+      "ask_human": null,
+      "env_passthrough": [],
+      "git_broker": null,
+      "miradesign_agent_per_instance": true,
+      "plugin_dirs": [],
+      "posture": "locked",
+      "repositories": [],
+      "subagent_depth": 1
+     },
+     "instructions": "You are an engineer.",
+     "instructions_file": null,
+     "max_steps": null,
+     "model": "claude-code:claude-opus-4-8",
+     "model_settings": null
+    },
+    "timezone": null,
+    "tools": null,
+    "triggers": [
+     {
+      "header_prompt": null,
+      "type": "http"
+     }
+    ],
+    "voice": null,
+    "watch": []
+   },
+   "python": {
+    "apiVersion": null,
+    "approval_delivery": "blocking",
+    "approval_mode": "open",
+    "approval_required": null,
+    "approval_timeout_s": 300,
+    "approval_webhook": null,
+    "executor": null,
+    "history_max_messages": null,
+    "inject_timestamp": true,
+    "limits": null,
+    "memory": null,
+    "mode": "interactive",
+    "name": "lane",
+    "on_complete": null,
+    "runtime_tools": {
+     "schedule": true
+    },
+    "spec": {
+     "capabilities": null,
+     "harness": {
+      "ask_human": null,
+      "env_passthrough": [],
+      "git_broker": null,
+      "miradesign_agent_per_instance": true,
+      "plugin_dirs": [],
+      "posture": "locked",
+      "repositories": [],
+      "subagent_depth": 1
+     },
+     "instructions": "You are an engineer.",
+     "instructions_file": null,
+     "max_steps": null,
+     "model": "claude-code:claude-opus-4-8",
+     "model_settings": null
+    },
+    "timezone": null,
+    "tools": null,
+    "triggers": [
+     {
+      "header_prompt": null,
+      "type": "http"
+     }
+    ],
+    "voice": null,
+    "watch": []
+   }
+  }
+ },
+ "profiles": {
+  "engineer_full": {
+   "env_passthrough": [
+    "MIRADESIGN_URL"
+   ],
+   "git_broker": {
+    "credential_file": "/run/secrets/broker",
+    "host": "gh-broker.internal:8443"
+   },
+   "plugin_dirs": [
+    "/agent/plugins/x"
+   ],
+   "posture": "engineer",
+   "repositories": [
+    {
+     "url": "https://gh-broker.internal:8443/o/r.git"
+    }
+   ],
+   "subagent_depth": 2
+  },
+  "engineer_minimal": {
+   "posture": "engineer"
+  },
+  "locked_block": {
+   "posture": "locked"
+  }
+ }
+}

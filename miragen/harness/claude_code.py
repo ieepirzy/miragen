@@ -98,6 +98,11 @@ STATE_FILE = "miragen-instances.json"
 WRAPPER_FILE = "miragen-claude"
 KEEP_ENV = "MIRAGEN_ENV_KEEP"
 MIRADESIGN_AGENT_ENV = "MIRADESIGN_AGENT"
+# spec.harness.subagent_model: pin → every subagent runs the session's model.
+SUBAGENT_MODEL_ENV = "CLAUDE_CODE_SUBAGENT_MODEL"
+# Without it an Agent call's own `model` still wins over the variable above
+# (observed, CLI 2.1.299: model "sonnet" ran claude-sonnet-5-5).
+SUBAGENT_MODEL_FORCE_ENV = "CLAUDE_CODE_SUBAGENT_MODEL_FORCE"
 # The only environment a claude process inherits from the container (plus
 # what _env sets). Same list as the Grok harness's.
 ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
@@ -379,6 +384,12 @@ class ClaudeCodeHarness:
             # actor_key), the name MiraRun's lane supervisor maps instances by.
             # A one-off run keeps the plugin's default per-session actor.
             env[MIRADESIGN_AGENT_ENV] = instance
+        if spec.subagent_model == "pin" and self.model:
+            # Every subagent runs the session's model, whatever an agent
+            # definition or an Agent call's `model` asks for. "inherit" sets
+            # nothing: Claude Code's own resolution, as before this option.
+            env[SUBAGENT_MODEL_ENV] = self.model
+            env[SUBAGENT_MODEL_FORCE_ENV] = "1"
         for name in spec.env_passthrough:
             # Never over a value the harness set (models.py also refuses the
             # names it knows; this holds for any it adds later).

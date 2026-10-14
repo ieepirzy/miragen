@@ -974,6 +974,22 @@ class HarnessSpec(_ProfileModel):
             "1 = the session's own subagents may not spawn more)."
         ),
     )
+    subagent_model: Literal["inherit", "pin"] = Field(
+        default="inherit",
+        # Serialized profiles leave out the default, as for agent_type: a v4
+        # runtime (extra=forbid) rejects the key, so dumping "inherit" would
+        # crash-loop every re-submitted harness profile on a v4 image. "pin"
+        # is kept and implies contract 5 (inferred_contract).
+        exclude_if=lambda v: v == "inherit",
+        description=(
+            "engineer: which model subagents run. 'inherit' (default) sets nothing and "
+            "leaves it to Claude Code (subagents follow the session's model unless an "
+            "agent definition or an Agent call names its own). 'pin' sets "
+            "CLAUDE_CODE_SUBAGENT_MODEL to spec.model's id plus "
+            "CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1, so every subagent runs the session's "
+            "model whatever an Agent call or agent definition asks for."
+        ),
+    )
     plugin_dirs: list[str] = Field(
         default_factory=list,
         description=(
@@ -1045,6 +1061,7 @@ class HarnessSpec(_ProfileModel):
             ("plugin_dirs", self.plugin_dirs), ("env_passthrough", self.env_passthrough),
             ("repositories", self.repositories), ("git_broker", self.git_broker),
             ("ask_human", self.ask_human), ("subagent_depth", self.subagent_depth != 1),
+            ("subagent_model", self.subagent_model != "inherit"),
             ("miradesign_agent_per_instance", not self.miradesign_agent_per_instance),
         ) if value]
         if dead:
@@ -1790,6 +1807,11 @@ class AgentProfile(_ProfileModel):
         rejects even `agent_type: internal` as an unknown key. Serialization
         drops the default (exclude_if on the field), so a profile that
         never declared it, or declared `internal`, dumps back to contract 1."""
+        harness = self.spec.harness if self.spec is not None else None
+        if harness is not None and harness.subagent_model == "pin":
+            # By value: "inherit" never reaches a dump (exclude_if), so only
+            # a pin needs a runtime that knows the key.
+            return 5
         if self.spec is not None and "harness" in self.spec.model_fields_set:
             return 4
         if "agent_type" in self.model_fields_set:
@@ -1823,7 +1845,7 @@ class AgentProfile(_ProfileModel):
                 f"profile declares apiVersion {self.api_version} but uses "
                 f"features requiring {format_api_version(inferred)} "
                 "(the executor tier is a v2 surface, agent_type a v3 one, "
-                "spec.harness a v4 one) — "
+                "spec.harness a v4 one, spec.harness.subagent_model: pin a v5 one) — "
                 "a profile must not understate its runtime requirement"
             )
         return self
@@ -1841,6 +1863,13 @@ class AgentProfile(_ProfileModel):
             raise ValueError(
                 "posture: engineer runs built-in tools with bypassPermissions; it is "
                 "refused on external/hybrid agents")
+        if harness.subagent_model == "pin":
+            if self.spec.model == "claude-code:":
+                raise ValueError(
+                    "subagent_model: pin needs a model to pin: claude-code: alone names none")
+            if harness.subagent_depth == 0:
+                raise ValueError(
+                    "subagent_model: pin with subagent_depth: 0 is dead config (no subagents)")
         return self
 
     @model_validator(mode="after")
