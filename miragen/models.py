@@ -817,17 +817,35 @@ class ModelSettings(_ProfileModel):
 
 # ── Claude Code harness posture (docs/design/harnesses.md, "Engineer posture") ──
 
-# Environment names a profile may never pass through to a harness child:
-# they outrank the subscription credential or route calls to a metered
-# provider (the same list as miragen/memory/claude_code.py's SCRUBBED_ENV,
-# which models.py cannot import without a cycle; a test pins the two).
-_NEVER_PASSTHROUGH_PREFIXES = ("ANTHROPIC_",)
+# Environment names a profile may never pass through to a harness child.
+# Prefixes: credentials that outrank the subscription token or switch
+# provider (ANTHROPIC_*, CLAUDE_*; a superset of miragen/memory/claude_code.py's
+# SCRUBBED_ENV, which models.py cannot import without a cycle; a test pins
+# the two), miragen's own secrets and switches (MIRAGEN_*), anything that
+# reconfigures git, gh or TLS trust (GIT_* can add a credential helper for
+# any host, GIT_ASKPASS; GH_*; SSL_*), and the dynamic loader (LD_*).
+# Suffixes: secrets by naming convention. Passthrough is for non-secret
+# plugin configuration; plugin credentials belong in the deployment-written
+# <CLAUDE_CONFIG_DIR>/settings.json or a file the plugin reads.
+_NEVER_PASSTHROUGH_PREFIXES = ("ANTHROPIC_", "CLAUDE_", "MIRAGEN_", "GIT_", "GH_", "SSL_",
+                               "LD_")
+_NEVER_PASSTHROUGH_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET")
 _NEVER_PASSTHROUGH = frozenset({
-    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
-    # Set by the harness itself; a passthrough would shadow its value.
-    "HOME", "CLAUDE_CONFIG_DIR", "MIRAGEN_GATEWAY_TOKEN", "MIRAGEN_ENV_KEEP",
-    "GIT_CONFIG_GLOBAL", "GH_HOST", "GH_ENTERPRISE_TOKEN",
+    # Set by the harness itself, or able to run code in every child.
+    "HOME", "PATH", "NODE_OPTIONS", "PYTHONPATH", "PYTHONSTARTUP",
+    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
 })
+
+
+def passthrough_refused(name: str) -> bool:
+    upper = name.upper()
+    return (name in _NEVER_PASSTHROUGH or upper.startswith(_NEVER_PASSTHROUGH_PREFIXES)
+            or upper.endswith(_NEVER_PASSTHROUGH_SUFFIXES))
+
+
+# A worktree / shared-clone directory name: no path separators, no leading
+# dot (so never '.', '..' or a hidden name), never empty.
+_DIR_NAME_PATTERN = r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$"
 
 
 class EngineerRepository(_ProfileModel):
@@ -842,7 +860,7 @@ class EngineerRepository(_ProfileModel):
     )
     name: Optional[str] = Field(
         default=None,
-        pattern=r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$",
+        pattern=_DIR_NAME_PATTERN,
         description="Directory name of the worktree (default: the URL's last path segment).",
     )
 
@@ -856,14 +874,29 @@ class EngineerRepository(_ProfileModel):
             raise ValueError("repository urls are https:// (through the broker) or file://")
         if parts.username or parts.password:
             raise ValueError("repository urls must not carry credentials")
+        if parts.query or parts.fragment:
+            raise ValueError("repository urls carry no query or fragment")
         return url
 
     @property
     def dir_name(self) -> str:
         if self.name:
             return self.name
-        last = self.url.rstrip("/").rsplit("/", 1)[-1]
-        return last[:-4] if last.endswith(".git") else last
+        from urllib.parse import unquote, urlsplit
+
+        last = unquote(urlsplit(self.url).path).rstrip("/").rsplit("/", 1)[-1]
+        return last.removesuffix(".git")
+
+    @model_validator(mode="after")
+    def _dir_name_is_safe(self) -> "EngineerRepository":
+        # The derived name becomes a directory under the instance's workdir
+        # (and the shared clone's name): '..', '.' or '' would point the
+        # worktree, and its cleanup, at a parent directory.
+        if not re.fullmatch(_DIR_NAME_PATTERN, self.dir_name):
+            raise ValueError(
+                f"repository url {self.url!r} gives the directory name {self.dir_name!r}, "
+                "which is not a plain name; set `name`")
+        return self
 
 
 class GitBrokerSpec(_ProfileModel):
@@ -921,7 +954,7 @@ class HarnessSpec(_ProfileModel):
             "'locked' (default): the gateway-only Claude Code session — no built-in "
             "tools, settings, plugins or skills. 'engineer': an unattended software "
             "engineer (mirarun ADR-041 §4) — built-in tools with bypassPermissions "
-            "(the container is the boundary), user+project settings and plugins, a "
+            "(the container is the boundary), user settings (not the repository's) and plugins, a "
             "git worktree per instance, broker-wired git/gh, subagent depth limit, "
             "and the ask_human gateway tool."
         ),
@@ -944,8 +977,10 @@ class HarnessSpec(_ProfileModel):
         default_factory=list,
         description=(
             "engineer: container env var NAMES passed to the claude process (and so "
-            "to plugin hooks and MCP servers, e.g. MIRADESIGN_URL). Values stay in the "
-            "container environment; ANTHROPIC_* and provider switches are refused."
+            "to plugin hooks and MCP servers), for non-secret configuration such as "
+            "MIRADESIGN_URL. Never overrides a variable the harness sets. Refused: "
+            "ANTHROPIC_*, CLAUDE_*, MIRAGEN_*, GIT_*, GH_*, SSL_*, LD_*, *_API_KEY, "
+            "*_TOKEN, *_SECRET, NODE_OPTIONS, proxies."
         ),
     )
     repositories: list[EngineerRepository] = Field(
@@ -972,10 +1007,11 @@ class HarnessSpec(_ProfileModel):
         for name in names:
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
                 raise ValueError(f"env_passthrough: '{name}' is not an environment variable name")
-            if name in _NEVER_PASSTHROUGH or name.startswith(_NEVER_PASSTHROUGH_PREFIXES):
+            if passthrough_refused(name):
                 raise ValueError(
-                    f"env_passthrough: '{name}' may not be passed to the harness (subscription "
-                    "only, and the harness sets its own identity variables)")
+                    f"env_passthrough: '{name}' may not be passed to the harness: secrets, "
+                    "provider/billing switches and git/gh/TLS/loader configuration are refused "
+                    "(plugin credentials go in <CLAUDE_CONFIG_DIR>/settings.json)")
         return names
 
     @model_validator(mode="after")

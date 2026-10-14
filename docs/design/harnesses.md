@@ -256,7 +256,7 @@ spec:
       credential_file: /run/secrets/broker_credential   # v1: one per container
       ca_bundle: /etc/ssl/certs/with-broker-ca.pem       # combined bundle, optional
     plugin_dirs: [/agent/plugins/miradesign, /agent/plugins/miragen-memory]
-    env_passthrough: [MIRADESIGN_URL, MIRADESIGN_TOKEN, MIRAGEN_BRIDGE_URL, MIRAGEN_BRIDGE_TOKEN]
+    env_passthrough: [MIRADESIGN_URL]   # non-secret plugin config only
     ask_human:
       url: https://design.muutto365.fi
       project: miragen
@@ -278,7 +278,7 @@ byte-for-byte by `tests/fixtures/claude_code_locked_options.json`):
 | Built-in tools | none (`--tools ""`, plus enabled web tools) | Claude Code's default set (`--tools default`): Bash, Read, Edit, Write, Glob, Grep, Agent, TodoWrite, WebFetch, WebSearch… |
 | Permissions | `default` + `can_use_tool` (gateway tools only) | `bypassPermissions`, no `can_use_tool` (it is never consulted under bypass); enforcement is hooks |
 | System prompt | `spec.instructions` only | Claude Code's preset + `spec.instructions` appended |
-| Settings | none (`--setting-sources=`) | `user,project`: `<CLAUDE_CONFIG_DIR>/settings.json` and the repository's `.claude/settings.json` + `CLAUDE.md` |
+| Settings | none (`--setting-sources=`) | `user` only: `<CLAUDE_CONFIG_DIR>/settings.json`, plus flag settings `{"disableAllHooks": false}`; never the repository's `.claude/settings.json` |
 | Skills / plugins | none | `skills="all"`; `plugin_dirs` as SDK local plugins, plus plugins enabled in the user settings |
 | MCP | the gateway only (`--strict-mcp-config`) | the gateway (`gw`) plus plugin/settings MCP servers |
 | Working directory | `<workdirs>/<instance>` | the instance's worktree (one repo) or `<workdirs>/<instance>` holding one worktree per repo |
@@ -297,11 +297,37 @@ loadable):
   container): `enabledPlugins` and `extraKnownMarketplaces` pointing at
   directory marketplaces in the volume, the same as an interactive install.
 Plugins need their own configuration (MiraDesign URL and token, the memory
-bridge's URL and token). The exec wrapper's allowlist strips everything else,
-so name those variables in `env_passthrough`; values stay in the container
-environment. `ANTHROPIC_*`, the provider switches and the variables the
-harness sets itself are refused there: the posture is subscription-only like
-the locked one (`CLAUDE_CODE_OAUTH_TOKEN` or a login in `CLAUDE_CONFIG_DIR`).
+bridge's URL and token). The exec wrapper's allowlist strips everything else.
+- **Credentials** go in the deployment-written `settings.json` (`env`) or in
+  files the plugin reads, never through `env_passthrough`.
+- **`env_passthrough`** is for non-secret configuration such as
+  `MIRADESIGN_URL`. It refuses `ANTHROPIC_*`, `CLAUDE_*`, `MIRAGEN_*`, `GIT_*`
+  (`GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` could add a credential helper
+  for any host), `GH_*`, `SSL_*`, `LD_*`, `*_API_KEY`, `*_TOKEN`, `*_SECRET`,
+  `NODE_OPTIONS`, `PYTHONPATH`/`PYTHONSTARTUP`, `PATH`, `HOME` and the
+  proxies.
+- **At spawn,** a passthrough never overrides a variable the harness set.
+
+The posture is subscription-only like the locked one (`CLAUDE_CODE_OAUTH_TOKEN`
+or a login in `CLAUDE_CONFIG_DIR`).
+
+**Why no project settings.** A worktree's `.claude/settings.json` is whatever
+branch is checked out, including a PR branch from outside. Its `env`,
+`apiKeyHelper` or `ANTHROPIC_BASE_URL` could redirect the subscription token
+or switch billing, and headless mode shows no trust prompt. It could also set
+`disableAllHooks`: the CLI (2.1.299) has messages for hooks being "turned off:
+the project's settings … set disableAllHooks". So `setting_sources` is
+`["user"]`, and the flag-settings layer (highest precedence among
+user-controlled sources) pins `disableAllHooks: false`.
+
+Unverified live:
+- whether `disableAllHooks` would also silence the SDK's in-process callback
+  hooks;
+- whether the flag-level `false` wins over a `true` in user settings.
+
+The repository's `CLAUDE.md`/`AGENTS.md` is therefore not loaded
+automatically. The kickoff tells the agent to read it, so its text stays in
+the conversation, not the system prompt.
 
 **Workspaces.** Each repository gets one shared bare clone,
 `<claude_home>/repos/<name>.git` (`git init --bare` + `origin`, so it holds
@@ -311,8 +337,13 @@ an instance creates `<workdirs>/<instance>/<name>` with `git worktree add
 starts from the latest default branch. An existing worktree is never reset:
 it is the agent's work in progress, and it survives process restarts. The
 clone/fetch runs before the process starts, outside the spawn lock, with one
-lock per shared clone and subprocess timeouts. A failure fails the turn
-(`workspace for '<instance>': …`). `DELETE /instances/{name}` removes the
+lock per shared clone and subprocess timeouts. A failure (git, or an
+`OSError` such as a full disk) fails the turn (`workspace for '<instance>':
+…`). Directory names are plain names: one derived from the URL is validated
+like an explicit `name` (no `.`, `..`, empty or hidden names; URLs carry no
+query or fragment). Provisioning separately refuses any path that does not
+resolve to a direct child of the instance directory, including a worktree
+replaced by a symlink. `DELETE /instances/{name}` removes the
 instance directory and prunes its worktrees from the shared clones. Branches
 the agent created stay in the shared clone. The same holds for ephemeral runs
 after their turn. Requires `git` (and `gh`) in the image (the Dockerfile
@@ -372,9 +403,22 @@ MiraDesign MCP `post(kind=question, to=[…])` makes, over REST:
 - **Without one:** a new thread, `POST /v1/projects/{p}/threads {kind:
   question, participants: to}`.
 - **Then the question:** `POST /v1/threads/{id}/messages {kind: question,
-  mentions: to, meta: {agent, instance, run_id, work_item}}`. The
-  `Idempotency-Key` is derived from (agent, instance, run, thread,
-  question).
+  mentions: to, meta: {agent, instance, run_id, work_item}}`.
+
+Retries stay one question:
+- **The key.** `Idempotency-Key` is derived from (agent, instance, question
+  text), not the run or the thread. MiraDesign replays a retried message
+  instead of posting it twice.
+- **Earlier runs.** The same question from an earlier run is a 409, which is
+  reported as "already filed".
+- **Thread creation.** MiraDesign's threads route takes no
+  `Idempotency-Key` today (the tool sends one anyway). A retry reuses the
+  thread from the tool's in-process memo, or failing that, an open question
+  thread in the project with the same subject and target. A retry after a
+  lost reply or a restart therefore opens no second thread.
+- **Recipients.** Each `to` handle is checked first (`GET /v1/actors/{h}`):
+  MiraDesign silently drops a mention of an unknown handle on an existing
+  thread, so an unknown recipient fails the call with nothing filed.
 
 The tool returns at once and tells the model not to wait. MiraDesign pushes
 the question to the person's attention queue (ADR-030). The answer is posted
@@ -384,6 +428,35 @@ per container, so every instance posts as the lane's actor. `meta` is what
 tells the supervisor which instance asked. The executor tier's `ask_human`
 (`/mcp/ask-human`, the intervention sentinel) is a different tool on a
 different mount.
+
+**Isolation between instances: the container is the only boundary.** All
+instances of a lane run as one uid in one container, so an instance can
+reach everything the others have:
+- **Other processes' environments.** It can read `/proc/<pid>/environ` of
+  every other `claude` process and of miragen itself, including the
+  subscription token, `GH_ENTERPRISE_TOKEN` and anything else in miragen's
+  container environment.
+- **Shared files it can rewrite.** These persist across spawns and reach
+  the other instances: the exec wrapper, the gitconfig, the credential
+  helper, `<CLAUDE_CONFIG_DIR>/settings.json`, and the shared bare clone's
+  `config`, hooks and refs.
+- **The broker credential.** `GH_ENTERPRISE_TOKEN` is in every child's
+  environment, and `gh … --hostname <any>` sends it to any host it is
+  pointed at. It is a broker credential, not a GitHub token, and the broker
+  binds it to the lane, but anything holding it can use it from anywhere.
+
+The wrapper, gitconfig and helper (and `settings.json`, when present) are made
+read-only after `prepare()` (`0o500`/`0o400`/`0o444`). That only guards
+against accidental rewrites: the same uid can `chmod` them back.
+
+*Deferred:*
+- Run `claude` as a separate uid, with root-owned harness files and clones
+  whose config the agent cannot write.
+- Keep miragen's container environment free of anything a lane must not see:
+  upstream MCP secrets, other lanes' credentials, the MiraDesign token if the
+  agent should not hold it.
+- A per-session broker credential (above), so a leaked one is scoped to one
+  session.
 
 ### Swapping harnesses
 

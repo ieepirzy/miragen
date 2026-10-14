@@ -84,6 +84,16 @@ def _gitconfig_value(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def write_readonly(path: Path, text: str, mode: int) -> None:
+    """Replace ``path`` atomically and leave it read-only (``mode``). Not a
+    boundary against the same uid (it can chmod back), only against
+    accidental rewrites; os.replace works on a read-only target."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text)
+    tmp.chmod(mode)
+    os.replace(tmp, path)
+
+
 def write_git_files(claude_home: Path, profile: AgentProfile) -> Path:
     """Write the container-level gitconfig (and the broker credential
     helper) under ``claude_home``; returns the gitconfig path. Idempotent."""
@@ -100,8 +110,7 @@ def write_git_files(claude_home: Path, profile: AgentProfile) -> Path:
     ]
     if broker is not None:
         helper = claude_home / CREDENTIAL_HELPER_FILE
-        helper.write_text(_HELPER)
-        helper.chmod(0o700)
+        write_readonly(helper, _HELPER, 0o500)
         base = f"https://{broker.host}"
         lines += [
             # Scoped to the broker: no other host is ever handed the credential.
@@ -112,9 +121,7 @@ def write_git_files(claude_home: Path, profile: AgentProfile) -> Path:
             "\tinsteadOf = ssh://git@github.com/",
         ]
     path = claude_home / GITCONFIG_FILE
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text("\n".join(lines) + "\n")
-    os.replace(tmp, path)
+    write_readonly(path, "\n".join(lines) + "\n", 0o400)
     return path
 
 
@@ -185,11 +192,29 @@ def _ensure_mirror(path: Path, url: str, env: dict[str, str]) -> str:
     return _git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], env=env, cwd=path)
 
 
+def _inside(parent: Path, name: str) -> Path:
+    """``parent/name``, refused unless it resolves to a direct child of
+    ``parent`` (the profile validates names too; this is the second lock)."""
+    target = parent / name
+    if name in ("", ".", "..") or "/" in name or target.resolve().parent != parent.resolve():
+        raise WorkspaceError(f"refusing a workspace path outside {parent}: {name!r}")
+    return target
+
+
 def _provision_sync(claude_home: Path, instance_dir: Path, repos: list[EngineerRepository],
                     env: dict[str, str]) -> Path:
+    try:
+        return _provision_unchecked(claude_home, instance_dir, repos, env)
+    except OSError as exc:  # disk full, permissions: a workspace failure, not a crash
+        raise WorkspaceError(f"{type(exc).__name__}: {exc}") from exc
+
+
+def _provision_unchecked(claude_home: Path, instance_dir: Path, repos: list[EngineerRepository],
+                         env: dict[str, str]) -> Path:
     instance_dir.mkdir(parents=True, exist_ok=True)
     for repo in repos:
-        tree = instance_dir / repo.dir_name
+        tree = _inside(instance_dir, repo.dir_name)
+        _inside(claude_home / REPOS_DIR, f"{repo.dir_name}.git")
         if (tree / ".git").exists():
             continue  # the agent's work in progress: never reset
         mirror = mirror_path(claude_home, repo)
@@ -253,14 +278,20 @@ def _worktree_mirrors(instance_dir: Path) -> set[Path]:
     return mirrors
 
 
-def remove_workdir(workdir: Path) -> bool:
+def remove_workdir(workdir: Path, *, ignore_errors: bool = False) -> bool:
     """Delete an instance's working directory, including any worktrees in
     it, and prune their records from the shared clones. Returns whether
-    there was anything to delete."""
+    there was anything to delete. ``ignore_errors`` is shutil.rmtree's
+    (best-effort cleanup keeps deleting past a failure)."""
     if not workdir.is_dir():
         return False
-    mirrors = _worktree_mirrors(workdir)
-    shutil.rmtree(workdir)
+    try:
+        mirrors = _worktree_mirrors(workdir)
+    except OSError:
+        if not ignore_errors:
+            raise
+        mirrors = set()
+    shutil.rmtree(workdir, ignore_errors=ignore_errors)
     for mirror in mirrors:
         try:
             _git(["worktree", "prune"], env={"GIT_CONFIG_NOSYSTEM": "1"}, cwd=mirror, timeout=60)
@@ -289,7 +320,12 @@ class SubagentDepthPolicy:
 
     def _caller_depth(self, data: dict) -> int | None:
         agent_id = data.get("agent_id")
-        return 0 if not agent_id else self._depth.get(agent_id)
+        if agent_id:
+            return self._depth.get(agent_id)
+        # agent_type without agent_id is only the main thread of an --agent
+        # session, which this harness never starts: treat it as a subagent
+        # whose id went missing (unknown, refused).
+        return None if data.get("agent_type") else 0
 
     async def pre_tool_use(self, data: dict, tool_use_id: str | None, _context: Any) -> dict:
         if data.get("tool_name") not in SUBAGENT_TOOLS:
@@ -361,7 +397,7 @@ def _token(spec: AskHumanMiraDesignSpec, environ: dict[str, str]) -> str:
 
 
 def _work_item_ref(value: str, default_project: str) -> tuple[str, int]:
-    match = re.fullmatch(r"\s*(?:([A-Za-z0-9_.-]+))?#?(\d+)\s*", value)
+    match = re.fullmatch(r"\s*(?:([A-Za-z0-9_.-]+)#|#)?(\d+)\s*", value)
     if not match:
         raise AskHumanFailed("work_item is a number, '#12' or 'project#12'")
     return match.group(1) or default_project, int(match.group(2))
@@ -382,6 +418,9 @@ def build_ask_human_tool(
     import httpx
 
     base = str(spec.url).rstrip("/") + "/v1"
+    # Question key -> thread it was filed in: a retried call (same agent,
+    # instance and question) reuses the thread instead of opening another.
+    threads: dict[str, str] = {}
 
     async def ask_human(question: str, work_item: str | None = None,
                         subject: str | None = None) -> str:
@@ -416,28 +455,65 @@ def build_ask_human_tool(
                         f"MiraDesign refused ({response.status_code}): {response.text[:300]}")
                 return response.json()
 
-            thread_id = None
+            # A mention of an unknown handle is dropped silently by MiraDesign
+            # on an existing thread: check the recipients first.
+            for handle in spec.to:
+                try:
+                    response = await client.get(f"/actors/{handle}")
+                except httpx.HTTPError as exc:
+                    raise AskHumanFailed(f"MiraDesign unreachable: {exc}") from exc
+                if response.status_code == 404:
+                    raise AskHumanFailed(
+                        f"MiraDesign has no actor '{handle}'; the question was not filed "
+                        "(fix ask_human.to in the profile)")
+                if response.status_code >= 400:
+                    raise AskHumanFailed(
+                        f"MiraDesign refused ({response.status_code}): {response.text[:300]}")
+
+            key = "miragen-ask-" + hashlib.sha256("\x1f".join(
+                [agent, instance or "", hashlib.sha256(question.encode()).hexdigest()]).encode()
+            ).hexdigest()[:40]
+            thread_id = threads.get(key)
             item = None
             if work_item:
                 project, number = _work_item_ref(work_item, spec.project)
                 item = await call("GET", f"/projects/{project}/work-items/{number}")
-                thread_id = item.get("thread_id")
+                thread_id = thread_id or item.get("thread_id")
             else:
                 project = spec.project
             if not thread_id:
                 body = {"subject": (subject or question.strip().splitlines()[0])[:120],
                         "kind": "question", "participants": list(spec.to)}
-                if item is not None and item.get("id"):
-                    body |= {"target_type": "work_item", "target_id": item["id"]}
-                thread_id = (await call("POST", f"/projects/{project}/threads", json=body))["id"]
-            key = hashlib.sha256("\x1f".join(
-                [agent, instance or "", run_id or "", str(thread_id), question]).encode()
-            ).hexdigest()[:40]
-            message = await call(
-                "POST", f"/threads/{thread_id}/messages",
-                json={"kind": "question", "body": question, "mentions": list(spec.to),
-                      "meta": meta},
-                headers={"Idempotency-Key": f"miragen-ask-{key}"})
+                target = item.get("id") if item is not None else None
+                if target:
+                    body |= {"target_type": "work_item", "target_id": target}
+                # The threads route takes no Idempotency-Key today (sent anyway,
+                # for when it does): reuse an open question thread with the same
+                # subject and target, so a retry after a lost reply (or a
+                # restart) does not open a second one.
+                for row in await call("GET", f"/projects/{project}/threads"):
+                    if (row.get("kind") == "question" and row.get("subject") == body["subject"]
+                            and row.get("target_id") == target):
+                        thread_id = row["id"]
+                        break
+                else:
+                    thread_id = (await call("POST", f"/projects/{project}/threads", json=body,
+                                            headers={"Idempotency-Key": key}))["id"]
+            threads[key] = thread_id
+            try:
+                message = await call(
+                    "POST", f"/threads/{thread_id}/messages",
+                    json={"kind": "question", "body": question, "mentions": list(spec.to),
+                          "meta": meta},
+                    headers={"Idempotency-Key": key})
+            except AskHumanFailed as exc:
+                if "(409)" not in str(exc):
+                    raise
+                # The same question from this instance, already filed by an
+                # earlier run: it is still the open question.
+                return (f"ok: this question was already filed in MiraDesign thread "
+                        f"{str(thread_id)[:8]}. Do not wait or poll; the answer arrives as a "
+                        "later turn.")
         to = ", ".join("@" + h for h in spec.to)
         return (f"ok: question {str(message.get('id', ''))[:8]} filed in MiraDesign thread "
                 f"{str(thread_id)[:8]} for {to}. Do not wait or poll for the answer: carry on "

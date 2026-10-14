@@ -30,7 +30,7 @@ swap between them (``spec.model``) when one is rate limited:
 All of the above is the default, ``locked`` posture. ``spec.harness.posture:
 engineer`` (mirarun ADR-041 §4) opts a profile out of the tool lockdown:
 Claude Code's own tools with ``bypassPermissions`` (the container is the
-boundary), user + project settings, plugins and skills, the gateway as one
+boundary), user settings (never the worktree's), plugins and skills, the gateway as one
 MCP server among others, a git worktree per instance, broker-wired git/gh
 and a subagent depth hook (``miragen/harness/engineer.py``). The
 subscription-only environment rules hold in both postures.
@@ -256,6 +256,8 @@ class ClaudeCodeHarness:
         # The SDK merges the parent's environment into the child's; this
         # wrapper replaces it with an allowlist before exec'ing the CLI.
         wrapper = home / WRAPPER_FILE
+        with contextlib.suppress(FileNotFoundError):
+            wrapper.chmod(0o700)  # an engineer posture left it read-only
         wrapper.write_text(
             f"#!{sys.executable}\n"
             "import os, sys\n"
@@ -266,6 +268,12 @@ class ClaudeCodeHarness:
         wrapper.chmod(0o700)
         if self.engineer:
             write_git_files(home, self.profile)
+            # Read-only against accidental rewrites by a session (not a
+            # boundary: the same uid can chmod them back; see the docs).
+            wrapper.chmod(0o500)
+            settings_json = home / "settings.json"
+            if settings_json.is_file():
+                settings_json.chmod(0o444)
         if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") and not self._logged_in():
             logger.warning("claude-code harness: no subscription credential (neither the "
                            "setup-token env var nor a login in CLAUDE_CONFIG_DIR); turns will "
@@ -334,7 +342,9 @@ class ClaudeCodeHarness:
             env.pop(WORKER_ENV)
         env.update(git_env(self.settings.claude_home, self.profile))
         for name in spec.env_passthrough:
-            if name in os.environ:
+            # Never over a value the harness set (models.py also refuses the
+            # names it knows; this holds for any it adds later).
+            if name in os.environ and name not in env:
                 env[name] = os.environ[name]
         keep = [k for k in ENV_ALLOWLIST if k in os.environ]
         keep += [*env, "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SDK_READS_SESSION_STATE", "PWD"]
@@ -423,9 +433,16 @@ class ClaudeCodeHarness:
                 "headers": {"Authorization": f"Bearer ${{{GATEWAY_TOKEN_ENV}}}"}}},
             # Plugins' MCP servers (MiraDesign, the memory bridge) load too.
             strict_mcp_config=False,
-            # <CLAUDE_CONFIG_DIR>/settings.json (enabled plugins, marketplaces,
-            # hooks) and the repository's own .claude/settings.json + CLAUDE.md.
-            setting_sources=["user", "project"],
+            # <CLAUDE_CONFIG_DIR>/settings.json only (deployment-written:
+            # enabled plugins, marketplaces, hooks). Never "project": a
+            # worktree's .claude/settings.json comes from whatever branch is
+            # checked out (any PR) and could set env, apiKeyHelper or a base
+            # URL that redirects the subscription token, or disableAllHooks;
+            # headless mode shows no trust prompt.
+            setting_sources=["user"],
+            # Flag settings outrank user settings: the depth hooks stay on even
+            # if a session rewrites settings.json.
+            settings=json.dumps({"disableAllHooks": False}),
             skills="all",
             plugins=[{"type": "local", "path": p} for p in spec.plugin_dirs],
             # The container is the boundary. can_use_tool would never be
@@ -455,7 +472,8 @@ class ClaudeCodeHarness:
         except WorkspaceError as exc:
             if ephemeral:
                 with contextlib.suppress(Exception):
-                    await asyncio.to_thread(remove_workdir, self.settings.workdirs / instance)
+                    await asyncio.to_thread(remove_workdir, self.settings.workdirs / instance,
+                                            ignore_errors=True)
             raise ClaudeCodeHarnessError(f"workspace for '{instance}': {exc}") from exc
 
     async def _spawn(self, instance: str, *, ephemeral: bool, cwd: Path | None = None) -> _Agent:
@@ -488,7 +506,7 @@ class ClaudeCodeHarness:
                 return await self._spawn(instance, ephemeral=ephemeral, cwd=cwd)
             if ephemeral:
                 with contextlib.suppress(Exception):
-                    remove_workdir(workdir)
+                    remove_workdir(workdir, ignore_errors=True)
             raise
         if not ephemeral and not known:
             entry = self._load_state().get(instance) or {}
@@ -657,7 +675,7 @@ class ClaudeCodeHarness:
                     with contextlib.suppress(OSError):
                         path.parent.rmdir()
                 with contextlib.suppress(Exception):
-                    remove_workdir(self.settings.workdirs / instance)
+                    remove_workdir(self.settings.workdirs / instance, ignore_errors=True)
         if result is None:
             raise ClaudeCodeHarnessError("claude ended the turn without a result")
         if not ephemeral:

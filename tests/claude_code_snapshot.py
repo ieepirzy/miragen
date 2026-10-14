@@ -44,11 +44,36 @@ def profile(variant: dict, **spec_extra) -> AgentProfile:
     })
 
 
+def _value(value):
+    """An option value as JSON: callables and other objects by kind, so the
+    rendering is stable and nothing an option carries goes unseen."""
+    import dataclasses
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        return [_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _value(v) for k, v in value.items()}
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {"<dataclass>": type(value).__name__,
+                **{f.name: _value(getattr(value, f.name)) for f in dataclasses.fields(value)}}
+    if callable(value):
+        return "<callable>"
+    if hasattr(value, "write"):  # debug_stderr: whichever stream the runner has
+        return "<stream>"
+    return f"<{type(value).__name__}>"
+
+
 def render(harness: ClaudeCodeHarness, options, root: Path, *, argv: bool = True) -> dict:
-    """What miragen passes to the SDK (option values, env, hooks, wrapper).
-    ``argv`` adds the CLI command line the SDK would build from them: a
+    """Every field of the ClaudeAgentOptions miragen builds (callables shown
+    by kind; hook matchers as matcher, hook count and timeout), plus the exec
+    wrapper. ``argv`` adds the CLI command line the SDK would build: a
     private SDK API whose rendering changes between SDK releases, so the
     golden leaves it out and only targeted assertions read it."""
+    import dataclasses
 
     def norm(value):
         if isinstance(value, str):
@@ -61,18 +86,14 @@ def render(harness: ClaudeCodeHarness, options, root: Path, *, argv: bool = True
             return {k: norm(v) for k, v in value.items()}
         return value
 
-    hooks = {event: [{"matcher": m.matcher, "hooks": len(m.hooks)} for m in matchers]
-             for event, matchers in (options.hooks or {}).items()}
+    fields = {f.name: _value(getattr(options, f.name)) for f in dataclasses.fields(options)}
+    fields["env"] = dict(sorted(options.env.items()))
     view = {
-        "env": dict(sorted(options.env.items())),
-        "hooks": hooks,
-        "permission_mode": options.permission_mode,
-        "can_use_tool": options.can_use_tool is not None,
-        "cwd": options.cwd,
-        "options": {k: getattr(options, k) for k in (
-            "tools", "allowed_tools", "disallowed_tools", "system_prompt", "setting_sources",
-            "skills", "plugins", "strict_mcp_config", "add_dirs", "verbatim_prompts",
-            "mcp_servers", "model", "effort", "cli_path", "resume", "session_id")},
+        "options": fields,
+        # Shorthands the engineer tests read.
+        "env": fields["env"],
+        "hooks": {event: [{"matcher": m.matcher, "hooks": len(m.hooks)} for m in matchers]
+                  for event, matchers in (options.hooks or {}).items()},
         "wrapper": (harness.settings.claude_home / WRAPPER_FILE).read_text(),
     }
     if argv:

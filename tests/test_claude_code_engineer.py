@@ -25,12 +25,15 @@ from miragen.harness.claude_code import (  # noqa: E402
     ClaudeCodeHarness, ClaudeCodeHarnessError, ClaudeCodeSettings,
 )
 from miragen.harness.engineer import (  # noqa: E402
-    GITCONFIG_FILE, AskHumanFailed, SubagentDepthPolicy, build_ask_human_tool, git_env,
+    GITCONFIG_FILE, AskHumanFailed, SubagentDepthPolicy, WorkspaceError, _inside,
+    _provision_sync, _work_item_ref, build_ask_human_tool, git_env, remove_workdir,
     write_git_files,
 )
 from miragen.harness.gateway import ToolGateway  # noqa: E402
 from miragen.memory.claude_code import SCRUBBED_ENV  # noqa: E402
-from miragen.models import _NEVER_PASSTHROUGH, AgentProfile, AskHumanMiraDesignSpec  # noqa: E402
+from miragen.models import (  # noqa: E402
+    AgentProfile, AskHumanMiraDesignSpec, EngineerRepository, HarnessSpec, passthrough_refused,
+)
 from tests import claude_code_snapshot as snap  # noqa: E402
 from tests.test_claude_code_harness import FakeClient, turn  # noqa: E402
 
@@ -171,13 +174,41 @@ def test_invalid_harness_blocks_are_refused(harness, model, extra, message):
         AgentProfile.model_validate(data)
 
 
-def test_passthrough_refusals_cover_every_scrubbed_credential():
-    from miragen.models import HarnessSpec
+@pytest.mark.parametrize("name", [
+    *SCRUBBED_ENV, "MIRAGEN_INTERNAL_TOKEN", "MIRAGEN_WORKER", "MIRAGEN_BROKER_CREDENTIAL_FILE",
+    "MIRAGEN_GATEWAY_TOKEN", "MIRAGEN_ENV_KEEP", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+    "GIT_ASKPASS", "GIT_SSL_CAINFO", "GIT_CONFIG_GLOBAL", "GH_HOST", "GH_ENTERPRISE_TOKEN",
+    "SSL_CERT_FILE", "OPENAI_API_KEY", "LD_PRELOAD", "LD_LIBRARY_PATH", "NODE_OPTIONS",
+    "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "GITHUB_TOKEN",
+    "SOME_SECRET", "HTTPS_PROXY",
+])
+def test_passthrough_refuses_secrets_and_harness_configuration(name):
+    assert passthrough_refused(name)
+    with pytest.raises(ValueError, match="may not be passed"):
+        HarnessSpec(posture="engineer", env_passthrough=[name])
 
-    for name in SCRUBBED_ENV:
-        assert name.startswith("ANTHROPIC_") or name in _NEVER_PASSTHROUGH, name
-        with pytest.raises(ValueError):
-            HarnessSpec(posture="engineer", env_passthrough=[name])
+
+def test_passthrough_allows_plain_plugin_configuration():
+    assert HarnessSpec(posture="engineer",
+                       env_passthrough=["MIRADESIGN_URL", "PROJECT_KEY"]).env_passthrough
+
+
+@pytest.mark.parametrize("url", [
+    "https://b/o/..", "https://b/o/...git", "https://b/o/.", "https://b/o/.git",
+    "https://b/o/%2e%2e", "https://b/o/.hidden", "file:///tmp/o/..", "https://b/",
+])
+def test_urls_whose_derived_directory_is_not_a_plain_name_are_refused(url):
+    with pytest.raises(ValueError):
+        EngineerRepository(url=url)
+
+
+def test_urls_with_a_query_are_refused():
+    with pytest.raises(ValueError, match="query"):
+        EngineerRepository(url="https://b/o/r.git?x=/../")
+
+
+def test_an_explicit_name_rescues_an_unusable_url_tail():
+    assert EngineerRepository(url="https://b/o/.git", name="repo").dir_name == "repo"
 
 
 @pytest.mark.parametrize("harness", [
@@ -213,7 +244,9 @@ async def test_engineer_options_open_the_tool_set_and_load_settings(env, monkeyp
     argv = view["argv"]
     assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
     assert argv[argv.index("--tools") + 1] == "default"
-    assert "--setting-sources=user,project" in argv
+    # User settings only: a worktree's .claude/settings.json is never loaded.
+    assert "--setting-sources=user" in argv
+    assert json.loads(argv[argv.index("--settings") + 1]) == {"disableAllHooks": False}
     assert "--strict-mcp-config" not in argv
     assert "--append-system-prompt" in argv and "You are Mira." in argv
     assert json.loads(argv[argv.index("--mcp-config") + 1])["mcpServers"]["gw"]["headers"] == {
@@ -243,6 +276,33 @@ async def test_engineer_options_open_the_tool_set_and_load_settings(env, monkeyp
     names = {line.split("=", 1)[0] for line in out.splitlines()}
     assert "ANTHROPIC_API_KEY" not in names and "UPSTREAM_SECRET" not in names
     assert {"GH_ENTERPRISE_TOKEN", "MIRADESIGN_URL", "GIT_CONFIG_GLOBAL"} <= names
+    # The harness's own files are read-only (against accidental rewrites).
+    for name, mode in (("miragen-claude", 0o500), (GITCONFIG_FILE, 0o400),
+                       ("miragen-git-credential", 0o500)):
+        assert (env.home / name).stat().st_mode & 0o777 == mode, name
+
+
+async def test_a_second_prepare_rewrites_the_read_only_files(env):
+    prof = engineer_profile(git_broker={"host": "b", "credential_file": "/nonexistent"})
+    env.harness(prof)
+    env.harness(prof)  # would raise PermissionError on a 0o500 wrapper
+    assert (env.home / "miragen-claude").stat().st_mode & 0o777 == 0o500
+
+
+async def test_passthrough_never_overrides_what_the_harness_sets(env, monkeypatch, tmp_path):
+    cred = tmp_path / "cred"
+    cred.write_text("broker-secret-9\n")
+    monkeypatch.setenv("GH_HOST", "evil.example")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/tmp/evil")
+    prof = engineer_profile(git_broker={"host": "broker.internal", "credential_file": str(cred)})
+    # Bypass validation (which refuses these names) to test the spawn rule itself.
+    spec = prof.spec.harness
+    object.__setattr__(spec, "env_passthrough", ["GH_HOST", "GIT_CONFIG_GLOBAL"])
+    h = env.harness(prof)
+    await h.run(turn("hi"))
+    e = FakeClient.instances[0].options.env
+    assert e["GH_HOST"] == "broker.internal"
+    assert e["GIT_CONFIG_GLOBAL"] == str(env.home / GITCONFIG_FILE)
 
 
 async def test_engineer_with_miragen_memory_keeps_the_plugin_quiet(env):
@@ -369,6 +429,55 @@ async def test_an_unreachable_repository_fails_the_turn_cleanly(env, tmp_path):
     assert not list((env.home / "repos").glob("*")) if (env.home / "repos").exists() else True
 
 
+def test_a_workspace_path_outside_the_instance_directory_is_refused(tmp_path):
+    inst = tmp_path / "work" / "a"
+    inst.mkdir(parents=True)
+    for bad in ("..", ".", "", "x/../..", "../b"):
+        with pytest.raises(WorkspaceError, match="outside"):
+            _inside(inst, bad)
+    # A worktree replaced by a symlink pointing elsewhere is refused too.
+    (tmp_path / "elsewhere").mkdir()
+    (inst / "repo").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(WorkspaceError, match="outside"):
+        _inside(inst, "repo")
+
+
+def test_an_unsafe_name_never_deletes_a_sibling_instance(tmp_path, origin, hermetic):
+    """The reviewer's reproduction: a URL whose tail is '..' made the
+    'half-made worktree' rmtree hit the workdirs directory. Validation
+    refuses it now; the provisioning check holds even without validation."""
+    sibling = tmp_path / "work" / "b"
+    sibling.mkdir(parents=True)
+    (sibling / "keep.txt").write_text("other instance's work")
+    repo = EngineerRepository.model_construct(url=origin.as_uri(), name="..")
+    with pytest.raises(WorkspaceError):
+        _provision_sync(tmp_path / "home", tmp_path / "work" / "a", [repo], {})
+    assert (sibling / "keep.txt").read_text() == "other instance's work"
+
+
+def test_os_errors_while_provisioning_are_workspace_errors(tmp_path, origin):
+    blocker = tmp_path / "work"
+    blocker.write_text("a file where the workdirs directory should be")
+    repo = EngineerRepository(url=origin.as_uri())
+    with pytest.raises(WorkspaceError, match="Error"):
+        _provision_sync(tmp_path / "home", blocker / "a", [repo], {})
+
+
+def test_best_effort_cleanup_keeps_going_past_errors(tmp_path):
+    work = tmp_path / "w"
+    locked = work / "locked"
+    locked.mkdir(parents=True)
+    (locked / "f").write_text("x")
+    (work / "other").write_text("y")
+    locked.chmod(0o500)
+    try:
+        with pytest.raises(OSError):
+            remove_workdir(work)
+        assert remove_workdir(work, ignore_errors=True)  # no exception
+    finally:
+        locked.chmod(0o700)
+
+
 # ── subagent depth ──────────────────────────────────────────────────────────
 
 def _call(tool="Agent", agent_id=None, tool_use_id="t1"):
@@ -408,6 +517,13 @@ async def test_depth_zero_refuses_every_subagent_and_two_allows_one_nesting():
     assert _denied(await p.pre_tool_use(_call(agent_id="a2", tool_use_id="t3"), "t3", None))
 
 
+async def test_a_subagent_context_without_an_agent_id_is_unknown():
+    p = SubagentDepthPolicy(3)
+    data = _call()
+    data["agent_type"] = "general-purpose"  # inside a subagent, but its id is missing
+    assert _denied(await p.pre_tool_use(data, "t1", None))
+
+
 async def test_a_subagent_starting_with_no_spawn_in_flight_is_at_the_limit():
     p = SubagentDepthPolicy(3)
     await p.subagent_start({"agent_id": "orphan"}, None, None)
@@ -417,33 +533,51 @@ async def test_a_subagent_starting_with_no_spawn_in_flight_is_at_the_limit():
 # ── ask_human ───────────────────────────────────────────────────────────────
 
 class FakeMiraDesign:
-    def __init__(self, *, thread_id="th-1234567890", fail=None):
+    def __init__(self, *, thread_id="th-1234567890", fail=None, actors=("ilari", "eemeli"),
+                 message_status=201):
         self.requests: list[httpx.Request] = []
-        self.thread_id, self.fail = thread_id, fail
+        self.thread_id, self.fail, self.actors = thread_id, fail, set(actors)
+        self.message_status = message_status
+        self.threads: list[dict] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         path = request.url.path
         if self.fail and self.fail in path:
             return httpx.Response(404, json={"error": "no such work item"})
+        if request.method == "GET" and path.startswith("/v1/actors/"):
+            handle = path.rsplit("/", 1)[-1]
+            return (httpx.Response(200, json={"handle": handle}) if handle in self.actors
+                    else httpx.Response(404, json={"error": "no actor"}))
         if request.method == "GET" and "/work-items/" in path:
             return httpx.Response(200, json={"id": "wi-1", "number": 12,
                                              "thread_id": self.thread_id})
-        if path.endswith("/threads"):
-            return httpx.Response(201, json={"id": "th-new-0000"})
+        if request.method == "GET" and path.endswith("/threads"):
+            return httpx.Response(200, json=self.threads)
+        if request.method == "POST" and path.endswith("/threads"):
+            body = json.loads(request.content)
+            row = {"id": f"th-new-{len(self.threads):04d}", "kind": body["kind"],
+                   "subject": body["subject"], "target_id": body.get("target_id")}
+            self.threads.append(row)
+            return httpx.Response(201, json=row)
         if path.endswith("/messages"):
+            if self.message_status != 201:
+                return httpx.Response(self.message_status, json={"error": "conflict"})
             return httpx.Response(201, json={"id": "msg-abcdef12", "thread_id": "x",
                                              "escalated": "sink"})
         return httpx.Response(500)
 
-    def body(self, i: int) -> dict:
-        return json.loads(self.requests[i].content)
+    def calls(self) -> list[tuple[str, str]]:
+        return [(r.method, r.url.path) for r in self.requests]
+
+    def sent(self, method: str, suffix: str) -> list[httpx.Request]:
+        return [r for r in self.requests if r.method == method and r.url.path.endswith(suffix)]
 
 
-def _ask(fake, *, token_env="MD_TOKEN", environ=None, **spec):
+def _ask(fake, *, token_env="MD_TOKEN", environ=None, current=None, **spec):
     md = AskHumanMiraDesignSpec(url="https://design.example", project="lane",
                                 token_env=token_env, **spec)
-    return build_ask_human_tool(md, "eng", lambda: ("run-1", "inst-a"),
+    return build_ask_human_tool(md, "eng", current or (lambda: ("run-1", "inst-a")),
                                 environ={"MD_TOKEN": "md-secret"} if environ is None else environ,
                                 transport=httpx.MockTransport(fake))
 
@@ -451,12 +585,13 @@ def _ask(fake, *, token_env="MD_TOKEN", environ=None, **spec):
 async def test_ask_human_on_a_work_item_posts_a_question_to_its_thread():
     fake = FakeMiraDesign()
     out = await _ask(fake)("Merge the schema change now or wait for review?", work_item="#12")
-    get, post = fake.requests
-    assert (get.method, get.url.path) == ("GET", "/v1/projects/lane/work-items/12")
-    assert (post.method, post.url.path) == ("POST", "/v1/threads/th-1234567890/messages")
+    assert fake.calls() == [("GET", "/v1/actors/ilari"),
+                            ("GET", "/v1/projects/lane/work-items/12"),
+                            ("POST", "/v1/threads/th-1234567890/messages")]
     assert {r.headers["authorization"] for r in fake.requests} == {"Bearer md-secret"}
+    (post,) = fake.sent("POST", "/messages")
     assert post.headers["idempotency-key"].startswith("miragen-ask-")
-    body = fake.body(1)
+    body = json.loads(post.content)
     assert body["kind"] == "question" and body["mentions"] == ["ilari"]
     assert body["body"] == "Merge the schema change now or wait for review?"
     assert body["meta"] == {"source": "miragen.ask_human", "agent": "eng", "instance": "inst-a",
@@ -464,24 +599,82 @@ async def test_ask_human_on_a_work_item_posts_a_question_to_its_thread():
     assert out.startswith("ok: question msg-abcd") and "Do not wait" in out and "@ilari" in out
 
 
+@pytest.mark.parametrize("ref, expected", [
+    ("12", ("lane", 12)), ("#12", ("lane", 12)), ("7", ("lane", 7)),
+    ("miragen#12", ("miragen", 12)), (" other#7 ", ("other", 7)),
+])
+def test_work_item_references(ref, expected):
+    assert _work_item_ref(ref, "lane") == expected
+
+
+@pytest.mark.parametrize("ref", ["miragen12", "twelve", "#", "a#b", "12#"])
+def test_bad_work_item_references(ref):
+    with pytest.raises(AskHumanFailed, match="work_item"):
+        _work_item_ref(ref, "lane")
+
+
+async def test_ask_human_bare_number_reaches_the_default_projects_item():
+    fake = FakeMiraDesign()
+    await _ask(fake)("Q?", work_item="12")
+    assert ("GET", "/v1/projects/lane/work-items/12") in fake.calls()
+
+
 async def test_ask_human_without_a_work_item_opens_a_question_thread():
     fake = FakeMiraDesign()
     await _ask(fake, to=["ilari", "eemeli"])("Which region?\nDetails…", subject=None)
-    create, post = fake.requests
-    assert (create.method, create.url.path) == ("POST", "/v1/projects/lane/threads")
-    assert fake.body(0) == {"subject": "Which region?", "kind": "question",
-                            "participants": ["ilari", "eemeli"]}
+    (create,) = fake.sent("POST", "/threads")
+    assert create.url.path == "/v1/projects/lane/threads"
+    assert json.loads(create.content) == {"subject": "Which region?", "kind": "question",
+                                          "participants": ["ilari", "eemeli"]}
+    (post,) = fake.sent("POST", "/messages")
     assert post.url.path == "/v1/threads/th-new-0000/messages"
-    assert fake.body(1)["mentions"] == ["ilari", "eemeli"]
+    assert json.loads(post.content)["mentions"] == ["ilari", "eemeli"]
+    assert create.headers["idempotency-key"] == post.headers["idempotency-key"]
+
+
+async def test_a_retried_question_opens_no_second_thread():
+    fake = FakeMiraDesign()
+    ask = _ask(fake)
+    await ask("Which region?")
+    await ask("Which region?")             # same tool: the in-process memo
+    await _ask(fake)("Which region?")      # a fresh tool (restart): the subject lookup
+    assert len(fake.sent("POST", "/threads")) == 1
+    assert len(fake.sent("GET", "/threads")) == 2  # the memo answered the second call
+    keys = {r.headers["idempotency-key"] for r in fake.sent("POST", "/messages")}
+    assert len(keys) == 1  # MiraDesign replays the message instead of posting it again
+
+
+async def test_the_key_names_agent_instance_and_question_not_the_run():
+    fake = FakeMiraDesign()
+    await _ask(fake, current=lambda: ("run-1", "inst-a"))("Q?")
+    await _ask(fake, current=lambda: ("run-2", "inst-a"))("Q?")
+    await _ask(fake, current=lambda: ("run-1", "inst-b"))("Q?")
+    keys = [r.headers["idempotency-key"] for r in fake.sent("POST", "/messages")]
+    assert keys[0] == keys[1] != keys[2]
+
+
+async def test_a_question_already_filed_by_an_earlier_run_is_reported_not_failed():
+    out = await _ask(FakeMiraDesign(message_status=409))("Q?")
+    assert out.startswith("ok: this question was already filed")
 
 
 async def test_ask_human_targets_another_project_and_falls_back_when_an_item_has_no_thread():
     fake = FakeMiraDesign(thread_id=None)
     await _ask(fake)("Q?", work_item="other#7")
-    assert [r.url.path for r in fake.requests] == [
-        "/v1/projects/other/work-items/7", "/v1/projects/other/threads",
-        "/v1/threads/th-new-0000/messages"]
-    assert fake.body(1)["target_type"] == "work_item" and fake.body(1)["target_id"] == "wi-1"
+    assert fake.calls() == [
+        ("GET", "/v1/actors/ilari"), ("GET", "/v1/projects/other/work-items/7"),
+        ("GET", "/v1/projects/other/threads"), ("POST", "/v1/projects/other/threads"),
+        ("POST", "/v1/threads/th-new-0000/messages")]
+    (create,) = fake.sent("POST", "/threads")
+    assert json.loads(create.content)["target_type"] == "work_item"
+    assert json.loads(create.content)["target_id"] == "wi-1"
+
+
+async def test_an_unknown_recipient_files_nothing():
+    fake = FakeMiraDesign(actors=("ilari",))
+    with pytest.raises(AskHumanFailed, match="no actor 'nobody'"):
+        await _ask(fake, to=["ilari", "nobody"])("Q?", work_item="12")
+    assert not [r for r in fake.requests if r.method == "POST"]
 
 
 async def test_ask_human_failures_are_tool_errors():
@@ -506,8 +699,8 @@ async def test_ask_human_through_the_gateway_names_the_calling_instance_and_run(
     with gw.turn("inst-a", "run-1"):
         result = await gw.call_tool("ask_human", {"question": "Q?"}, instance="inst-a")
     assert not result.isError, result
-    assert fake.body(1)["meta"]["instance"] == "inst-a"
-    assert fake.body(1)["meta"]["run_id"] == "run-1"
+    meta = json.loads(fake.sent("POST", "/messages")[0].content)["meta"]
+    assert meta["instance"] == "inst-a" and meta["run_id"] == "run-1"
 
 
 def test_ask_human_reaches_the_gateway_only_for_engineers(tmp_path, monkeypatch):
