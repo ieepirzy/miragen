@@ -460,20 +460,64 @@ Autonomous + cron + LLM = unbounded spend. `max_steps` caps round-trips per run,
 
 ```yaml
 limits:
-  tokens_per_run: 200000     # optional, >= 1 — per-run cap, enforced by PydanticAI
+  tokens_per_run: 200000     # optional, >= 1 — per-run cap in budget tokens
   tokens_per_day: 2000000    # optional, >= 1 — rolling UTC-day cap, enforced by miragen
   on_exceeded: skip          # skip (default) | notify — what a blocked scheduled run does
 ```
 
 At least one of `tokens_per_run` / `tokens_per_day` must be set — an empty `limits: {}` block fails `miragen validate` as dead config.
 
-- **`tokens_per_run`** wires straight into PydanticAI's `UsageLimits(total_tokens_limit=...)`. Exceeding it ends the run with PydanticAI's own usage-limit error; the [run record](#run-records) is written with `status: failed` and that error as `error`.
-- **`tokens_per_day`** is a rolling UTC-day sum of `input_tokens + output_tokens` across this agent's run records (a run with no recorded usage — e.g. one that failed before the model responded — counts as 0, not unbounded). Checked before every run starts:
+- **`tokens_per_run`** caps a run's [budget tokens](#what-a-budget-token-is), checked by the executors and the in-flight reserve; the model tier also wires it into PydanticAI's `UsageLimits(total_tokens_limit=...)`, whose total counts cache reads in full. Exceeding it ends the run with PydanticAI's own usage-limit error; the [run record](#run-records) is written with `status: failed` and that error as `error`.
+- **`tokens_per_day`** is a rolling UTC-day sum of budget tokens across this agent's run records (a run with no recorded usage — e.g. one that failed before the model responded — counts as 0, not unbounded). Checked before every run starts:
   - A cron/interval/startup run over budget is **skipped**, with a log line. If `on_exceeded: notify`, the `on_complete.notify` handler fires with a budget-exceeded message (not `log_to` or `post_to` — there's no run output to log).
   - `POST /run` and `POST /run/async` return `429` with the used/limit counts and the UTC reset time in the message.
   - The budget resets at UTC midnight — yesterday's records never count against today.
 
-Cost-in-dollars conversion, per-model pricing, and cross-agent (swarm-wide) budgets are out of scope for now — this is a token-count circuit breaker, not a billing system.
+#### What a budget token is
+
+**Without a rates source** (the default), uncached input, cache writes and output count one budget token per token, and cache reads are left out.
+
+**With a rates source configured** (below), uncached input and output still count one budget token per token, and cache reads and writes are weighted by the model's own rates relative to its fresh-input rate:
+
+| Tokens | Weight |
+|---|---|
+| uncached input, output | 1 |
+| cache reads | `cached_input / input` |
+| cache writes, 5-minute TTL | `cache_write / input` (1 when the source gives no write rate, logged once per model) |
+| cache writes, 1-hour TTL | `cache_write_1h / input` (when absent, the dearest known write weight: the 5-minute weight or 1, whichever is higher; the dearer of the two TTL weights when the run doesn't report the split) |
+
+When a run reports per-request usage (`usage.calls`), each request is weighted by the model it reports; usage the requests don't account for is weighted by the run's model: the model its run record names, else the profile's (`spec.model`, or `<executor>:<executor.model>` on the executor tier). Rates are always the source's current table, so today's spend follows today's rates. Each request rounds up, so the result is always a whole number.
+
+A reported model is matched to a rates entry by, in order: the exact string (or without a provider snapshot date such as `-20260901`); the run's model when the reported id is its id without the `provider:` prefix (`anthropic:claude-x` ↔ `claude-x`); the reported id under the run model's provider prefix; then any entry whose id without the prefix is the reported id (a harness reports the API model behind its selector). When several entries match, each weight is the highest among them.
+
+**With a source, budgets never undercount.** For a model the source doesn't list, or one rated at zero (flat-rate subscription harnesses, whose ratios mean nothing), cache reads and writes count in full. Each such model is logged once.
+
+**Upgrading.** Nothing changes until you configure a source: with none, budgets count exactly as before (cache reads left out), and the agent logs one line at startup saying so. Once a source is configured, cache reads start counting (at the model's ratio, or in full for models it can't weight), so cache-heavy agents spend their budgets faster. Check `tokens_per_run` / `tokens_per_day` on those agents, and make sure the source lists every model they use, harness models included.
+
+MiraGen keeps no rates of its own (`tests/test_telemetry.py` guards against a rate table in the code). It reads them from one configured source:
+
+| Variable | Meaning |
+|---|---|
+| `MIRAGEN_MODEL_RATES_URL` | An http(s) endpoint serving the rates document, typically a control plane's model catalogue. Fetched at startup and on every refresh; the last good copy is kept under the runs directory (`model-rates/rates.json`), so a restart without network still has rates. A failed fetch keeps the last good rates. |
+| `MIRAGEN_MODEL_RATES_TOKEN` | Optional bearer token for the URL (`MIRAGEN_MODEL_RATES_TOKEN_FILE` works like every `*_FILE` secret inside the agent container; miragend forwards only the plain `_TOKEN`). |
+| `MIRAGEN_MODEL_RATES_REFRESH_S` | Refresh interval in seconds; default 900, minimum 30. Each fetch has 10 s of wall clock in total. With no copy on disk, startup waits up to 5 s for a first fetch. |
+| `MIRAGEN_MODEL_RATES_PATH` | A local rates document instead of a URL, for self-hosting. Re-read when it changes. The URL wins when both are set. (Not `_FILE`: that suffix means a secret file, which startup reads into the variable without the suffix.) |
+
+miragend forwards `MIRAGEN_MODEL_RATES_URL`, `_TOKEN` and `_REFRESH_S` from its own environment to every managed agent.
+
+The rates document, per million tokens, decimals as strings. Only the ratios matter, so the currency is irrelevant. Unknown fields are ignored, and a malformed entry is skipped with a log line:
+
+```json
+{"models": {
+  "anthropic:claude-x": {"input": "2.00", "cached_input": "0.10",
+                         "cache_write": "2.50", "cache_write_1h": "4.00", "output": "10.00"},
+  "deepseek:deepseek-x": {"input": "0.15", "cached_input": "0.003", "output": "0.60"}
+}}
+```
+
+`cache_write` and `cache_write_1h` are optional. Other sources plug in through the `RatesSource` protocol in `miragen/model_rates.py`.
+
+Currency conversion and cross-agent (swarm-wide) budgets are out of scope: this is a token-count circuit breaker, not a billing system.
 
 ---
 

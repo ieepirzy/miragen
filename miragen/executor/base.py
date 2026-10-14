@@ -64,6 +64,7 @@ from miragen.models import (
     ExecutorSpec,
     InterventionRequest,
     RunUsage,
+    budget_model,
     budget_tokens,
     sum_usage,
 )
@@ -767,7 +768,7 @@ class ExecutorBackend(ABC):
         limits = self.profile.limits
         if limits is None or limits.tokens_per_run is None or usage is None:
             return False
-        return budget_tokens(usage) > limits.tokens_per_run
+        return budget_tokens(usage, budget_model(self.profile)) > limits.tokens_per_run
 
 
 def event_payload(event: Any) -> dict[str, Any]:

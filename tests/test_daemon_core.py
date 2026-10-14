@@ -359,6 +359,39 @@ def test_max_concurrent_forwarded_into_agent_env(tmp_path):
     assert env["MIRAGEN_MAX_CONCURRENT"] == "8"
 
 
+def test_model_rates_source_forwarded_into_agent_env(tmp_path):
+    """One rates source on the daemon weights every managed agent's budget
+    (miragen/model_rates.py). A rates file is a host path: not forwarded."""
+    docker_client = FakeDocker()
+    runner = RecordingRunner()
+    runner.on_up = lambda name: docker_client.add(name)
+    core = LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        environ={
+            "MIRAGEN_MODEL_RATES_URL": "https://catalogue.example/api/model-rates",
+            "MIRAGEN_MODEL_RATES_TOKEN": "rates-token-example",
+            "MIRAGEN_MODEL_RATES_REFRESH_S": "600",
+            "MIRAGEN_MODEL_RATES_PATH": "/host/rates.json",
+        },
+        runner=runner,
+        not_found=FakeNotFound,
+        sleep=lambda _s: None,
+    )
+    core.create_agent("alpha", _yaml("alpha"))
+
+    import yaml as pyyaml
+
+    env = pyyaml.safe_load((tmp_path / "compose.yml").read_text())["services"]["alpha"][
+        "environment"
+    ]
+    assert env["MIRAGEN_MODEL_RATES_URL"] == "https://catalogue.example/api/model-rates"
+    assert env["MIRAGEN_MODEL_RATES_TOKEN"] == "rates-token-example"
+    assert env["MIRAGEN_MODEL_RATES_REFRESH_S"] == "600"
+    assert "MIRAGEN_MODEL_RATES_PATH" not in env
+
+
 
 EXTERNAL_YAML = VALID_YAML.replace("mode: interactive\n", "mode: interactive\nagent_type: external\n")
 
