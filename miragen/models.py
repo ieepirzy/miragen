@@ -829,13 +829,14 @@ class ModelSettings(_ProfileModel):
 # <CLAUDE_CONFIG_DIR>/settings.json or a file the plugin reads.
 _NEVER_PASSTHROUGH_PREFIXES = ("ANTHROPIC_", "CLAUDE_", "MIRAGEN_", "GIT_", "GH_", "SSL_",
                                "LD_")
-_NEVER_PASSTHROUGH_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET")
+_NEVER_PASSTHROUGH_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIALS")
 _NEVER_PASSTHROUGH = frozenset({
     # Set by the harness itself, or able to run code in every child.
     "HOME", "PATH", "NODE_OPTIONS", "PYTHONPATH", "PYTHONSTARTUP",
     # The MiraDesign plugin's actor name: per instance, set by the harness.
     "MIRADESIGN_AGENT",
     "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
+    "ALL_PROXY", "all_proxy", "NODE_EXTRA_CA_CERTS", "BASH_ENV", "ENV",
 })
 
 
@@ -937,7 +938,9 @@ class AskHumanMiraDesignSpec(_ProfileModel):
     token_env: Optional[str] = Field(
         default=None, pattern=r"^[A-Z_][A-Z0-9_]*$",
         description=("Container env var holding a MiraDesign MCP bearer (a MIRADESIGN_MCP_TOKENS "
-                     "entry; miragen's env, not the child's)."))
+                     "entry). miragen reads it from its own environment and does not pass it "
+                     "to the claude child, but the child runs as the same uid and can read "
+                     "miragen's /proc/<pid>/environ: treat it as visible to the agent."))
     token_file: Optional[str] = Field(
         default=None, min_length=1,
         description="File holding a MiraDesign MCP bearer (a MIRADESIGN_MCP_TOKENS entry).")
@@ -985,7 +988,8 @@ class HarnessSpec(_ProfileModel):
             "to plugin hooks and MCP servers), for non-secret configuration such as "
             "MIRADESIGN_URL. Never overrides a variable the harness sets. Refused: "
             "ANTHROPIC_*, CLAUDE_*, MIRAGEN_*, GIT_*, GH_*, SSL_*, LD_*, *_API_KEY, "
-            "*_TOKEN, *_SECRET, NODE_OPTIONS, proxies."
+            "*_KEY, *_TOKEN, *_SECRET, *_PASSWORD, *_CREDENTIALS, NODE_OPTIONS, "
+            "NODE_EXTRA_CA_CERTS, BASH_ENV, proxies."
         ),
     )
     repositories: list[EngineerRepository] = Field(

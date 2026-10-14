@@ -89,10 +89,21 @@ def write_readonly(path: Path, text: str, mode: int) -> None:
     """Replace ``path`` atomically and leave it read-only (``mode``). Not a
     boundary against the same uid (it can chmod back), only against
     accidental rewrites; os.replace works on a read-only target."""
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(text)
-    tmp.chmod(mode)
-    os.replace(tmp, path)
+    import tempfile
+
+    # A fresh, exclusively created name per write: a leftover read-only temp
+    # file cannot block the next restart, and no fixed name can be pre-planted
+    # as a symlink (mkstemp opens with O_EXCL).
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+        tmp.chmod(mode)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def write_git_files(claude_home: Path, profile: AgentProfile) -> Path:
@@ -188,6 +199,9 @@ def _ensure_mirror(path: Path, url: str, env: dict[str, str]) -> str:
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
     else:
+        # The profile may have repointed this repository (same directory
+        # name, new URL): never keep fetching the old one.
+        _git(["remote", "set-url", "origin", url], env=env, cwd=path)
         _git(["fetch", "--prune", "--quiet", "origin"], env=env, cwd=path)
     _git(["remote", "set-head", "origin", "--auto"], env=env, cwd=path)
     return _git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], env=env, cwd=path)
@@ -404,6 +418,24 @@ def _work_item_ref(value: str, default_project: str) -> tuple[str, int]:
     return match.group(1) or default_project, int(match.group(2))
 
 
+ASK_MEMO_MAX = 256
+
+
+def _mcp_failure(exc: BaseException) -> str:
+    """The MCP client raises from inside task groups: find the real error,
+    and say an HTTP refusal (401/403: the bearer) apart from an outage."""
+    import httpx
+
+    leaf: BaseException = exc
+    while isinstance(leaf, BaseExceptionGroup) and leaf.exceptions:
+        leaf = leaf.exceptions[0]
+    if isinstance(leaf, httpx.HTTPStatusError):
+        status = leaf.response.status_code
+        hint = " (check ask_human's MiraDesign MCP bearer)" if status in (401, 403) else ""
+        return f"MiraDesign MCP answered HTTP {status}{hint}"
+    return f"MiraDesign MCP unreachable: {type(leaf).__name__}: {leaf}"
+
+
 def build_ask_human_tool(
     spec: AskHumanMiraDesignSpec,
     agent: str,
@@ -426,7 +458,7 @@ def build_ask_human_tool(
     # question in the same session returns the first answer instead of
     # posting again. (Remaining risk: a reply lost after the post landed,
     # in a process that then restarts, is asked again.)
-    asked: dict[tuple[str, str], str] = {}
+    asked: dict[tuple[str, str], str] = {}  # insertion-ordered; bounded below
 
     async def ask_human(question: str, work_item: str | None = None,
                         subject: str | None = None) -> str:
@@ -442,6 +474,9 @@ def build_ask_human_tool(
         work_item: the MiraDesign work item this is about ('12', '#12' or
             'project#12'), when there is one — the question goes on its thread.
         subject: a short title for a new thread (when there is no work item).
+
+        Recipients come from the profile. Do not @mention anyone in the
+        question: MiraDesign refuses a post that @mentions an unknown handle.
         """
         from mcp import ClientSession
         from mcp.client.streamable_http import streamablehttp_client
@@ -455,7 +490,8 @@ def build_ask_human_tool(
                 "this session has no MiraDesign session key yet; use the MiraDesign plugin's "
                 "`post` tool (kind=question, to=[...]) directly")
         skey = f"claude-code:{session_id}"
-        memo = (skey, hashlib.sha256(question.encode()).hexdigest())
+        memo = (skey, hashlib.sha256("\x1f".join(
+            [question, work_item or "", subject or ""]).encode()).hexdigest())
         if memo in asked:
             return asked[memo] + " (Already asked in this session; not posted again.)"
         args: dict[str, Any] = {"session": skey, "body": question, "kind": "question",
@@ -478,7 +514,7 @@ def build_ask_human_tool(
                     await mcp_session.initialize()
                     result = await mcp_session.call_tool("post", args)
         except Exception as exc:  # transport, HTTP status, protocol
-            raise AskHumanFailed(f"MiraDesign MCP unreachable: {type(exc).__name__}: {exc}") from exc
+            raise AskHumanFailed(_mcp_failure(exc)) from exc
         text = "".join(getattr(block, "text", "") for block in result.content).strip()
         if result.isError or not text.startswith("ok:"):
             # A refusal is MiraDesign's answer (unknown recipient, no live
@@ -488,6 +524,8 @@ def build_ask_human_tool(
             text += (" Do not wait or poll for the answer: carry on with work that does not "
                      "depend on it, or end the turn. The answer arrives as a later turn.")
         asked[memo] = text
+        while len(asked) > ASK_MEMO_MAX:
+            asked.pop(next(iter(asked)))
         return text
 
     return ask_human

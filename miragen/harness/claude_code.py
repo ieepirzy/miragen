@@ -68,6 +68,27 @@ from miragen.models import AgentProfile, CallUsage, RunUsage, anthropic_usage_fi
 
 logger = logging.getLogger("miragen.harness.claude_code")
 
+
+def check_miradesign_actor_name(profile: AgentProfile, instance: str) -> None:
+    """With miradesign_agent_per_instance, the instance name becomes the
+    MiraDesign actor agent:claude-code/<slug(name)>, and MiraDesign's slug
+    (harness/identity.py: lowercase, [^a-z0-9._-] -> '-', strip '-', first
+    48 chars) is lossy: two instance names with the same slug would share one
+    actor. Refuse any name the slug would change."""
+    spec = harness_spec(profile)
+    if spec is None or not spec.miradesign_agent_per_instance:
+        return
+    import re
+
+    slug = re.sub(r"[^a-z0-9._-]+", "-", instance.strip().lower()).strip("-")[:48]
+    if slug != instance:
+        raise ClaudeCodeHarnessError(
+            f"instance name '{instance}' cannot be a MiraDesign actor name: MiraDesign keeps "
+            f"'{slug}' (at most 48 characters, no leading or trailing '-'), so another "
+            "instance could share its actor. Use a shorter name, or set "
+            "spec.harness.miradesign_agent_per_instance: false")
+
+
 NAME = "claude-code"
 # Short on purpose: Claude Code names MCP tools mcp__<server>__<tool>, and
 # tool names are capped at 64 characters.
@@ -548,6 +569,8 @@ class ClaudeCodeHarness:
         return int(prev.get("seq") or 0) + 1 if prev else 1
 
     async def _agent_for(self, instance: str, *, ephemeral: bool) -> _Agent:
+        if self.engineer and not ephemeral:
+            check_miradesign_actor_name(self.profile, instance)
         cwd = None
         if self.engineer and not (instance in self._agents and not self._agents[instance].dead):
             cwd = await self._workspace(instance, ephemeral=ephemeral)

@@ -182,7 +182,9 @@ def test_invalid_harness_blocks_are_refused(harness, model, extra, message):
     "GIT_ASKPASS", "GIT_SSL_CAINFO", "GIT_CONFIG_GLOBAL", "GH_HOST", "GH_ENTERPRISE_TOKEN",
     "SSL_CERT_FILE", "OPENAI_API_KEY", "LD_PRELOAD", "LD_LIBRARY_PATH", "NODE_OPTIONS",
     "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "GITHUB_TOKEN",
-    "SOME_SECRET", "HTTPS_PROXY",
+    "SOME_SECRET", "HTTPS_PROXY", "AWS_SECRET_ACCESS_KEY", "SIGNING_KEY", "DB_PASSWORD",
+    "GOOGLE_APPLICATION_CREDENTIALS", "ALL_PROXY", "all_proxy", "NODE_EXTRA_CA_CERTS",
+    "BASH_ENV", "MIRADESIGN_AGENT",
 ])
 def test_passthrough_refuses_secrets_and_harness_configuration(name):
     assert passthrough_refused(name)
@@ -192,7 +194,7 @@ def test_passthrough_refuses_secrets_and_harness_configuration(name):
 
 def test_passthrough_allows_plain_plugin_configuration():
     assert HarnessSpec(posture="engineer",
-                       env_passthrough=["MIRADESIGN_URL", "PROJECT_KEY"]).env_passthrough
+                       env_passthrough=["MIRADESIGN_URL", "PROJECT_NAME"]).env_passthrough
 
 
 @pytest.mark.parametrize("url", [
@@ -301,6 +303,23 @@ async def test_per_instance_miradesign_identity_can_be_turned_off(env):
     assert "MIRADESIGN_AGENT" not in FakeClient.instances[0].options.env
 
 
+async def test_instance_names_miradesign_would_shorten_or_change_are_refused(env):
+    h = env.harness(engineer_profile())
+    ok = "l" * 37 + "-engineer-1"  # 48 characters
+    await h.run(turn("hi", instance=ok))
+    for bad in ("l" * 38 + "-engineer-1", "lane-engineer-"):
+        with pytest.raises(ClaudeCodeHarnessError, match="MiraDesign actor"):
+            await h.run(turn("hi", instance=bad, run_id="r-" + bad[-3:]))
+    assert len(FakeClient.instances) == 1
+    await h.run(turn("once", use_history=False, run_id="eph"))  # one-off runs: no actor name
+
+
+async def test_long_instance_names_are_fine_without_per_instance_actors(env):
+    h = env.harness(engineer_profile(miradesign_agent_per_instance=False))
+    await h.run(turn("hi", instance="l" * 60))
+    assert len(FakeClient.instances) == 1
+
+
 async def test_passthrough_cannot_override_the_instance_identity(env, monkeypatch):
     with pytest.raises(ValueError, match="may not be passed"):
         HarnessSpec(posture="engineer", env_passthrough=["MIRADESIGN_AGENT"])
@@ -344,6 +363,25 @@ async def test_engineer_with_miragen_memory_keeps_the_plugin_quiet(env):
 
 
 # ── git configuration ───────────────────────────────────────────────────────
+
+def test_read_only_files_survive_a_leftover_temp_file_and_never_follow_a_planted_link(tmp_path):
+    from miragen.harness.engineer import write_readonly
+
+    target = tmp_path / "miragen-gitconfig"
+    outside = tmp_path / "outside"
+    outside.write_text("untouched\n")
+    leftover = tmp_path / ".miragen-gitconfig.tmp"  # the old fixed temp name
+    leftover.symlink_to(outside)
+    write_readonly(target, "one\n", 0o400)
+    assert target.read_text() == "one\n" and outside.read_text() == "untouched\n"
+    leftover.unlink()
+    leftover.write_text("stale")
+    leftover.chmod(0o400)  # a read-only leftover from a crashed write
+    write_readonly(target, "two\n", 0o400)
+    assert target.read_text() == "two\n" and target.stat().st_mode & 0o777 == 0o400
+    assert not [p for p in tmp_path.iterdir()
+                if p.name.startswith(".miragen-gitconfig.") and p != leftover]
+
 
 def test_gitconfig_routes_github_to_the_broker_and_scopes_the_credential(tmp_path, hermetic):
     cred = tmp_path / "cred"
@@ -414,6 +452,23 @@ async def test_each_instance_gets_its_own_worktree_and_delete_removes_it(env, or
     assert str(tree_a) not in listed and str(tree_b) in listed
     # The branch the agent made is still in the shared clone (pushed or not).
     assert git("rev-parse", "--verify", "--quiet", "refs/heads/agent/1-thing", cwd=mirror)
+
+
+async def test_a_repointed_repository_is_fetched_from_its_new_url(env, origin, tmp_path):
+    other = tmp_path / "origin2" / "lane-repo"  # same directory name, different repo
+    other.mkdir(parents=True)
+    git("init", "--quiet", "-b", "main", str(other))
+    (other / "OTHER.md").write_text("other\n")
+    git("add", "OTHER.md", cwd=other)
+    git("commit", "--quiet", "-m", "other", cwd=other)
+    h = env.harness(engineer_profile(repositories=[{"url": origin.as_uri()}]))
+    await h.run(turn("one", instance="a"))
+    await h.aclose()
+    h2 = env.harness(engineer_profile(repositories=[{"url": other.as_uri()}]))
+    await h2.run(turn("two", instance="b", run_id="r2"))
+    mirror = env.home / "repos" / "lane-repo.git"
+    assert git("remote", "get-url", "origin", cwd=mirror) == other.as_uri()
+    assert (env.tmp_path / "work" / "b" / "lane-repo" / "OTHER.md").exists()
 
 
 async def test_a_new_instance_starts_at_the_latest_default_branch(env, origin):
@@ -665,6 +720,45 @@ async def test_a_bare_number_names_the_default_projects_item():
     assert [c["work_item"] for c in fake.calls] == ["lane#12", "other#7"]
 
 
+async def test_the_same_question_on_another_work_item_is_posted():
+    async with FakeMiraDesignMCP().running() as fake:
+        ask = _ask(fake)
+        await ask("Ship it?", work_item="12")
+        await ask("Ship it?", work_item="13")
+        await ask("Ship it?", subject="A")
+        await ask("Ship it?", subject="B")
+    assert len(fake.calls) == 4
+
+
+async def test_the_memo_is_bounded(monkeypatch):
+    from miragen.harness import engineer
+
+    monkeypatch.setattr(engineer, "ASK_MEMO_MAX", 2)
+    async with FakeMiraDesignMCP().running() as fake:
+        ask = _ask(fake)
+        for q in ("Q1?", "Q2?", "Q3?", "Q1?"):
+            await ask(q)
+    assert [c["body"] for c in fake.calls] == ["Q1?", "Q2?", "Q3?", "Q1?"]
+
+
+def test_the_tool_tells_the_model_not_to_mention_anyone():
+    tool = _ask(FakeMiraDesignMCP())
+    assert "@mention" in tool.__doc__ and "refuses" in tool.__doc__
+
+
+async def test_a_refused_bearer_is_reported_as_http_401_not_unreachable():
+    def refusing(headers=None, timeout=None, auth=None):
+        return httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda r: httpx.Response(401, json={"error": "unknown token"})),
+            headers=headers, timeout=timeout, auth=auth)
+
+    md = AskHumanMiraDesignSpec(url="https://design.example", project="lane", token_env="T")
+    tool = build_ask_human_tool(md, "eng", lambda: (None, "inst-a"), {"inst-a": "s"}.get,
+                                environ={"T": "x"}, httpx_client_factory=refusing, timeout_s=5)
+    with pytest.raises(AskHumanFailed, match=r"HTTP 401 \(check ask_human's MiraDesign MCP bearer\)"):
+        await asyncio.wait_for(tool("Q?"), 20)
+
+
 async def test_a_repeated_question_in_the_same_session_is_not_posted_again():
     async with FakeMiraDesignMCP().running() as fake:
         ask = _ask(fake)
@@ -715,8 +809,11 @@ async def test_ask_human_failures_are_tool_errors():
             await _ask(fake)("Q?", work_item="twelve")
     assert not fake.calls
 
+    def refuse_connection(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
     def unreachable(headers=None, timeout=None, auth=None):
-        return httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(503)),
+        return httpx.AsyncClient(transport=httpx.MockTransport(refuse_connection),
                                  headers=headers, timeout=timeout, auth=auth)
 
     md = AskHumanMiraDesignSpec(url="https://design.example", project="lane", token_env="T")

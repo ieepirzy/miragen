@@ -304,9 +304,10 @@ bridge's URL and token). The exec wrapper's allowlist strips everything else.
 - **`env_passthrough`** is for non-secret configuration such as
   `MIRADESIGN_URL`. It refuses `ANTHROPIC_*`, `CLAUDE_*`, `MIRAGEN_*`, `GIT_*`
   (`GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` could add a credential helper
-  for any host), `GH_*`, `SSL_*`, `LD_*`, `*_API_KEY`, `*_TOKEN`, `*_SECRET`,
-  `NODE_OPTIONS`, `PYTHONPATH`/`PYTHONSTARTUP`, `PATH`, `HOME` and the
-  proxies.
+  for any host), `GH_*`, `SSL_*`, `LD_*`, `*_KEY`, `*_TOKEN`, `*_SECRET`,
+  `*_PASSWORD`, `*_CREDENTIALS`, `NODE_OPTIONS`, `NODE_EXTRA_CA_CERTS`,
+  `BASH_ENV`/`ENV`, `PYTHONPATH`/`PYTHONSTARTUP`, `PATH`, `HOME`,
+  `MIRADESIGN_AGENT` and the proxies (including `ALL_PROXY`).
 - **At spawn,** a passthrough never overrides a variable the harness set.
 
 The posture is subscription-only like the locked one (`CLAUDE_CODE_OAUTH_TOKEN`
@@ -401,11 +402,23 @@ towards refusing. Limits:
 that variable from its environment (`AGENT_ENV_VARS` in
 `plugins/miradesign/miradesign_hook/client.py`) on every event, starting with
 SessionStart. The daemon turns it into the actor key `agent:claude-code/<name>`
-(`miradesign.harness.identity.actor_key`; the name is slugged to
-`[a-z0-9._-]`, which instance names already are). So lane instance
+(`miradesign.harness.identity.actor_key`). MiraDesign slugs the name: it
+lowercases it, turns anything outside `[a-z0-9._-]` into `-`, strips leading
+and trailing `-`, and keeps the first 48 characters. That loses information:
+instance names may be up to 63 characters, so `…-engineer-1` and
+`…-engineer-2` past 48 characters would become one actor. With this option
+on, the harness refuses (fails the turn for) any instance name the slug would
+change. So lane instance
 `miragen-engineer-1` is the durable actor `agent:claude-code/miragen-engineer-1`
 in every session it runs, which is the name MiraRun's lane supervisor maps
 instances by. The session key stays `claude-code:<session id>`.
+
+**Instance names must be globally unique.** The actor key carries only the
+instance name, not the profile or container. The same name in two profiles
+or two containers is one MiraDesign actor. MiraRun names instances
+`<lane_key>-<role>-<n>`, which is unique as long as lane keys are. The key is
+deliberately not namespaced, because MiraRun's supervisor maps
+`agent:claude-code/<instance>` back to the instance.
 
 The variable is set by the harness, so `env_passthrough` refuses it and could
 never override it. One-off runs (no instance) keep the plugin's default
@@ -429,7 +442,9 @@ session's own plugin actor's, and the answer comes back to that session as
 `ANSWER … to your question`.
 
 The bearer (`token_env` or `token_file`) is a MiraDesign MCP bearer, a
-`MIRADESIGN_MCP_TOKENS` entry. An MCP bearer keeps MiraDesign's session-key
+`MIRADESIGN_MCP_TOKENS` entry. miragen reads it and does not pass it to the
+child, but the child can read it anyway (same uid: miragen's
+`/proc/<pid>/environ`, or the file). An MCP bearer keeps MiraDesign's session-key
 rules: the session decides the actor, not the token.
 
 **Failures:**
@@ -440,8 +455,12 @@ rules: the session decides the actor, not the token.
 - **Waiting:** an `ok:` answer is returned as is. MiraDesign's own reply
   already says not to wait; the tool adds that if it is missing.
 
+**Mentions.** Recipients come from the profile's `to`. MiraDesign refuses a
+post whose body @mentions an unknown handle, and the tool's description tells
+the model not to @mention anyone.
+
 **Idempotency.** `post` takes no idempotency key. The tool dedupes locally on
-(session key, sha256(question)): the same question again in the same session
+(session key, sha256(question, work_item, subject)), keeping the last 256: the same question again in the same session
 returns the first answer without posting. A new session (rotation, restart)
 may ask it again. Remaining retry risk: if the reply to a successful post is
 lost and the tool's process then restarts, the question is asked twice.
@@ -464,6 +483,13 @@ reach everything the others have:
   environment, and `gh … --hostname <any>` sends it to any host it is
   pointed at. It is a broker credential, not a GitHub token, and the broker
   binds it to the lane, but anything holding it can use it from anywhere.
+
+- **Settings that persist.** The agent can create, or `chmod` and rewrite,
+  `<CLAUDE_CONFIG_DIR>/settings.json` (hooks, `env`, `apiKeyHelper`, a base
+  URL, `disableAllHooks`). User settings are loaded, so that change takes
+  effect at the next spawn of every instance in the container, including
+  after restarts. The flag-level `disableAllHooks: false` is the only setting
+  pinned against it.
 
 The wrapper, gitconfig and helper (and `settings.json`, when present) are made
 read-only after `prepare()` (`0o500`/`0o400`/`0o444`). That only guards
