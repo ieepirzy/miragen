@@ -1,26 +1,5 @@
 {
  "plain": {
-  "argv": [
-   "<root>/home/miragen-claude",
-   "--output-format",
-   "stream-json",
-   "--verbose",
-   "--system-prompt",
-   "You are Mira.",
-   "--tools",
-   "",
-   "--model",
-   "sonnet",
-   "--permission-mode",
-   "default",
-   "--session-id=00000000-0000-0000-0000-000000000000",
-   "--mcp-config",
-   "{\"mcpServers\": {\"gw\": {\"type\": \"http\", \"url\": \"http://127.0.0.1:9/mcp/gateway/\", \"headers\": {\"Authorization\": \"Bearer ${MIRAGEN_GATEWAY_TOKEN}\"}}}}",
-   "--strict-mcp-config",
-   "--setting-sources=",
-   "--input-format",
-   "stream-json"
-  ],
   "can_use_tool": true,
   "cwd": "<root>/work/chat",
   "env": {
@@ -45,8 +24,22 @@
   "options": {
    "add_dirs": [],
    "allowed_tools": [],
+   "cli_path": "<root>/home/miragen-claude",
    "disallowed_tools": [],
+   "effort": null,
+   "mcp_servers": {
+    "gw": {
+     "headers": {
+      "Authorization": "Bearer ${MIRAGEN_GATEWAY_TOKEN}"
+     },
+     "type": "http",
+     "url": "http://127.0.0.1:9/mcp/gateway/"
+    }
+   },
+   "model": "sonnet",
    "plugins": [],
+   "resume": null,
+   "session_id": "00000000-0000-0000-0000-000000000000",
    "setting_sources": [],
    "skills": [],
    "strict_mcp_config": true,
@@ -58,27 +51,6 @@
   "wrapper": "#!<python>\nimport os, sys\nkeep = set(os.environ.get('MIRAGEN_ENV_KEEP', '').split())\nenv = {k: v for k, v in os.environ.items()\n       if k in keep or k.startswith('CLAUDE_AGENT_SDK_')}\nos.execve('/usr/bin/env', ['/usr/bin/env', *sys.argv[1:]], env)\n"
  },
  "web_and_gated": {
-  "argv": [
-   "<root>/home/miragen-claude",
-   "--output-format",
-   "stream-json",
-   "--verbose",
-   "--system-prompt",
-   "You are Mira.",
-   "--tools",
-   "WebFetch,WebSearch",
-   "--model",
-   "sonnet",
-   "--permission-mode",
-   "default",
-   "--session-id=00000000-0000-0000-0000-000000000000",
-   "--mcp-config",
-   "{\"mcpServers\": {\"gw\": {\"type\": \"http\", \"url\": \"http://127.0.0.1:9/mcp/gateway/\", \"headers\": {\"Authorization\": \"Bearer ${MIRAGEN_GATEWAY_TOKEN}\"}}}}",
-   "--strict-mcp-config",
-   "--setting-sources=",
-   "--input-format",
-   "stream-json"
-  ],
   "can_use_tool": true,
   "cwd": "<root>/work/chat",
   "env": {
@@ -104,8 +76,22 @@
   "options": {
    "add_dirs": [],
    "allowed_tools": [],
+   "cli_path": "<root>/home/miragen-claude",
    "disallowed_tools": [],
+   "effort": null,
+   "mcp_servers": {
+    "gw": {
+     "headers": {
+      "Authorization": "Bearer ${MIRAGEN_GATEWAY_TOKEN}"
+     },
+     "type": "http",
+     "url": "http://127.0.0.1:9/mcp/gateway/"
+    }
+   },
+   "model": "sonnet",
    "plugins": [],
+   "resume": null,
+   "session_id": "00000000-0000-0000-0000-000000000000",
    "setting_sources": [],
    "skills": [],
    "strict_mcp_config": true,

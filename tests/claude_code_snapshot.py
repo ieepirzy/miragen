@@ -44,8 +44,11 @@ def profile(variant: dict, **spec_extra) -> AgentProfile:
     })
 
 
-def render(harness: ClaudeCodeHarness, options, root: Path) -> dict:
-    from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+def render(harness: ClaudeCodeHarness, options, root: Path, *, argv: bool = True) -> dict:
+    """What miragen passes to the SDK (option values, env, hooks, wrapper).
+    ``argv`` adds the CLI command line the SDK would build from them: a
+    private SDK API whose rendering changes between SDK releases, so the
+    golden leaves it out and only targeted assertions read it."""
 
     def norm(value):
         if isinstance(value, str):
@@ -58,11 +61,9 @@ def render(harness: ClaudeCodeHarness, options, root: Path) -> dict:
             return {k: norm(v) for k, v in value.items()}
         return value
 
-    argv = SubprocessCLITransport("", options)._build_command()
     hooks = {event: [{"matcher": m.matcher, "hooks": len(m.hooks)} for m in matchers]
              for event, matchers in (options.hooks or {}).items()}
-    return norm({
-        "argv": argv,
+    view = {
         "env": dict(sorted(options.env.items())),
         "hooks": hooks,
         "permission_mode": options.permission_mode,
@@ -70,9 +71,15 @@ def render(harness: ClaudeCodeHarness, options, root: Path) -> dict:
         "cwd": options.cwd,
         "options": {k: getattr(options, k) for k in (
             "tools", "allowed_tools", "disallowed_tools", "system_prompt", "setting_sources",
-            "skills", "plugins", "strict_mcp_config", "add_dirs", "verbatim_prompts")},
+            "skills", "plugins", "strict_mcp_config", "add_dirs", "verbatim_prompts",
+            "mcp_servers", "model", "effort", "cli_path", "resume", "session_id")},
         "wrapper": (harness.settings.claude_home / WRAPPER_FILE).read_text(),
-    })
+    }
+    if argv:
+        from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+
+        view["argv"] = SubprocessCLITransport("", options)._build_command()
+    return norm(view)
 
 
 def locked_snapshots() -> dict:
@@ -89,7 +96,7 @@ def locked_snapshots() -> dict:
             options = harness._options("chat", root / "work" / "chat", resume=None,
                                        new_id="00000000-0000-0000-0000-000000000000",
                                        stderr=deque())
-            out[name] = render(harness, options, root)
+            out[name] = render(harness, options, root, argv=False)
     return out
 
 

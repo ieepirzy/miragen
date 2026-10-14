@@ -67,6 +67,17 @@ def build_model_harness(
         )
     else:
         from miragen.harness.codex import CodexHarness as cls, CodexSettings as settings_cls
+    if name == "claude-code":
+        from miragen.harness.engineer import build_ask_human_tool, harness_spec, is_engineer
+
+        spec = harness_spec(profile)
+        if is_engineer(profile) and spec.ask_human is not None:
+            from miragen.harness.gateway import current_call
+
+            # A gateway runtime tool (engineer posture only): files a
+            # MiraDesign question and returns at once.
+            runtime_tools = [*(runtime_tools or []),
+                             build_ask_human_tool(spec.ask_human, profile.name, current_call)]
     gateway = ToolGateway(profile, runtime_tools=runtime_tools,
                           registered_tools=registered_tools, bind_context=bind_context,
                           native_capabilities=cls.native_capabilities,

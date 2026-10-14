@@ -26,6 +26,14 @@ swap between them (``spec.model``) when one is rate limited:
 * **Per-turn context rides the prompt** (decision 6), which also keeps the
   system prompt byte-stable for the prompt cache. Prompts are delivered
   verbatim: no ``@path`` expansion, no slash commands.
+
+All of the above is the default, ``locked`` posture. ``spec.harness.posture:
+engineer`` (mirarun ADR-041 §4) opts a profile out of the tool lockdown:
+Claude Code's own tools with ``bypassPermissions`` (the container is the
+boundary), user + project settings, plugins and skills, the gateway as one
+MCP server among others, a git worktree per instance, broker-wired git/gh
+and a subagent depth hook (``miragen/harness/engineer.py``). The
+subscription-only environment rules hold in both postures.
 """
 
 from __future__ import annotations
@@ -48,6 +56,10 @@ from typing import Any
 
 from miragen.harness.base import (
     HarnessResult, HarnessTurn, InstanceBusyError, TaskStream, parse_harness_model,
+)
+from miragen.harness.engineer import (
+    SubagentDepthPolicy, WorkspaceError, git_env, harness_spec, is_engineer, provision_workspace,
+    remove_workdir, workspace_cwd, write_git_files,
 )
 from miragen.harness.gateway import ToolGateway, _capability_entries
 from miragen.harness.served import ServedLedger
@@ -177,9 +189,9 @@ def purge_instance(settings: ClaudeCodeSettings, instance: str) -> list[str]:
             path.unlink()
             shutil.rmtree(path.with_suffix(""), ignore_errors=True)
             removed.append(f"claude_session:{sid}")
-    workdir = settings.workdirs / instance
-    if workdir.is_dir():
-        shutil.rmtree(workdir)
+    # An engineer instance's directory holds git worktrees of shared clones:
+    # remove_workdir also prunes their records there.
+    if remove_workdir(settings.workdirs / instance):
         removed.append("workdir")
     return removed
 
@@ -211,6 +223,8 @@ class ClaudeCodeHarness:
         self.instructions = with_voice_guidance(profile.spec.instructions or "", system_guidance)
         self._client_factory = client_factory or _sdk_client
         self.served = served
+        self.engineer = is_engineer(profile)
+        self._repo_locks: dict[str, asyncio.Lock] = {}
         # Clock order, as in the Grok harness: approval wait < Claude Code's
         # MCP tool timeout < this harness's turn timeout.
         self.tool_timeout_s: int | None = (
@@ -250,6 +264,8 @@ class ClaudeCodeHarness:
             "       if k in keep or k.startswith('CLAUDE_AGENT_SDK_')}\n"
             f"os.execve({real!r}, [{real!r}, *sys.argv[1:]], env)\n")
         wrapper.chmod(0o700)
+        if self.engineer:
+            write_git_files(home, self.profile)
         if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") and not self._logged_in():
             logger.warning("claude-code harness: no subscription credential (neither the "
                            "setup-token env var nor a login in CLAUDE_CONFIG_DIR); turns will "
@@ -304,6 +320,29 @@ class ClaudeCodeHarness:
         env[KEEP_ENV] = " ".join(keep)
         return env
 
+    def _engineer_env(self, instance: str) -> dict[str, str]:
+        """The locked posture's child environment plus git/gh wiring and the
+        profile's passthrough names; the same allowlist mechanism (and the
+        same refusal of API keys) applies."""
+        spec = harness_spec(self.profile)
+        env = self._env(instance)
+        env.pop(KEEP_ENV)
+        if self.profile.memory is None:
+            # No miragen memory boundary: the miragen-memory plugin's hooks
+            # capture this session (MIRAGEN_WORKER would silence them). With
+            # one, miragen captures and the plugin stays quiet (no doubles).
+            env.pop(WORKER_ENV)
+        env.update(git_env(self.settings.claude_home, self.profile))
+        for name in spec.env_passthrough:
+            if name in os.environ:
+                env[name] = os.environ[name]
+        keep = [k for k in ENV_ALLOWLIST if k in os.environ]
+        keep += [*env, "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SDK_READS_SESSION_STATE", "PWD"]
+        keep = list(dict.fromkeys(keep))
+        assert not set(keep) & set(SCRUBBED_ENV)
+        env[KEEP_ENV] = " ".join(keep)
+        return env
+
     # ── processes ────────────────────────────────────────────────────────
     async def _permission(self, tool_name: str, _input: dict, _context: Any):
         from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
@@ -335,6 +374,9 @@ class ClaudeCodeHarness:
                     instance, compactions=int(entry.get("compactions") or 0) + 1)
             return {}
 
+        if self.engineer:
+            return self._engineer_options(instance, workdir, resume=resume, new_id=new_id,
+                                          stderr=stderr, pre_compact=pre_compact)
         return ClaudeAgentOptions(
             tools=sorted(self.builtins),
             system_prompt=self.instructions,
@@ -360,9 +402,67 @@ class ClaudeCodeHarness:
             stderr=stderr.append,
         )
 
-    async def _spawn(self, instance: str, *, ephemeral: bool) -> _Agent:
+    def _engineer_options(self, instance: str, workdir: Path, *, resume: str | None,
+                          new_id: str | None, stderr: deque, pre_compact):
+        """Launch options for posture: engineer (docs/design/harnesses.md)."""
+        from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+
+        spec = harness_spec(self.profile)
+        depth = SubagentDepthPolicy(spec.subagent_depth)
+        hooks = {"PreCompact": [HookMatcher(hooks=[pre_compact])], **depth.hooks()}
+        system_prompt: dict[str, str] = {"type": "preset", "preset": "claude_code"}
+        if self.instructions:
+            system_prompt["append"] = self.instructions
+        return ClaudeAgentOptions(
+            # Claude Code's own tool set and system prompt: it is a working
+            # engineer, and the built-ins are documented in that prompt.
+            tools={"type": "preset", "preset": "claude_code"},
+            system_prompt=system_prompt,
+            mcp_servers={GATEWAY_SERVER: {
+                "type": "http", "url": self.settings.gateway_url,
+                "headers": {"Authorization": f"Bearer ${{{GATEWAY_TOKEN_ENV}}}"}}},
+            # Plugins' MCP servers (MiraDesign, the memory bridge) load too.
+            strict_mcp_config=False,
+            # <CLAUDE_CONFIG_DIR>/settings.json (enabled plugins, marketplaces,
+            # hooks) and the repository's own .claude/settings.json + CLAUDE.md.
+            setting_sources=["user", "project"],
+            skills="all",
+            plugins=[{"type": "local", "path": p} for p in spec.plugin_dirs],
+            # The container is the boundary. can_use_tool would never be
+            # consulted under bypassPermissions; the depth limit is a hook.
+            permission_mode="bypassPermissions",
+            model=self.model,
+            effort=self.settings.effort,
+            cwd=str(workdir),
+            cli_path=str(self.settings.claude_home / WRAPPER_FILE),
+            env=self._engineer_env(instance),
+            resume=resume,
+            session_id=new_id,
+            verbatim_prompts=True,
+            hooks=hooks,
+            stderr=stderr.append,
+        )
+
+    async def _workspace(self, instance: str, *, ephemeral: bool) -> Path | None:
+        """engineer: the instance's worktree(s), made before its process
+        starts (outside the spawn lock: a first clone can take a while)."""
+        if not self.engineer:
+            return None
+        try:
+            return await provision_workspace(self.settings.claude_home,
+                                             self.settings.workdirs / instance, self.profile,
+                                             self._repo_locks)
+        except WorkspaceError as exc:
+            if ephemeral:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(remove_workdir, self.settings.workdirs / instance)
+            raise ClaudeCodeHarnessError(f"workspace for '{instance}': {exc}") from exc
+
+    async def _spawn(self, instance: str, *, ephemeral: bool, cwd: Path | None = None) -> _Agent:
         workdir = self.settings.workdirs / instance
         workdir.mkdir(parents=True, exist_ok=True)
+        if cwd is None:
+            cwd = workspace_cwd(workdir, self.profile) if self.engineer else workdir
         known = None if ephemeral else (self._load_state().get(instance) or {}).get("session_id")
         if known and self._session_file(known) is None:
             logger.warning("claude-code harness: session %s of %s is gone; starting a new one",
@@ -372,7 +472,7 @@ class ClaudeCodeHarness:
         session_id = known or str(uuid.uuid4())
         stderr: deque = deque(maxlen=40)
         client = self._client_factory(self._options(
-            instance, workdir, resume=known, new_id=None if known else session_id, stderr=stderr,
+            instance, cwd, resume=known, new_id=None if known else session_id, stderr=stderr,
             ephemeral=ephemeral))
         try:
             await client.connect()
@@ -385,9 +485,10 @@ class ClaudeCodeHarness:
                 logger.warning("claude-code harness: session %s of %s would not resume (%s); "
                                "starting a new one", known, instance, exc)
                 await self._update_instance(instance, session_id=None, lost=True)
-                return await self._spawn(instance, ephemeral=ephemeral)
+                return await self._spawn(instance, ephemeral=ephemeral, cwd=cwd)
             if ephemeral:
-                shutil.rmtree(workdir, ignore_errors=True)
+                with contextlib.suppress(Exception):
+                    remove_workdir(workdir)
             raise
         if not ephemeral and not known:
             entry = self._load_state().get(instance) or {}
@@ -410,6 +511,9 @@ class ClaudeCodeHarness:
         return int(prev.get("seq") or 0) + 1 if prev else 1
 
     async def _agent_for(self, instance: str, *, ephemeral: bool) -> _Agent:
+        cwd = None
+        if self.engineer and not (instance in self._agents and not self._agents[instance].dead):
+            cwd = await self._workspace(instance, ephemeral=ephemeral)
         async with self._spawn_lock:
             agent = self._agents.get(instance)
             if agent is not None and not agent.dead:
@@ -418,7 +522,7 @@ class ClaudeCodeHarness:
             if agent is not None:
                 await self._drop(instance)
             await self._evict_for_capacity()
-            agent = await self._spawn(instance, ephemeral=ephemeral)
+            agent = await self._spawn(instance, ephemeral=ephemeral, cwd=cwd)
             agent.reserved += 1
             self._agents[instance] = agent
             self._ensure_reaper()
@@ -552,7 +656,8 @@ class ClaudeCodeHarness:
                     shutil.rmtree(path.with_suffix(""), ignore_errors=True)
                     with contextlib.suppress(OSError):
                         path.parent.rmdir()
-                shutil.rmtree(self.settings.workdirs / instance, ignore_errors=True)
+                with contextlib.suppress(Exception):
+                    remove_workdir(self.settings.workdirs / instance)
         if result is None:
             raise ClaudeCodeHarnessError("claude ended the turn without a result")
         if not ephemeral:
