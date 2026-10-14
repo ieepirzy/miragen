@@ -1,0 +1,35 @@
+# An engineer lane pinned to Claude Opus 4.8 (claude-opus-4-8).
+#
+# For work that needs an Opus 4.8 runtime instead of Claude Code's current
+# `opus` alias. The pin is the full model id after `claude-code:`; the harness
+# passes it to the CLI as `--model claude-opus-4-8` (docs/design/harnesses.md,
+# "Pinning a model").
+#
+# This is an example. A deployable copy, with the real broker host and secret
+# file paths, belongs in the deployment, not in this public repository. No
+# secret goes in this file: credentials are file paths under /run/secrets and
+# the subscription token is CLAUDE_CODE_OAUTH_TOKEN in the container env.
+name: lane-opus-4-8
+mode: hybrid
+triggers:
+  - type: http
+spec:
+  model: claude-code:claude-opus-4-8     # full id: the bare `opus` alias resolves to the newest Opus
+  instructions: |
+    You are an unattended engineer working on ieepirzy/tyyni. Open pull
+    requests for review; never merge or deploy.
+  harness:
+    posture: engineer
+    subagent_depth: 1                    # subagents inherit the pinned model (observed, CLI 2.1.299)
+    repositories:
+      - url: https://gh-broker.internal:8443/ieepirzy/tyyni.git
+    git_broker:
+      host: gh-broker.internal:8443
+      credential_file: /run/secrets/broker_credential
+    plugin_dirs: [/agent/plugins/miradesign, /agent/plugins/miragen-memory]
+    env_passthrough: [MIRADESIGN_URL]
+    ask_human:
+      url: https://design.muutto365.fi
+      project: tyyni
+      token_file: /run/secrets/miradesign_mcp_token
+      to: [ilari]

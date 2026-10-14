@@ -230,6 +230,30 @@ without any change on the client side.
 - **Lifecycle.** Claude Code compacts on its own. By default that happens near the model's full window (sonnet: 967k, observed), so a persistent agent sets `MIRAGEN_CLAUDE_AUTO_COMPACT_WINDOW` (→ `CLAUDE_CODE_AUTO_COMPACT_WINDOW`; 100000 is Claude Code's floor and compacts at 67k, observed via `get_context_usage`). Its PreCompact hook reaches the memory plane as `context.compacting`. There is no miragen compaction/rotation policy and no handoff note here. `POST /instances/{name}/rotate` starts a new session (the plane sees `context.closed`), and `DELETE /instances/{name}` removes the process, mapping, session files and working directory.
 - **Clock order** as for Grok: with gated tools, `MCP_TOOL_TIMEOUT` is `approval_timeout_s + 120` s and the turn timeout is raised above it.
 
+### Pinning a model
+
+The part after `claude-code:` goes to the CLI as `--model` unchanged, so it
+can be an alias (`sonnet`, `opus`) or a full model id. An alias follows Claude
+Code's newest model of that family: `--model opus` ran `claude-opus-5-5` on
+2026-10-14. To stay on one model, name its full id, e.g.
+`claude-code:claude-opus-4-8` (`examples/profiles/opus-4-8-engineer.yaml`,
+pinned by `tests/test_model_pin_profile.py`). The harness sets no fallback
+model, so an unavailable model fails the turn instead of switching.
+
+Subagents (engineer posture only; the locked posture has no Agent tool) run in
+the same process. Observed live on CLI 2.1.299 (the version claude-agent-sdk
+0.2.166 bundles), parent `--model claude-opus-4-8`: a `general-purpose`
+subagent, an `Explore` subagent and a `general-purpose` subagent called with
+`model: "opus"` all ran `claude-opus-4-8`. That is CLI behaviour, not a
+miragen guarantee. Two things the profile cannot stop override it:
+- an agent definition (from a plugin or the user settings) with its own `model:`;
+- `CLAUDE_CODE_SUBAGENT_MODEL` or `ANTHROPIC_DEFAULT_OPUS_MODEL` in the
+  deployment-written `<claude_home>/settings.json` `env`. `env_passthrough`
+  refuses `CLAUDE_*`/`ANTHROPIC_*`, so a profile cannot set these.
+
+The executor tier (`executor: {executor: claude-code, model: claude-opus-4-8}`) pins
+separately: `ExecutorSpec.model` goes to the SDK's `model` option the same way.
+
 ### Engineer posture
 
 Everything above is the default, `locked` posture. `spec.harness.posture:
