@@ -1,6 +1,7 @@
-"""Budget tokens: uncached input and output count 1:1; cache reads and writes
-are weighted by the model's own rates from the configured source, and count
-in full whenever those rates can't weight them."""
+"""Budget tokens. Without a rates source: as before rates existed (cache reads
+left out, writes 1:1). With one: uncached input and output 1:1, cache reads
+and writes weighted by the model's own rates, and in full whenever those
+rates can't weight them."""
 
 import logging
 from datetime import datetime, timezone
@@ -29,14 +30,29 @@ TABLE = parse_rates_document({"models": {
 CACHE_HEAVY = RunUsage(requests=1, input_tokens=1000, cached_input_tokens=900, output_tokens=50)
 
 
-# ── fallback: never undercount ──────────────────────────────────────────────
+# ── no source: exactly as before rates ──────────────────────────────────────
 
 
-def test_without_a_rates_source_cache_reads_count_in_full(caplog):
-    with caplog.at_level(logging.WARNING, logger="miragen.model_rates"):
-        assert budget_tokens(CACHE_HEAVY, "anthropic:claude-x") == 1050
-        assert budget_tokens(CACHE_HEAVY, "anthropic:claude-x") == 1050
-    assert sum("no model rates source" in r.getMessage() for r in caplog.records) == 1
+def test_without_a_rates_source_cache_reads_are_left_out():
+    assert budget_tokens(CACHE_HEAVY, "anthropic:claude-x") == 150
+    assert budget_tokens(CACHE_HEAVY, "acme:unlisted") == 150
+    assert budget_tokens(CACHE_HEAVY, "anthropic:claude-x", rates=None) == 150
+
+
+def test_without_a_rates_source_cache_writes_count_one_to_one():
+    usage = RunUsage(requests=1, input_tokens=1000, cached_input_tokens=100,
+                     cache_write_tokens=800, cache_write_1h_tokens=300, output_tokens=5)
+    assert budget_tokens(usage) == 905
+
+
+def test_without_a_rates_source_calls_change_nothing():
+    usage = RunUsage(requests=1, input_tokens=1000, cached_input_tokens=900, output_tokens=50,
+                     calls=[CallUsage(model="mystery", input_tokens=1000, cached_input_tokens=900)])
+    assert budget_tokens(usage, "acme:unlisted") == 150
+
+
+# ── with a source: never undercount ─────────────────────────────────────────
+
 
 
 def test_an_unlisted_model_counts_cache_reads_in_full(caplog):
@@ -59,6 +75,15 @@ def test_the_configured_source_is_what_budgets_read():
     model_rates.configure(StaticRatesSource(TABLE))
     assert budget_tokens(CACHE_HEAVY, "anthropic:claude-x") == 195
     model_rates.configure(None)
+    assert budget_tokens(CACHE_HEAVY, "anthropic:claude-x") == 150
+
+
+def test_a_source_with_no_rates_yet_counts_in_full():
+    class Empty:
+        def current(self):
+            return None
+
+    model_rates.configure(Empty())
     assert budget_tokens(CACHE_HEAVY, "anthropic:claude-x") == 1050
 
 
@@ -103,6 +128,16 @@ def test_cache_writes_without_a_rate_count_one_to_one():
     assert budget_tokens(usage) == 1000  # no source at all
 
 
+def test_a_missing_write_rate_is_logged_once_per_model(caplog):
+    usage = RunUsage(requests=1, input_tokens=1000, cache_write_tokens=800)
+    with caplog.at_level(logging.WARNING, logger="miragen.model_rates"):
+        budget_tokens(usage, "openai:gpt-x", rates=TABLE)
+        budget_tokens(usage, "openai:gpt-x", rates=TABLE)
+        budget_tokens(CACHE_HEAVY, "deepseek:ds", rates=TABLE)  # no writes: no warning
+    warned = [r.getMessage() for r in caplog.records if "no cache_write rate" in r.getMessage()]
+    assert len(warned) == 1 and "openai:gpt-x" in warned[0]
+
+
 def test_a_one_hour_rate_falls_back_to_the_five_minute_rate():
     table = parse_rates_document({"models": {"p:m": {
         "input": "1", "cached_input": "0.1", "cache_write": "1.5", "output": "2"}}})
@@ -111,12 +146,23 @@ def test_a_one_hour_rate_falls_back_to_the_five_minute_rate():
     assert budget_tokens(usage, "p:m", rates=table) == 150
 
 
+def test_a_missing_one_hour_rate_never_drops_below_one():
+    # 5-minute writes cheaper than input: 1-hour writes still count at least 1:1.
+    table = parse_rates_document({"models": {"p:m": {
+        "input": "1", "cached_input": "0.1", "cache_write": "0.5", "output": "2"}}})
+    usage = RunUsage(requests=1, input_tokens=200, cache_write_tokens=200,
+                     cache_write_1h_tokens=100)
+    assert budget_tokens(usage, "p:m", rates=table) == 50 + 100
+
+
 def test_unknown_usage_is_zero_and_counts_never_go_negative():
     assert budget_tokens(None) == 0
     assert budget_tokens(RunUsage(requests=1)) == 0
-    # Reads above input (stored rows are normalised on load; live usage is
-    # not) still count, never cancel output.
-    assert budget_tokens(RunUsage(requests=1, input_tokens=10, cached_input_tokens=50)) == 50
+    assert budget_tokens(RunUsage(requests=1, input_tokens=10, cached_input_tokens=50)) == 0
+    # With a source, reads above input (stored rows are normalised on load;
+    # live usage is not) still count and never cancel output.
+    assert budget_tokens(RunUsage(requests=1, input_tokens=10, cached_input_tokens=50),
+                         rates=TABLE) == 50
     assert budget_tokens(RunUsage(requests=1, input_tokens=10, cached_input_tokens=50),
                          "anthropic:claude-x", rates=TABLE) == 3
 
@@ -247,7 +293,7 @@ def test_daily_budget_and_in_flight_reserve_weigh_the_same_way(tmp_path):
     model_rates.configure(StaticRatesSource(TABLE))
     assert tokens_used_since(store, since, "anthropic:claude-x") == 195
     assert tokens_used_since(store, since, "openai:gpt-x") == 600
-    assert tokens_used_since(store, since) == 1050  # record has no model: in full
+    assert tokens_used_since(store, since) == 1050  # no model anywhere: in full
 
     running = store.start(agent_name="a", trigger="http", prompt="p")
     running.usage = CACHE_HEAVY
@@ -314,3 +360,20 @@ def test_sum_usage_keeps_a_reported_zero():
     assert (total.input_tokens, total.cached_input_tokens, total.output_tokens) == (0, 0, 0)
     unknown = sum_usage(RunUsage(requests=1), RunUsage(requests=1))
     assert unknown.cached_input_tokens is None
+
+
+def test_a_run_is_weighted_by_the_model_it_recorded(tmp_path):
+    from miragen.runs import RunStore, reserved_tokens_in_flight, tokens_used_since
+
+    since = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    store = RunStore(tmp_path)
+    earlier = store.start(agent_name="a", trigger="launch", prompt="p", model="openai:gpt-x")
+    store.finish(earlier, status="succeeded", usage=CACHE_HEAVY)
+    model_rates.configure(StaticRatesSource(TABLE))
+    # The profile has since moved to claude-x; the earlier run keeps gpt-x.
+    assert tokens_used_since(store, since, "anthropic:claude-x") == 600
+    running = store.start(agent_name="a", trigger="launch", prompt="p", model="openai:gpt-x")
+    running.usage = CACHE_HEAVY
+    store._write(running)
+    assert reserved_tokens_in_flight(store, since, 1000, 10_000, "anthropic:claude-x") == 400
+

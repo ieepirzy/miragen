@@ -475,29 +475,33 @@ At least one of `tokens_per_run` / `tokens_per_day` must be set — an empty `li
 
 #### What a budget token is
 
-Uncached input and output count one budget token per token. Cache reads and cache writes are weighted by the model's own rates relative to its fresh-input rate:
+**Without a rates source** (the default), uncached input, cache writes and output count one budget token per token, and cache reads are left out.
+
+**With a rates source configured** (below), uncached input and output still count one budget token per token, and cache reads and writes are weighted by the model's own rates relative to its fresh-input rate:
 
 | Tokens | Weight |
 |---|---|
 | uncached input, output | 1 |
 | cache reads | `cached_input / input` |
-| cache writes, 5-minute TTL | `cache_write / input` (1 when the source gives no write rate) |
-| cache writes, 1-hour TTL | `cache_write_1h / input` (the 5-minute weight when absent; the dearer of the two when the run doesn't report the split) |
+| cache writes, 5-minute TTL | `cache_write / input` (1 when the source gives no write rate, logged once per model) |
+| cache writes, 1-hour TTL | `cache_write_1h / input` (when absent, the dearest known write weight: the 5-minute weight or 1, whichever is higher; the dearer of the two TTL weights when the run doesn't report the split) |
 
-When a run reports per-request usage (`usage.calls`), each request is weighted by the model it reports; usage the requests don't account for is weighted by the run's model (`spec.model`, or `<executor>:<executor.model>` on the executor tier). Each request rounds up, so the result is always a whole number.
+When a run reports per-request usage (`usage.calls`), each request is weighted by the model it reports; usage the requests don't account for is weighted by the run's model: the model its run record names, else the profile's (`spec.model`, or `<executor>:<executor.model>` on the executor tier). Rates are always the source's current table, so today's spend follows today's rates. Each request rounds up, so the result is always a whole number.
 
 A reported model is matched to a rates entry by, in order: the exact string (or without a provider snapshot date such as `-20260901`); the run's model when the reported id is its id without the `provider:` prefix (`anthropic:claude-x` ↔ `claude-x`); the reported id under the run model's provider prefix; then any entry whose id without the prefix is the reported id (a harness reports the API model behind its selector). When several entries match, each weight is the highest among them.
 
-**Budgets never undercount.** With no rates source configured, for a model the source doesn't list, or for a model rated at zero (flat-rate subscription harnesses, whose ratios mean nothing), cache reads and writes count in full. Each such model is logged once.
+**With a source, budgets never undercount.** For a model the source doesn't list, or one rated at zero (flat-rate subscription harnesses, whose ratios mean nothing), cache reads and writes count in full. Each such model is logged once.
+
+**Upgrading.** Nothing changes until you configure a source: with none, budgets count exactly as before (cache reads left out), and the agent logs one line at startup saying so. Once a source is configured, cache reads start counting (at the model's ratio, or in full for models it can't weight), so cache-heavy agents spend their budgets faster. Check `tokens_per_run` / `tokens_per_day` on those agents, and make sure the source lists every model they use, harness models included.
 
 MiraGen keeps no rates of its own (`tests/test_telemetry.py` guards against a rate table in the code). It reads them from one configured source:
 
 | Variable | Meaning |
 |---|---|
 | `MIRAGEN_MODEL_RATES_URL` | An http(s) endpoint serving the rates document, typically a control plane's model catalogue. Fetched at startup and on every refresh; the last good copy is kept under the runs directory (`model-rates/rates.json`), so a restart without network still has rates. A failed fetch keeps the last good rates. |
-| `MIRAGEN_MODEL_RATES_TOKEN` | Optional bearer token for the URL (`MIRAGEN_MODEL_RATES_TOKEN_FILE` works like every `*_FILE` secret). |
-| `MIRAGEN_MODEL_RATES_REFRESH_S` | Refresh interval in seconds; default 900, minimum 30. Each fetch times out after 10 s. |
-| `MIRAGEN_MODEL_RATES_FILE` | A local rates document instead of a URL, for self-hosting. Re-read when it changes. The URL wins when both are set. |
+| `MIRAGEN_MODEL_RATES_TOKEN` | Optional bearer token for the URL (`MIRAGEN_MODEL_RATES_TOKEN_FILE` works like every `*_FILE` secret inside the agent container; miragend forwards only the plain `_TOKEN`). |
+| `MIRAGEN_MODEL_RATES_REFRESH_S` | Refresh interval in seconds; default 900, minimum 30. Each fetch has 10 s of wall clock in total. With no copy on disk, startup waits up to 5 s for a first fetch. |
+| `MIRAGEN_MODEL_RATES_PATH` | A local rates document instead of a URL, for self-hosting. Re-read when it changes. The URL wins when both are set. (Not `_FILE`: that suffix means a secret file, which startup reads into the variable without the suffix.) |
 
 miragend forwards `MIRAGEN_MODEL_RATES_URL`, `_TOKEN` and `_REFRESH_S` from its own environment to every managed agent.
 

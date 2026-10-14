@@ -219,13 +219,13 @@ def test_the_url_configures_an_http_source(tmp_path):
 
 
 def test_the_file_configures_a_file_source(tmp_path):
-    source = source_from_env({"MIRAGEN_MODEL_RATES_FILE": str(tmp_path / "r.json")}, tmp_path)
+    source = source_from_env({"MIRAGEN_MODEL_RATES_PATH": str(tmp_path / "r.json")}, tmp_path)
     assert isinstance(source, FileRatesSource)
 
 
 def test_the_url_wins_over_the_file(tmp_path):
     source = source_from_env({"MIRAGEN_MODEL_RATES_URL": "http://c.example/r",
-                              "MIRAGEN_MODEL_RATES_FILE": "/x.json"}, tmp_path)
+                              "MIRAGEN_MODEL_RATES_PATH": "/x.json"}, tmp_path)
     assert isinstance(source, HttpRatesSource)
 
 
@@ -236,3 +236,70 @@ def test_the_url_wins_over_the_file(tmp_path):
 def test_bad_configuration_stops_startup(env, tmp_path):
     with pytest.raises(ValueError):
         source_from_env(env, tmp_path)
+
+
+# ── startup and deadlines ───────────────────────────────────────────────────
+
+
+def test_start_without_a_copy_on_disk_fetches_before_returning(tmp_path):
+    source = _http(_Server(httpx.Response(200, json=DOC)), tmp_path)
+    source.start()
+    try:
+        assert set(source.current()) == set(DOC["models"])  # no waiting needed
+    finally:
+        source.stop()
+
+
+def test_start_with_a_copy_on_disk_does_not_wait_for_the_network(tmp_path):
+    _http(_Server(httpx.Response(200, json=DOC)), tmp_path).refresh()
+    server = _Server(httpx.Response(200, json=DOC))
+    source = _http(server, tmp_path)
+    source.start()
+    try:
+        assert source.current() is not None
+        assert server.requests == []  # the next fetch waits for the interval
+    finally:
+        source.stop()
+
+
+def _trickle(chunks: int, delay: float):
+    def body():
+        for _ in range(chunks):
+            time.sleep(delay)
+            yield b" "
+        yield json.dumps(DOC).encode()
+    return body()
+
+
+def test_a_fetch_has_one_wall_clock_deadline_across_phases(tmp_path):
+    # Each chunk arrives well inside httpx's per-read timeout; the whole
+    # body does not arrive inside the total deadline.
+    def handler(request):
+        return httpx.Response(200, content=_trickle(8, 0.1))
+
+    source = HttpRatesSource("https://catalogue.example/r", transport=httpx.MockTransport(handler))
+    started = time.monotonic()
+    assert source.refresh(timeout_s=0.35) is False
+    assert time.monotonic() - started < 0.7
+    assert source.current() is None
+    assert source.refresh(timeout_s=5) is True  # the same body, given time
+
+
+def test_startup_against_an_unreachable_source_is_bounded(tmp_path):
+    def handler(request):
+        return httpx.Response(200, content=_trickle(50, 0.1))
+
+    source = HttpRatesSource("https://catalogue.example/r", transport=httpx.MockTransport(handler),
+                             cache_path=tmp_path / "rates.json")
+    started = time.monotonic()
+    source.start(startup_timeout_s=0.3)
+    try:
+        assert time.monotonic() - started < 1.0
+        assert source.current() is None
+    finally:
+        source.stop()
+
+
+def test_the_path_variable_is_not_a_secret_file_name():
+    # `*_FILE` is consumed by the startup secret loader (miragen.app).
+    assert not model_rates.PATH_ENV.endswith("_FILE")

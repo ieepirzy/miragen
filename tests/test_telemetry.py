@@ -216,3 +216,12 @@ def test_no_pricing_tables_in_miragen():
     # A literal fractional weight for cache tokens, the shape a fixed
     # cache-read discount takes.
     assert not re.search(r"cache\w*\s*[:=]\s*(fraction|decimal)\(\s*[\"']?\d", source)
+    # Nor a data file shipped in the package (JSON/YAML/TOML).
+    data_rate_key = re.compile(
+        r"""\b["']?(cached_input|cache_write|cache_write_1h|input_per_million|"""
+        r"""cached_input_per_million|output_per_million)["']?\s*[:=]""")
+    for path in pathlib.Path("miragen").rglob("*"):
+        if path.suffix.lower() in {".json", ".yaml", ".yml", ".toml"}:
+            text = path.read_text(errors="replace").lower()
+            assert "price" not in text and "per_million" not in text, path
+            assert not data_rate_key.search(text), path

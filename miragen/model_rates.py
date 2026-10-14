@@ -10,8 +10,9 @@ operator configures:
   catalogue. Fetched at startup and every ``MIRAGEN_MODEL_RATES_REFRESH_S``
   seconds (default 900). The last good copy is kept on disk, so a restart
   without network still has rates.
-- ``MIRAGEN_MODEL_RATES_FILE``: a local JSON file, for self-hosters. Re-read
-  when it changes.
+- ``MIRAGEN_MODEL_RATES_PATH``: a local JSON file, for self-hosters. Re-read
+  when it changes. (Not ``*_FILE``: that suffix is the secret-file
+  convention, and the startup loader would consume the variable.)
 
 Both serve the same document, rates per million tokens with decimals as
 strings::
@@ -24,8 +25,10 @@ strings::
 ratios matter, so the currency is irrelevant. Reading is tolerant: unknown
 fields are ignored and a malformed entry is skipped with a log line.
 
-Fallback, so a budget never undercounts: with no source, for a model the
-source doesn't list, or for one whose input rate is 0 (a flat-rate
+With NO source configured, budgets count exactly as before rates existed:
+cache reads are left out and cache writes count 1:1 (models.budget_tokens).
+Configuring a source never loosens that for a model it can't weight: for a
+model the source doesn't list, or one whose input rate is 0 (a flat-rate
 subscription harness), cache reads and writes count in full, one budget
 token per token. Each such model is logged once.
 
@@ -39,6 +42,7 @@ import logging
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
@@ -51,11 +55,12 @@ logger = logging.getLogger(__name__)
 
 URL_ENV = "MIRAGEN_MODEL_RATES_URL"
 TOKEN_ENV = "MIRAGEN_MODEL_RATES_TOKEN"
-FILE_ENV = "MIRAGEN_MODEL_RATES_FILE"
+PATH_ENV = "MIRAGEN_MODEL_RATES_PATH"
 REFRESH_ENV = "MIRAGEN_MODEL_RATES_REFRESH_S"
 DEFAULT_REFRESH_S = 900.0
 MIN_REFRESH_S = 30.0
-FETCH_TIMEOUT_S = 10.0
+FETCH_TIMEOUT_S = 10.0  # wall clock for one whole fetch
+STARTUP_FETCH_TIMEOUT_S = 5.0  # the synchronous first fetch with no copy on disk
 # A rates document is a few KB; anything far larger is not one.
 MAX_DOCUMENT_BYTES = 4 * 1024 * 1024
 CACHE_FILE_NAME = "rates.json"
@@ -97,13 +102,16 @@ def weights_for(rates: Optional[ModelRates]) -> Optional[BudgetWeights]:
 
     Reads weigh `cached_input / input`. 5-minute writes weigh
     `cache_write / input`, 1 when the rate is absent (a write billed as
-    ordinary input). 1-hour writes weigh `cache_write_1h / input`, falling
-    back to the 5-minute weight when absent."""
+    ordinary input). 1-hour writes weigh `cache_write_1h / input`; when that
+    rate is absent, the dearest known write weight (the 5-minute weight or
+    1, whichever is higher)."""
     if rates is None or rates.input <= 0:
         return None
     write = rates.cache_write / rates.input if rates.cache_write is not None else Fraction(1)
     write_1h = (
-        rates.cache_write_1h / rates.input if rates.cache_write_1h is not None else write
+        rates.cache_write_1h / rates.input
+        if rates.cache_write_1h is not None
+        else max(write, Fraction(1))
     )
     return BudgetWeights(rates.cached_input / rates.input, write, write_1h)
 
@@ -242,10 +250,11 @@ class HttpRatesSource:
         with self._lock:
             return self._table
 
-    def refresh(self) -> bool:
-        """Fetch once. True when a new table was stored."""
+    def refresh(self, timeout_s: Optional[float] = None) -> bool:
+        """Fetch once, within `timeout_s` of wall clock (default: the
+        source's fetch timeout). True when a new table was stored."""
         try:
-            table = self._fetch()
+            table = self._fetch(self._timeout_s if timeout_s is None else timeout_s)
         except (httpx.HTTPError, OSError, ValueError) as error:
             if not self._failing:
                 logger.warning("model rates fetch from %s failed (%s); keeping the last "
@@ -260,9 +269,16 @@ class HttpRatesSource:
         self._write_cache(table)
         return True
 
-    def start(self) -> None:
+    def start(self, startup_timeout_s: float = STARTUP_FETCH_TIMEOUT_S) -> None:
+        """Start refreshing in the background. With no last good copy on
+        disk, first fetch once synchronously (bounded by
+        `startup_timeout_s`), so the first budget check already has rates
+        when the source is reachable."""
         if self._thread is not None:
             return
+        initial = self.current() is None
+        if initial:
+            self.refresh(startup_timeout_s)
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run, name="miragen-model-rates", daemon=True
@@ -276,23 +292,32 @@ class HttpRatesSource:
             thread.join(timeout=self._timeout_s + 1)
 
     def _run(self) -> None:
-        while not self._stop.is_set():
+        # start() has just fetched (or loaded the copy on disk): wait first.
+        while not self._stop.wait(self.refresh_s):
             self.refresh()
-            self._stop.wait(self.refresh_s)
 
-    def _fetch(self) -> dict[str, ModelRates]:
+    def _fetch(self, timeout_s: float) -> dict[str, ModelRates]:
+        """One GET within `timeout_s` of wall clock in total. httpx bounds
+        each phase (connect, each read) on its own; the deadline is checked
+        between body chunks too, so a server trickling bytes can't hold a
+        fetch open past it."""
+        deadline = time.monotonic() + timeout_s
         headers = {"Accept": "application/json"}
         if self._token:
             headers["Authorization"] = f"Bearer {self._token}"
-        with httpx.Client(timeout=self._timeout_s, transport=self._transport) as client:
+        with httpx.Client(timeout=timeout_s, transport=self._transport) as client:
             with client.stream("GET", self.url, headers=headers) as response:
                 if response.status_code != 200:
                     raise ValueError(f"HTTP {response.status_code}")
                 body = bytearray()
                 for chunk in response.iter_bytes():
+                    if time.monotonic() > deadline:
+                        raise ValueError(f"fetch exceeded {timeout_s:g}s")
                     body.extend(chunk)
                     if len(body) > MAX_DOCUMENT_BYTES:
                         raise ValueError("response is too large for a rates document")
+        if time.monotonic() > deadline:
+            raise ValueError(f"fetch exceeded {timeout_s:g}s")
         return parse_rates_document(json.loads(bytes(body)))
 
     def _load_cache(self) -> None:
@@ -347,10 +372,10 @@ def source_from_env(
     """The source the environment configures, or None. An HTTP source keeps
     its last good copy under `state_dir`."""
     url = (environ.get(URL_ENV) or "").strip()
-    path = (environ.get(FILE_ENV) or "").strip()
+    path = (environ.get(PATH_ENV) or "").strip()
     if url:
         if path:
-            logger.warning("%s and %s are both set; using %s", URL_ENV, FILE_ENV, URL_ENV)
+            logger.warning("%s and %s are both set; using %s", URL_ENV, PATH_ENV, URL_ENV)
         if not url.startswith(("http://", "https://")):
             raise ValueError(f"{URL_ENV} must be an http(s) URL")
         raw_refresh = (environ.get(REFRESH_ENV) or "").strip()
@@ -385,14 +410,23 @@ def configured_source() -> Optional[RatesSource]:
 
 
 def current_table() -> Optional[RatesTable]:
+    """The configured source's table; None only when NO source is configured
+    (budgets then count as before rates existed). A configured source that
+    has no rates yet, or fails, gives an empty table: every model is then
+    unlisted and its cache tokens count in full."""
     if _source is None:
         return None
     try:
-        return _source.current()
+        table = _source.current()
     except Exception as error:  # noqa: BLE001 — a broken source must not break a run
         _warn_once("source-error", "model rates source failed (%s); cache reads count "
                    "in full", error)
-        return None
+        return {}
+    if table is None:
+        _warn_once("source-empty", "the model rates source has no rates yet; cache reads "
+                   "count in full until it does")
+        return {}
+    return table
 
 
 # ── matching a model to its rates ───────────────────────────────────────────
@@ -465,23 +499,26 @@ def _candidates(table: RatesTable, reported: Optional[str],
 
 
 def budget_weights(
-    table: Optional[RatesTable], reported: Optional[str], run_model: Optional[str]
+    table: Optional[RatesTable], reported: Optional[str], run_model: Optional[str],
+    *, writes: bool = False,
 ) -> BudgetWeights:
-    """The weights for one model request (or a run's unbroken-down usage).
+    """The weights for one model request (or a run's unbroken-down usage),
+    under a configured source's table.
 
-    FULL_WEIGHTS when there is no table, no matching entry, or a matching
-    entry whose input rate is 0. When several entries match, each weight is
-    the highest among them, so a budget never undercounts."""
+    FULL_WEIGHTS when there is no matching entry or a matching entry whose
+    input rate is 0. When several entries match, each weight is the highest
+    among them, so a budget never undercounts. `writes`: the slice has cache
+    writes, so a missing write rate (counted 1:1) is worth a warning."""
     model = (reported or "").strip() or (run_model or "")
-    if table is None:
-        _warn_once("no-source", "no model rates source is configured (%s or %s); "
-                   "cache reads count in full in budgets", URL_ENV, FILE_ENV)
-        return FULL_WEIGHTS
-    weights = [weights_for(rates) for rates in _candidates(table, reported, run_model)]
+    candidates = _candidates(table or {}, reported, run_model)
+    weights = [weights_for(rates) for rates in candidates]
     if not weights or any(w is None for w in weights):
         _warn_once(f"model:{model}", "no usable model rates for %r (unlisted, or rated "
                    "at zero); its cache reads count in full in budgets", model or "unknown")
         return FULL_WEIGHTS
+    if writes and any(rates.cache_write is None for rates in candidates):
+        _warn_once(f"write:{model}", "model rates for %r have no cache_write rate; its "
+                   "cache writes count 1:1 in budgets", model or "unknown")
     return BudgetWeights(
         max(w.cache_read for w in weights),  # type: ignore[union-attr]
         max(w.cache_write for w in weights),  # type: ignore[union-attr]

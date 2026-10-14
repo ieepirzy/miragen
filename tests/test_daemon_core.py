@@ -373,7 +373,7 @@ def test_model_rates_source_forwarded_into_agent_env(tmp_path):
             "MIRAGEN_MODEL_RATES_URL": "https://catalogue.example/api/model-rates",
             "MIRAGEN_MODEL_RATES_TOKEN": "rates-token-example",
             "MIRAGEN_MODEL_RATES_REFRESH_S": "600",
-            "MIRAGEN_MODEL_RATES_FILE": "/host/rates.json",
+            "MIRAGEN_MODEL_RATES_PATH": "/host/rates.json",
         },
         runner=runner,
         not_found=FakeNotFound,
@@ -389,7 +389,7 @@ def test_model_rates_source_forwarded_into_agent_env(tmp_path):
     assert env["MIRAGEN_MODEL_RATES_URL"] == "https://catalogue.example/api/model-rates"
     assert env["MIRAGEN_MODEL_RATES_TOKEN"] == "rates-token-example"
     assert env["MIRAGEN_MODEL_RATES_REFRESH_S"] == "600"
-    assert "MIRAGEN_MODEL_RATES_FILE" not in env
+    assert "MIRAGEN_MODEL_RATES_PATH" not in env
 
 
 

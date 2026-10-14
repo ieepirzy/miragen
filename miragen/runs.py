@@ -305,16 +305,20 @@ class RunStore:
 
 
 def _budget_model(record: RunRecord, model: str | None) -> str | None:
-    # The profile's model when the caller knows it, else what the record says.
-    return model or record.model
+    # The model the run recorded, so a later profile change doesn't re-weight
+    # earlier runs; the profile's model (`model`) for records without one.
+    # The rates themselves are always the source's current table.
+    return record.model or model
 
 
 def tokens_used_since(store: RunStore, since: datetime, model: str | None = None) -> int:
     """
     Sum budget tokens (models.budget_tokens: uncached input + output, cache
     reads and writes weighted by the model's rates) across `store`'s run
-    records with started_at >= since. `model` is the run model usage without
-    a per-call breakdown is weighted by (the profile's; models.budget_model).
+    records with started_at >= since. Usage without a per-call breakdown is
+    weighted by the record's own model, else `model` (the profile's;
+    models.budget_model), at the source's CURRENT rates: today's spend
+    follows the rates table as it is now, not as it was at each run.
 
     Records with no usage (e.g. a run that failed before the model responded,
     or a fresh `running` record that hasn't finished a turn yet) contribute 0

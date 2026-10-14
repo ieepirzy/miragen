@@ -164,22 +164,29 @@ def budget_tokens(
     """Tokens a run spends against `limits.tokens_per_run` and the daily
     budget.
 
-    Uncached input and output count 1:1. Cache reads count at the model's
-    `cached_input / input` rate ratio, cache writes at `cache_write / input`
-    (5-minute) and `cache_write_1h / input` (1-hour), with the rates read
-    from the configured source (miragen/model_rates.py). Each reported call
-    (`usage.calls`) is weighted by its own model; usage the calls don't
-    account for is weighted by `model`, the run's model (the profile's
-    spec.model). Each slice rounds up.
+    With NO rates source configured (miragen/model_rates.py), as before
+    rates existed: uncached input, cache writes and output count 1:1, and
+    cache reads are left out.
 
-    Never undercounts: with no rates source, an unlisted model, or a model
-    rated at zero (subscription harnesses), cache reads and writes count in
-    full. A write whose rate is absent counts 1:1. `rates` overrides the
-    configured source's table (None = no source).
+    With a source: uncached input and output count 1:1, cache reads at the
+    model's `cached_input / input` rate ratio, cache writes at
+    `cache_write / input` (5-minute) and `cache_write_1h / input` (1-hour).
+    Each reported call (`usage.calls`) is weighted by its own model; usage
+    the calls don't account for is weighted by `model`, the run's model.
+    Each slice rounds up. A model the source can't weight (unlisted, or
+    rated at zero like a subscription harness) has its cache reads and
+    writes counted in full, never left out. A write whose rate is absent
+    counts 1:1.
+
+    `rates` overrides the configured source's table (None = no source).
     """
     if usage is None:
         return 0
     table = model_rates.current_table() if rates is _UNSET else rates
+    if table is None:
+        cached = max(usage.cached_input_tokens or 0, 0)
+        fresh_input = max((usage.input_tokens or 0) - cached, 0)
+        return fresh_input + max(usage.output_tokens or 0, 0)
     slices = _call_slices(usage)
     reads_total = sum(s[1] for s in slices)
     writes_total = sum(s[2] for s in slices)
@@ -188,7 +195,7 @@ def budget_tokens(
     for call_model, reads, writes, one_hour in slices:
         if not reads and not writes:
             continue
-        weights = model_rates.budget_weights(table, call_model, model)
+        weights = model_rates.budget_weights(table, call_model, model, writes=bool(writes))
         if one_hour is None:
             # Split unknown: every write at the dearer of the two weights.
             weighted_writes = writes * max(weights.cache_write, weights.cache_write_1h)
@@ -944,9 +951,9 @@ class Limits(_ProfileModel):
         description=(
             "Per-run token cap. Executors and the in-flight reserve count budget_tokens: "
             "uncached input + output 1:1, cache reads and writes weighted by the model's "
-            "rates from the configured rates source (in full without one); the model tier "
-            "also hands it to PydanticAI as UsageLimits.total_tokens_limit, whose total "
-            "counts cache reads in full."
+            "rates from the configured rates source (without one: cache reads left out, "
+            "writes 1:1); the model tier also hands it to PydanticAI as "
+            "UsageLimits.total_tokens_limit, whose total counts cache reads in full."
         ),
     )
     tokens_per_day: Optional[int] = Field(
@@ -955,8 +962,8 @@ class Limits(_ProfileModel):
         description=(
             "Rolling UTC-day token cap across this agent's run records, enforced by miragen. "
             "Counts budget_tokens: uncached input + output 1:1, cache reads and writes "
-            "weighted by the model's rates from the configured rates source (in full "
-            "without one)."
+            "weighted by the model's rates from the configured rates source (without "
+            "one: cache reads left out, writes 1:1)."
         ),
     )
     on_exceeded: Literal["skip", "notify"] = Field(

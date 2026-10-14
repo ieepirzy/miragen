@@ -1316,12 +1316,15 @@ async def lifespan(app: FastAPI):
     rates_source = model_rates.source_from_env(os.environ, _run_store.root / "model-rates")
     model_rates.configure(rates_source)
     if isinstance(rates_source, model_rates.HttpRatesSource):
-        rates_source.start()
+        # With no copy on disk, one bounded synchronous fetch (off the loop)
+        # so the first budget check already has rates.
+        await asyncio.to_thread(rates_source.start)
         logger.info(f"Model rates from {rates_source.url}, refreshed every {rates_source.refresh_s:.0f}s")
     elif rates_source is not None:
-        logger.info("Model rates from a local file")
+        logger.info(f"Model rates from {os.environ.get(model_rates.PATH_ENV)}")
     else:
-        logger.info("No model rates source configured: cache reads count in full in budgets")
+        logger.info("No model rates source configured: budgets count as before rates "
+                    "(cache reads left out, cache writes 1:1)")
 
     # The schedule store exists before the agent is built: the scheduling
     # tools close over it (and managed-schedule registration reuses it
