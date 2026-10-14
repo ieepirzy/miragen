@@ -76,6 +76,7 @@ GATEWAY_TOKEN_ENV = "MIRAGEN_GATEWAY_TOKEN"
 STATE_FILE = "miragen-instances.json"
 WRAPPER_FILE = "miragen-claude"
 KEEP_ENV = "MIRAGEN_ENV_KEEP"
+MIRADESIGN_AGENT_ENV = "MIRADESIGN_AGENT"
 # The only environment a claude process inherits from the container (plus
 # what _env sets). Same list as the Grok harness's.
 ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
@@ -328,7 +329,16 @@ class ClaudeCodeHarness:
         env[KEEP_ENV] = " ".join(keep)
         return env
 
-    def _engineer_env(self, instance: str) -> dict[str, str]:
+    def current_session_id(self, instance: str) -> str | None:
+        """The Claude Code session id serving ``instance`` now (its live
+        process's, else the mapped one): the MiraDesign session key is
+        ``claude-code:<id>``."""
+        agent = self._agents.get(instance)
+        if agent is not None and not agent.dead:
+            return agent.session_id
+        return (self._load_state().get(instance) or {}).get("session_id")
+
+    def _engineer_env(self, instance: str, *, ephemeral: bool = False) -> dict[str, str]:
         """The locked posture's child environment plus git/gh wiring and the
         profile's passthrough names; the same allowlist mechanism (and the
         same refusal of API keys) applies."""
@@ -341,6 +351,13 @@ class ClaudeCodeHarness:
             # one, miragen captures and the plugin stays quiet (no doubles).
             env.pop(WORKER_ENV)
         env.update(git_env(self.settings.claude_home, self.profile))
+        if spec.miradesign_agent_per_instance and not ephemeral:
+            # The MiraDesign plugin's hooks read this at SessionStart: the
+            # session registers as the durable actor
+            # agent:claude-code/<instance> (miradesign harness/identity.py
+            # actor_key), the name MiraRun's lane supervisor maps instances by.
+            # A one-off run keeps the plugin's default per-session actor.
+            env[MIRADESIGN_AGENT_ENV] = instance
         for name in spec.env_passthrough:
             # Never over a value the harness set (models.py also refuses the
             # names it knows; this holds for any it adds later).
@@ -386,7 +403,8 @@ class ClaudeCodeHarness:
 
         if self.engineer:
             return self._engineer_options(instance, workdir, resume=resume, new_id=new_id,
-                                          stderr=stderr, pre_compact=pre_compact)
+                                          stderr=stderr, pre_compact=pre_compact,
+                                          ephemeral=ephemeral)
         return ClaudeAgentOptions(
             tools=sorted(self.builtins),
             system_prompt=self.instructions,
@@ -413,7 +431,8 @@ class ClaudeCodeHarness:
         )
 
     def _engineer_options(self, instance: str, workdir: Path, *, resume: str | None,
-                          new_id: str | None, stderr: deque, pre_compact):
+                          new_id: str | None, stderr: deque, pre_compact,
+                          ephemeral: bool = False):
         """Launch options for posture: engineer (docs/design/harnesses.md)."""
         from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 
@@ -452,7 +471,7 @@ class ClaudeCodeHarness:
             effort=self.settings.effort,
             cwd=str(workdir),
             cli_path=str(self.settings.claude_home / WRAPPER_FILE),
-            env=self._engineer_env(instance),
+            env=self._engineer_env(instance, ephemeral=ephemeral),
             resume=resume,
             session_id=new_id,
             verbatim_prompts=True,

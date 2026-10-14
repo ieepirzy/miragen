@@ -8,6 +8,8 @@ Everything here is bounded: git runs against local temp repositories
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
 import subprocess
@@ -282,6 +284,34 @@ async def test_engineer_options_open_the_tool_set_and_load_settings(env, monkeyp
         assert (env.home / name).stat().st_mode & 0o777 == mode, name
 
 
+async def test_each_instance_registers_as_its_own_miradesign_actor(env):
+    h = env.harness(engineer_profile())
+    await h.run(turn("hi", instance="lane-a-engineer-1"))
+    await h.run(turn("hi", instance="lane-a-engineer-2", run_id="r2"))
+    await h.run(turn("once", use_history=False, run_id="eph"))
+    envs = [c.options.env for c in FakeClient.instances]
+    assert [e.get("MIRADESIGN_AGENT") for e in envs] == [
+        "lane-a-engineer-1", "lane-a-engineer-2", None]
+    assert "MIRADESIGN_AGENT" in envs[0]["MIRAGEN_ENV_KEEP"].split()
+
+
+async def test_per_instance_miradesign_identity_can_be_turned_off(env):
+    h = env.harness(engineer_profile(miradesign_agent_per_instance=False))
+    await h.run(turn("hi"))
+    assert "MIRADESIGN_AGENT" not in FakeClient.instances[0].options.env
+
+
+async def test_passthrough_cannot_override_the_instance_identity(env, monkeypatch):
+    with pytest.raises(ValueError, match="may not be passed"):
+        HarnessSpec(posture="engineer", env_passthrough=["MIRADESIGN_AGENT"])
+    monkeypatch.setenv("MIRADESIGN_AGENT", "someone-else")
+    prof = engineer_profile()
+    object.__setattr__(prof.spec.harness, "env_passthrough", ["MIRADESIGN_AGENT"])
+    h = env.harness(prof)
+    await h.run(turn("hi", instance="lane-a-engineer-1"))
+    assert FakeClient.instances[0].options.env["MIRADESIGN_AGENT"] == "lane-a-engineer-1"
+
+
 async def test_a_second_prepare_rewrites_the_read_only_files(env):
     prof = engineer_profile(git_broker={"host": "b", "credential_file": "/nonexistent"})
     env.harness(prof)
@@ -532,71 +562,86 @@ async def test_a_subagent_starting_with_no_spawn_in_flight_is_at_the_limit():
 
 # ── ask_human ───────────────────────────────────────────────────────────────
 
-class FakeMiraDesign:
-    def __init__(self, *, thread_id="th-1234567890", fail=None, actors=("ilari", "eemeli"),
-                 message_status=201):
-        self.requests: list[httpx.Request] = []
-        self.thread_id, self.fail, self.actors = thread_id, fail, set(actors)
-        self.message_status = message_status
-        self.threads: list[dict] = []
+class FakeMiraDesignMCP:
+    """A real MCP server (FastMCP, stateless streamable HTTP at /mcp/, as
+    MiraDesign mounts it) with MiraDesign's `post` signature, served in
+    process through httpx's ASGI transport."""
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append(request)
-        path = request.url.path
-        if self.fail and self.fail in path:
-            return httpx.Response(404, json={"error": "no such work item"})
-        if request.method == "GET" and path.startswith("/v1/actors/"):
-            handle = path.rsplit("/", 1)[-1]
-            return (httpx.Response(200, json={"handle": handle}) if handle in self.actors
-                    else httpx.Response(404, json={"error": "no actor"}))
-        if request.method == "GET" and "/work-items/" in path:
-            return httpx.Response(200, json={"id": "wi-1", "number": 12,
-                                             "thread_id": self.thread_id})
-        if request.method == "GET" and path.endswith("/threads"):
-            return httpx.Response(200, json=self.threads)
-        if request.method == "POST" and path.endswith("/threads"):
-            body = json.loads(request.content)
-            row = {"id": f"th-new-{len(self.threads):04d}", "kind": body["kind"],
-                   "subject": body["subject"], "target_id": body.get("target_id")}
-            self.threads.append(row)
-            return httpx.Response(201, json=row)
-        if path.endswith("/messages"):
-            if self.message_status != 201:
-                return httpx.Response(self.message_status, json={"error": "conflict"})
-            return httpx.Response(201, json={"id": "msg-abcdef12", "thread_id": "x",
-                                             "escalated": "sink"})
-        return httpx.Response(500)
+    def __init__(self, *, reply="ok: question 0a1b2c3d in thread 9f8e7d6c, directed at @ilari. "
+                                 "It is also in their attention queue (MiraRun), where they "
+                                 "decide it. Do not wait or poll: carry on."):
+        from mcp.server.fastmcp import FastMCP
+        from mcp.server.transport_security import TransportSecuritySettings
 
-    def calls(self) -> list[tuple[str, str]]:
-        return [(r.method, r.url.path) for r in self.requests]
+        self.calls: list[dict] = []
+        self.headers: list[dict] = []
+        self.reply = reply
+        self.server = FastMCP("miradesign-fake", stateless_http=True, json_response=True,
+                              streamable_http_path="/mcp/",
+                              transport_security=TransportSecuritySettings(
+                                  enable_dns_rebinding_protection=False))
+        fake = self
 
-    def sent(self, method: str, suffix: str) -> list[httpx.Request]:
-        return [r for r in self.requests if r.method == method and r.url.path.endswith(suffix)]
+        @self.server.tool()
+        async def post(session: str, body: str, kind: str = "comment", thread: str | None = None,
+                       work_item: str | None = None, subject: str | None = None,
+                       to: list[str] | None = None, in_reply_to: str | None = None,
+                       project: str | None = None) -> str:
+            fake.calls.append({k: v for k, v in dict(
+                session=session, body=body, kind=kind, thread=thread, work_item=work_item,
+                subject=subject, to=to, in_reply_to=in_reply_to, project=project).items()
+                if v is not None})
+            return fake.reply
+
+        inner = self.server.streamable_http_app()
+
+        async def app(scope, receive, send):
+            if scope["type"] == "http":
+                fake.headers.append({k.decode(): v.decode() for k, v in scope["headers"]})
+            await inner(scope, receive, send)
+
+        self.app = app
+
+    def factory(self, headers=None, timeout=None, auth=None):
+        return httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app),
+                                 base_url="https://design.example", headers=headers,
+                                 timeout=timeout, auth=auth)
+
+    @contextlib.asynccontextmanager
+    async def running(self):
+        async with self.server.session_manager.run():
+            yield self
 
 
-def _ask(fake, *, token_env="MD_TOKEN", environ=None, current=None, **spec):
+def _ask(fake, *, token_env="MD_TOKEN", environ=None, current=None, sessions=None, **spec):
     md = AskHumanMiraDesignSpec(url="https://design.example", project="lane",
                                 token_env=token_env, **spec)
+    sessions = {"inst-a": "sess-a"} if sessions is None else sessions
     return build_ask_human_tool(md, "eng", current or (lambda: ("run-1", "inst-a")),
+                                sessions.get,
                                 environ={"MD_TOKEN": "md-secret"} if environ is None else environ,
-                                transport=httpx.MockTransport(fake))
+                                httpx_client_factory=fake.factory)
 
 
-async def test_ask_human_on_a_work_item_posts_a_question_to_its_thread():
-    fake = FakeMiraDesign()
-    out = await _ask(fake)("Merge the schema change now or wait for review?", work_item="#12")
-    assert fake.calls() == [("GET", "/v1/actors/ilari"),
-                            ("GET", "/v1/projects/lane/work-items/12"),
-                            ("POST", "/v1/threads/th-1234567890/messages")]
-    assert {r.headers["authorization"] for r in fake.requests} == {"Bearer md-secret"}
-    (post,) = fake.sent("POST", "/messages")
-    assert post.headers["idempotency-key"].startswith("miragen-ask-")
-    body = json.loads(post.content)
-    assert body["kind"] == "question" and body["mentions"] == ["ilari"]
-    assert body["body"] == "Merge the schema change now or wait for review?"
-    assert body["meta"] == {"source": "miragen.ask_human", "agent": "eng", "instance": "inst-a",
-                            "run_id": "run-1", "work_item": "#12"}
-    assert out.startswith("ok: question msg-abcd") and "Do not wait" in out and "@ilari" in out
+async def test_ask_human_posts_as_the_calling_session_through_miradesign_mcp():
+    async with FakeMiraDesignMCP().running() as fake:
+        out = await _ask(fake)("Merge the schema change now or wait for review?",
+                               work_item="#12")
+    assert fake.calls == [{"session": "claude-code:sess-a", "kind": "question",
+                           "body": "Merge the schema change now or wait for review?",
+                           "to": ["ilari"], "project": "lane", "work_item": "lane#12"}]
+    posts = [h for h in fake.headers if h.get("authorization")]
+    assert posts and {h["authorization"] for h in posts} == {"Bearer md-secret"}
+    assert {h["x-harness-session"] for h in posts} == {"claude-code:sess-a"}
+    assert out.startswith("ok: question 0a1b2c3d") and "Do not wait" in out
+
+
+async def test_ask_human_without_a_work_item_opens_a_thread_with_a_subject():
+    async with FakeMiraDesignMCP().running() as fake:
+        await _ask(fake, to=["ilari", "eemeli"])("Which region?\nDetails…")
+    (call,) = fake.calls
+    assert call["subject"] == "Which region?" and "work_item" not in call
+    assert call["to"] == ["ilari", "eemeli"]
 
 
 @pytest.mark.parametrize("ref, expected", [
@@ -613,100 +658,120 @@ def test_bad_work_item_references(ref):
         _work_item_ref(ref, "lane")
 
 
-async def test_ask_human_bare_number_reaches_the_default_projects_item():
-    fake = FakeMiraDesign()
-    await _ask(fake)("Q?", work_item="12")
-    assert ("GET", "/v1/projects/lane/work-items/12") in fake.calls()
+async def test_a_bare_number_names_the_default_projects_item():
+    async with FakeMiraDesignMCP().running() as fake:
+        await _ask(fake)("Q?", work_item="12")
+        await _ask(fake)("Q2?", work_item="other#7")
+    assert [c["work_item"] for c in fake.calls] == ["lane#12", "other#7"]
 
 
-async def test_ask_human_without_a_work_item_opens_a_question_thread():
-    fake = FakeMiraDesign()
-    await _ask(fake, to=["ilari", "eemeli"])("Which region?\nDetails…", subject=None)
-    (create,) = fake.sent("POST", "/threads")
-    assert create.url.path == "/v1/projects/lane/threads"
-    assert json.loads(create.content) == {"subject": "Which region?", "kind": "question",
-                                          "participants": ["ilari", "eemeli"]}
-    (post,) = fake.sent("POST", "/messages")
-    assert post.url.path == "/v1/threads/th-new-0000/messages"
-    assert json.loads(post.content)["mentions"] == ["ilari", "eemeli"]
-    assert create.headers["idempotency-key"] == post.headers["idempotency-key"]
+async def test_a_repeated_question_in_the_same_session_is_not_posted_again():
+    async with FakeMiraDesignMCP().running() as fake:
+        ask = _ask(fake)
+        first = await ask("Which region?")
+        again = await ask("Which region?")
+        other = await ask("Which zone?")
+    assert len(fake.calls) == 2 and "Already asked" in again and again.startswith(first)
+    assert other.startswith("ok:")
 
 
-async def test_a_retried_question_opens_no_second_thread():
-    fake = FakeMiraDesign()
-    ask = _ask(fake)
-    await ask("Which region?")
-    await ask("Which region?")             # same tool: the in-process memo
-    await _ask(fake)("Which region?")      # a fresh tool (restart): the subject lookup
-    assert len(fake.sent("POST", "/threads")) == 1
-    assert len(fake.sent("GET", "/threads")) == 2  # the memo answered the second call
-    keys = {r.headers["idempotency-key"] for r in fake.sent("POST", "/messages")}
-    assert len(keys) == 1  # MiraDesign replays the message instead of posting it again
+async def test_a_new_session_may_ask_the_same_question_again():
+    sessions = {"inst-a": "sess-a"}
+    async with FakeMiraDesignMCP().running() as fake:
+        ask = _ask(fake, sessions=sessions)
+        await ask("Which region?")
+        sessions["inst-a"] = "sess-b"  # rotated
+        await ask("Which region?")
+    assert [c["session"] for c in fake.calls] == ["claude-code:sess-a", "claude-code:sess-b"]
 
 
-async def test_the_key_names_agent_instance_and_question_not_the_run():
-    fake = FakeMiraDesign()
-    await _ask(fake, current=lambda: ("run-1", "inst-a"))("Q?")
-    await _ask(fake, current=lambda: ("run-2", "inst-a"))("Q?")
-    await _ask(fake, current=lambda: ("run-1", "inst-b"))("Q?")
-    keys = [r.headers["idempotency-key"] for r in fake.sent("POST", "/messages")]
-    assert keys[0] == keys[1] != keys[2]
+async def test_no_session_yet_points_the_agent_at_the_plugin():
+    async with FakeMiraDesignMCP().running() as fake:
+        with pytest.raises(AskHumanFailed, match="plugin's `post`"):
+            await _ask(fake, sessions={})("Q?")
+    assert not fake.calls
 
 
-async def test_a_question_already_filed_by_an_earlier_run_is_reported_not_failed():
-    out = await _ask(FakeMiraDesign(message_status=409))("Q?")
-    assert out.startswith("ok: this question was already filed")
+async def test_a_miradesign_refusal_is_a_tool_error():
+    reply = "refused: unknown recipient(s) nobody — a message directed at nobody is a silent failure"
+    async with FakeMiraDesignMCP(reply=reply).running() as fake:
+        with pytest.raises(AskHumanFailed, match="unknown recipient"):
+            await _ask(fake, to=["nobody"])("Q?")
 
 
-async def test_ask_human_targets_another_project_and_falls_back_when_an_item_has_no_thread():
-    fake = FakeMiraDesign(thread_id=None)
-    await _ask(fake)("Q?", work_item="other#7")
-    assert fake.calls() == [
-        ("GET", "/v1/actors/ilari"), ("GET", "/v1/projects/other/work-items/7"),
-        ("GET", "/v1/projects/other/threads"), ("POST", "/v1/projects/other/threads"),
-        ("POST", "/v1/threads/th-new-0000/messages")]
-    (create,) = fake.sent("POST", "/threads")
-    assert json.loads(create.content)["target_type"] == "work_item"
-    assert json.loads(create.content)["target_id"] == "wi-1"
-
-
-async def test_an_unknown_recipient_files_nothing():
-    fake = FakeMiraDesign(actors=("ilari",))
-    with pytest.raises(AskHumanFailed, match="no actor 'nobody'"):
-        await _ask(fake, to=["ilari", "nobody"])("Q?", work_item="12")
-    assert not [r for r in fake.requests if r.method == "POST"]
+async def test_an_ok_without_guidance_gets_the_dont_wait_note():
+    async with FakeMiraDesignMCP(reply="ok: question 1 in thread 2, directed at @ilari.").running() as fake:
+        out = await _ask(fake)("Q?")
+    assert out.startswith("ok: question 1") and "Do not wait" in out
 
 
 async def test_ask_human_failures_are_tool_errors():
-    with pytest.raises(AskHumanFailed, match="404"):
-        await _ask(FakeMiraDesign(fail="work-items"))("Q?", work_item="12")
-    with pytest.raises(AskHumanFailed, match="not set"):
-        await _ask(FakeMiraDesign(), environ={})("Q?")
-    with pytest.raises(AskHumanFailed, match="required"):
-        await _ask(FakeMiraDesign())("  ")
-    with pytest.raises(AskHumanFailed, match="work_item"):
-        await _ask(FakeMiraDesign())("Q?", work_item="twelve")
+    async with FakeMiraDesignMCP().running() as fake:
+        with pytest.raises(AskHumanFailed, match="not set"):
+            await _ask(fake, environ={})("Q?")
+        with pytest.raises(AskHumanFailed, match="required"):
+            await _ask(fake)("  ")
+        with pytest.raises(AskHumanFailed, match="work_item"):
+            await _ask(fake)("Q?", work_item="twelve")
+    assert not fake.calls
+
+    def unreachable(headers=None, timeout=None, auth=None):
+        return httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(503)),
+                                 headers=headers, timeout=timeout, auth=auth)
+
+    md = AskHumanMiraDesignSpec(url="https://design.example", project="lane", token_env="T")
+    tool = build_ask_human_tool(md, "eng", lambda: (None, "inst-a"), {"inst-a": "s"}.get,
+                                environ={"T": "x"}, httpx_client_factory=unreachable,
+                                timeout_s=5)
+    with pytest.raises(AskHumanFailed, match="unreachable"):
+        await asyncio.wait_for(tool("Q?"), 20)
 
 
-async def test_ask_human_through_the_gateway_names_the_calling_instance_and_run():
+async def test_ask_human_through_the_gateway_uses_the_calling_instances_session():
     from miragen.harness.gateway import current_call
 
-    fake = FakeMiraDesign()
     md = AskHumanMiraDesignSpec(url="https://design.example", project="lane", token_env="MD")
-    tool = build_ask_human_tool(md, "eng", current_call, environ={"MD": "md-secret"},
-                                transport=httpx.MockTransport(fake))
-    gw = ToolGateway(engineer_profile(), runtime_tools=[tool])
-    with gw.turn("inst-a", "run-1"):
-        result = await gw.call_tool("ask_human", {"question": "Q?"}, instance="inst-a")
+    async with FakeMiraDesignMCP().running() as fake:
+        tool = build_ask_human_tool(md, "eng", current_call,
+                                    {"inst-a": "sess-a", "inst-b": "sess-b"}.get,
+                                    environ={"MD": "md-secret"}, httpx_client_factory=fake.factory)
+        gw = ToolGateway(engineer_profile(), runtime_tools=[tool])
+        with gw.turn("inst-b", "run-1"):
+            result = await gw.call_tool("ask_human", {"question": "Q?"}, instance="inst-b")
     assert not result.isError, result
-    meta = json.loads(fake.sent("POST", "/messages")[0].content)["meta"]
-    assert meta["instance"] == "inst-a" and meta["run_id"] == "run-1"
+    assert fake.calls[0]["session"] == "claude-code:sess-b"
 
 
-def test_ask_human_reaches_the_gateway_only_for_engineers(tmp_path, monkeypatch):
+async def test_the_harness_resolves_an_instances_current_session(env):
+    h = env.harness(engineer_profile())
+    assert h.current_session_id("chat") is None
+    await h.run(turn("hi"))
+    live = FakeClient.instances[0].session_id
+    assert h.current_session_id("chat") == live
+    await h.aclose()
+    assert h.current_session_id("chat") == live  # from the mapping when no process runs
+
+
+async def test_ask_human_reaches_the_gateway_only_for_engineers(tmp_path, monkeypatch):
+    from miragen.harness.gateway import _CURRENT
+
     monkeypatch.setenv("MIRAGEN_CLAUDE_HOME", str(tmp_path / "claude-home"))
     ask = {"url": "https://design.example", "project": "lane", "token_env": "MD_TOKEN"}
-    _, gw = build_model_harness(engineer_profile(ask_human=ask), runs_root=tmp_path)
+    harness, gw = build_model_harness(engineer_profile(ask_human=ask), runs_root=tmp_path)
     assert "ask_human" in gw._local
+    # The tool's session resolver is bound to the harness built after it.
+    harness._agents["inst-a"] = type("A", (), {"dead": False, "session_id": "sid-1"})()
+    try:
+        fn = gw._local["ask_human"].fn_tool.fn
+        token = _CURRENT.set(("r", "inst-a"))
+        with pytest.raises(AskHumanFailed, match="not set"):  # got past the session lookup
+            await fn(question="Q?")
+        _CURRENT.reset(token)
+        token = _CURRENT.set(("r", "inst-unknown"))
+        with pytest.raises(AskHumanFailed, match="no MiraDesign session key"):
+            await fn(question="Q?")
+        _CURRENT.reset(token)
+    finally:
+        harness._agents.clear()
     _, gw = build_model_harness(snap.profile({}), runs_root=tmp_path / "locked")
     assert "ask_human" not in gw._local

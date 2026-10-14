@@ -833,6 +833,8 @@ _NEVER_PASSTHROUGH_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET")
 _NEVER_PASSTHROUGH = frozenset({
     # Set by the harness itself, or able to run code in every child.
     "HOME", "PATH", "NODE_OPTIONS", "PYTHONPATH", "PYTHONSTARTUP",
+    # The MiraDesign plugin's actor name: per instance, set by the harness.
+    "MIRADESIGN_AGENT",
     "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
 })
 
@@ -929,13 +931,16 @@ class GitBrokerSpec(_ProfileModel):
 
 
 class AskHumanMiraDesignSpec(_ProfileModel):
-    url: HttpUrl = Field(description="MiraDesign base URL (the REST API is under /v1).")
-    project: str = Field(min_length=1, description="MiraDesign project key questions are filed in.")
+    url: HttpUrl = Field(description="MiraDesign base URL (its MCP endpoint is <url>/mcp/).")
+    project: str = Field(min_length=1, description=(
+        "MiraDesign project key: new question threads and bare work item numbers resolve here."))
     token_env: Optional[str] = Field(
         default=None, pattern=r"^[A-Z_][A-Z0-9_]*$",
-        description="Container env var holding the MiraDesign bearer (miragen's, not the child's).")
+        description=("Container env var holding a MiraDesign MCP bearer (a MIRADESIGN_MCP_TOKENS "
+                     "entry; miragen's env, not the child's)."))
     token_file: Optional[str] = Field(
-        default=None, min_length=1, description="File holding the MiraDesign bearer.")
+        default=None, min_length=1,
+        description="File holding a MiraDesign MCP bearer (a MIRADESIGN_MCP_TOKENS entry).")
     to: list[str] = Field(
         default_factory=lambda: ["ilari"], min_length=1,
         description="Handles (or actor keys) a question is directed at.")
@@ -993,6 +998,15 @@ class HarnessSpec(_ProfileModel):
     )
     git_broker: Optional[GitBrokerSpec] = Field(
         default=None, description="engineer: git/gh reach GitHub only through this broker.")
+    miradesign_agent_per_instance: bool = Field(
+        default=True,
+        description=(
+            "engineer: set MIRADESIGN_AGENT=<instance name> in each instance's claude "
+            "process, so the MiraDesign plugin registers the session as the durable "
+            "actor agent:claude-code/<instance> (MiraRun maps lane instances by it). "
+            "false = the plugin's default per-session actor. Not for one-off runs."
+        ),
+    )
     ask_human: Optional[AskHumanMiraDesignSpec] = Field(
         default=None,
         description=(
@@ -1027,6 +1041,7 @@ class HarnessSpec(_ProfileModel):
             ("plugin_dirs", self.plugin_dirs), ("env_passthrough", self.env_passthrough),
             ("repositories", self.repositories), ("git_broker", self.git_broker),
             ("ask_human", self.ask_human), ("subagent_depth", self.subagent_depth != 1),
+            ("miradesign_agent_per_instance", not self.miradesign_agent_per_instance),
         ) if value]
         if dead:
             raise ValueError(f"harness fields {dead} only apply to posture: engineer")

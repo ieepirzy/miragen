@@ -22,7 +22,8 @@ posture"): the pieces that are not launch options.
   ``agent_id`` only when the caller is itself a subagent, and
   ``SubagentStart`` records each subagent's depth. Unknown callers are
   treated as at the limit (fail closed).
-* **ask_human.** A gateway runtime tool that files a MiraDesign question and
+* **ask_human.** A gateway runtime tool that files a question through
+  MiraDesign's MCP ``post`` as the calling session (``claude-code:<id>``) and
   returns at once.
 """
 
@@ -407,20 +408,25 @@ def build_ask_human_tool(
     spec: AskHumanMiraDesignSpec,
     agent: str,
     current: Callable[[], tuple[str | None, str | None]],
+    session_for: Callable[[str], str | None],
     *,
     environ: dict[str, str] | None = None,
-    transport: Any = None,
-    timeout_s: float = 20.0,
+    httpx_client_factory: Callable[..., Any] | None = None,
+    timeout_s: float = 30.0,
 ) -> Callable:
-    """The ``ask_human`` gateway tool: files a MiraDesign question (REST, the
-    same records the MiraDesign MCP ``post(kind=question)`` makes) and
-    returns at once. ``current`` gives the gateway call's (run_id, instance)."""
-    import httpx
-
-    base = str(spec.url).rstrip("/") + "/v1"
-    # Question key -> thread it was filed in: a retried call (same agent,
-    # instance and question) reuses the thread instead of opening another.
-    threads: dict[str, str] = {}
+    """The ``ask_human`` gateway tool: files the question through MiraDesign's
+    MCP ``post`` tool (kind=question) AS THE CALLING SESSION, so it is the
+    session's own plugin actor that asks, and the answer is delivered to that
+    session. ``current`` gives the gateway call's (run_id, instance);
+    ``session_for(instance)`` the instance's current Claude Code session id
+    (the MiraDesign session key is ``claude-code:<id>``, registered by the
+    plugin's hooks)."""
+    endpoint = str(spec.url).rstrip("/") + "/mcp/"
+    # MiraDesign's `post` takes no idempotency key: a retry of the same
+    # question in the same session returns the first answer instead of
+    # posting again. (Remaining risk: a reply lost after the post landed,
+    # in a process that then restarts, is asked again.)
+    asked: dict[tuple[str, str], str] = {}
 
     async def ask_human(question: str, work_item: str | None = None,
                         subject: str | None = None) -> str:
@@ -437,87 +443,51 @@ def build_ask_human_tool(
             'project#12'), when there is one — the question goes on its thread.
         subject: a short title for a new thread (when there is no work item).
         """
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+
         if not question or not question.strip():
             raise AskHumanFailed("`question` is required")
-        run_id, instance = current()
-        headers = {"Authorization": f"Bearer {_token(spec, environ if environ is not None else dict(os.environ))}"}
-        meta = {"source": "miragen.ask_human", "agent": agent, "instance": instance,
-                "run_id": run_id, "work_item": work_item}
-        async with httpx.AsyncClient(base_url=base, headers=headers, timeout=timeout_s,
-                                     transport=transport) as client:
-            async def call(method: str, path: str, **kw) -> dict:
-                try:
-                    response = await client.request(method, path, **kw)
-                except httpx.HTTPError as exc:
-                    raise AskHumanFailed(f"MiraDesign unreachable: {exc}") from exc
-                if response.status_code >= 400:
-                    raise AskHumanFailed(
-                        f"MiraDesign refused ({response.status_code}): {response.text[:300]}")
-                return response.json()
-
-            # A mention of an unknown handle is dropped silently by MiraDesign
-            # on an existing thread: check the recipients first.
-            for handle in spec.to:
-                try:
-                    response = await client.get(f"/actors/{handle}")
-                except httpx.HTTPError as exc:
-                    raise AskHumanFailed(f"MiraDesign unreachable: {exc}") from exc
-                if response.status_code == 404:
-                    raise AskHumanFailed(
-                        f"MiraDesign has no actor '{handle}'; the question was not filed "
-                        "(fix ask_human.to in the profile)")
-                if response.status_code >= 400:
-                    raise AskHumanFailed(
-                        f"MiraDesign refused ({response.status_code}): {response.text[:300]}")
-
-            key = "miragen-ask-" + hashlib.sha256("\x1f".join(
-                [agent, instance or "", hashlib.sha256(question.encode()).hexdigest()]).encode()
-            ).hexdigest()[:40]
-            thread_id = threads.get(key)
-            item = None
-            if work_item:
-                project, number = _work_item_ref(work_item, spec.project)
-                item = await call("GET", f"/projects/{project}/work-items/{number}")
-                thread_id = thread_id or item.get("thread_id")
-            else:
-                project = spec.project
-            if not thread_id:
-                body = {"subject": (subject or question.strip().splitlines()[0])[:120],
-                        "kind": "question", "participants": list(spec.to)}
-                target = item.get("id") if item is not None else None
-                if target:
-                    body |= {"target_type": "work_item", "target_id": target}
-                # The threads route takes no Idempotency-Key today (sent anyway,
-                # for when it does): reuse an open question thread with the same
-                # subject and target, so a retry after a lost reply (or a
-                # restart) does not open a second one.
-                for row in await call("GET", f"/projects/{project}/threads"):
-                    if (row.get("kind") == "question" and row.get("subject") == body["subject"]
-                            and row.get("target_id") == target):
-                        thread_id = row["id"]
-                        break
-                else:
-                    thread_id = (await call("POST", f"/projects/{project}/threads", json=body,
-                                            headers={"Idempotency-Key": key}))["id"]
-            threads[key] = thread_id
-            try:
-                message = await call(
-                    "POST", f"/threads/{thread_id}/messages",
-                    json={"kind": "question", "body": question, "mentions": list(spec.to),
-                          "meta": meta},
-                    headers={"Idempotency-Key": key})
-            except AskHumanFailed as exc:
-                if "(409)" not in str(exc):
-                    raise
-                # The same question from this instance, already filed by an
-                # earlier run: it is still the open question.
-                return (f"ok: this question was already filed in MiraDesign thread "
-                        f"{str(thread_id)[:8]}. Do not wait or poll; the answer arrives as a "
-                        "later turn.")
-        to = ", ".join("@" + h for h in spec.to)
-        return (f"ok: question {str(message.get('id', ''))[:8]} filed in MiraDesign thread "
-                f"{str(thread_id)[:8]} for {to}. Do not wait or poll for the answer: carry on "
-                "with work that does not depend on it, or end the turn. The answer arrives "
-                "as a later turn.")
+        _run_id, instance = current()
+        session_id = session_for(instance) if instance else None
+        if not session_id:
+            raise AskHumanFailed(
+                "this session has no MiraDesign session key yet; use the MiraDesign plugin's "
+                "`post` tool (kind=question, to=[...]) directly")
+        skey = f"claude-code:{session_id}"
+        memo = (skey, hashlib.sha256(question.encode()).hexdigest())
+        if memo in asked:
+            return asked[memo] + " (Already asked in this session; not posted again.)"
+        args: dict[str, Any] = {"session": skey, "body": question, "kind": "question",
+                                "to": list(spec.to), "project": spec.project}
+        if work_item:
+            project, number = _work_item_ref(work_item, spec.project)
+            args["work_item"] = f"{project}#{number}"
+        else:
+            args["subject"] = (subject or question.strip().splitlines()[0])[:120]
+        token = _token(spec, environ if environ is not None else dict(os.environ))
+        # X-Harness-Session: MiraDesign lets a live session named on the
+        # connection win over the argument; both say the same here.
+        headers = {"Authorization": f"Bearer {token}", "X-Harness-Session": skey}
+        kwargs: dict[str, Any] = {"headers": headers, "timeout": timeout_s}
+        if httpx_client_factory is not None:
+            kwargs["httpx_client_factory"] = httpx_client_factory
+        try:
+            async with streamablehttp_client(endpoint, **kwargs) as (read, write, _):
+                async with ClientSession(read, write) as mcp_session:
+                    await mcp_session.initialize()
+                    result = await mcp_session.call_tool("post", args)
+        except Exception as exc:  # transport, HTTP status, protocol
+            raise AskHumanFailed(f"MiraDesign MCP unreachable: {type(exc).__name__}: {exc}") from exc
+        text = "".join(getattr(block, "text", "") for block in result.content).strip()
+        if result.isError or not text.startswith("ok:"):
+            # A refusal is MiraDesign's answer (unknown recipient, no live
+            # session, …): surface it, nothing was filed.
+            raise AskHumanFailed(text or "MiraDesign returned no result")
+        if "Do not wait" not in text:
+            text += (" Do not wait or poll for the answer: carry on with work that does not "
+                     "depend on it, or end the turn. The answer arrives as a later turn.")
+        asked[memo] = text
+        return text
 
     return ask_human

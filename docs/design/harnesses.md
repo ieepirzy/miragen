@@ -257,10 +257,11 @@ spec:
       ca_bundle: /etc/ssl/certs/with-broker-ca.pem       # combined bundle, optional
     plugin_dirs: [/agent/plugins/miradesign, /agent/plugins/miragen-memory]
     env_passthrough: [MIRADESIGN_URL]   # non-secret plugin config only
+    miradesign_agent_per_instance: true   # default: actor agent:claude-code/<instance>
     ask_human:
       url: https://design.muutto365.fi
       project: miragen
-      token_file: /run/secrets/miradesign_token
+      token_file: /run/secrets/miradesign_mcp_token   # a MIRADESIGN_MCP_TOKENS entry
       to: [ilari]
 ```
 
@@ -394,40 +395,59 @@ towards refusing. Limits:
   hook. It has the subscription token, because the token is in its
   environment.
 
+**Per-instance MiraDesign identity.** With `miradesign_agent_per_instance`
+(default `true`), each instance's `claude` process gets
+`MIRADESIGN_AGENT=<instance name>`. The MiraDesign plugin's hook client reads
+that variable from its environment (`AGENT_ENV_VARS` in
+`plugins/miradesign/miradesign_hook/client.py`) on every event, starting with
+SessionStart. The daemon turns it into the actor key `agent:claude-code/<name>`
+(`miradesign.harness.identity.actor_key`; the name is slugged to
+`[a-z0-9._-]`, which instance names already are). So lane instance
+`miragen-engineer-1` is the durable actor `agent:claude-code/miragen-engineer-1`
+in every session it runs, which is the name MiraRun's lane supervisor maps
+instances by. The session key stays `claude-code:<session id>`.
+
+The variable is set by the harness, so `env_passthrough` refuses it and could
+never override it. One-off runs (no instance) keep the plugin's default
+per-session actor. `false` turns this off.
+
 **ask_human.** With `ask_human:` set, the gateway serves an `ask_human`
 runtime tool (`mcp__gw__ask_human`) with parameters `question`, `work_item`
-(`12`, `#12` or `project#12`) and `subject`. It files the same records the
-MiraDesign MCP `post(kind=question, to=[…])` makes, over REST:
-- **With a work item:** `GET /v1/projects/{p}/work-items/{n}`, then the
-  item's thread.
-- **Without one:** a new thread, `POST /v1/projects/{p}/threads {kind:
-  question, participants: to}`.
-- **Then the question:** `POST /v1/threads/{id}/messages {kind: question,
-  mentions: to, meta: {agent, instance, run_id, work_item}}`.
+(`12`, `#12` or `project#12`) and `subject`.
 
-Retries stay one question:
-- **The key.** `Idempotency-Key` is derived from (agent, instance, question
-  text), not the run or the thread. MiraDesign replays a retried message
-  instead of posting it twice.
-- **Earlier runs.** The same question from an earlier run is a 409, which is
-  reported as "already filed".
-- **Thread creation.** MiraDesign's threads route takes no
-  `Idempotency-Key` today (the tool sends one anyway). A retry reuses the
-  thread from the tool's in-process memo, or failing that, an open question
-  thread in the project with the same subject and target. A retry after a
-  lost reply or a restart therefore opens no second thread.
-- **Recipients.** Each `to` handle is checked first (`GET /v1/actors/{h}`):
-  MiraDesign silently drops a mention of an unknown handle on an existing
-  thread, so an unknown recipient fails the call with nothing filed.
+**It posts as the calling session.** It calls MiraDesign's MCP `post` tool,
+stateless streamable HTTP at `<url>/mcp/`, with:
+- `kind=question`, `to` from the profile, and `project`;
+- `work_item` normalized to `project#n`, or a `subject` (the question's
+  first line) for a new thread;
+- `session=claude-code:<the instance's current Claude Code session id>`,
+  which the harness knows from the live process or `miragen-instances.json`.
 
-The tool returns at once and tells the model not to wait. MiraDesign pushes
-the question to the person's attention queue (ADR-030). The answer is posted
-in the thread, and the supervisor delivers it to the session as a later turn.
-The bearer (`token_env` from miragen's own environment, or `token_file`) is
-per container, so every instance posts as the lane's actor. `meta` is what
-tells the supervisor which instance asked. The executor tier's `ask_human`
-(`/mcp/ask-human`, the intervention sentinel) is a different tool on a
-different mount.
+The same key goes in `X-Harness-Session`, which MiraDesign lets win over the
+argument when it names a live session. The question is therefore the
+session's own plugin actor's, and the answer comes back to that session as
+`ANSWER … to your question`.
+
+The bearer (`token_env` or `token_file`) is a MiraDesign MCP bearer, a
+`MIRADESIGN_MCP_TOKENS` entry. An MCP bearer keeps MiraDesign's session-key
+rules: the session decides the actor, not the token.
+
+**Failures:**
+- **No session yet:** if the instance has no session id, the call fails and
+  tells the agent to use the plugin's `post` tool directly.
+- **Refusals:** a `refused:` answer (an unknown recipient, no live session)
+  is a tool error, and nothing was filed.
+- **Waiting:** an `ok:` answer is returned as is. MiraDesign's own reply
+  already says not to wait; the tool adds that if it is missing.
+
+**Idempotency.** `post` takes no idempotency key. The tool dedupes locally on
+(session key, sha256(question)): the same question again in the same session
+returns the first answer without posting. A new session (rotation, restart)
+may ask it again. Remaining retry risk: if the reply to a successful post is
+lost and the tool's process then restarts, the question is asked twice.
+
+The executor tier's `ask_human` (`/mcp/ask-human`, the intervention sentinel)
+is a different tool on a different mount.
 
 **Isolation between instances: the container is the only boundary.** All
 instances of a lane run as one uid in one container, so an instance can
