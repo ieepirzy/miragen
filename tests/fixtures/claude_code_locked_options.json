@@ -1,0 +1,122 @@
+{
+ "plain": {
+  "argv": [
+   "<root>/home/miragen-claude",
+   "--output-format",
+   "stream-json",
+   "--verbose",
+   "--system-prompt",
+   "You are Mira.",
+   "--tools",
+   "",
+   "--model",
+   "sonnet",
+   "--permission-mode",
+   "default",
+   "--session-id=00000000-0000-0000-0000-000000000000",
+   "--mcp-config",
+   "{\"mcpServers\": {\"gw\": {\"type\": \"http\", \"url\": \"http://127.0.0.1:9/mcp/gateway/\", \"headers\": {\"Authorization\": \"Bearer ${MIRAGEN_GATEWAY_TOKEN}\"}}}}",
+   "--strict-mcp-config",
+   "--setting-sources=",
+   "--input-format",
+   "stream-json"
+  ],
+  "can_use_tool": true,
+  "cwd": "<root>/work/chat",
+  "env": {
+   "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+   "CLAUDE_CODE_OAUTH_TOKEN": "sk-sub",
+   "CLAUDE_CONFIG_DIR": "<root>/home",
+   "DISABLE_AUTOUPDATER": "1",
+   "ENABLE_TOOL_SEARCH": "false",
+   "HOME": "<root>/home/home",
+   "MIRAGEN_ENV_KEEP": "PATH LANG HOME CLAUDE_CONFIG_DIR MIRAGEN_GATEWAY_TOKEN MIRAGEN_WORKER ENABLE_TOOL_SEARCH DISABLE_AUTOUPDATER CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SDK_READS_SESSION_STATE PWD",
+   "MIRAGEN_GATEWAY_TOKEN": "<gateway-token>",
+   "MIRAGEN_WORKER": "1"
+  },
+  "hooks": {
+   "PreCompact": [
+    {
+     "hooks": 1,
+     "matcher": null
+    }
+   ]
+  },
+  "options": {
+   "add_dirs": [],
+   "allowed_tools": [],
+   "disallowed_tools": [],
+   "plugins": [],
+   "setting_sources": [],
+   "skills": [],
+   "strict_mcp_config": true,
+   "system_prompt": "You are Mira.",
+   "tools": [],
+   "verbatim_prompts": true
+  },
+  "permission_mode": "default",
+  "wrapper": "#!<python>\nimport os, sys\nkeep = set(os.environ.get('MIRAGEN_ENV_KEEP', '').split())\nenv = {k: v for k, v in os.environ.items()\n       if k in keep or k.startswith('CLAUDE_AGENT_SDK_')}\nos.execve('/usr/bin/env', ['/usr/bin/env', *sys.argv[1:]], env)\n"
+ },
+ "web_and_gated": {
+  "argv": [
+   "<root>/home/miragen-claude",
+   "--output-format",
+   "stream-json",
+   "--verbose",
+   "--system-prompt",
+   "You are Mira.",
+   "--tools",
+   "WebFetch,WebSearch",
+   "--model",
+   "sonnet",
+   "--permission-mode",
+   "default",
+   "--session-id=00000000-0000-0000-0000-000000000000",
+   "--mcp-config",
+   "{\"mcpServers\": {\"gw\": {\"type\": \"http\", \"url\": \"http://127.0.0.1:9/mcp/gateway/\", \"headers\": {\"Authorization\": \"Bearer ${MIRAGEN_GATEWAY_TOKEN}\"}}}}",
+   "--strict-mcp-config",
+   "--setting-sources=",
+   "--input-format",
+   "stream-json"
+  ],
+  "can_use_tool": true,
+  "cwd": "<root>/work/chat",
+  "env": {
+   "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+   "CLAUDE_CODE_OAUTH_TOKEN": "sk-sub",
+   "CLAUDE_CONFIG_DIR": "<root>/home",
+   "DISABLE_AUTOUPDATER": "1",
+   "ENABLE_TOOL_SEARCH": "false",
+   "HOME": "<root>/home/home",
+   "MCP_TOOL_TIMEOUT": "420000",
+   "MIRAGEN_ENV_KEEP": "PATH LANG HOME CLAUDE_CONFIG_DIR MIRAGEN_GATEWAY_TOKEN MIRAGEN_WORKER ENABLE_TOOL_SEARCH DISABLE_AUTOUPDATER CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC MCP_TOOL_TIMEOUT CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SDK_READS_SESSION_STATE PWD",
+   "MIRAGEN_GATEWAY_TOKEN": "<gateway-token>",
+   "MIRAGEN_WORKER": "1"
+  },
+  "hooks": {
+   "PreCompact": [
+    {
+     "hooks": 1,
+     "matcher": null
+    }
+   ]
+  },
+  "options": {
+   "add_dirs": [],
+   "allowed_tools": [],
+   "disallowed_tools": [],
+   "plugins": [],
+   "setting_sources": [],
+   "skills": [],
+   "strict_mcp_config": true,
+   "system_prompt": "You are Mira.",
+   "tools": [
+    "WebFetch",
+    "WebSearch"
+   ],
+   "verbatim_prompts": true
+  },
+  "permission_mode": "default",
+  "wrapper": "#!<python>\nimport os, sys\nkeep = set(os.environ.get('MIRAGEN_ENV_KEEP', '').split())\nenv = {k: v for k, v in os.environ.items()\n       if k in keep or k.startswith('CLAUDE_AGENT_SDK_')}\nos.execve('/usr/bin/env', ['/usr/bin/env', *sys.argv[1:]], env)\n"
+ }
+}
