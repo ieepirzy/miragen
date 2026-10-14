@@ -467,8 +467,8 @@ limits:
 
 At least one of `tokens_per_run` / `tokens_per_day` must be set — an empty `limits: {}` block fails `miragen validate` as dead config.
 
-- **`tokens_per_run`** wires straight into PydanticAI's `UsageLimits(total_tokens_limit=...)`. Exceeding it ends the run with PydanticAI's own usage-limit error; the [run record](#run-records) is written with `status: failed` and that error as `error`.
-- **`tokens_per_day`** is a rolling UTC-day sum of `input_tokens + output_tokens` across this agent's run records (a run with no recorded usage — e.g. one that failed before the model responded — counts as 0, not unbounded). Checked before every run starts:
+- **`tokens_per_run`** caps a run's budget tokens (fresh input + output + cache reads at a tenth), checked by the executors and the in-flight reserve; the model tier also wires it into PydanticAI's `UsageLimits(total_tokens_limit=...)`, whose total counts cache reads in full. Exceeding it ends the run with PydanticAI's own usage-limit error; the [run record](#run-records) is written with `status: failed` and that error as `error`.
+- **`tokens_per_day`** is a rolling UTC-day sum of budget tokens (fresh input + output + cache reads at a tenth) across this agent's run records (a run with no recorded usage — e.g. one that failed before the model responded — counts as 0, not unbounded). Checked before every run starts:
   - A cron/interval/startup run over budget is **skipped**, with a log line. If `on_exceeded: notify`, the `on_complete.notify` handler fires with a budget-exceeded message (not `log_to` or `post_to` — there's no run output to log).
   - `POST /run` and `POST /run/async` return `429` with the used/limit counts and the UTC reset time in the message.
   - The budget resets at UTC midnight — yesterday's records never count against today.

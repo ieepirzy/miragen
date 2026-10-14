@@ -123,11 +123,11 @@ def _add_optional(a: Optional[int], b: Optional[int]) -> Optional[int]:
     return (a or 0) + (b or 0)
 
 
-# Cache reads count at a tenth of a fresh input token. On every model a
-# profile can name today a cache read is billed at a tenth of fresh input or
-# less (down to about a fiftieth), so the weight never undercounts reads. It
-# is a fixed budget weight, not a rate table: what runs cost stays with the
-# control plane.
+# Cache reads count at a tenth of a fresh input token. This is a budget
+# heuristic, not a bound on what reads are billed: providers bill cache reads
+# at anywhere from about a fiftieth to half of fresh input, depending on the
+# model. A tenth matches the most common rate. It is a fixed weight, not a
+# rate table: what runs cost stays with the control plane.
 CACHE_READ_BUDGET_DIVISOR = 10
 
 
@@ -883,7 +883,10 @@ class Limits(_ProfileModel):
     tokens_per_day: Optional[int] = Field(
         default=None,
         ge=1,
-        description="Rolling UTC-day token cap across this agent's run records, enforced by miragen.",
+        description=(
+            "Rolling UTC-day token cap across this agent's run records, enforced by miragen. "
+            "Counts budget_tokens (fresh input + output + cache reads at a tenth)."
+        ),
     )
     on_exceeded: Literal["skip", "notify"] = Field(
         default="skip",

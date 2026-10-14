@@ -25,7 +25,8 @@ def test_cache_writes_count_as_fresh_input():
 def test_unknown_usage_is_zero_and_counts_never_go_negative():
     assert budget_tokens(None) == 0
     assert budget_tokens(RunUsage(requests=1)) == 0
-    # Reads above input (normalised away on load) still count at a tenth.
+    # Reads above input (stored rows are normalised on load; live usage is
+    # not) still count at a tenth.
     assert budget_tokens(RunUsage(requests=1, input_tokens=10, cached_input_tokens=50)) == 5
 
 
