@@ -1,14 +1,19 @@
-"""Budgets count fresh input and output; cache reads don't use them up."""
+"""Budgets count fresh input and output in full and cache reads at a tenth."""
 
 from datetime import datetime, timezone
 
 from miragen.models import RunUsage, budget_tokens
 
 
-def test_cache_reads_are_left_out_of_budget_tokens():
-    # A cache-heavy turn: 100 fresh, 900 reused from cache, 50 out.
+def test_cache_reads_count_at_a_tenth():
+    # A cache-heavy turn: 100 fresh, 900 reused from cache (90), 50 out.
     usage = RunUsage(requests=1, input_tokens=1000, cached_input_tokens=900, output_tokens=50)
-    assert budget_tokens(usage) == 150
+    assert budget_tokens(usage) == 240
+
+
+def test_a_partial_tenth_of_cache_reads_rounds_up():
+    assert budget_tokens(RunUsage(requests=1, input_tokens=1, cached_input_tokens=1)) == 1
+    assert budget_tokens(RunUsage(requests=1, input_tokens=11, cached_input_tokens=11)) == 2
 
 
 def test_cache_writes_count_as_fresh_input():
@@ -20,7 +25,8 @@ def test_cache_writes_count_as_fresh_input():
 def test_unknown_usage_is_zero_and_counts_never_go_negative():
     assert budget_tokens(None) == 0
     assert budget_tokens(RunUsage(requests=1)) == 0
-    assert budget_tokens(RunUsage(requests=1, input_tokens=10, cached_input_tokens=50)) == 0
+    # Reads above input (normalised away on load) still count at a tenth.
+    assert budget_tokens(RunUsage(requests=1, input_tokens=10, cached_input_tokens=50)) == 5
 
 
 def test_daily_budget_sums_budget_tokens(tmp_path):
@@ -30,7 +36,7 @@ def test_daily_budget_sums_budget_tokens(tmp_path):
     record = store.start(agent_name="a", trigger="http", prompt="p")
     store.finish(record, status="succeeded", usage=RunUsage(
         requests=2, input_tokens=1000, cached_input_tokens=900, output_tokens=50))
-    assert tokens_used_since(store, datetime(2000, 1, 1, tzinfo=timezone.utc)) == 150
+    assert tokens_used_since(store, datetime(2000, 1, 1, tzinfo=timezone.utc)) == 240
 
 
 def _stored(usage: dict, **record) -> "RunRecord":
@@ -79,8 +85,8 @@ def test_a_resumed_run_over_a_legacy_record_keeps_its_fresh_input_in_the_budget(
                       "output_tokens": 500}, executor="claude-code").usage
     resumed = RunUsage(requests=1, input_tokens=60000, cached_input_tokens=55000,
                        output_tokens=1000)
-    # fresh: 1000 (legacy) + 5000 (new) input, 1500 output
-    assert budget_tokens(sum_usage(legacy, resumed)) == 7500
+    # fresh: 1000 (legacy) + 5000 (new) input, 1500 output; reads 105000 / 10
+    assert budget_tokens(sum_usage(legacy, resumed)) == 18000
 
 
 def test_sum_usage_keeps_a_reported_zero():

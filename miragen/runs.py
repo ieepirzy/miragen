@@ -307,7 +307,7 @@ class RunStore:
 def tokens_used_since(store: RunStore, since: datetime) -> int:
     """
     Sum budget tokens (models.budget_tokens: fresh input + output, cache
-    reads excluded) across `store`'s run records with started_at >= since.
+    reads at a tenth) across `store`'s run records with started_at >= since.
 
     Records with no usage (e.g. a run that failed before the model responded,
     or a fresh `running` record that hasn't finished a turn yet) contribute 0

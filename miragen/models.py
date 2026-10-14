@@ -123,16 +123,27 @@ def _add_optional(a: Optional[int], b: Optional[int]) -> Optional[int]:
     return (a or 0) + (b or 0)
 
 
+# Cache reads count at a tenth of a fresh input token. On every model a
+# profile can name today a cache read is billed at a tenth of fresh input or
+# less (down to about a fiftieth), so the weight never undercounts reads. It
+# is a fixed budget weight, not a rate table: what runs cost stays with the
+# control plane.
+CACHE_READ_BUDGET_DIVISOR = 10
+
+
 def budget_tokens(usage: Optional[RunUsage]) -> int:
     """Tokens a run spends against `limits.tokens_per_run` and the daily
-    budget: fresh input (uncached input and cache writes) plus output. Cache
-    reads are left out. They cost about a tenth of fresh input, and counting
-    them would make a long cached session exhaust its budget on reuse alone
-    (input_tokens includes them since the inclusive convention)."""
+    budget: fresh input (uncached input and cache writes), plus output, plus
+    cache reads at a tenth (rounded up). Counting reads in full would make a
+    long cached session exhaust its budget on reuse alone; leaving them out
+    would let a loop re-reading a large context run nearly free of budget
+    (input_tokens includes reads since the inclusive convention)."""
     if usage is None:
         return 0
-    fresh_input = max((usage.input_tokens or 0) - (usage.cached_input_tokens or 0), 0)
-    return fresh_input + (usage.output_tokens or 0)
+    cached = max(usage.cached_input_tokens or 0, 0)
+    fresh_input = max((usage.input_tokens or 0) - cached, 0)
+    cache_reads = -(-cached // CACHE_READ_BUDGET_DIVISOR)
+    return fresh_input + cache_reads + (usage.output_tokens or 0)
 
 
 # Adapters whose stored input_tokens excluded cache reads before the
@@ -865,7 +876,7 @@ class Limits(_ProfileModel):
         ge=1,
         description=(
             "Per-run token cap. Executors and the in-flight reserve count budget_tokens "
-            "(fresh input + output, cache reads excluded); the model tier also hands it to "
+            "(fresh input + output + cache reads at a tenth); the model tier also hands it to "
             "PydanticAI as UsageLimits.total_tokens_limit, whose total includes cache reads."
         ),
     )
