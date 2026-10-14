@@ -62,8 +62,10 @@ from miragen.models import (
     RunRecord,
     RunSummary,
     StartupTrigger as ProfileStartupTrigger,
+    budget_model,
     sum_usage,
 )
+from miragen import model_rates
 from miragen.publication import (
     PublicationConfigError,
     PublicationError,
@@ -950,9 +952,11 @@ def _daily_budget_status() -> tuple[int, int] | None:
         return None
     midnight_utc = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     limit = _profile.limits.tokens_per_day
-    used = tokens_used_since(_run_store, midnight_utc)
+    model = budget_model(_profile)
+    used = tokens_used_since(_run_store, midnight_utc, model)
     still_remaining = limit - used
-    used += reserved_tokens_in_flight(_run_store, midnight_utc, _profile.limits.tokens_per_run, still_remaining)
+    used += reserved_tokens_in_flight(
+        _run_store, midnight_utc, _profile.limits.tokens_per_run, still_remaining, model)
     return used, limit
 
 
@@ -1307,6 +1311,18 @@ async def lifespan(app: FastAPI):
     if interrupted:
         logger.warning(f"Marked {interrupted} stale 'running' record(s) as interrupted")
 
+    # Model rates weight cache tokens in budgets (miragen/model_rates.py).
+    # A subdirectory: the runs root itself holds only run records.
+    rates_source = model_rates.source_from_env(os.environ, _run_store.root / "model-rates")
+    model_rates.configure(rates_source)
+    if isinstance(rates_source, model_rates.HttpRatesSource):
+        rates_source.start()
+        logger.info(f"Model rates from {rates_source.url}, refreshed every {rates_source.refresh_s:.0f}s")
+    elif rates_source is not None:
+        logger.info("Model rates from a local file")
+    else:
+        logger.info("No model rates source configured: cache reads count in full in budgets")
+
     # The schedule store exists before the agent is built: the scheduling
     # tools close over it (and managed-schedule registration reuses it
     # further down, unchanged).
@@ -1468,6 +1484,9 @@ async def lifespan(app: FastAPI):
 
     _scheduler.shutdown(wait=False)
     logger.info("Scheduler stopped")
+    if isinstance(rates_source, model_rates.HttpRatesSource):
+        rates_source.stop()
+    model_rates.configure(None)
     if _harness is not None:
         # Long-lived harnesses hold processes (e.g. one grok agent per
         # instance); stop them with the container.

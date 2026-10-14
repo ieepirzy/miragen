@@ -195,10 +195,24 @@ async def test_resumed_run_accumulates_telemetry(tmp_path):
 
 
 def test_no_pricing_tables_in_miragen():
-    """Phase E guardrail: cost/pricing stays a control-plane concern."""
+    """Phase E guardrail: cost stays a control-plane concern. MiraGen holds no
+    rates of its own: budget weights read per-model rates only from the
+    configured source (miragen/model_rates.py), so no source file may carry
+    a rate table or a hardcoded rate."""
     import pathlib
+    import re
     source = "".join(
         p.read_text() for p in pathlib.Path("miragen").rglob("*.py")
-    )
-    assert "price" not in source.lower()
-    assert "cost_per" not in source.lower()
+    ).lower()
+    assert "price" not in source
+    assert "cost_per" not in source
+    assert "per_million" not in source
+    # A rate key next to a numeric literal: `"cached_input": "0.1"`,
+    # `cache_write=1.25`, `input_rate = 3`.
+    rate_literal = re.compile(
+        r"""\b["']?(input|cached_input|cache_write|cache_write_1h|output)(_rate)?["']?"""
+        r"""\s*[:=]\s*["']?\d""")
+    assert not rate_literal.search(source), rate_literal.search(source)
+    # A literal fractional weight for cache tokens, the shape a fixed
+    # cache-read discount takes.
+    assert not re.search(r"cache\w*\s*[:=]\s*(fraction|decimal)\(\s*[\"']?\d", source)

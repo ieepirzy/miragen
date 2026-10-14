@@ -287,6 +287,34 @@ async def test_budget_exhaustion_persists_across_resume(tmp_path):
     assert result2.exit_reason == "budget"
 
 
+def _cache_heavy_events():
+    events = default_events()
+    events[-1] = {"type": "turn.completed", "usage": {
+        "input_tokens": 1000, "cached_input_tokens": 900, "output_tokens": 50}}
+    return events
+
+
+async def test_budget_counts_cache_reads_in_full_without_rates(tmp_path):
+    profile = _executor_profile(limits={"tokens_per_run": 500})
+    profile.executor.model = "gpt-x"
+    result = await make_executor(profile, tmp_path, events=_cache_heavy_events()).run_job(
+        "task", "run-rates-none")
+    assert result.status == "suspended" and result.exit_reason == "budget"  # 1050 > 500
+
+
+async def test_budget_weighs_cache_reads_by_the_models_rates(tmp_path):
+    from miragen import model_rates
+    from miragen.model_rates import StaticRatesSource, parse_rates_document
+
+    model_rates.configure(StaticRatesSource(parse_rates_document({"models": {
+        "codex:gpt-x": {"input": "1.00", "cached_input": "0.10", "output": "4.00"}}})))
+    profile = _executor_profile(limits={"tokens_per_run": 500})
+    profile.executor.model = "gpt-x"
+    result = await make_executor(profile, tmp_path, events=_cache_heavy_events()).run_job(
+        "task", "run-rates-known")
+    assert result.status == "succeeded"  # 100 + 90 + 50 = 240 <= 500
+
+
 async def test_events_are_persisted_jsonl(tmp_path):
     executor = make_executor(_executor_profile(), tmp_path)
     await executor.run_job("task", "run5")

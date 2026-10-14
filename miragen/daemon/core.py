@@ -50,6 +50,9 @@ from miragen.agent_type import (
     is_code_path,
 )
 from miragen.load import load_profile
+from miragen.model_rates import REFRESH_ENV as RATES_REFRESH_ENV
+from miragen.model_rates import TOKEN_ENV as RATES_TOKEN_ENV
+from miragen.model_rates import URL_ENV as RATES_URL_ENV
 from miragen.profile_contract import (
     PROFILE_CONTRACTS_LABEL,
     parse_contracts_label,
@@ -947,6 +950,12 @@ class LifecycleCore:
         # a profile against this daemon's values, and the container's own load must see
         # the same one or a profile validated here fails closed at boot.
         for key in (ALLOWED_PROVIDERS_ENV, ALLOWED_HOSTS_ENV):
+            if self._environ.get(key):
+                env[key] = self._environ[key]
+        # The model rates source budgets weight cache tokens by
+        # (miragen/model_rates.py): one catalogue for every managed agent.
+        # A local rates file is a path on this host, so it is not forwarded.
+        for key in (RATES_URL_ENV, RATES_TOKEN_ENV, RATES_REFRESH_ENV):
             if self._environ.get(key):
                 env[key] = self._environ[key]
         # Operator-named passthrough for credentials the suffix filter above

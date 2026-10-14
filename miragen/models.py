@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime
 from typing import Annotated, Any, Literal, Optional, Union
 
 from apscheduler.triggers.cron import CronTrigger as _APCronTrigger
 
+from miragen import model_rates
 from miragen.profile_contract import format_api_version, parse_api_version
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
@@ -123,27 +125,92 @@ def _add_optional(a: Optional[int], b: Optional[int]) -> Optional[int]:
     return (a or 0) + (b or 0)
 
 
-# Cache reads count at a tenth of a fresh input token. This is a budget
-# heuristic, not a bound on what reads are billed: providers bill cache reads
-# at anywhere from about a fiftieth to half of fresh input, depending on the
-# model. A tenth matches the most common rate. It is a fixed weight, not a
-# rate table: what runs cost stays with the control plane.
-CACHE_READ_BUDGET_DIVISOR = 10
+class _Unset:
+    pass
 
 
-def budget_tokens(usage: Optional[RunUsage]) -> int:
+_UNSET: Any = _Unset()
+
+
+def _call_slices(usage: RunUsage) -> list[tuple[Optional[str], int, int, Optional[int]]]:
+    """(model, cache reads, cache writes, 1h writes or None if the split is
+    unknown) per weighting slice: one per reported call, then the remainder
+    of the run's totals that the calls don't account for (all of it when
+    there is no breakdown, the rest when `calls` was truncated), under the
+    run's model (None)."""
+    calls = usage.calls or []
+    slices: list[tuple[Optional[str], int, int, Optional[int]]] = []
+    for call in calls:
+        reads = max(call.cached_input_tokens or 0, 0)
+        writes = max(call.cache_write_tokens or 0, 0)
+        one_hour = None if call.cache_write_1h_tokens is None else max(call.cache_write_1h_tokens, 0)
+        slices.append((call.model, reads, writes, one_hour))
+    reads_rest = max(max(usage.cached_input_tokens or 0, 0) - sum(s[1] for s in slices), 0)
+    writes_rest = max(max(usage.cache_write_tokens or 0, 0) - sum(s[2] for s in slices), 0)
+    split_known = usage.cache_write_1h_tokens is not None and all(
+        s[3] is not None or not s[2] for s in slices)
+    one_hour_rest = (
+        max(usage.cache_write_1h_tokens - sum(s[3] or 0 for s in slices), 0)  # type: ignore[operator]
+        if split_known else None
+    )
+    if reads_rest or writes_rest:
+        slices.append((None, reads_rest, writes_rest, one_hour_rest))
+    return slices
+
+
+def budget_tokens(
+    usage: Optional[RunUsage], model: Optional[str] = None, *, rates: Any = _UNSET
+) -> int:
     """Tokens a run spends against `limits.tokens_per_run` and the daily
-    budget: fresh input (uncached input and cache writes), plus output, plus
-    cache reads at a tenth (rounded up). Counting reads in full would make a
-    long cached session exhaust its budget on reuse alone; leaving them out
-    would let a loop re-reading a large context run nearly free of budget
-    (input_tokens includes reads since the inclusive convention)."""
+    budget.
+
+    Uncached input and output count 1:1. Cache reads count at the model's
+    `cached_input / input` rate ratio, cache writes at `cache_write / input`
+    (5-minute) and `cache_write_1h / input` (1-hour), with the rates read
+    from the configured source (miragen/model_rates.py). Each reported call
+    (`usage.calls`) is weighted by its own model; usage the calls don't
+    account for is weighted by `model`, the run's model (the profile's
+    spec.model). Each slice rounds up.
+
+    Never undercounts: with no rates source, an unlisted model, or a model
+    rated at zero (subscription harnesses), cache reads and writes count in
+    full. A write whose rate is absent counts 1:1. `rates` overrides the
+    configured source's table (None = no source).
+    """
     if usage is None:
         return 0
-    cached = max(usage.cached_input_tokens or 0, 0)
-    fresh_input = max((usage.input_tokens or 0) - cached, 0)
-    cache_reads = -(-cached // CACHE_READ_BUDGET_DIVISOR)
-    return fresh_input + cache_reads + (usage.output_tokens or 0)
+    table = model_rates.current_table() if rates is _UNSET else rates
+    slices = _call_slices(usage)
+    reads_total = sum(s[1] for s in slices)
+    writes_total = sum(s[2] for s in slices)
+    uncached = max((usage.input_tokens or 0) - reads_total - writes_total, 0)
+    total = uncached + max(usage.output_tokens or 0, 0)
+    for call_model, reads, writes, one_hour in slices:
+        if not reads and not writes:
+            continue
+        weights = model_rates.budget_weights(table, call_model, model)
+        if one_hour is None:
+            # Split unknown: every write at the dearer of the two weights.
+            weighted_writes = writes * max(weights.cache_write, weights.cache_write_1h)
+        else:
+            one_hour = min(one_hour, writes)
+            weighted_writes = ((writes - one_hour) * weights.cache_write
+                               + one_hour * weights.cache_write_1h)
+        total += math.ceil(reads * weights.cache_read + weighted_writes)
+    return total
+
+
+def budget_model(profile: Any) -> Optional[str]:
+    """The model a profile's runs are weighted by when usage has no per-call
+    model: spec.model, or `<executor>:<executor.model>` on the executor tier
+    (None when the executor picks its own default)."""
+    spec = getattr(profile, "spec", None)
+    if spec is not None and getattr(spec, "model", None):
+        return spec.model
+    executor = getattr(profile, "executor", None)
+    if executor is not None and getattr(executor, "model", None):
+        return f"{executor.executor}:{executor.model}"
+    return None
 
 
 # Adapters whose stored input_tokens excluded cache reads before the
@@ -875,9 +942,11 @@ class Limits(_ProfileModel):
         default=None,
         ge=1,
         description=(
-            "Per-run token cap. Executors and the in-flight reserve count budget_tokens "
-            "(fresh input + output + cache reads at a tenth); the model tier also hands it to "
-            "PydanticAI as UsageLimits.total_tokens_limit, whose total includes cache reads."
+            "Per-run token cap. Executors and the in-flight reserve count budget_tokens: "
+            "uncached input + output 1:1, cache reads and writes weighted by the model's "
+            "rates from the configured rates source (in full without one); the model tier "
+            "also hands it to PydanticAI as UsageLimits.total_tokens_limit, whose total "
+            "counts cache reads in full."
         ),
     )
     tokens_per_day: Optional[int] = Field(
@@ -885,7 +954,9 @@ class Limits(_ProfileModel):
         ge=1,
         description=(
             "Rolling UTC-day token cap across this agent's run records, enforced by miragen. "
-            "Counts budget_tokens (fresh input + output + cache reads at a tenth)."
+            "Counts budget_tokens: uncached input + output 1:1, cache reads and writes "
+            "weighted by the model's rates from the configured rates source (in full "
+            "without one)."
         ),
     )
     on_exceeded: Literal["skip", "notify"] = Field(
