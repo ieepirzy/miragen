@@ -241,15 +241,53 @@ pinned by `tests/test_model_pin_profile.py`). The harness sets no fallback
 model, so an unavailable model fails the turn instead of switching.
 
 Subagents (engineer posture only; the locked posture has no Agent tool) run in
-the same process. Observed live on CLI 2.1.299 (the version claude-agent-sdk
-0.2.166 bundles), parent `--model claude-opus-4-8`: a `general-purpose`
-subagent, an `Explore` subagent and a `general-purpose` subagent called with
-`model: "opus"` all ran `claude-opus-4-8`. That is CLI behaviour, not a
-miragen guarantee. Two things the profile cannot stop override it:
-- an agent definition (from a plugin or the user settings) with its own `model:`;
-- `CLAUDE_CODE_SUBAGENT_MODEL` or `ANTHROPIC_DEFAULT_OPUS_MODEL` in the
-  deployment-written `<claude_home>/settings.json` `env`. `env_passthrough`
-  refuses `CLAUDE_*`/`ANTHROPIC_*`, so a profile cannot set these.
+the same process. Which model they run is `spec.harness.subagent_model`:
+
+- **`inherit`** (default). miragen sets nothing; Claude Code resolves it.
+  Existing lanes launch exactly as before. Observed live on CLI 2.1.299 (the
+  version claude-agent-sdk 0.2.166 bundles), parent `--model claude-opus-4-8`:
+  - a `general-purpose` and an `Explore` subagent ran `claude-opus-4-8`;
+  - an Agent call with `model: "opus"` ran `claude-opus-4-8` (same family as
+    the parent);
+  - an Agent call with `model: "sonnet"` ran `claude-sonnet-5-5`.
+
+  So the session's model holds unless an Agent call or an agent definition
+  names another family. That is CLI behaviour, not a miragen guarantee.
+- **`pin`**. The claude child gets `CLAUDE_CODE_SUBAGENT_MODEL=<spec.model's
+  id>` and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`. The variable alone is not
+  enough: the call with `model: "sonnet"` still ran `claude-sonnet-5-5` with
+  only `CLAUDE_CODE_SUBAGENT_MODEL` set. With FORCE as well it ran
+  `claude-opus-4-8` (both observed on CLI 2.1.299). The CLI also drops an agent
+  definition's own `model:` under FORCE (read from the 2.1.299 bundle, not
+  observed).
+
+  `pin` is refused under `posture: locked`, with `claude-code:` alone (no id
+  to pin) and with `subagent_depth: 0`, since all three would be dead config.
+
+  Points to weigh before pinning:
+  - **Cost.** `pin` covers every subagent, not just the ones you write. That
+    includes `Explore` and any agent a plugin ships, which would otherwise run
+    a cheaper model of their own choosing. All of them run on the pinned
+    model, so usage goes up.
+  - **Aliases.** The pin is whatever `spec.model` names. With an alias such as
+    `claude-code:opus`, `pin` follows whatever that alias resolves to at
+    launch, so it moves when Claude Code's newest Opus changes. To stay on
+    one model, use a full id.
+  - **Untested.** A child `claude -p` that a hook or a plugin starts inherits
+    the environment, but whether it honours
+    `CLAUDE_CODE_SUBAGENT_MODEL` or its own `--model` is untested.
+  - **Contract.** `pin` implies profile contract 5, so miragend never places
+    a pinned profile on an image that can't read the key. The default
+    `inherit` is left out of serialized profiles, so a profile that doesn't
+    pin still runs on a v4 image.
+
+`env_passthrough` refuses `CLAUDE_*`/`ANTHROPIC_*`, so `subagent_model` is the
+only profile-side control. A deployment-written `<claude_home>/settings.json`
+`env` can still set these variables or `ANTHROPIC_DEFAULT_OPUS_MODEL`. Its
+precedence over the child environment is untested.
+
+Profiles that actually run live in the deployment repo, not in this public
+repository. The example here only illustrates the setting.
 
 The executor tier (`executor: {executor: claude-code, model: claude-opus-4-8}`) pins
 separately: `ExecutorSpec.model` goes to the SDK's `model` option the same way.

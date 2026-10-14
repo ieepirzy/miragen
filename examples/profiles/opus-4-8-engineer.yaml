@@ -5,10 +5,11 @@
 # passes it to the CLI as `--model claude-opus-4-8` (docs/design/harnesses.md,
 # "Pinning a model").
 #
-# This is an example. A deployable copy, with the real broker host and secret
-# file paths, belongs in the deployment, not in this public repository. No
-# secret goes in this file: credentials are file paths under /run/secrets and
-# the subscription token is CLAUDE_CODE_OAUTH_TOKEN in the container env.
+# This is an example. Profiles that actually run live in the deployment repo,
+# not in this public repository. No secret goes in this file: credentials are
+# file paths under /run/secrets and the subscription token is
+# CLAUDE_CODE_OAUTH_TOKEN in the container env. subagent_model: pin requires
+# profile contract 5.
 name: lane-opus-4-8
 mode: hybrid
 triggers:
@@ -20,7 +21,8 @@ spec:
     requests for review; never merge or deploy.
   harness:
     posture: engineer
-    subagent_depth: 1                    # subagents inherit the pinned model (observed, CLI 2.1.299)
+    subagent_depth: 1
+    subagent_model: pin                  # every subagent runs claude-opus-4-8, whatever an Agent call asks
     repositories:
       - url: https://gh-broker.internal:8443/ieepirzy/tyyni.git
     git_broker:
