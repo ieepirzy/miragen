@@ -1008,11 +1008,20 @@ class LifecycleCore:
         return self.workspace / ".miragend" / "profiles" / f"{name}.yaml"
 
     def _save_last_good(self, name: str, text: str) -> None:
+        """Best effort: the agent has already booted on `text`, so a full
+        disk must not fail (or tear down) the operation that succeeded.
+        Without a fresh copy a later rollback restores an older profile
+        text, but never wider credentials: it re-applies the previous unit
+        verbatim."""
         path = self._last_good_path(name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(text)
-        os.replace(tmp, path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(text)
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.warning(
+                "agent '%s': could not save its last-known-good profile (%s)", name, exc)
 
     def _last_good(self, name: str) -> str | None:
         try:

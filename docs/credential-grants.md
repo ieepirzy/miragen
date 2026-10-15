@@ -71,6 +71,10 @@ metered billing. So for these two executors:
   `MIRAGEND_AGENT_ENV_PASSTHROUGH` or a hand-run container.
 - The codex executor calls `login_api_key` only with a granted key
   (`CODEX_API_KEY` first, then `OPENAI_API_KEY`).
+- A `${ANTHROPIC_API_KEY}` reference without a default (or `${CODEX_API_KEY}`,
+  `${OPENAI_API_KEY}` for codex) therefore fails to load in the container
+  unless the key is granted. The first boot fails and the create or update
+  rolls back, so the error is visible right away.
 
 The grant is all or nothing per key. A claude-code agent with an
 `anthropic:` memory model needs `credentials: [ANTHROPIC_API_KEY]` for that

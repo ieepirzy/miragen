@@ -706,3 +706,23 @@ def test_spawn_executor_gets_no_key_unless_granted():
     assert credential_plan(AgentProfile.model_validate(body)).api_keys == frozenset()
     granted = AgentProfile.model_validate({**body, "credentials": ["TAVILY_API_KEY"]})
     assert credential_plan(granted).api_keys == {"TAVILY_API_KEY"}
+
+
+def test_a_failed_last_good_save_does_not_fail_a_booted_create_or_update(
+    core, tmp_path, monkeypatch, caplog
+):
+    from pathlib import Path
+
+    real = Path.write_text
+
+    def flaky(self, *a, **kw):
+        if ".miragend" in self.parts:
+            raise OSError("No space left on device")
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "write_text", flaky)
+    core.create_agent("alpha", _model("alpha", "anthropic:claude-sonnet-4-6"))
+    core.update_agent_config("alpha", _model("alpha", "openai:gpt-5"))
+    assert core._docker.container_map["alpha"].status == "running"
+    assert not core._last_good_path("alpha").exists()
+    assert "last-known-good" in caplog.text
