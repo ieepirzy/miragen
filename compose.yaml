@@ -37,11 +37,12 @@ services:
       - ${MIRAGEN_WORKSPACE:-/opt/miragen}:${MIRAGEN_WORKSPACE:-/opt/miragen}
     env_file:
       # The daemon can only forward credentials that reach ITS OWN
-      # environment (the *_API_KEY suffix filter, the passthrough list, and
-      # the executor-kind auto-forward all read os.environ). Loading the
+      # environment (per-profile credential grants, the passthrough list and
+      # the subscription-token forward all read os.environ). Loading the
       # operator env file wholesale here means "set the variable" is the
       # whole operator surface -- no per-credential declaration line on this
-      # service. `.env` covers plain docker compose; `stack.env` is the same
+      # service. Which agent then receives a key is the agent's profile's
+      # call, not this file's (docs/credential-grants.md). `.env` covers plain docker compose; `stack.env` is the same
       # mechanism under Portainer-managed stacks. Both optional.
       - path: .env
         required: false
@@ -64,14 +65,15 @@ services:
       MIRAGEN_WORKSPACE: ${MIRAGEN_WORKSPACE:-/opt/miragen}
       MIRAGEN_BASE_IMAGE: ${MIRAGEN_BASE_IMAGE:-ghcr.io/ieepirzy/miragen:latest}
       # Env var NAMES the daemon forwards from its own environment into
-      # every agent container it writes -- for operator-specific credentials
-      # (tool-server bearers and the like) the suffix filter and the
-      # executor-kind auto-forward cannot know about. Values arrive via the
-      # env_file above; the declarations below exist only so a deployment
-      # that injects env some other way (shell exports, CI) still works.
-      # CLAUDE_CODE_OAUTH_TOKEN needs NO passthrough entry: the daemon
-      # auto-forwards it to agents whose profile declares
-      # `executor: claude-code` (docs/design/subscription-homes.md).
+      # EVERY agent container it writes, outside the per-profile grants --
+      # for non-credential settings and operator-specific values that are
+      # not *_API_KEY keys. Values arrive via the env_file above; the
+      # declarations below exist only so a deployment that injects env some
+      # other way (shell exports, CI) still works. Never list a *_API_KEY or
+      # CLAUDE_CODE_OAUTH_TOKEN here (miragend warns at startup if you do):
+      # a provider key reaches an agent whose profile implies or grants it,
+      # and the token reaches agents that run Claude Code, with no entry
+      # (docs/credential-grants.md).
       MIRAGEND_AGENT_ENV_PASSTHROUGH: ${MIRAGEND_AGENT_ENV_PASSTHROUGH:-}
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       MIRAGEND_TOKEN: ${MIRAGEND_TOKEN:-}

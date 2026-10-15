@@ -13,7 +13,10 @@ executors; Codex behaviour is unchanged.
 The load-bearing constraint is the same as for Codex: containers spin up and
 down constantly; interactive OAuth inside each spawn is impossible and wrong.
 Subscription OAuth is the **primary** path for self-harnessed coding agents;
-metered API keys are the CI / no-subscription fallback.
+metered API keys are the CI / no-subscription fallback. For `claude-code`
+and `codex` that fallback is an explicit grant (`credentials:` in the
+profile), never automatic: a present key would outrank the subscription
+(docs/credential-grants.md).
 
 ## 2. Product homes (verified conventions)
 
@@ -37,8 +40,11 @@ OAuth token bound to the operator's subscription, and both the CLI and the
 whole shared-home lifecycle for this backend — no login helper, no volume,
 no refresh races; mint once, set the variable, rotate before expiry. The
 `~/.claude` mount remains as the alternative for operators who prefer the
-home-volume model, and `ANTHROPIC_API_KEY` stays the metered fallback.
-`prepare()` accepts any of the three.
+home-volume model, and `ANTHROPIC_API_KEY` stays the metered fallback —
+but only when the profile grants it in `credentials:`. Claude Code prefers
+the metered key over the token, so `prepare()` removes an ungranted
+`ANTHROPIC_API_KEY` (and `ANTHROPIC_AUTH_TOKEN`) before any Claude Code
+child starts (docs/credential-grants.md).
 
 Delivery through miragend is automatic and scoped to agents that run
 Claude Code: the daemon knows each agent's profile, so a set
