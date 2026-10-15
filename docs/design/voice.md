@@ -26,7 +26,9 @@ drivable by miragen it grows a miragen-schema route, not the reverse.)
    ```
 
    Cloud credentials ride the existing `*_API_KEY` / `*_API_KEY_FILE` env
-   forwarding — zero daemon changes.
+   forwarding — zero daemon changes. Since per-profile grants
+   (docs/credential-grants.md) the voice's `api_key_env` is an implied
+   grant, so only agents with a voice block receive that key.
 
 2. **`VoiceBackend` seam**, same pattern as executor/publication backends:
    `async speak(text, *, voice) -> bytes | None`. Two v1 implementations:

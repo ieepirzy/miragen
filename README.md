@@ -431,7 +431,7 @@ spec:
 
 miragend reads both lists from its own environment and forwards them into every agent it creates, so its `/validate` and the spawned container apply the same lists. **Narrowing a list does not reach agents that already exist** until they are re-checked: miragend checks against its current lists on create, config update and import, and a container keeps the lists it was created with until its service is regenerated (delete and re-create, import, or a config update that recreates the container). A plain restart re-checks the profile only against the container's own, older lists. After narrowing, re-create or re-import your external/hybrid agents.
 
-Declaring `agent_type` at all implies profile contract v3 ([miragen/profile_contract.py](miragen/profile_contract.py)): a control plane can tell a runtime enforces it when `/health` → `profile_contracts`, the image label `io.miragen.profile-contracts`, or `miragen contract` include `3`, and miragend refuses to spawn such a profile onto an older image. Serialized profiles (`model_dump`, an EDF's `resolved_profile`) omit `agent_type: internal`, so a profile that never declared a public type dumps back to its original contract. Declaring `spec.harness` (the Claude Code harness posture, [docs/design/harnesses.md](docs/design/harnesses.md#engineer-posture)) implies contract v4 the same way. `spec.harness.subagent_model: pin` implies v5; the default `inherit` is omitted from serialized profiles, so it never raises a profile above v4.
+Declaring `agent_type` at all implies profile contract v3 ([miragen/profile_contract.py](miragen/profile_contract.py)): a control plane can tell a runtime enforces it when `/health` → `profile_contracts`, the image label `io.miragen.profile-contracts`, or `miragen contract` include `3`, and miragend refuses to spawn such a profile onto an older image. Serialized profiles (`model_dump`, an EDF's `resolved_profile`) omit `agent_type: internal`, so a profile that never declared a public type dumps back to its original contract. Declaring `spec.harness` (the Claude Code harness posture, [docs/design/harnesses.md](docs/design/harnesses.md#engineer-posture)) implies contract v4 the same way. `spec.harness.subagent_model: pin` implies v5; the default `inherit` is omitted from serialized profiles, so it never raises a profile above v4. Declaring `credentials` (per-profile credential grants, [docs/credential-grants.md](docs/credential-grants.md)) implies v6; an empty list is omitted from serialized profiles.
 
 ### Environment interpolation
 
@@ -452,7 +452,7 @@ spec:
 - `$${VAR}` — escape hatch, renders the literal text `${VAR}`.
 - Interpolation runs on every string value, including inside multi-line `instructions` blocks, but never on dict keys or non-string values (ints, bools stay untouched).
 
-Agent containers already get `*_API_KEY` env vars injected by miragen-mcp's compose management, and file-based `*_FILE` secrets are resolved into the environment before the profile loads — so secrets are interpolatable out of the box. Be careful interpolating secrets into `instructions`, though: that puts them in the model's context window.
+Agent containers managed by miragend get the `*_API_KEY` env vars their profile is entitled to ([docs/credential-grants.md](docs/credential-grants.md)), and a `${FOO_API_KEY}` reference itself entitles the profile to that key. File-based `*_FILE` secrets are resolved into the environment before the profile loads, so secrets are interpolatable out of the box. Be careful interpolating secrets into `instructions`, though: that puts them in the model's context window.
 
 ### Budgets
 
@@ -623,7 +623,7 @@ voice:
   voice: alloy                    # default voice id, provider-defined
 ```
 
-The block grants three surfaces: a `speak(text, voice?)` tool on model-tier agents, the `/mcp/voice` MCP mount for executor-tier agents (point an `executor.mcp_servers` entry at it, like `/mcp/ask-human`), and `on_complete.speak: true` to voice a scheduled run's output. Credentials ride the daemon's existing `*_API_KEY` env forwarding.
+The block grants three surfaces: a `speak(text, voice?)` tool on model-tier agents, the `/mcp/voice` MCP mount for executor-tier agents (point an `executor.mcp_servers` entry at it, like `/mcp/ask-human`), and `on_complete.speak: true` to voice a scheduled run's output. Credentials ride the daemon's `*_API_KEY` forwarding: the voice's `api_key_env` (default `OPENAI_API_KEY` for `openai`) is an implied grant ([docs/credential-grants.md](docs/credential-grants.md)).
 
 ---
 
@@ -865,6 +865,7 @@ Without `register_*`, a prompt-injected agent could register a new tool at runti
 ## Security notes
 
 - API keys are mounted as Docker secrets and read into the environment at startup via the `*_API_KEY_FILE` → `*_API_KEY` pattern. Any env var ending in `_API_KEY_FILE` whose value is a readable path is resolved automatically — `ANTHROPIC_API_KEY_FILE`, `OPENAI_API_KEY_FILE`, `GEMINI_API_KEY_FILE`, etc. The `_FILE` var is removed after loading so keys are never visible in the agent's context window or environment dump.
+- miragend gives each managed agent only the keys its profile implies (its models' providers, a kimi-code or grok-build executor's metered fallback, its voice) or grants in `credentials:`, and gives `CLAUDE_CODE_OAUTH_TOKEN` only to agents that run Claude Code; none by default. See [docs/credential-grants.md](docs/credential-grants.md), including the migration steps.
 - Network egress is enforced at the container/firewall level, not in config files.
 - Set `MIRAGEN_INTERNAL_TOKEN` to require a matching `X-Miragen-Token` header on every `/run*` and `/approvals*` request — otherwise access to those endpoints relies entirely on Docker network isolation. Unset by default so single-container deployments stay zero-config; `/health` is never guarded.
 - `approval_required` globs suspend matching tool calls for human approval before execution.
@@ -887,7 +888,7 @@ Backends implement the contract (`executor.executor`):
 - **`grok-build`** — Grok Build via MIT `grok-build-client` (`headless` or `acp` transport; image installs CLI + client). See [docs/design/kimi-and-grok-executors.md](docs/design/kimi-and-grok-executors.md) and [packages/grok-build-client](packages/grok-build-client). A locked-down headless mode (`grok_tools`, `grok_permission_mode`, `grok_allow`/`grok_deny`, `grok_hermetic`, `grok_auth: subscription`) runs Grok with only the profile's MCP servers and no shell/file/web/subagent tools — see §6 Phase C of that doc.
 - **`spawn`** — no-SDK fallback: an argv template (`executor.command`) is spawned in the workspace, stdout becomes the event stream, exit 0 harvests. No resume, no usage reporting.
 
-Auth is per backend and always spawn-time state, never profile content. **Subscription OAuth is the primary path** for Codex, Kimi, and Grok: authenticate **once** into a shared home volume; agent containers mount it and never log in. Codex: `miragen codex-login --codex-home <volume>` or `CODEX_API_KEY`/`OPENAI_API_KEY` (metered) — [docs/design/codex-auth.md](docs/design/codex-auth.md). Kimi: `miragen kimi-login --kimi-home <volume>` or `KIMI_API_KEY`/`MOONSHOT_API_KEY`. Grok: `miragen grok-login --grok-home <volume>` (device-code) or `XAI_API_KEY` — [docs/design/subscription-homes.md](docs/design/subscription-homes.md). Claude Code: `ANTHROPIC_API_KEY` or mounted `~/.claude`. Persistent volumes for homes + `workspace_root` keep credentials and suspended runs alive across container restarts; see `compose.example.yml`.
+Auth is per backend and always spawn-time state, never profile content. **Subscription OAuth is the primary path** for Codex, Kimi, and Grok: authenticate **once** into a shared home volume; agent containers mount it and never log in. Codex: `miragen codex-login --codex-home <volume>` or `CODEX_API_KEY`/`OPENAI_API_KEY` (metered, granted in the profile's `credentials:`) — [docs/design/codex-auth.md](docs/design/codex-auth.md). Kimi: `miragen kimi-login --kimi-home <volume>` or `KIMI_API_KEY`/`MOONSHOT_API_KEY`. Grok: `miragen grok-login --grok-home <volume>` (device-code) or `XAI_API_KEY` — [docs/design/subscription-homes.md](docs/design/subscription-homes.md). Claude Code: `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`), mounted `~/.claude`, or `ANTHROPIC_API_KEY` granted in `credentials:` ([docs/credential-grants.md](docs/credential-grants.md)). Persistent volumes for homes + `workspace_root` keep credentials and suspended runs alive across container restarts; see `compose.example.yml`.
 
 Optionally, `executor.artifact_sink` names a **publication backend** for
 reviewed whole-run graduation (`POST /runs/{id}/publications`). Capability
