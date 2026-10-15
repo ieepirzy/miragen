@@ -167,6 +167,17 @@ def test_interpolated_claude_code_model_gets_the_token(core, tmp_path, monkeypat
     assert _service(tmp_path, "lane")["environment"]["CLAUDE_CODE_OAUTH_TOKEN"] == TOKEN
 
 
+def test_claude_code_memory_selector_gets_the_token(core, tmp_path):
+    """The recall selector runs headless `claude -p` inside the agent."""
+    core.create_agent("alpha", _model(
+        "alpha", "anthropic:claude-sonnet-4-6",
+        "memory:\n  backend: ephemeral\n  scopes: {read: [s], propose: [s], default_write: s}\n"
+        "  recall: {model: 'claude-code:haiku'}\n"))
+    service = _service(tmp_path, "alpha")
+    assert service["environment"]["CLAUDE_CODE_OAUTH_TOKEN"] == TOKEN
+    assert _key_env(service) == {"ANTHROPIC_API_KEY_FILE"}
+
+
 @pytest.mark.parametrize("model", ["anthropic:claude-sonnet-4-6", "openai:gpt-5",
                                    "codex:gpt-5", "test:whatever"])
 def test_non_claude_code_profile_does_not_get_the_token(core, tmp_path, model):

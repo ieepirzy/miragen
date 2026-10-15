@@ -61,9 +61,11 @@ credentials: [TAVILY_API_KEY]   # e.g. a tool that reads the key from its env
 ### The subscription token
 
 `CLAUDE_CODE_OAUTH_TOKEN` goes to agents that run Claude Code, and to no
-others. Those are agents with `executor: claude-code`, and model-tier
-agents whose `spec.model` starts with `claude-code:`. The model is read
-through the loader, so `model: ${LANE_MODEL:-claude-code:…}` counts.
+others. Those are agents with `executor: claude-code`, and agents with a
+`claude-code:` model: `spec.model` (the harness), or `memory.recall.model`
+or `memory.extraction.model` (these run headless `claude -p` inside the
+agent). Models are read through the loader, so
+`model: ${LANE_MODEL:-claude-code:…}` counts.
 Previously only `executor: claude-code` got it, which left `claude-code:`
 model-tier profiles without a credential.
 

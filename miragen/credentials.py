@@ -29,8 +29,9 @@ Everything else is withheld. Only names matching
 its way to a daemon variable outside the ``*_API_KEY`` family.
 
 The subscription token (``CLAUDE_CODE_OAUTH_TOKEN``) is separate: it goes
-to agents that run Claude Code — ``executor: claude-code`` or a
-``claude-code:`` ``spec.model`` — and never to any other.
+to agents that run Claude Code — ``executor: claude-code``, a
+``claude-code:`` ``spec.model``, or a ``claude-code:`` memory recall /
+extraction model — and never to any other.
 
 Docs: docs/credential-grants.md.
 """
@@ -118,9 +119,12 @@ NO_CREDENTIALS = CredentialPlan()
 
 
 def runs_claude_code(profile: AgentProfile) -> bool:
-    if profile.executor is not None:
-        return profile.executor.executor == "claude-code"
-    return profile.spec is not None and profile.spec.model.startswith(CLAUDE_CODE_MODEL_PREFIX)
+    """`executor: claude-code`, or any model the profile names with the
+    `claude-code:` prefix: spec.model (the harness) or a memory model (the
+    recall selector / extraction run headless `claude -p` in the agent)."""
+    if profile.executor is not None and profile.executor.executor == "claude-code":
+        return True
+    return any(m.startswith(CLAUDE_CODE_MODEL_PREFIX) for m in _model_strings(profile))
 
 
 def _model_strings(profile: AgentProfile) -> list[str]:
