@@ -802,10 +802,10 @@ def test_only_rendered_recall_entries_are_tracked():
     not be in the manifest or counted for citation either."""
     from miragen.memory.selection import fit_optional_entries, render_optional_section
 
-    entries = [{"record_id": f"rec-{i}aaaaaa", "type": "claim", "text": "x" * 60 + "\nline two",
-                "reason": "r"} for i in range(5)]
+    entries = [{"record_id": f"rec-{i}aaaaaa", "revision_id": f"rev-{i}", "type": "claim",
+                "text": "x" * 60 + "\nline two", "reason": "r"} for i in range(5)]
     fitted = fit_optional_entries(entries, 250)
-    section = render_optional_section(entries, 250)
+    section = render_optional_section(entries, 250).text
     assert 0 < len(fitted) < len(entries)
     assert all(e["record_id"][:8] in section for e in fitted)
     assert not any(e["record_id"][:8] in section for e in entries[len(fitted):])

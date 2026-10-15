@@ -245,8 +245,8 @@ class TestBudgetAndRendering:
              "text": "y" * 300, "reason": "does not fit"},
         ]
         section = render_optional_section(entries, budget_chars=500)
-        assert "x" * 100 in section
-        assert "y" * 50 not in section  # omitted whole, not truncated mid-item
+        assert "x" * 100 in section.text
+        assert "y" * 50 not in section.text  # omitted whole, not truncated mid-item
 
     def test_clamp_dedupes_and_caps(self):
         cards = [{"record_id": f"id-{i}"} for i in range(10)]

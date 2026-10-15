@@ -393,10 +393,62 @@ class TestBridgeMcp:
         names = {t.name for t in await mcp.list_tools()}
         assert names == {
             "bridge_status", "bridge_sessions",
-            "memory_recall", "memory_read", "memory_remember", "memory_correct", "memory_checkpoint",
+            "memory_recall", "memory_for_resources", "memory_read", "memory_remember", "memory_correct", "memory_checkpoint",
             "store_open_run", "store_close_run", "store_put_artifact", "store_get_artifact",
             "store_lineage", "store_search", "store_list_namespaces", "store_run_tree",
         }
+
+    async def test_resource_tool_requires_observed_local_session(self, tmp_path):
+        h, mcp = self._mcp(tmp_path)
+        missing = _text(await mcp.call_tool("memory_for_resources", {
+            "resources": [{"path": "pricing.py", "symbol": "price"}]}))
+        assert missing["status"] == "unverified"
+        await h.send("SessionStart", source="startup", session="remote", cwd="/workspace/repo",
+                     remote=True, host="cloud", project_remote="https://github.com/org/repo.git")
+        remote = _text(await mcp.call_tool("memory_for_resources", {
+            "resources": [{"path": "pricing.py", "symbol": "price"}], "project": "claude-code:remote"}))
+        assert remote["status"] == "unverified"
+
+    @pytest.mark.parametrize("transport_error", [True, False])
+    async def test_resource_inspection_outage_is_a_structured_status(
+            self, tmp_path, transport_error):
+        """inspect=True calls Loimi directly: an outage (or a refusal) comes
+        back as the JSON status the other memory tools use, not as a
+        protocol-level tool failure."""
+        import subprocess
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for args in (["init", "-b", "main"], ["config", "user.name", "t"],
+                     ["config", "user.email", "t@example.invalid"],
+                     ["config", "commit.gpgsign", "false"],
+                     ["remote", "add", "origin", "https://github.com/org/repo.git"]):
+            subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+        (repo / "pricing.py").write_text("def price():\n    return 10\n")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "x"], check=True,
+                       capture_output=True)
+        h, mcp = self._mcp(tmp_path, transport_error=transport_error)
+        await h.send("SessionStart", source="startup", session="local", cwd=str(repo),
+                     project_remote="https://github.com/org/repo.git")
+        if not transport_error:
+            # Reachable, but the lookup is refused.
+            from miragen.memory.client import MemoryAPIError
+
+            lifecycle, _, _ = await h.plane.lifecycle_for_project(
+                h.plane.resolve_identity("claude-code:local"))
+
+            async def refuse(body):
+                raise MemoryAPIError(403, {"error": {"message": "scope not readable"}})
+
+            lifecycle.client.lookup_resources = refuse
+        out = _text(await mcp.call_tool("memory_for_resources", {
+            "resources": [{"path": "pricing.py", "symbol": "price"}],
+            "project": "claude-code:local", "inspect": True}))
+        if transport_error:
+            assert out["status"] == "persistence_unavailable"
+        else:
+            assert out["status"] == "rejected" and out["http_status"] == 403
 
     async def test_memory_tools_are_scoped_by_project(self, tmp_path):
         h, mcp = self._mcp(tmp_path)
