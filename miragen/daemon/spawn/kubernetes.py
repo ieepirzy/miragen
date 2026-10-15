@@ -214,6 +214,10 @@ class KubernetesSpawnDriver:
             "labels": dict(spec.labels),
             "cpu_limit": spec.cpu_limit,
             "mem_limit": spec.mem_limit,
+            # Not used to build the pod (Kubernetes has no Docker secrets);
+            # kept so current_spec can return the definition whole.
+            "secret_names": list(spec.secret_names),
+            "workspace_dir": str(spec.workspace_dir),
         }
         configmap = {
             "apiVersion": "v1",
@@ -387,6 +391,25 @@ class KubernetesSpawnDriver:
             return None
         record = json.loads(configmap.get("data", {}).get("spec.json") or "{}")
         return record.get("image")
+
+    def current_spec(self, name: str) -> ServiceSpec | None:
+        configmap = self._get_configmap(name)
+        if configmap is None:
+            return None
+        record = json.loads(configmap.get("data", {}).get("spec.json") or "{}")
+        if not record.get("image") or "workspace_dir" not in record:
+            # A definition from before current_spec existed: unknown, so the
+            # caller recreates (once) rather than trust it.
+            return None
+        return ServiceSpec(
+            image=record["image"],
+            environment=dict(record.get("environment") or {}),
+            labels=dict(record.get("labels") or {}),
+            cpu_limit=record.get("cpu_limit", ""),
+            mem_limit=record.get("mem_limit", ""),
+            workspace_dir=Path(record["workspace_dir"]),
+            secret_names=tuple(record.get("secret_names") or ()),
+        )
 
     def endpoint(self, name: str) -> str:
         pod = self._get_pod(name)

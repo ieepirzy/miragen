@@ -1891,11 +1891,14 @@ class AgentProfile(_ProfileModel):
             "(each must end in _API_KEY, e.g. TAVILY_API_KEY). The daemon "
             "forwards the variable and its *_API_KEY_FILE secret only when it "
             "holds them. Keys the profile already implies need no entry: each "
-            "pydantic-ai model's provider key (openai: -> OPENAI_API_KEY), an "
-            "executor's own metered fallback, a voice api_key_env, any *_env "
-            "field naming a key and any ${..._API_KEY} reference. Everything "
-            "else is withheld (docs/credential-grants.md). Declaring the field "
-            "implies profile contract v6."
+            "pydantic-ai model's provider key (openai: -> OPENAI_API_KEY), a "
+            "kimi-code / grok-build executor's metered fallback, a voice "
+            "api_key_env, any *_env field naming a key and any ${..._API_KEY} "
+            "reference. Exception: a claude-code executor gets ANTHROPIC_API_KEY, "
+            "and a codex executor CODEX_API_KEY / OPENAI_API_KEY, only when "
+            "listed here — they run on the subscription, which those keys would "
+            "outrank. Everything else is withheld (docs/credential-grants.md). "
+            "Declaring the field implies profile contract v6."
         ),
     )
     spec: Optional[AgentSpec] = Field(

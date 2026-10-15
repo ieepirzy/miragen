@@ -151,6 +151,24 @@ class TestDefineAndUp:
         record = json.loads(fake_api.configmaps["alpha"]["data"]["spec.json"])
         assert record["image"] == "second"
 
+    def test_current_spec_round_trips_the_definition(self, driver, fake_api, tmp_path):
+        """The update path compares this with the unit it would build: the
+        environment and secrets must come back whole, or every update
+        recreates (or, worse, none does)."""
+        spec = _spec(tmp_path, environment={"AGENT_PROFILE": "agent.yaml", "X_API_KEY": "k"},
+                     secret_names=("x_key",))
+        driver.define_service("alpha", spec)
+        assert driver.current_spec("alpha") == spec
+
+    def test_current_spec_is_unknown_for_a_legacy_record_or_none(self, driver, fake_api, tmp_path):
+        assert driver.current_spec("alpha") is None
+        driver.define_service("alpha", _spec(tmp_path))
+        cm = fake_api.configmaps["alpha"]
+        record = json.loads(cm["data"]["spec.json"])
+        del record["workspace_dir"]
+        cm["data"]["spec.json"] = json.dumps(record)
+        assert driver.current_spec("alpha") is None
+
     def test_define_service_rejects_a_name_invalid_for_kubernetes(self, driver, tmp_path):
         with pytest.raises(SpawnOperationFailed):
             driver.define_service("has_underscore", _spec(tmp_path))

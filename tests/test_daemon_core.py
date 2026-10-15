@@ -679,23 +679,36 @@ def test_subscription_token_not_forwarded_to_other_kinds(tmp_path):
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in _service_env(tmp_path, "alpha")
 
 
-def test_subscription_token_resolved_through_profile_interpolation(tmp_path, monkeypatch):
+@pytest.mark.parametrize("forwarded", [True, False])
+def test_subscription_token_resolved_through_profile_interpolation(
+    tmp_path, monkeypatch, forwarded
+):
     """The kind is read through the loader, not the raw file: a profile
     naming its executor via ${VAR:-default} interpolates before validation,
     so the credential lookup must see the resolved kind, not the literal.
 
-    interpolate_env resolves against the process environment (os.environ),
-    which in a real daemon is the same environment the forwarded value comes
-    from — hence monkeypatch here rather than the injected environ dict."""
-    monkeypatch.setenv("EXECUTOR_KIND", "claude-code")
-    core = _executor_kind_core(
-        tmp_path, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-auto"}
-    )
+    And it must resolve as the CONTAINER will: against what the daemon
+    forwards, not the daemon's whole environment. EXECUTOR_KIND forwarded
+    (passthrough) -> claude-code there, so the token goes; held by the
+    daemon but not forwarded -> the container takes the default (codex), so
+    it does not. The injected environ is what is read: os.environ carries a
+    decoy that would flip both answers."""
+    monkeypatch.setenv("EXECUTOR_KIND", "codex" if forwarded else "claude-code")
+    environ = {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-auto", "EXECUTOR_KIND": "claude-code"}
+    if forwarded:
+        environ["MIRAGEND_AGENT_ENV_PASSTHROUGH"] = "EXECUTOR_KIND"
+    core = _executor_kind_core(tmp_path, environ)
     interpolated = EXECUTOR_CLAUDE_YAML.format(name="worker").replace(
         "executor: claude-code", "executor: ${EXECUTOR_KIND:-codex}"
     )
     core.create_agent("worker", interpolated)
-    assert _service_env(tmp_path, "worker")["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-auto"
+    env = _service_env(tmp_path, "worker")
+    if forwarded:
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-auto"
+        assert env["EXECUTOR_KIND"] == "claude-code"
+    else:
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+        assert "EXECUTOR_KIND" not in env
 
 
 def test_update_config_to_claude_code_recreates_with_token(tmp_path):

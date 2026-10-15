@@ -49,7 +49,13 @@ from miragen.agent_type import (
     code_violations,
     is_code_path,
 )
-from miragen.credentials import NO_CREDENTIALS, CredentialPlan, credential_plan
+from miragen.credentials import (
+    CLAUDE_CODE_TOKEN_ENV,
+    GRANTABLE_RE,
+    NO_CREDENTIALS,
+    CredentialPlan,
+    credential_plan,
+)
 from miragen.load import load_profile
 from miragen.models import AgentProfile
 from miragen.model_rates import REFRESH_ENV as RATES_REFRESH_ENV
@@ -573,6 +579,25 @@ class LifecycleCore:
         # window; hold it only across the count check through the step that
         # actually commits the new agent, not the slower I/O around it.
         self._agent_creation_lock = threading.Lock()
+        self._warn_broadcast_credentials()
+
+    def _warn_broadcast_credentials(self) -> None:
+        """MIRAGEND_AGENT_ENV_PASSTHROUGH reaches EVERY agent. A provider key
+        or the subscription token listed there bypasses the per-profile
+        grants (docs/credential-grants.md), so say so once at startup."""
+        broadcast = [
+            key for key in self._passthrough_names()
+            if key == CLAUDE_CODE_TOKEN_ENV
+            or GRANTABLE_RE.fullmatch(key)
+            or (key.endswith("_FILE") and GRANTABLE_RE.fullmatch(key[: -len("_FILE")]))
+        ]
+        if broadcast:
+            logger.warning(
+                "MIRAGEND_AGENT_ENV_PASSTHROUGH lists %s: passthrough reaches EVERY "
+                "agent, bypassing per-profile credential grants. Remove them and let "
+                "profiles imply or grant keys (docs/credential-grants.md).",
+                ", ".join(broadcast),
+            )
 
     # -- naming / paths -----------------------------------------------------
 
@@ -880,53 +905,140 @@ class LifecycleCore:
             if k.endswith("_API_KEY_FILE") and v and k[: -len("_FILE")] in plan.api_keys
         ]
 
-    def _agent_executor_kind(self, name: str) -> str:
-        """Executor kind from the agent's on-disk profile, through the loader
-        (see _agent_profile). Model-tier profiles and unreadable YAML yield
-        ""."""
-        loaded = self._agent_profile(name)
-        if loaded is None or loaded[0].executor is None:
-            return ""
-        return loaded[0].executor.executor
+    def _passthrough_names(self) -> list[str]:
+        """MIRAGEND_AGENT_ENV_PASSTHROUGH, parsed: names, never values."""
+        raw = self._environ.get("MIRAGEND_AGENT_ENV_PASSTHROUGH", "")
+        return [n.strip() for n in raw.split(",") if n.strip()]
 
-    def _agent_profile(self, name: str) -> tuple[AgentProfile, object] | None:
-        """(profile, document as written) from the agent's agent.yaml —
-        every caller of _compose_add_service (create, import, config update)
-        has written it before the service is composed.
+    def _shared_forward_env(self) -> dict[str, str]:
+        """The daemon variables EVERY managed agent receives, whatever its
+        profile: the forwards below the credential plan in
+        _build_service_spec, in their order. Set non-empty only."""
+        env: dict[str, str] = {}
+        # Host-wide in-container concurrency cap (instances/v1): tuned on the
+        # daemon, effective in every managed agent — without this forward the
+        # env override documented in .env.example would only ever apply to
+        # hand-run containers.
+        # The provider and host allowlists for agent_type: external | hybrid
+        # profiles, forwarded for the same reason: /validate and create check
+        # a profile against this daemon's values, and the container's own load
+        # must see the same one or a profile validated here fails closed at boot.
+        # The model rates source budgets weight cache tokens by
+        # (miragen/model_rates.py): one catalogue for every managed agent.
+        # A local rates file is a path on this host, so it is not forwarded.
+        for key in ("MIRAGEN_MAX_CONCURRENT", ALLOWED_PROVIDERS_ENV, ALLOWED_HOSTS_ENV,
+                    RATES_URL_ENV, RATES_TOKEN_ENV, RATES_REFRESH_ENV):
+            if self._environ.get(key):
+                env[key] = self._environ[key]
+        return env
 
-        Resolved through load_profile, NOT a raw YAML read: `executor:
-        ${EXECUTOR_KIND:-claude-code}` and `model: ${MODEL:-claude-code:x}`
-        are valid profiles, and interpolate_env expands them before Pydantic
-        ever sees them. Reading the unprocessed file returns the literal
-        placeholder and the credential lookup silently misses. Interpolation
-        resolves against this daemon's own os.environ — the same environment
-        forwarded values are read from, so the two cannot disagree. Loaded
-        from the agent's own path so a relative instructions_file resolves.
+    def _container_view(self) -> dict[str, str]:
+        """The environment a spawned agent's own loader resolves ${VAR}
+        against — NOT this daemon's whole environment. An agent sees the
+        shared forwards, the passthrough names and its granted *_API_KEY
+        family (a referenced key is granted, so a ${X_API_KEY} the daemon
+        holds does resolve in the container; a *_FILE secret resolves to its
+        file there, so its name is present here with an empty value). A
+        variable the daemon holds but does not forward resolves to its
+        ${VAR:-default}, as the container will — or fails to load, as the
+        container will."""
+        view = dict(self._shared_forward_env())
+        for key in self._passthrough_names():
+            if self._environ.get(key):
+                view[key] = self._environ[key]
+        for key, value in self._environ.items():
+            if not value:
+                continue
+            if GRANTABLE_RE.fullmatch(key):
+                view[key] = value
+            elif key.endswith("_FILE") and GRANTABLE_RE.fullmatch(key[: -len("_FILE")]):
+                view.setdefault(key[: -len("_FILE")], "")
+        return view
 
-        None when the profile does not load: no credentials (fail closed)."""
-        path = self._agent_dir(name) / "agent.yaml"
+    def _load_profile_text(self, name: str, text: str) -> AgentProfile:
+        """`text` as the agent's container will load it: through the loader
+        (`executor: ${KIND:-claude-code}` and `model: ${MODEL:-claude-code:x}`
+        are valid profiles, and only interpolation reveals what they say),
+        against the container's view of the environment (_container_view),
+        anchored at the agent's own path so a relative instructions_file
+        resolves. Raises when it does not load."""
+        return load_profile(
+            self._agent_dir(name) / "agent.yaml",
+            source=text,
+            allowed_providers=allowed_providers_from_env(self._environ),
+            allowed_hosts=allowed_hosts_from_env(self._environ),
+            environ=self._container_view(),
+        )
+
+    def _profile_kind(self, name: str, text: str) -> str:
+        """Executor kind `text` declares; "" for model tier or a profile that
+        does not load."""
         try:
-            profile = load_profile(
-                path,
-                allowed_providers=allowed_providers_from_env(self._environ),
-                allowed_hosts=allowed_hosts_from_env(self._environ),
-            )
-            return profile, yaml.safe_load(path.read_text())
+            profile = self._load_profile_text(name, text)
+        except Exception:
+            return ""
+        return profile.executor.executor if profile.executor is not None else ""
+
+    def _credentials_for(self, name: str, text: str | None) -> CredentialPlan:
+        """What the profile `text` entitles the agent to
+        (miragen/credentials.py): its implied provider keys, its explicit
+        `credentials` grants and, for agents that run Claude Code, the
+        subscription token. NO_CREDENTIALS when it does not load (fail
+        closed)."""
+        try:
+            if text is None:
+                raise ValueError("no profile text")
+            profile = self._load_profile_text(name, text)
+            raw = yaml.safe_load(text)
         except Exception as exc:
             logger.warning(
                 "agent '%s': profile did not load (%s); spawning it with no credentials",
                 name, exc,
             )
+            return NO_CREDENTIALS
+        return credential_plan(profile, raw)
+
+    # The daemon's own copy of each agent's last successfully applied
+    # profile. agents/<name>/ is mounted read-write into the agent as /agent,
+    # so the agent can rewrite its agent.yaml at will; this copy lives outside
+    # every mount and is written only after a create, import or update has
+    # booted. A rollback restores it, and the update path reads the agent's
+    # previous executor kind from it, never from the agent-writable file.
+    def _last_good_path(self, name: str) -> Path:
+        return self.workspace / ".miragend" / "profiles" / f"{name}.yaml"
+
+    def _save_last_good(self, name: str, text: str) -> None:
+        path = self._last_good_path(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(text)
+        os.replace(tmp, path)
+
+    def _last_good(self, name: str) -> str | None:
+        try:
+            return self._last_good_path(name).read_text()
+        except OSError:
             return None
 
-    def _agent_credentials(self, name: str) -> CredentialPlan:
-        """What the agent's profile entitles it to (miragen/credentials.py):
-        its implied provider keys, its explicit `credentials` grants and,
-        for agents that run Claude Code, the subscription token."""
-        loaded = self._agent_profile(name)
-        if loaded is None:
-            return NO_CREDENTIALS
-        return credential_plan(*loaded)
+    def _current_spec(self, name: str) -> ServiceSpec | None:
+        """The definition the agent's unit runs now, as the spawn driver
+        stores it (outside the agent's mount). None when the driver cannot
+        say — callers treat that as "different" and recreate."""
+        current = getattr(self._spawn_driver, "current_spec", None)
+        if current is None:
+            return None
+        try:
+            return current(name)
+        except Exception as exc:
+            logger.warning("agent '%s': could not read its current definition (%s)", name, exc)
+            return None
+
+    @staticmethod
+    def _delivered(spec: ServiceSpec | None) -> tuple[dict[str, str], frozenset[str]] | None:
+        """What a unit hands its process: environment and mounted secrets."""
+        if spec is None:
+            return None
+        return dict(spec.environment), frozenset(spec.secret_names)
 
     def _labels_path(self, name: str) -> Path:
         return self._agent_dir(name) / "labels.json"
@@ -947,8 +1059,18 @@ class LifecycleCore:
         else:
             self._labels_path(name).unlink(missing_ok=True)
 
-    def _build_service_spec(self, name: str, image_ref: str | None = None) -> ServiceSpec:
-        plan = self._agent_credentials(name)
+    def _build_service_spec(
+        self, name: str, image_ref: str | None = None, *, profile_text: str | None = None
+    ) -> ServiceSpec:
+        """The unit for `name`. `profile_text`: the profile to plan credentials
+        from — the text the caller is applying. None reads the agent's
+        agent.yaml, which create and import have just written themselves."""
+        if profile_text is None:
+            try:
+                profile_text = (self._agent_dir(name) / "agent.yaml").read_text()
+            except OSError:
+                profile_text = None
+        plan = self._credentials_for(name, profile_text)
         secret_names = self._secret_names(plan)
         env = {"AGENT_PROFILE": "agent.yaml"}
         if self._internal_token:
@@ -965,25 +1087,7 @@ class LifecycleCore:
             for var in (key, f"{key}_FILE"):
                 if self._environ.get(var):
                     env[var] = self._environ[var]
-        # Host-wide in-container concurrency cap (instances/v1): tuned on the
-        # daemon, effective in every managed agent — without this forward the
-        # env override documented in .env.example would only ever apply to
-        # hand-run containers.
-        if self._environ.get("MIRAGEN_MAX_CONCURRENT"):
-            env["MIRAGEN_MAX_CONCURRENT"] = self._environ["MIRAGEN_MAX_CONCURRENT"]
-        # The provider and host allowlists for agent_type: external | hybrid
-        # profiles, forwarded for the same reason: /validate and create check
-        # a profile against this daemon's values, and the container's own load must see
-        # the same one or a profile validated here fails closed at boot.
-        for key in (ALLOWED_PROVIDERS_ENV, ALLOWED_HOSTS_ENV):
-            if self._environ.get(key):
-                env[key] = self._environ[key]
-        # The model rates source budgets weight cache tokens by
-        # (miragen/model_rates.py): one catalogue for every managed agent.
-        # A local rates file is a path on this host, so it is not forwarded.
-        for key in (RATES_URL_ENV, RATES_TOKEN_ENV, RATES_REFRESH_ENV):
-            if self._environ.get(key):
-                env[key] = self._environ[key]
+        env.update(self._shared_forward_env())
         # Operator-named passthrough — a deliberate broadcast to EVERY agent,
         # outside the per-profile grants above (so it is no place for a
         # provider key or the subscription token, which have scoped paths).
@@ -995,10 +1099,8 @@ class LifecycleCore:
         # only when the operator listed it here AND it is set non-empty in
         # the daemon's own environment, so the daemon still cannot be talked
         # into minting credentials it does not hold.
-        passthrough = self._environ.get("MIRAGEND_AGENT_ENV_PASSTHROUGH", "")
-        for raw_name in passthrough.split(","):
-            key = raw_name.strip()
-            if key and self._environ.get(key):
+        for key in self._passthrough_names():
+            if self._environ.get(key):
                 env[key] = self._environ[key]
         # Runtime-scoped auto-forward: the subscription token goes to agents
         # that run Claude Code — `executor: claude-code` or a `claude-code:`
@@ -1037,9 +1139,15 @@ class LifecycleCore:
             secret_names=tuple(secret_names),
         )
 
-    def _compose_add_service(self, name: str, image_ref: str | None = None) -> None:
+    def _compose_add_service(
+        self, name: str, image_ref: str | None = None, *, profile_text: str | None = None
+    ) -> None:
+        self._define_service(
+            name, self._build_service_spec(name, image_ref, profile_text=profile_text))
+
+    def _define_service(self, name: str, spec: ServiceSpec) -> None:
         self.ensure_network()
-        self._spawn_driver.define_service(name, self._build_service_spec(name, image_ref))
+        self._spawn_driver.define_service(name, spec)
 
     def _compose_remove_service(self, name: str) -> None:
         self._spawn_driver.remove_service(name)
@@ -1171,10 +1279,11 @@ class LifecycleCore:
                 else f"from miragen import register\n\n# Tools for {name}\n"
             )
             self._write_agent_labels(name, validated_labels)
-            self._compose_add_service(name, spawn_ref)
+            self._compose_add_service(name, spawn_ref, profile_text=yaml_source)
             try:
                 self._compose_up(name)
                 self._watch_first_boot(name)
+                self._save_last_good(name, yaml_source)
             except AgentBootFailed:
                 # The container came up and died: tear it down so the
                 # rollback leaves nothing crash-looping behind the error.
@@ -1211,32 +1320,36 @@ class LifecycleCore:
                     f"remove its tools before making it agent_type: {summary['agent_type']}"
                 )
 
-        old_kind_for_contract = self._agent_executor_kind(name)
-        will_recreate = str(summary.get("executor") or "") != old_kind_for_contract
-        # Credentials the running container holds, before the new profile
-        # lands: if the new one entitles it to a different set, the
-        # container must be recreated (below) — a restart keeps its env.
-        old_credentials = self._agent_credentials(name)
+        # The profile this agent was last successfully given, from the
+        # daemon's own copy: agents/<name>/ is mounted rw into the agent, so
+        # the on-disk agent.yaml may say anything by now. Agents applied
+        # before that copy existed fall back to the file (see rollback).
+        original = yaml_path.read_text()
+        last_good = self._last_good(name)
+        previous = last_good if last_good is not None else original
+        old_kind = self._profile_kind(name, previous)
+        # Both kinds as the container resolves them (_container_view).
+        new_kind = self._profile_kind(name, yaml_source)
+        will_recreate = new_kind != old_kind
 
         # Same boundary as create, against the RIGHT image — which depends
         # on what this update will actually do. A kind change recreates the
         # container from the base image (validate and pin that, exactly like
-        # create); anything else restarts in place and re-executes the image
-        # pinned in the service, so THAT is what must satisfy the contract.
-        # Checking the base tag on the restart path would both reject
-        # updates the running image supports and admit updates that crash
-        # it (Codex review, PR #76). Falls back to the base image for agents
-        # created before service pinning existed.
+        # create); anything else keeps the image pinned in the service, so
+        # THAT is what must satisfy the contract. Checking the base tag on
+        # the keep-image path would both reject updates the running image
+        # supports and admit updates that crash it (Codex review, PR #76).
+        # Falls back to the base image for agents created before service
+        # pinning existed.
+        running_ref = self._service_image(name)
         if will_recreate:
-            spawn_ref = self._validated_spawn_ref(summary["profile_contract"])
+            apply_ref = self._validated_spawn_ref(summary["profile_contract"])
         else:
-            spawn_ref = None
-            running_ref = self._service_image(name) or self._base_image
-            self._validated_image(running_ref, summary["profile_contract"])
+            apply_ref = running_ref or self._base_image
+            self._validated_image(apply_ref, summary["profile_contract"])
 
-        original = yaml_path.read_text()
         try:
-            old_data = yaml.safe_load(original)
+            old_data = yaml.safe_load(previous)
         except Exception:
             old_data = {}
         if not isinstance(old_data, dict):
@@ -1248,40 +1361,39 @@ class LifecycleCore:
         if not isinstance(new_data, dict):
             new_data = {}
 
-        # A change of executor kind changes which credentials the service is
-        # entitled to, and container environment is fixed at create time --
-        # restart() preserves it. Recompose and let compose recreate the
-        # container instead, or an agent switched TO claude-code runs without
-        # its subscription token while one switched AWAY keeps holding it.
-        #
-        # The same holds for any change in the credential plan within a kind
-        # (a model-tier agent moved to a claude-code: model gains the token;
-        # a dropped grant or provider must be revoked, not left in the env).
-        # Such a recreate keeps the image the running container already
-        # validated against (running_ref), so the digest pin survives.
-        old_kind = self._agent_executor_kind(name)
-        new_kind = str(summary.get("executor") or "")
+        # Container environment and secret mounts are fixed at create time —
+        # a restart preserves them. So the unit this profile entitles the
+        # agent to is compared with the one it ACTUALLY has (the spawn
+        # driver's stored definition, outside the agent's reach), and any
+        # difference recreates it: a kind change, a gained claude-code:
+        # model, a dropped grant or provider, and also an unchanged profile
+        # re-submitted after a daemon upgrade narrowed what it forwards.
+        # Comparing two plans recomputed from profile text would miss that
+        # last case and leave revoked keys in the running container. The
+        # new unit is planned from the submitted text, never re-read from
+        # the agent-writable file. A recreate that keeps the kind keeps the
+        # image the running container validated against (apply_ref), so the
+        # digest pin survives.
+        previous_spec = self._current_spec(name)
+        new_spec = self._build_service_spec(name, apply_ref, profile_text=yaml_source)
+        recreate = will_recreate or self._delivered(previous_spec) != self._delivered(new_spec)
 
         yaml_path.write_text(yaml_source)
-        credentials_changed = self._agent_credentials(name) != old_credentials
-        recreate = new_kind != old_kind or credentials_changed
-        apply_ref = spawn_ref if will_recreate else (running_ref if recreate else None)
         try:
-            self._apply_config(name, recreate=recreate, image_ref=apply_ref)
+            if recreate:
+                self._define_service(name, new_spec)
+                self._compose_up(name)
+            else:
+                self.restart_agent(name)
             self._watch_first_boot(name)
         except DaemonError as exc:
-            yaml_path.write_text(original)
-            try:
-                self._apply_config(
-                    name, recreate=recreate,
-                    image_ref=None if will_recreate else apply_ref,
-                )
-            except DaemonError:
-                pass
+            self._roll_back_config(
+                name, previous, previous_spec, recreate=recreate, image_ref=running_ref)
             raise RestartFailed(
                 "new config applied but restart failed — previous config restored: "
                 f"{exc}"
             ) from exc
+        self._save_last_good(name, yaml_source)
 
         changed = sorted(
             k for k in (set(old_data) | set(new_data)) if old_data.get(k) != new_data.get(k)
@@ -1298,23 +1410,38 @@ class LifecycleCore:
         self._require_agent(name)
         self._compose_up(name)
 
-    def _apply_config(
-        self, name: str, *, recreate: bool, image_ref: str | None = None
+    def _roll_back_config(
+        self,
+        name: str,
+        previous_text: str,
+        previous_spec: ServiceSpec | None,
+        *,
+        recreate: bool,
+        image_ref: str | None,
     ) -> None:
-        """Put a rewritten agent.yaml into effect. A plain restart re-reads
-        the mounted profile, which is all most edits need; `recreate` also
-        regenerates the compose service so `compose up` replaces the
-        container, picking up an environment the running one cannot change.
+        """Best effort: put the agent back as it was before a failed update.
 
-        `image_ref` is the runtime the caller validated for the new profile
-        — required on the recreate path, because regenerating the service
-        without it would rewrite the mutable tag and discard the digest pin
-        the contract check established (#75 + Codex review on #76)."""
-        if recreate:
-            self._compose_add_service(name, image_ref)
+        The profile written back is the daemon's last-known-good copy (or,
+        for an agent applied before that copy existed, the file as it was
+        when the update began). The unit is the driver's previous definition,
+        re-applied VERBATIM: its environment and secrets are what the agent
+        already held, so the rollback never recomputes credentials from
+        profile text — text the agent itself may have rewritten through its
+        rw /agent mount. Only when the driver cannot report a previous
+        definition is the unit recomposed from `previous_text` on the image
+        the agent ran (`image_ref`)."""
+        (self._agent_dir(name) / "agent.yaml").write_text(previous_text)
+        try:
+            if not recreate:
+                self.restart_agent(name)
+                return
+            if previous_spec is not None:
+                self._define_service(name, previous_spec)
+            else:
+                self._compose_add_service(name, image_ref, profile_text=previous_text)
             self._compose_up(name)
-        else:
-            self.restart_agent(name)
+        except DaemonError:
+            pass
 
     def restart_agent(self, name: str) -> None:
         self._require_agent(name)
@@ -1341,6 +1468,7 @@ class LifecycleCore:
         except SpawnOperationFailed as exc:
             raise ContainerOperationFailed(str(exc)) from exc
         self._compose_remove_service(name)
+        self._last_good_path(name).unlink(missing_ok=True)
         if d.exists():
             shutil.rmtree(d)
 
@@ -1704,13 +1832,15 @@ class LifecycleCore:
                 shutil.move(str(src_root), str(d))
                 created_dir = True
 
-            self._compose_add_service(name, spawn_ref)
+            imported_text = (d / "agent.yaml").read_text()
+            self._compose_add_service(name, spawn_ref, profile_text=imported_text)
             added_service = True
 
             if start:
                 self._compose_up(name)
                 started = True
                 self._watch_first_boot(name)
+            self._save_last_good(name, imported_text)
         except DaemonError:
             if started:
                 self._teardown_container(name)

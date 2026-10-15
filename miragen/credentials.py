@@ -8,14 +8,16 @@ could read (and spend, or leak) all of them. An agent now receives only:
 - **Implied keys** — what the profile itself already says it uses:
   - the provider key of every pydantic-ai model it names (``spec.model``,
     ``memory.extraction.model`` / ``memory.recall.model``, an
-    ``ImageGeneration`` ``fallback_model``): ``openai:...`` ->
-    ``OPENAI_API_KEY``. Subscription harness models (``claude-code:``,
-    ``codex:``, ``grok-build:``) imply no key — they run on the
-    subscription, and a stray metered key would silently outrank it;
-  - an executor's own documented metered fallback (``codex`` ->
-    ``CODEX_API_KEY`` / ``OPENAI_API_KEY`` …). ``claude-code`` is left out
-    for the same reason as the harness models, and ``grok-build`` with
-    ``grok_auth: subscription`` gets none (the executor strips it anyway);
+    ``ImageGeneration`` ``fallback_model``): ``openai:...`` (or a bare
+    ``gpt-4o`` pydantic-ai still resolves) -> ``OPENAI_API_KEY``,
+    ``gateway/...`` -> the gateway key. Subscription harness models
+    (``claude-code:``, ``codex:``, ``grok-build:``) imply no key — they run
+    on the subscription, and a stray metered key would silently outrank it;
+  - an executor's own documented metered fallback (``kimi-code``,
+    ``grok-build`` — except with ``grok_auth: subscription``, which the
+    executor strips anyway). ``claude-code`` and ``codex`` run on the
+    subscription: their metered keys (SUBSCRIPTION_OVERRIDING_KEYS) reach
+    them only through an explicit grant, never through any implied route;
   - any ``*_env`` field naming a key (``voice.api_key_env``, which
     defaults to ``OPENAI_API_KEY`` for ``provider: openai``;
     ``bearer_token_env`` …) and any ``${..._API_KEY}`` reference in the
@@ -38,13 +40,15 @@ Docs: docs/credential-grants.md.
 
 from __future__ import annotations
 
+import os
 import re
+from collections.abc import MutableMapping
 from dataclasses import dataclass
 from typing import Any
 
 from miragen.models import GRANTABLE_CREDENTIAL_PATTERN, AgentProfile
 
-_GRANTABLE_RE = re.compile(GRANTABLE_CREDENTIAL_PATTERN)
+GRANTABLE_RE = re.compile(GRANTABLE_CREDENTIAL_PATTERN)
 
 # pydantic-ai provider prefix -> the *_API_KEY variables its provider reads
 # (pydantic_ai/providers/*). Providers that authenticate otherwise
@@ -83,14 +87,26 @@ PROVIDER_CREDENTIAL_ENV: dict[str, tuple[str, ...]] = {
 }
 
 # Executor kind -> its documented metered fallback (docs/design/
-# subscription-homes.md). claude-code is absent on purpose: its credential
-# is the subscription token below, and ANTHROPIC_API_KEY outranks that
-# token inside Claude Code, so forwarding it would silently switch the
-# agent to metered billing. Grant it explicitly to opt in.
+# subscription-homes.md). claude-code and codex are absent on purpose: they
+# run on the subscription (the long-lived token / the mounted auth.json),
+# and a metered key outranks it — Claude Code prefers ANTHROPIC_API_KEY over
+# its token, the codex executor logs in with an API key over auth.json. So
+# their metered fallback is an explicit grant (`credentials:`), never implied.
 EXECUTOR_FALLBACK_CREDENTIAL_ENV: dict[str, tuple[str, ...]] = {
-    "codex": ("CODEX_API_KEY", "OPENAI_API_KEY"),
     "kimi-code": ("KIMI_API_KEY", "MOONSHOT_API_KEY", "KIMI_CODE_API_KEY"),
     "grok-build": ("XAI_API_KEY", "GROK_CODE_XAI_API_KEY"),
+}
+
+# Keys a subscription executor would let outrank its subscription, by kind:
+# they reach such an agent only when `credentials:` lists them, never through
+# an implied route (a memory model's provider, a ${VAR} reference, a *_env
+# field). The executors enforce the same rule on their child processes
+# (executor/claude_code.py, executor/codex.py), because the daemon's plan is
+# not the only way a key can reach a container (MIRAGEND_AGENT_ENV_PASSTHROUGH,
+# a hand-run container).
+SUBSCRIPTION_OVERRIDING_KEYS: dict[str, tuple[str, ...]] = {
+    "claude-code": ("ANTHROPIC_API_KEY",),
+    "codex": ("CODEX_API_KEY", "OPENAI_API_KEY"),
 }
 
 # The subscription token and who may receive it. Not a *_API_KEY: never
@@ -144,15 +160,41 @@ def _model_strings(profile: AgentProfile) -> list[str]:
     return models
 
 
+# pydantic-ai's Pydantic AI Gateway routes `gateway/<provider>:model` through
+# one gateway key (pydantic_ai/providers/gateway.py), whatever the upstream.
+GATEWAY_PROVIDER_PREFIX = "gateway/"
+
+
+def _model_provider(model: str) -> str | None:
+    """The provider pydantic-ai resolves `model` to: its own parse_model_id,
+    so `provider:model` and the legacy bare names it still accepts (`gpt-4o`
+    -> openai, `claude-…` -> anthropic, `gemini-…` -> google; its
+    _LEGACY_MODEL_PREFIXES) map exactly as the runtime will. None for a name
+    the runtime cannot resolve either."""
+    import warnings
+
+    from pydantic_ai.models import parse_model_id
+
+    with warnings.catch_warnings():
+        # A bare name is deprecated upstream, not invalid: the runtime still
+        # serves it, so the plan must too.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        provider, _ = parse_model_id(model.strip())
+    return provider.strip().lower() if provider else None
+
+
 def provider_credentials(model: str) -> tuple[str, ...]:
-    """'openai:gpt-5' -> ('OPENAI_API_KEY',). Harness models, bare names and
-    unknown providers -> ()."""
+    """'openai:gpt-5' / 'gpt-5' -> ('OPENAI_API_KEY',);
+    'gateway/openai:gpt-5' -> the gateway key. Harness models and unknown
+    providers -> ()."""
     if model.startswith(_HARNESS_MODEL_PREFIXES):
         return ()
-    provider, sep, _ = model.partition(":")
-    if not sep:
+    provider = _model_provider(model)
+    if provider is None:
         return ()
-    return PROVIDER_CREDENTIAL_ENV.get(provider.strip().lower(), ())
+    if provider.startswith(GATEWAY_PROVIDER_PREFIX):
+        return PROVIDER_CREDENTIAL_ENV["gateway"]
+    return PROVIDER_CREDENTIAL_ENV.get(provider, ())
 
 
 def _env_field_names(value: Any) -> list[str]:
@@ -203,8 +245,47 @@ def credential_plan(profile: AgentProfile, raw_document: Any = None) -> Credenti
     names.update(_env_field_names(profile.model_dump(mode="json")))
     if raw_document is not None:
         names.update(_env_references(raw_document))
+    if profile.executor is not None:
+        # Only an explicit grant may hand a subscription executor the key
+        # that would outrank its subscription: an anthropic: memory model,
+        # a ${ANTHROPIC_API_KEY} reference or a bearer_token_env naming it
+        # implies nothing here.
+        explicit = set(profile.credentials)
+        names -= set(SUBSCRIPTION_OVERRIDING_KEYS.get(profile.executor.executor, ())) - explicit
     tokens = {CLAUDE_CODE_TOKEN_ENV} if runs_claude_code(profile) else set()
     return CredentialPlan(
-        api_keys=frozenset(n for n in names if _GRANTABLE_RE.fullmatch(n)),
+        api_keys=frozenset(n for n in names if GRANTABLE_RE.fullmatch(n)),
         env_tokens=frozenset(tokens),
     )
+
+
+# Never grantable (not a *_API_KEY), and Claude Code bills it over the token.
+CLAUDE_CODE_ALWAYS_SCRUBBED = ("ANTHROPIC_AUTH_TOKEN",)
+
+
+def scrub_subscription_overrides(
+    profile: AgentProfile, environ: MutableMapping[str, str] | None = None
+) -> list[str]:
+    """Remove from `environ` (default: this process's) every key that would
+    outrank a subscription executor's own credential, unless the profile
+    grants it in `credentials:`. Runs in the agent at executor startup, after
+    *_FILE secrets resolve and before any child (Claude Code, the Codex app
+    server) is spawned — children inherit this environment, and the SDKs can
+    override a variable but not unset it. Returns the names removed."""
+    env = os.environ if environ is None else environ
+    if profile.executor is None:
+        return []
+    kind = profile.executor.executor
+    granted = set(profile.credentials)
+    names = [k for k in SUBSCRIPTION_OVERRIDING_KEYS.get(kind, ()) if k not in granted]
+    if kind == "claude-code":
+        names += CLAUDE_CODE_ALWAYS_SCRUBBED
+    removed = [k for k in names if k in env]
+    for key in removed:
+        del env[key]
+    return removed
+
+
+def granted_explicitly(profile: AgentProfile, key: str) -> bool:
+    """`key` is listed in the profile's `credentials:`."""
+    return key in profile.credentials

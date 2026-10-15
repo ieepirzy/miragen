@@ -8,6 +8,7 @@ the env forwarding and the Docker secret mount are each checked."""
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 import yaml as pyyaml
@@ -38,6 +39,12 @@ spec:
   model: "{model}"
   instructions: "be helpful"
 """
+
+MEMORY = (
+    "memory:\n  backend: ephemeral\n"
+    "  scopes: {{read: [s], propose: [s], default_write: s}}\n"
+    "  extraction: {{model: '{model}'}}\n"
+)
 
 EXECUTOR_YAML = """\
 name: {name}
@@ -134,11 +141,28 @@ def test_openai_voice_implies_its_key(core, tmp_path):
     assert sorted(service["secrets"]) == ["anthropic_key", "openai_key"]
 
 
-def test_codex_executor_gets_its_metered_fallback_only(core, tmp_path):
+def test_codex_executor_gets_no_metered_key_without_a_grant(core, tmp_path):
+    """Codex runs on the subscription auth.json; its API-key fallback would
+    replace it, so it is an explicit grant, never implied."""
     core.create_agent("worker", EXECUTOR_YAML.format(name="worker", kind="codex"))
     service = _service(tmp_path, "worker")
-    assert _key_env(service) == {"OPENAI_API_KEY_FILE"}
+    assert _key_env(service) == set()
+    assert service["secrets"] == []
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in service["environment"]
+
+
+def test_codex_executor_gets_its_metered_fallback_when_granted(core, tmp_path):
+    core.create_agent("worker", EXECUTOR_YAML.format(name="worker", kind="codex")
+                      + "credentials: [OPENAI_API_KEY]\n")
+    service = _service(tmp_path, "worker")
+    assert _key_env(service) == {"OPENAI_API_KEY_FILE"}
+    assert service["secrets"] == ["openai_key"]
+
+
+def test_codex_executor_openai_memory_model_needs_the_grant_too(core, tmp_path):
+    core.create_agent("worker", EXECUTOR_YAML.format(name="worker", kind="codex") + MEMORY.format(
+        model="openai:gpt-5-mini"))
+    assert _key_env(_service(tmp_path, "worker")) == set()
 
 
 # ── the subscription token ───────────────────────────────────────────────────
@@ -325,3 +349,360 @@ def test_grok_subscription_auth_gets_no_metered_key():
         "executor": {"executor": "grok-build", "instructions": "x",
                      "grok_auth": "subscription"}})
     assert credential_plan(prof).api_keys == frozenset()
+
+
+# ── review round: bare and gateway model names ──────────────────────────────
+
+
+@pytest.mark.parametrize("model, keys", [
+    ("gpt-4o", ("OPENAI_API_KEY",)),
+    ("o3-mini", ("OPENAI_API_KEY",)),
+    ("o1", ("OPENAI_API_KEY",)),
+    ("claude-sonnet-4-6", ("ANTHROPIC_API_KEY",)),
+    ("gemini-2.5-pro", ("GOOGLE_API_KEY", "GEMINI_API_KEY")),
+    ("gateway/openai:gpt-5", ("PYDANTIC_AI_GATEWAY_API_KEY", "PAIG_API_KEY")),
+    ("gateway/anthropic:claude-sonnet-4-6", ("PYDANTIC_AI_GATEWAY_API_KEY", "PAIG_API_KEY")),
+    ("llama-3", ()),
+])
+def test_bare_and_gateway_model_names(model, keys):
+    from miragen.credentials import provider_credentials
+
+    assert provider_credentials(model) == keys
+
+
+def test_every_legacy_prefix_pydantic_ai_accepts_maps_to_its_providers_key():
+    """Drift guard against the installed pydantic-ai: each bare-name prefix
+    it still resolves maps to the key of the provider it resolves to."""
+    from pydantic_ai.models import _LEGACY_MODEL_PREFIXES
+
+    from miragen.credentials import PROVIDER_CREDENTIAL_ENV, provider_credentials
+
+    assert _LEGACY_MODEL_PREFIXES  # the table this guard is about still exists
+    for prefix, provider in _LEGACY_MODEL_PREFIXES.items():
+        assert PROVIDER_CREDENTIAL_ENV.get(provider), provider
+        assert provider_credentials(f"{prefix}-x") == PROVIDER_CREDENTIAL_ENV[provider]
+
+
+def test_a_bare_model_name_gets_its_key_at_spawn(core, tmp_path):
+    """`model: gpt-4o` runs (pydantic-ai resolves it to openai): withholding
+    the key would crash-loop it at boot."""
+    core.create_agent("alpha", _model("alpha", "gpt-4o"))
+    service = _service(tmp_path, "alpha")
+    assert _key_env(service) == {"OPENAI_API_KEY_FILE"}
+    assert service["secrets"] == ["openai_key"]
+
+
+def test_a_gateway_model_gets_the_gateway_key_at_spawn(tmp_path):
+    core = _executor_kind_core(tmp_path, {**DAEMON_ENV, "PYDANTIC_AI_GATEWAY_API_KEY": "paig"})
+    core.create_agent("alpha", _model("alpha", "gateway/openai:gpt-5"))
+    assert _key_env(_service(tmp_path, "alpha")) == {"PYDANTIC_AI_GATEWAY_API_KEY"}
+
+
+# ── review round: claude-code never gets ANTHROPIC_* implicitly ─────────────
+
+
+def _claude_code_executor_yaml(extra: str = "") -> str:
+    return EXECUTOR_YAML.format(name="worker", kind="claude-code") + extra
+
+
+@pytest.mark.parametrize("route", [
+    MEMORY.format(model="anthropic:claude-haiku-4-5"),
+    "on_complete:\n  post_to: 'https://example.com/${ANTHROPIC_API_KEY:-x}'\n",
+])
+def test_claude_code_executor_gets_no_anthropic_key_through_an_implied_route(
+    core, tmp_path, route
+):
+    core.create_agent("worker", _claude_code_executor_yaml(route))
+    service = _service(tmp_path, "worker")
+    assert _key_env(service) == set()
+    assert service["secrets"] == []
+    assert service["environment"]["CLAUDE_CODE_OAUTH_TOKEN"] == TOKEN
+
+
+def test_claude_code_executor_bearer_token_env_does_not_imply_the_anthropic_key():
+    from miragen.credentials import credential_plan
+
+    prof = AgentProfile.model_validate({
+        "name": "w", "mode": "interactive", "triggers": [{"type": "http"}],
+        "executor": {"executor": "claude-code", "instructions": "x", "mcp_servers": [
+            {"name": "m", "url": "https://mcp.example.com/mcp",
+             "bearer_token_env": "ANTHROPIC_API_KEY"}]}})
+    assert credential_plan(prof).api_keys == frozenset()
+
+
+def test_claude_code_executor_with_an_explicit_grant_gets_the_anthropic_key(core, tmp_path):
+    core.create_agent("worker", _claude_code_executor_yaml(
+        MEMORY.format(model="anthropic:claude-haiku-4-5")
+        + "credentials: [ANTHROPIC_API_KEY]\n"))
+    service = _service(tmp_path, "worker")
+    assert _key_env(service) == {"ANTHROPIC_API_KEY_FILE"}
+    assert service["secrets"] == ["anthropic_key"]
+
+
+def _executor_profile(kind: str, credentials: list[str] | None = None) -> AgentProfile:
+    body = {"name": "w", "mode": "interactive", "triggers": [{"type": "http"}],
+            "executor": {"executor": kind, "instructions": "x"}}
+    if credentials is not None:
+        body["credentials"] = credentials
+    return AgentProfile.model_validate(body)
+
+
+@pytest.mark.parametrize("granted", [False, True])
+def test_claude_code_executor_child_env_drops_an_ungranted_metered_key(
+    tmp_path, monkeypatch, granted
+):
+    """The Claude Code child inherits this process's environment (the SDK
+    can override a variable but not unset one), so prepare() removes the
+    metered key unless the profile grants it — whatever delivered it
+    (passthrough, a hand-run container). ANTHROPIC_AUTH_TOKEN is never
+    grantable and always goes."""
+    from miragen.executor.claude_code import ClaudeCodeExecutor
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-metered")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-bearer")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN)
+    profile = _executor_profile("claude-code", ["ANTHROPIC_API_KEY"] if granted else None)
+    ClaudeCodeExecutor(profile, runs_root=tmp_path / "runs").prepare()
+    assert ("ANTHROPIC_API_KEY" in os.environ) is granted
+    assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
+    assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"] == TOKEN
+
+
+# ── review round: codex logs in with an API key only when granted ───────────
+
+
+class _FakeCodex:
+    def __init__(self):
+        self.logins: list[str] = []
+
+    async def login_api_key(self, key):
+        self.logins.append(key)
+
+
+@pytest.mark.parametrize("granted, expected", [
+    (None, []),
+    (["OPENAI_API_KEY"], ["sk-openai"]),
+    (["CODEX_API_KEY", "OPENAI_API_KEY"], ["sk-codex"]),
+])
+async def test_codex_logs_in_with_an_api_key_only_when_granted(
+    tmp_path, monkeypatch, granted, expected
+):
+    """A key that is merely present — OPENAI_API_KEY forwarded for an
+    openai: memory model, say — never replaces the subscription auth.json."""
+    from miragen.executor import CodexExecutor
+
+    monkeypatch.setenv("CODEX_API_KEY", "sk-codex")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+    executor = CodexExecutor(_executor_profile("codex", granted),
+                             runs_root=tmp_path / "runs", session_factory=None)
+    codex = _FakeCodex()
+    await executor._login(codex)
+    assert codex.logins == expected
+
+
+@pytest.mark.parametrize("granted", [False, True])
+def test_codex_prepare_withholds_ungranted_keys_from_the_app_server(
+    tmp_path, monkeypatch, granted
+):
+    from miragen.executor import CodexExecutor
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "inherited"))
+    monkeypatch.setenv("CODEX_API_KEY", "sk-codex")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+    profile = _executor_profile("codex", ["OPENAI_API_KEY"] if granted else None)
+    profile.executor.codex_home = str(tmp_path / "codex-home")
+    CodexExecutor(profile, runs_root=tmp_path / "runs", session_factory=None).prepare()
+    assert "CODEX_API_KEY" not in os.environ
+    assert ("OPENAI_API_KEY" in os.environ) is granted
+
+
+# ── review round: updates compare against the unit as it runs ──────────────
+
+
+def _ups(core) -> list[list[str]]:
+    return [c for c in core._spawn_driver._run.calls if c[:3] == ["docker", "compose", "up"]]
+
+
+def test_an_unchanged_resubmit_recreates_when_the_running_unit_holds_more(core, tmp_path):
+    """After an upgrade narrows what the daemon forwards, re-submitting the
+    SAME profile must recreate: the running container still holds the old,
+    wider environment. Simulated by widening its stored definition the way
+    the pre-grants daemon wrote it."""
+    text = _model("alpha", "anthropic:claude-sonnet-4-6")
+    core.create_agent("alpha", text)
+    compose = pyyaml.safe_load((tmp_path / "compose.yml").read_text())
+    compose["services"]["alpha"]["environment"]["TAVILY_API_KEY_FILE"] = "/run/secrets/tavily_key"
+    compose["services"]["alpha"]["secrets"].append("tavily_key")
+    (tmp_path / "compose.yml").write_text(pyyaml.safe_dump(compose))
+    container = core._docker.container_map["alpha"]
+    ups = len(_ups(core))
+
+    core.update_agent_config("alpha", text)
+    service = _service(tmp_path, "alpha")
+    assert "TAVILY_API_KEY_FILE" not in service["environment"]
+    assert service["secrets"] == ["anthropic_key"]
+    assert len(_ups(core)) == ups + 1  # recreated…
+    assert container.restarted == 0  # …not merely restarted
+    assert service["image"] == DEFAULT_DIGEST
+
+
+def test_a_true_no_op_update_only_restarts(core, tmp_path):
+    text = _model("alpha", "anthropic:claude-sonnet-4-6")
+    core.create_agent("alpha", text)
+    ups = len(_ups(core))
+    core.update_agent_config("alpha", text)
+    assert len(_ups(core)) == ups
+    assert core._docker.container_map["alpha"].restarted == 1
+
+
+def test_a_driver_that_cannot_report_its_definition_recreates(core, tmp_path, monkeypatch):
+    text = _model("alpha", "anthropic:claude-sonnet-4-6")
+    core.create_agent("alpha", text)
+    monkeypatch.setattr(core._spawn_driver, "current_spec", lambda name: None)
+    ups = len(_ups(core))
+    core.update_agent_config("alpha", text)
+    assert len(_ups(core)) == ups + 1
+
+
+def _fail_next_boot(core):
+    docker = core._docker
+
+    def on_up(name):
+        docker.add(name).status = "restarting"
+    core._spawn_driver._run.on_up = on_up
+
+
+def test_rollback_restores_the_last_good_profile_and_unit_not_a_tampered_file(core, tmp_path):
+    """agents/<name>/ is the agent's rw /agent mount. An agent that rewrote
+    its own agent.yaml (granting itself a key, switching its executor) must
+    not get that profile — or its credentials — back from a failed update's
+    rollback."""
+    from miragen.daemon.core import RestartFailed
+
+    good = _model("alpha", "anthropic:claude-sonnet-4-6")
+    core.create_agent("alpha", good)
+    before = _service(tmp_path, "alpha")
+    yaml_path = tmp_path / "agents" / "alpha" / "agent.yaml"
+    yaml_path.write_text(_model("alpha", "claude-code:claude-opus-4-8",
+                                "credentials: [TAVILY_API_KEY, OPENAI_API_KEY]\n"))
+
+    _fail_next_boot(core)
+    with pytest.raises(RestartFailed):
+        core.update_agent_config("alpha", _model("alpha", "openai:gpt-5"))
+
+    assert yaml_path.read_text() == good
+    after = _service(tmp_path, "alpha")
+    assert after == before  # the previous unit, verbatim
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in after["environment"]
+    assert "tavily_key" not in after["secrets"]
+
+
+def test_a_tampered_executor_kind_does_not_drive_the_update(core, tmp_path):
+    """The previous kind comes from the daemon's copy: a profile rewritten
+    in place to claim another executor must not flip the update onto the
+    base-image recreate path (which would drop the digest pin)."""
+    good = _model("alpha", "anthropic:claude-sonnet-4-6")
+    core.create_agent("alpha", good)
+    (tmp_path / "agents" / "alpha" / "agent.yaml").write_text(
+        EXECUTOR_YAML.format(name="alpha", kind="codex"))
+    core.update_agent_config("alpha", good)
+    # Unchanged unit, same kind as last applied: a plain restart.
+    assert core._docker.container_map["alpha"].restarted == 1
+
+
+def test_rollback_without_a_last_good_copy_keeps_the_previous_unit(core, tmp_path):
+    """An agent applied before the daemon kept its copy: the file as found
+    is written back, but the unit is still the previous definition, so its
+    credentials are never recomputed from that file."""
+    from miragen.daemon.core import RestartFailed
+
+    core.create_agent("alpha", _model("alpha", "anthropic:claude-sonnet-4-6"))
+    core._last_good_path("alpha").unlink()
+    before = _service(tmp_path, "alpha")
+    tampered = _model("alpha", "anthropic:claude-sonnet-4-6", "credentials: [TAVILY_API_KEY]\n")
+    (tmp_path / "agents" / "alpha" / "agent.yaml").write_text(tampered)
+
+    _fail_next_boot(core)
+    with pytest.raises(RestartFailed):
+        core.update_agent_config("alpha", _model("alpha", "openai:gpt-5"))
+    assert _service(tmp_path, "alpha") == before
+
+
+def test_last_good_copy_follows_create_update_and_delete(core, tmp_path):
+    first = _model("alpha", "anthropic:claude-sonnet-4-6")
+    core.create_agent("alpha", first)
+    path = core._last_good_path("alpha")
+    assert path.read_text() == first
+    # Outside the agent's own mount.
+    assert (tmp_path / "agents" / "alpha") not in path.parents
+    second = _model("alpha", "openai:gpt-5")
+    core.update_agent_config("alpha", second)
+    assert path.read_text() == second
+    core.delete_agent("alpha")
+    assert not path.exists()
+
+
+def test_import_plans_from_the_imported_profile_and_keeps_a_copy(core, tmp_path):
+    core.create_agent("alpha", _model("alpha", "openai:gpt-5"))
+    archive = core.export_agent("alpha")["archive_path"]
+    core.import_agent("beta", archive)
+    service = _service(tmp_path, "beta")
+    assert _key_env(service) == {"OPENAI_API_KEY_FILE"}
+    assert service["secrets"] == ["openai_key"]
+    assert "name: beta" in core._last_good_path("beta").read_text()
+
+
+# ── review round: interpolation as the container resolves it ────────────────
+
+
+@pytest.mark.parametrize("forwarded", [False, True])
+def test_interpolated_model_resolves_as_the_container_will(tmp_path, monkeypatch, forwarded):
+    """LANE_MODEL is set in the daemon. Not forwarded, the container takes
+    the default (anthropic) — so must the plan; forwarded by passthrough,
+    the container sees openai — so must the plan. os.environ holds a decoy
+    to prove the injected environment is what is read."""
+    monkeypatch.setenv("LANE_MODEL", "groq:llama-3.3-70b")
+    environ = {**DAEMON_ENV, "LANE_MODEL": "openai:gpt-5"}
+    if forwarded:
+        environ["MIRAGEND_AGENT_ENV_PASSTHROUGH"] = "LANE_MODEL"
+    core = _executor_kind_core(tmp_path, environ)
+    core.create_agent("alpha", _model("alpha", "${LANE_MODEL:-anthropic:claude-sonnet-4-6}"))
+    expected = {"OPENAI_API_KEY_FILE"} if forwarded else {"ANTHROPIC_API_KEY_FILE"}
+    assert _key_env(_service(tmp_path, "alpha")) == expected
+
+
+def test_interpolate_env_reads_the_mapping_it_is_given(monkeypatch):
+    from miragen.load import interpolate_env
+
+    monkeypatch.setenv("X", "process")
+    assert interpolate_env({"a": ["${X}"]}, environ={"X": "given"}) == {"a": ["given"]}
+    assert interpolate_env("${X:-dflt}", environ={}) == "dflt"
+    assert interpolate_env("${X}") == "process"
+
+
+# ── review round: passthrough broadcast warning ─────────────────────────────
+
+
+@pytest.mark.parametrize("listed, warned", [
+    ("CLAUDE_CODE_OAUTH_TOKEN", True),
+    ("FOO, OPENAI_API_KEY", True),
+    ("OPENAI_API_KEY_FILE", True),
+    ("LANE_MODEL,MIRAGEN_SOMETHING", False),
+])
+def test_passthrough_of_a_credential_warns_at_startup(tmp_path, caplog, listed, warned):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="miragen.daemon"):
+        _executor_kind_core(tmp_path, {"MIRAGEND_AGENT_ENV_PASSTHROUGH": listed})
+    hits = [r for r in caplog.records if "MIRAGEND_AGENT_ENV_PASSTHROUGH" in r.getMessage()]
+    assert bool(hits) is warned
+
+
+def test_spawn_executor_gets_no_key_unless_granted():
+    from miragen.credentials import credential_plan
+
+    body = {"name": "s", "mode": "interactive", "triggers": [{"type": "http"}],
+            "executor": {"executor": "spawn", "instructions": "x", "command": ["true"]}}
+    assert credential_plan(AgentProfile.model_validate(body)).api_keys == frozenset()
+    granted = AgentProfile.model_validate({**body, "credentials": ["TAVILY_API_KEY"]})
+    assert credential_plan(granted).api_keys == {"TAVILY_API_KEY"}

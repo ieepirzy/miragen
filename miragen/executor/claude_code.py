@@ -10,8 +10,12 @@ in the container environment (the long-lived subscription token from
 `claude setup-token` — Claude Code is the one backend whose subscription
 credential travels as a single env var, so no shared home volume is needed),
 or Claude Code OAuth credentials volume-mounted at ~/.claude (the Codex
-`auth.json` story, one door over), or a metered `ANTHROPIC_API_KEY`.
-`prepare()` warns at startup when none of the three is visible.
+`auth.json` story, one door over), or a metered `ANTHROPIC_API_KEY` — the
+last ONLY when the profile grants it in `credentials:`. Claude Code prefers
+the metered key over the token, so `prepare()` removes an ungranted
+`ANTHROPIC_API_KEY` (and `ANTHROPIC_AUTH_TOKEN`, never grantable) from the
+process before any Claude Code child can inherit it
+(docs/credential-grants.md). It then warns when no credential is visible.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import os
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
+from miragen.credentials import scrub_subscription_overrides
 from miragen.executor.base import ExecutorBackend
 from miragen.executor.leash import GateOperation
 from miragen.models import AgentProfile, anthropic_usage_fields
@@ -59,6 +64,12 @@ class ClaudeCodeExecutor(ExecutorBackend):
     # ── Startup ────────────────────────────────────────────────────────────
 
     def prepare(self) -> None:
+        removed = scrub_subscription_overrides(self.profile)
+        if removed:
+            logger.info(
+                f"[{self.profile.name}] withheld {', '.join(removed)} from Claude Code "
+                "(not in credentials:) — it runs on the subscription token"
+            )
         if (
             not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
             and not os.environ.get("ANTHROPIC_API_KEY")
@@ -67,8 +78,8 @@ class ClaudeCodeExecutor(ExecutorBackend):
             logger.warning(
                 f"[{self.profile.name}] no CLAUDE_CODE_OAUTH_TOKEN, no ANTHROPIC_API_KEY and "
                 "no ~/.claude credentials — executor spawns will fail auth. Mint a "
-                "subscription token with `claude setup-token`, set a metered key, or mount "
-                "Claude Code credentials."
+                "subscription token with `claude setup-token`, grant a metered key "
+                "(credentials: [ANTHROPIC_API_KEY]), or mount Claude Code credentials."
             )
 
     # ── Turn streaming ─────────────────────────────────────────────────────
