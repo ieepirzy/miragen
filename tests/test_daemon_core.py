@@ -246,8 +246,11 @@ def test_create_agent_writes_workspace_compose_and_starts(core, runner, tmp_path
     assert service["networks"] == ["miragen-net"]
     # The internal token is forwarded so the agent's /run guard is armed.
     assert service["environment"]["MIRAGEN_INTERNAL_TOKEN"] == "shared-secret"
-    assert service["environment"]["ANTHROPIC_API_KEY_FILE"] == "/run/secrets/anthropic_key"
-    assert compose["secrets"] == {"anthropic_key": {"external": True}}
+    # The daemon holds an Anthropic key, but this profile's model
+    # ('test:whatever') implies none and it grants none: no key, no mount
+    # (per-profile grants, tests/test_credential_grants.py).
+    assert "ANTHROPIC_API_KEY_FILE" not in service["environment"]
+    assert service["secrets"] == []
 
 
 def test_create_agent_forwards_labels_to_the_spawned_unit(core, tmp_path):

@@ -9,6 +9,11 @@ from apscheduler.triggers.cron import CronTrigger as _APCronTrigger
 
 from miragen import model_rates
 from miragen.profile_contract import format_api_version, parse_api_version
+
+# A credential a profile may be granted by name (AgentProfile.credentials):
+# only the *_API_KEY family miragend forwards, never an arbitrary daemon
+# variable such as MIRAGEN_INTERNAL_TOKEN or CLAUDE_CODE_OAUTH_TOKEN.
+GRANTABLE_CREDENTIAL_PATTERN = r"^[A-Z][A-Z0-9_]*_API_KEY$"
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 
@@ -1874,6 +1879,25 @@ class AgentProfile(_ProfileModel):
             "are kept after loading (oldest dropped first). None = unbounded (today's behaviour)."
         ),
     )
+    credentials: list[Annotated[str, Field(pattern=GRANTABLE_CREDENTIAL_PATTERN)]] = Field(
+        default_factory=list,
+        # Declaring the field implies profile contract v6 (older runtimes
+        # reject the key, extra=forbid); an empty list is left out of
+        # serialized profiles so a profile without grants dumps back to its
+        # original contract.
+        exclude_if=lambda v: not v,
+        description=(
+            "Extra credentials miragend may hand this agent, by env var name "
+            "(each must end in _API_KEY, e.g. TAVILY_API_KEY). The daemon "
+            "forwards the variable and its *_API_KEY_FILE secret only when it "
+            "holds them. Keys the profile already implies need no entry: each "
+            "pydantic-ai model's provider key (openai: -> OPENAI_API_KEY), an "
+            "executor's own metered fallback, a voice api_key_env, any *_env "
+            "field naming a key and any ${..._API_KEY} reference. Everything "
+            "else is withheld (docs/credential-grants.md). Declaring the field "
+            "implies profile contract v6."
+        ),
+    )
     spec: Optional[AgentSpec] = Field(
         default=None,
         description="Model-tier backend (miragen owns the loop). Exactly one of spec/executor.",
@@ -1899,6 +1923,10 @@ class AgentProfile(_ProfileModel):
         rejects even `agent_type: internal` as an unknown key. Serialization
         drops the default (exclude_if on the field), so a profile that
         never declared it, or declared `internal`, dumps back to contract 1."""
+        if "credentials" in self.model_fields_set:
+            # By presence, like agent_type: miragend spawns the text as
+            # written, and an older runtime rejects even `credentials: []`.
+            return 6
         harness = self.spec.harness if self.spec is not None else None
         if harness is not None and harness.subagent_model == "pin":
             # By value: "inherit" never reaches a dump (exclude_if), so only
@@ -1937,7 +1965,8 @@ class AgentProfile(_ProfileModel):
                 f"profile declares apiVersion {self.api_version} but uses "
                 f"features requiring {format_api_version(inferred)} "
                 "(the executor tier is a v2 surface, agent_type a v3 one, "
-                "spec.harness a v4 one, spec.harness.subagent_model: pin a v5 one) — "
+                "spec.harness a v4 one, spec.harness.subagent_model: pin a v5 one, "
+                "credentials a v6 one) — "
                 "a profile must not understate its runtime requirement"
             )
         return self
