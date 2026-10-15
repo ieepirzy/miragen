@@ -276,3 +276,111 @@ class TestInjectTools:
         assert mock_agent.tool.call_count == 2
         calls = [c.args[0] for c in mock_agent.tool.call_args_list]
         assert calls == [alpha, beta]
+
+
+# ── inference_geo for public-facing Anthropic profiles ──────────────────────
+#
+# Asserted on the request body the Anthropic SDK actually sends, not on the
+# settings dict: the claim is "the Messages API receives inference_geo", and
+# that depends on pydantic-ai forwarding extra_body and the SDK merging it.
+
+def _anthropic_reply() -> dict:
+    return {
+        "id": "msg_test", "type": "message", "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [{"type": "text", "text": "ok"}],
+        "stop_reason": "end_turn", "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+
+
+async def _sent_body(profile, monkeypatch, env=None):
+    """Run the built agent once against a fake Anthropic endpoint and return
+    the JSON body of the Messages API request."""
+    import json
+
+    import httpx
+    from pydantic_ai.models.anthropic import AnthropicModel
+    from pydantic_ai.providers.anthropic import AnthropicProvider
+
+    from miragen.agent_type import INFERENCE_GEO_ENV
+
+    monkeypatch.delenv(INFERENCE_GEO_ENV, raising=False)
+    # Agent() resolves the provider at build time; the key is never used
+    # (the model is overridden onto the fake endpoint below).
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "unused")
+    for k, v in (env or {}).items():
+        monkeypatch.setenv(k, v)
+
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json=_anthropic_reply())
+
+    agent, _ = build_agent(profile)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    model = AnthropicModel(
+        profile.spec.model.partition(":")[2],
+        provider=AnthropicProvider(api_key="test-key", http_client=client),
+    )
+    with agent.override(model=model):
+        await agent.run("hello")
+    await client.aclose()
+    assert len(bodies) == 1
+    return bodies[0]
+
+
+def _public(agent_type="external", model="anthropic:claude-sonnet-4-6"):
+    return _profile(agent_type=agent_type, spec={"model": model, "instructions": "Test."})
+
+
+class TestInferenceGeo:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("agent_type", ["external", "hybrid"])
+    async def test_public_anthropic_profile_sends_us_by_default(self, agent_type, monkeypatch):
+        body = await _sent_body(_public(agent_type), monkeypatch)
+        assert body["inference_geo"] == "us"
+
+    @pytest.mark.asyncio
+    async def test_empty_env_still_means_us(self, monkeypatch):
+        body = await _sent_body(
+            _public(), monkeypatch, {"MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO": "  "}
+        )
+        assert body["inference_geo"] == "us"
+
+    @pytest.mark.asyncio
+    async def test_env_overrides_the_geo(self, monkeypatch):
+        body = await _sent_body(
+            _public(), monkeypatch, {"MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO": " Global "}
+        )
+        assert body["inference_geo"] == "global"
+
+    @pytest.mark.asyncio
+    async def test_kept_alongside_profile_model_settings(self, monkeypatch):
+        profile = _profile(
+            agent_type="external",
+            spec={"model": "anthropic:claude-sonnet-4-6", "instructions": "Test.",
+                  "model_settings": {"max_tokens": 321}},
+        )
+        body = await _sent_body(profile, monkeypatch)
+        assert body["inference_geo"] == "us"
+        assert body["max_tokens"] == 321
+
+    @pytest.mark.asyncio
+    async def test_internal_profile_sends_no_geo(self, monkeypatch):
+        body = await _sent_body(_profile(spec={"model": "anthropic:claude-sonnet-4-6",
+                                               "instructions": "Test."}), monkeypatch)
+        assert "inference_geo" not in body
+
+    def test_malformed_env_refuses_to_build(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "unused")
+        monkeypatch.setenv("MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO", "us; drop")
+        with pytest.raises(ValueError, match="MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO"):
+            build_agent(_public())
+
+    def test_other_providers_get_no_extra_body(self, monkeypatch):
+        monkeypatch.delenv("MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "unused")
+        agent, _ = build_agent(_public(model="openai-chat:gpt-4o"))
+        assert "extra_body" not in (agent.model_settings or {})

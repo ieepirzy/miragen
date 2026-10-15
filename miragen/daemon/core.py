@@ -43,6 +43,7 @@ from miragen.daemon.spawn.docker_compose import DockerComposeSpawnDriver
 from miragen.agent_type import (
     ALLOWED_HOSTS_ENV,
     ALLOWED_PROVIDERS_ENV,
+    INFERENCE_GEO_ENV,
     PUBLIC_AGENT_TYPES,
     allowed_hosts_from_env,
     allowed_providers_from_env,
@@ -923,11 +924,13 @@ class LifecycleCore:
         # profiles, forwarded for the same reason: /validate and create check
         # a profile against this daemon's values, and the container's own load
         # must see the same one or a profile validated here fails closed at boot.
+        # The Anthropic inference geo those profiles run with goes along: it is
+        # applied in the container, where the model requests are made.
         # The model rates source budgets weight cache tokens by
         # (miragen/model_rates.py): one catalogue for every managed agent.
         # A local rates file is a path on this host, so it is not forwarded.
         for key in ("MIRAGEN_MAX_CONCURRENT", ALLOWED_PROVIDERS_ENV, ALLOWED_HOSTS_ENV,
-                    RATES_URL_ENV, RATES_TOKEN_ENV, RATES_REFRESH_ENV):
+                    INFERENCE_GEO_ENV, RATES_URL_ENV, RATES_TOKEN_ENV, RATES_REFRESH_ENV):
             if self._environ.get(key):
                 env[key] = self._environ[key]
         return env

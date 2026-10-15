@@ -18,6 +18,10 @@ account backing — and `hybrid` serves both, so it is held to the same rules:
   once the environment is, so it cannot be checked at validation time;
 - no ``memory:`` block: a public-facing agent keeps no long-term memory of
   the people it talks to;
+- a model on the ``anthropic`` provider is sent with the Messages API's
+  ``inference_geo`` (``MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO``, default
+  ``us``), applied when the agent is built (`miragen.factory.build_agent`),
+  not at load;
 - every outbound URL (MCP servers, an http voice endpoint,
   ``approval_webhook``, ``on_complete.post_to``) has its host in
   ``MIRAGEN_EXTERNAL_ALLOWED_HOSTS`` (exact hostnames; unset refuses any);
@@ -34,6 +38,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -44,6 +49,14 @@ from miragen.models import AgentProfile
 
 ALLOWED_PROVIDERS_ENV = "MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS"
 ALLOWED_HOSTS_ENV = "MIRAGEN_EXTERNAL_ALLOWED_HOSTS"
+# Where Anthropic runs inference for a public-facing profile's model
+# requests: the Messages API's `inference_geo` ("us" or "global"; unset means
+# the API workspace's default, and "global" may process anywhere). Customer
+# chats must stay under EU or US jurisdiction (mirarun ADR-036, Decision 5),
+# so unset or empty here means "us", not "leave it to the workspace".
+INFERENCE_GEO_ENV = "MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO"
+DEFAULT_INFERENCE_GEO = "us"
+_INFERENCE_GEO_RE = re.compile(r"[a-z][a-z0-9_-]*")
 
 PUBLIC_AGENT_TYPES = frozenset({"external", "hybrid"})
 
@@ -120,6 +133,37 @@ def allowed_hosts_from_env(environ: Mapping[str, str] | None = None) -> frozense
     endpoint may live on: exact names, no wildcards."""
     env = os.environ if environ is None else environ
     return parse_allowed_providers(env.get(ALLOWED_HOSTS_ENV))
+
+
+def inference_geo_from_env(environ: Mapping[str, str] | None = None) -> str:
+    """MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO, trimmed and lowercased;
+    unset or empty is "us". A value that is not a plain region name raises
+    rather than being sent and failing on every request."""
+    env = os.environ if environ is None else environ
+    raw = (env.get(INFERENCE_GEO_ENV) or "").strip().lower()
+    if not raw:
+        return DEFAULT_INFERENCE_GEO
+    if not _INFERENCE_GEO_RE.fullmatch(raw):
+        raise ValueError(
+            f"{INFERENCE_GEO_ENV}: {raw!r} is not an inference geo (e.g. 'us')"
+        )
+    return raw
+
+
+def anthropic_request_extras(
+    profile: AgentProfile, environ: Mapping[str, str] | None = None
+) -> dict[str, str] | None:
+    """Extra Messages API request fields for a public-facing profile whose
+    model runs on the `anthropic` provider: `{"inference_geo": ...}`. None
+    for internal profiles and for any other provider (inference_geo is a
+    first-party Anthropic API parameter; Bedrock and Vertex place inference
+    by region instead)."""
+    if profile.agent_type not in PUBLIC_AGENT_TYPES or profile.spec is None:
+        return None
+    model = profile.spec.model
+    if not isinstance(model, str) or model.partition(":")[0] != "anthropic":
+        return None
+    return {"inference_geo": inference_geo_from_env(environ)}
 
 
 def _check_url_host(
@@ -224,7 +268,7 @@ def check_agent_type(
         raise ValueError(
             f"{who} needs the deployment's allowed-provider list: set "
             f"{ALLOWED_PROVIDERS_ENV} to comma-separated provider names "
-            "(e.g. 'anthropic,openai'). Unset or empty refuses every "
+            "(e.g. 'anthropic'). Unset or empty refuses every "
             "external/hybrid profile."
         )
 

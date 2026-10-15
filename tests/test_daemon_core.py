@@ -433,6 +433,23 @@ def test_external_allowlist_forwarded_into_agent_env(tmp_path):
     assert env["MIRAGEN_EXTERNAL_ALLOWED_HOSTS"] == "mcp.example.com"
 
 
+def test_inference_geo_forwarded_into_agent_env(tmp_path):
+    """The Anthropic inference geo is applied where the model requests are
+    made, inside the container, so the daemon's setting must reach it."""
+    core = _external_core(tmp_path, {
+        "MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS": "anthropic,test",
+        "MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO": "global",
+    })
+    core.create_agent("alpha", _yaml("alpha"))
+
+    import yaml as pyyaml
+
+    env = pyyaml.safe_load((tmp_path / "compose.yml").read_text())["services"]["alpha"][
+        "environment"
+    ]
+    assert env["MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO"] == "global"
+
+
 def test_external_profile_refused_at_create_without_daemon_allowlist(tmp_path, monkeypatch):
     # The process environment holds a list, the daemon's own mapping does
     # not: create must judge by the mapping it forwards into containers.

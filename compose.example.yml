@@ -46,8 +46,13 @@ services:
       MIRAGEN_INTERNAL_TOKEN: replace-with-the-shared-agent-token
       # Providers agent_type: external / hybrid profiles may use (pydantic-ai
       # provider names, comma-separated). Unset or empty refuses every such
-      # profile; miragend forwards it into the agents it creates.
-      # MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS: anthropic,openai
+      # profile; miragend forwards it into the agents it creates. Anthropic
+      # only until a transfer analysis covers another provider (mirarun
+      # ADR-036). compose.yaml defaults it to this value.
+      MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS: anthropic
+      # Where Anthropic runs a public-facing model's inference (Messages API
+      # inference_geo). Unset or empty = us; forwarded like the list above.
+      # MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO: us
       # Hostnames their MCP servers / http voice endpoint may live on (exact,
       # comma-separated). Unset or empty refuses any MCP on such a profile.
       # MIRAGEN_EXTERNAL_ALLOWED_HOSTS: mcp.example.com
