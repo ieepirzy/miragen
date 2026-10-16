@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 import miragen.app as app_module
@@ -24,3 +26,15 @@ def _reset_model_rates():
     model_rates._warned.clear()
     yield
     model_rates.configure(None)
+
+
+@pytest.fixture(autouse=True)
+def _restore_environ():
+    """CLI and lifespan tests run the *_FILE secrets loader against the real
+    os.environ. Restore it after each test so one test's resolved (or
+    deleted) variables never reach the next one's subprocesses."""
+    saved = dict(os.environ)
+    yield
+    if os.environ != saved:
+        os.environ.clear()
+        os.environ.update(saved)

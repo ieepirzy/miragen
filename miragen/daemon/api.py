@@ -606,7 +606,7 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
     # Loimi credentials. (Found live: a MIRAGEND_TOKEN_FILE resolved after
     # the token was read left the API unguarded while logging nothing
     # worse than the usual empty-token warning.)
-    from miragen.daemon.sessions.config import load_file_secrets
+    from miragen.file_secrets import load_file_secrets
 
     load_file_secrets()
 

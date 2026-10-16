@@ -8,7 +8,6 @@ per-project bindings, the recall lane, and housekeeping bounds.
 
 from __future__ import annotations
 
-import logging
 import os
 from pathlib import Path
 from typing import Literal, Optional
@@ -17,8 +16,6 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from miragen.models import MemoryRecallSpec
-
-logger = logging.getLogger(__name__)
 
 _SCOPE_ID = r"^[a-z0-9][a-z0-9_.:-]{0,126}$"
 
@@ -296,21 +293,3 @@ def load_sessions_config(path: str | Path) -> SessionsConfig:
     return SessionsConfig.model_validate(data)
 
 
-def load_file_secrets(environ: dict | None = None) -> None:
-    """Resolve *_FILE env vars into their plain counterparts — the same
-    contract as the agent runtime's loader (miragen.app._load_file_secrets),
-    kept local so the daemon never imports the agent runtime for it."""
-    env = os.environ if environ is None else environ
-    for file_var, path in list(env.items()):
-        if not file_var.endswith("_FILE"):
-            continue
-        secret_path = Path(path)
-        if not secret_path.exists():
-            logger.warning(f"Secret file referenced by {file_var} not found: {path}")
-            continue
-        target = file_var[: -len("_FILE")]
-        try:
-            env[target] = secret_path.read_text().strip()
-            del env[file_var]
-        except OSError as exc:
-            logger.error(f"Failed to read secret file {path} for {file_var}: {exc}")
