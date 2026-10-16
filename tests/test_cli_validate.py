@@ -79,3 +79,16 @@ def test_interpolated_capability_config_is_not_printed(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert "sk-very-secret" not in result.output
     assert "['WebSearch', 'MCP(home)']" in result.output
+
+
+def test_a_misshapen_capability_error_does_not_print_its_values(tmp_path, monkeypatch):
+    """#196 review: `name:` beside `MCP:` instead of under it made the error
+    print the interpolated capability, URL token and all."""
+    doc = _profile()
+    doc["spec"]["capabilities"] = [{"MCP": {"url": "https://mcp.example.com/mcp?key=${MCP_KEY}"},
+                                    "name": "home"}]
+    result = _validate(tmp_path, monkeypatch, _write(tmp_path, "a.yaml", doc),
+                       env={"MCP_KEY": "sk-very-secret"})
+    assert result.exit_code == 1
+    assert "exactly one key" in result.output and "'MCP', 'name'" in result.output
+    assert "sk-very-secret" not in result.output

@@ -158,12 +158,12 @@ def resolve_capabilities(
         elif isinstance(entry, dict):
             if len(entry) != 1:
                 raise ValueError(
-                    f"Capability dict must have exactly one key (the capability name), got: {entry}"
+                    f"Capability dict must have exactly one key (the capability name), got keys: {[str(k) for k in entry]}"
                 )
             name, cfg = next(iter(entry.items()))
             cfg = cfg or {}
         else:
-            raise ValueError(f"Unexpected capability format: {entry!r}")
+            raise ValueError(f"Unexpected capability format: a {type(entry).__name__}, not a name or a mapping")
 
         if name not in _CAPABILITY_REGISTRY:
             raise ValueError(

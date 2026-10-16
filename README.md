@@ -722,17 +722,28 @@ Environment variables: `AGENT_PROFILE`, `TOOLS`, `HOST`, `PORT`.
 
 ```yaml
 # .github/workflows/profiles.yml
-- uses: actions/setup-python@v5
-  with: { python-version: "3.12" }
-- run: pip install "miragen==${{ env.MIRAGEN_VERSION }}"   # the version your image runs
-- run: miragen validate agents/*/agent.yaml
-  env:
-    # A profile's ${VAR} must be defined, as at runtime. Placeholders are
-    # enough for validation; no real credentials are needed.
-    WEBHOOK_URL: https://example.invalid/hook
+name: Validate agent profiles
+on: [pull_request]
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      MIRAGEN_VERSION: "0.2.0"   # the version your image runs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install "miragen==${{ env.MIRAGEN_VERSION }}"
+      - run: miragen validate agents/*/agent.yaml
+        env:
+          # A profile's ${VAR} must be defined, as at runtime. Placeholders
+          # are enough for validation; no real credentials are needed.
+          WEBHOOK_URL: https://example.invalid/hook
 ```
 
-Capabilities are printed by name only (`MCP(github)`), never with their interpolated URLs or headers.
+One `--tools` module (default `./tools.py`) is imported for the whole run. Profiles that register capabilities from their own directory's `tools.py` need one `miragen validate` per directory, run from that directory.
+
+Capabilities are printed by name only (`MCP(github)`), never with their interpolated URLs or headers, and errors name a malformed capability's keys, not its values.
 
 ---
 
