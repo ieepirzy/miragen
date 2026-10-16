@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Any
 
 from miragen.harness.base import (
-    HarnessResult, HarnessTurn, InstanceBusyError, TaskStream, parse_harness_model,
+    HarnessResult, HarnessTurn, InstanceBusyError, MiraRunEnv, TaskStream, parse_harness_model,
 )
 from miragen.harness.gateway import ToolGateway, _capability_entries
 from miragen.harness.grok_lifecycle import (
@@ -321,7 +321,7 @@ class _Outcome:
         return "\n\n".join(self.final or self.other).strip()
 
 
-class CodexHarness:
+class CodexHarness(MiraRunEnv):
     name = NAME
     native_capabilities = NATIVE_CAPABILITIES
 
@@ -417,6 +417,7 @@ class CodexHarness:
         env = {k: os.environ[k] for k in ENV_ALLOWLIST if k in os.environ}
         env.update({"CODEX_HOME": str(self.settings.codex_home),
                     "HOME": str(self.settings.codex_home / "home")})
+        env.update(self._mirarun_env(instance))
         return env
 
     # ── server requests: gateway tool calls run, everything else is denied ──
@@ -778,7 +779,11 @@ class CodexHarness:
         # raised while starting this turn must survive it (next turn: fresh).
         lost_before = bool((self._load_state().get(instance) or {}).get("lost"))
         handoff = None if ephemeral else self._pending_handoff(instance)
-        agent = await self._agent_for(instance, ephemeral=ephemeral)
+        await self._remember_mirarun(instance, ephemeral, turn.mirarun)
+        try:
+            agent = await self._agent_for(instance, ephemeral=ephemeral)
+        finally:
+            self._forget_mirarun(instance)
         try:
             async with agent.lock:
                 agent.last_used = time.monotonic()

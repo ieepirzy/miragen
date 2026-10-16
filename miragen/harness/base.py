@@ -24,7 +24,7 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-from miragen.models import RunUsage, ToolCallRecord
+from miragen.models import RunUsage, ToolCallRecord, mirarun_env
 
 PYDANTIC_AI = "pydantic-ai"
 # Harness model prefixes. The part after the colon is the harness's own model
@@ -59,6 +59,11 @@ class HarnessTurn:
     secret_env: dict[str, str] | None = None
     # Per-run system context (the memory packet): transient by contract.
     extra_instructions: str | None = None
+    # MiraRun's ids for the run or session (execution-refs/v1). A harness
+    # sets them as MIRARUN_* in the agent process's environment; for a
+    # named instance it keeps them in the instance's state so a restarted
+    # process gets them too.
+    mirarun: dict[str, str] | None = None
 
 
 @dataclass
@@ -131,3 +136,36 @@ class Harness(Protocol):
 # (Grok Build sessions) doesn't use them.
 LoadHistory = Callable[[str], list]
 SaveHistory = Callable[[str, list, "str | None"], None]
+
+
+class MiraRunEnv:
+    """MIRARUN_* in a harness's agent processes (execution-refs/v1).
+
+    For the CLI harnesses, which start one process per instance (or per
+    one-off run) and keep it across turns. A named instance's refs live in
+    its state entry (``mirarun``), so a process started after a restart — or
+    after a crash — gets the same ones; a one-off run's are held in memory
+    only for as long as its process is being started. A live process keeps
+    the environment it started with: refs that change apply from the next
+    process (rotate the instance to apply them at once).
+
+    The harness supplies ``_load_state`` and ``_update_instance``."""
+
+    async def _remember_mirarun(self, instance: str, ephemeral: bool,
+                                refs: dict[str, str] | None) -> None:
+        if not refs:
+            return
+        if ephemeral:
+            self.__dict__.setdefault("_mirarun_ephemeral", {})[instance] = dict(refs)
+            return
+        if (self._load_state().get(instance) or {}).get("mirarun") != refs:
+            await self._update_instance(instance, mirarun=dict(refs))
+
+    def _forget_mirarun(self, instance: str) -> None:
+        self.__dict__.get("_mirarun_ephemeral", {}).pop(instance, None)
+
+    def _mirarun_env(self, instance: str) -> dict[str, str]:
+        refs = self.__dict__.get("_mirarun_ephemeral", {}).get(instance)
+        if refs is None:
+            refs = (self._load_state().get(instance) or {}).get("mirarun")
+        return mirarun_env(refs)

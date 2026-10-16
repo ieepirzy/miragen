@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import logging
+import math
 import re
 from datetime import datetime
 from typing import Annotated, Any, Literal, Optional, Union
 
 from apscheduler.triggers.cron import CronTrigger as _APCronTrigger
 
+from miragen import model_rates
 from miragen.profile_contract import format_api_version, parse_api_version
+
+# A credential a profile may be granted by name (AgentProfile.credentials):
+# only the *_API_KEY family miragend forwards, never an arbitrary daemon
+# variable such as MIRAGEN_INTERNAL_TOKEN or CLAUDE_CODE_OAUTH_TOKEN.
+GRANTABLE_CREDENTIAL_PATTERN = r"^[A-Z][A-Z0-9_]*_API_KEY$"
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 
@@ -123,16 +131,99 @@ def _add_optional(a: Optional[int], b: Optional[int]) -> Optional[int]:
     return (a or 0) + (b or 0)
 
 
-def budget_tokens(usage: Optional[RunUsage]) -> int:
+class _Unset:
+    pass
+
+
+_UNSET: Any = _Unset()
+
+
+def _call_slices(usage: RunUsage) -> list[tuple[Optional[str], int, int, Optional[int]]]:
+    """(model, cache reads, cache writes, 1h writes or None if the split is
+    unknown) per weighting slice: one per reported call, then the remainder
+    of the run's totals that the calls don't account for (all of it when
+    there is no breakdown, the rest when `calls` was truncated), under the
+    run's model (None)."""
+    calls = usage.calls or []
+    slices: list[tuple[Optional[str], int, int, Optional[int]]] = []
+    for call in calls:
+        reads = max(call.cached_input_tokens or 0, 0)
+        writes = max(call.cache_write_tokens or 0, 0)
+        one_hour = None if call.cache_write_1h_tokens is None else max(call.cache_write_1h_tokens, 0)
+        slices.append((call.model, reads, writes, one_hour))
+    reads_rest = max(max(usage.cached_input_tokens or 0, 0) - sum(s[1] for s in slices), 0)
+    writes_rest = max(max(usage.cache_write_tokens or 0, 0) - sum(s[2] for s in slices), 0)
+    split_known = usage.cache_write_1h_tokens is not None and all(
+        s[3] is not None or not s[2] for s in slices)
+    one_hour_rest = (
+        max(usage.cache_write_1h_tokens - sum(s[3] or 0 for s in slices), 0)  # type: ignore[operator]
+        if split_known else None
+    )
+    if reads_rest or writes_rest:
+        slices.append((None, reads_rest, writes_rest, one_hour_rest))
+    return slices
+
+
+def budget_tokens(
+    usage: Optional[RunUsage], model: Optional[str] = None, *, rates: Any = _UNSET
+) -> int:
     """Tokens a run spends against `limits.tokens_per_run` and the daily
-    budget: fresh input (uncached input and cache writes) plus output. Cache
-    reads are left out. They cost about a tenth of fresh input, and counting
-    them would make a long cached session exhaust its budget on reuse alone
-    (input_tokens includes them since the inclusive convention)."""
+    budget.
+
+    With NO rates source configured (miragen/model_rates.py), as before
+    rates existed: uncached input, cache writes and output count 1:1, and
+    cache reads are left out.
+
+    With a source: uncached input and output count 1:1, cache reads at the
+    model's `cached_input / input` rate ratio, cache writes at
+    `cache_write / input` (5-minute) and `cache_write_1h / input` (1-hour).
+    Each reported call (`usage.calls`) is weighted by its own model; usage
+    the calls don't account for is weighted by `model`, the run's model.
+    Each slice rounds up. A model the source can't weight (unlisted, or
+    rated at zero like a subscription harness) has its cache reads and
+    writes counted in full, never left out. A write whose rate is absent
+    counts 1:1.
+
+    `rates` overrides the configured source's table (None = no source).
+    """
     if usage is None:
         return 0
-    fresh_input = max((usage.input_tokens or 0) - (usage.cached_input_tokens or 0), 0)
-    return fresh_input + (usage.output_tokens or 0)
+    table = model_rates.current_table() if rates is _UNSET else rates
+    if table is None:
+        cached = max(usage.cached_input_tokens or 0, 0)
+        fresh_input = max((usage.input_tokens or 0) - cached, 0)
+        return fresh_input + max(usage.output_tokens or 0, 0)
+    slices = _call_slices(usage)
+    reads_total = sum(s[1] for s in slices)
+    writes_total = sum(s[2] for s in slices)
+    uncached = max((usage.input_tokens or 0) - reads_total - writes_total, 0)
+    total = uncached + max(usage.output_tokens or 0, 0)
+    for call_model, reads, writes, one_hour in slices:
+        if not reads and not writes:
+            continue
+        weights = model_rates.budget_weights(table, call_model, model, writes=bool(writes))
+        if one_hour is None:
+            # Split unknown: every write at the dearer of the two weights.
+            weighted_writes = writes * max(weights.cache_write, weights.cache_write_1h)
+        else:
+            one_hour = min(one_hour, writes)
+            weighted_writes = ((writes - one_hour) * weights.cache_write
+                               + one_hour * weights.cache_write_1h)
+        total += math.ceil(reads * weights.cache_read + weighted_writes)
+    return total
+
+
+def budget_model(profile: Any) -> Optional[str]:
+    """The model a profile's runs are weighted by when usage has no per-call
+    model: spec.model, or `<executor>:<executor.model>` on the executor tier
+    (None when the executor picks its own default)."""
+    spec = getattr(profile, "spec", None)
+    if spec is not None and getattr(spec, "model", None):
+        return spec.model
+    executor = getattr(profile, "executor", None)
+    if executor is not None and getattr(executor, "model", None):
+        return f"{executor.executor}:{executor.model}"
+    return None
 
 
 # Adapters whose stored input_tokens excluded cache reads before the
@@ -261,6 +352,68 @@ class RunProvenance(BaseModel):
     invocation_id: Optional[str] = None
     requested_by: Optional[str] = None
     edf_api_version: Optional[str] = None
+
+
+# ── MiraRun execution references (execution-refs/v1) ────────────────────────
+#
+# The ids MiraRun knows a run or session by, handed to the agent as
+# environment so tools inside it (the MiraDesign plugin's hooks) can attribute
+# what the agent records — an impediment, a blocker — to its run without the
+# agent ever looking the id up. Pointers for analysis, not authentication.
+# Only the harness sets these names: MIRARUN_ is a never-passthrough prefix,
+# so a profile cannot forward a host value that would spoof another run.
+
+MIRARUN_REF_ENV = {
+    "run_id": "MIRARUN_RUN_ID",
+    "agent_session_id": "MIRARUN_AGENT_SESSION_ID",
+    "lane_id": "MIRARUN_LANE_ID",
+    "lane_role": "MIRARUN_LANE_ROLE",
+    "lane_slot": "MIRARUN_LANE_SLOT",
+}
+_REF_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+_REF_RE = re.compile(_REF_PATTERN)
+_log = logging.getLogger("miragen.mirarun_refs")
+
+
+class MiraRunRefs(BaseModel):
+    """`mirarun` on a launch or turn request. Declared keys are checked;
+    anything else is ignored (a newer MiraRun may send more).
+
+    A malformed pointer never costs a launch: a value that is not a short id
+    is dropped (logged without the value) and the request goes ahead with
+    the keys that are."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    run_id: Optional[str] = None
+    agent_session_id: Optional[str] = None
+    lane_id: Optional[str] = None
+    lane_role: Optional[str] = None
+    lane_slot: Optional[str] = None
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _drop_malformed(cls, value: Any, info: Any) -> Any:
+        if value is None or (isinstance(value, str) and _REF_RE.match(value)):
+            return value
+        _log.warning("mirarun ref %s is not a short id; dropped", info.field_name)
+        return None
+
+    def present(self) -> dict[str, str]:
+        return {k: v for k, v in self.model_dump().items() if v}
+
+
+def mirarun_env(refs: Any) -> dict[str, str]:
+    """The MIRARUN_* environment for ``refs`` (a MiraRunRefs or the dict it
+    was persisted as). Re-checked here because the dict may come back from a
+    state file or a run record: a value that does not match is dropped, not
+    passed on."""
+    if isinstance(refs, MiraRunRefs):
+        refs = refs.present()
+    if not isinstance(refs, dict):
+        return {}
+    return {env: str(refs[key]) for key, env in MIRARUN_REF_ENV.items()
+            if isinstance(refs.get(key), str) and _REF_RE.match(refs[key])}
 
 
 class RepositoryRevision(BaseModel):
@@ -495,7 +648,11 @@ _TRIGGER_INSTANCE_FIELD = Field(
 class CronTrigger(_ProfileModel):
     type: Literal["cron"]
     schedule: str = Field(
-        description="Standard 5-field cron expression, e.g. '0 9 * * 1-5' (09:00 Mon–Fri).",
+        description=(
+            "Standard 5-field cron expression evaluated in UTC, e.g. "
+            "'0 9 * * mon-fri' (09:00 UTC Mon–Fri). Prefer weekday names: "
+            "numeric day_of_week counts from 0 = Monday, so '1-5' is Tue–Sat."
+        ),
         min_length=1,
     )
     default_prompt: Optional[str] = Field(
@@ -512,7 +669,7 @@ class CronTrigger(_ProfileModel):
         except ValueError as e:
             raise ValueError(
                 f"invalid cron expression '{v}': {e}. "
-                "Expected 5 fields (minute hour day month day_of_week), e.g. '0 9 * * 1-5'."
+                "Expected 5 fields (minute hour day month day_of_week), e.g. '0 9 * * mon-fri'."
             )
         return v
 
@@ -815,6 +972,261 @@ class ModelSettings(_ProfileModel):
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
 
 
+# ── Claude Code harness posture (docs/design/harnesses.md, "Engineer posture") ──
+
+# Environment names a profile may never pass through to a harness child.
+# Prefixes: credentials that outrank the subscription token or switch
+# provider (ANTHROPIC_*, CLAUDE_*; a superset of miragen/memory/claude_code.py's
+# SCRUBBED_ENV, which models.py cannot import without a cycle; a test pins
+# the two), miragen's own secrets and switches (MIRAGEN_*), the run identity
+# the harness sets from a launch's refs (MIRARUN_*, execution-refs/v1), anything that
+# reconfigures git, gh or TLS trust (GIT_* can add a credential helper for
+# any host, GIT_ASKPASS; GH_*; SSL_*), and the dynamic loader (LD_*).
+# Suffixes: secrets by naming convention. Passthrough is for non-secret
+# plugin configuration; plugin credentials belong in the deployment-written
+# <CLAUDE_CONFIG_DIR>/settings.json or a file the plugin reads.
+_NEVER_PASSTHROUGH_PREFIXES = ("ANTHROPIC_", "CLAUDE_", "MIRAGEN_", "MIRARUN_", "GIT_", "GH_",
+                               "SSL_", "LD_")
+_NEVER_PASSTHROUGH_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIALS")
+_NEVER_PASSTHROUGH = frozenset({
+    # Set by the harness itself, or able to run code in every child.
+    "HOME", "PATH", "NODE_OPTIONS", "PYTHONPATH", "PYTHONSTARTUP",
+    # The MiraDesign plugin's actor name: per instance, set by the harness.
+    "MIRADESIGN_AGENT",
+    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
+    "ALL_PROXY", "all_proxy", "NODE_EXTRA_CA_CERTS", "BASH_ENV", "ENV",
+})
+
+
+def passthrough_refused(name: str) -> bool:
+    upper = name.upper()
+    return (name in _NEVER_PASSTHROUGH or upper.startswith(_NEVER_PASSTHROUGH_PREFIXES)
+            or upper.endswith(_NEVER_PASSTHROUGH_SUFFIXES))
+
+
+# A worktree / shared-clone directory name: no path separators, no leading
+# dot (so never '.', '..' or a hidden name), never empty.
+_DIR_NAME_PATTERN = r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$"
+
+
+class EngineerRepository(_ProfileModel):
+    url: str = Field(
+        min_length=1,
+        description=(
+            "Clone URL, normally through the GitHub broker "
+            "(https://<broker>/<owner>/<repo>.git); https://github.com/… URLs are "
+            "rewritten to the broker when `git_broker` is set. Never carries "
+            "credentials (the broker credential comes from a credential helper)."
+        ),
+    )
+    name: Optional[str] = Field(
+        default=None,
+        pattern=_DIR_NAME_PATTERN,
+        description="Directory name of the worktree (default: the URL's last path segment).",
+    )
+
+    @field_validator("url")
+    @classmethod
+    def _no_credentials_in_url(cls, url: str) -> str:
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(url)
+        if parts.scheme not in ("https", "file"):
+            raise ValueError("repository urls are https:// (through the broker) or file://")
+        if parts.username or parts.password:
+            raise ValueError("repository urls must not carry credentials")
+        if parts.query or parts.fragment:
+            raise ValueError("repository urls carry no query or fragment")
+        return url
+
+    @property
+    def dir_name(self) -> str:
+        if self.name:
+            return self.name
+        from urllib.parse import unquote, urlsplit
+
+        last = unquote(urlsplit(self.url).path).rstrip("/").rsplit("/", 1)[-1]
+        return last.removesuffix(".git")
+
+    @model_validator(mode="after")
+    def _dir_name_is_safe(self) -> "EngineerRepository":
+        # The derived name becomes a directory under the instance's workdir
+        # (and the shared clone's name): '..', '.' or '' would point the
+        # worktree, and its cleanup, at a parent directory.
+        if not re.fullmatch(_DIR_NAME_PATTERN, self.dir_name):
+            raise ValueError(
+                f"repository url {self.url!r} gives the directory name {self.dir_name!r}, "
+                "which is not a plain name; set `name`")
+        return self
+
+
+class GitBrokerSpec(_ProfileModel):
+    host: str = Field(
+        pattern=r"^[A-Za-z0-9.-]+(:\d{1,5})?$",
+        description="The GitHub broker's host[:port] (mirarun ADR-041 §7); GH_HOST for gh.",
+    )
+    credential_file: str = Field(
+        min_length=1,
+        description=(
+            "File holding the broker credential (v1: one per container, a mounted "
+            "secret). Read at call time by the git credential helper and at process "
+            "start for GH_ENTERPRISE_TOKEN; never written into a repository's config."
+        ),
+    )
+    ca_bundle: Optional[str] = Field(
+        default=None,
+        description=(
+            "CA bundle trusting the broker (GIT_SSL_CAINFO and SSL_CERT_FILE). Must be "
+            "a COMBINED bundle (system roots + broker CA): SSL_CERT_FILE replaces the "
+            "system roots for Python and Go tools. Leave unset when the broker's CA "
+            "is already in the image's trust store."
+        ),
+    )
+    commit_name: Optional[str] = Field(default=None, min_length=1,
+                                       description="git user.name (default: the agent name).")
+    commit_email: Optional[str] = Field(
+        default=None, min_length=3,
+        description="git user.email (default: <agent>@agents.miragen.invalid).")
+
+
+class AskHumanMiraDesignSpec(_ProfileModel):
+    url: HttpUrl = Field(description="MiraDesign base URL (its MCP endpoint is <url>/mcp/).")
+    project: str = Field(min_length=1, description=(
+        "MiraDesign project key: new question threads and bare work item numbers resolve here."))
+    token_env: Optional[str] = Field(
+        default=None, pattern=r"^[A-Z_][A-Z0-9_]*$",
+        description=("Container env var holding a MiraDesign MCP bearer (a MIRADESIGN_MCP_TOKENS "
+                     "entry). miragen reads it from its own environment and does not pass it "
+                     "to the claude child, but the child runs as the same uid and can read "
+                     "miragen's /proc/<pid>/environ: treat it as visible to the agent."))
+    token_file: Optional[str] = Field(
+        default=None, min_length=1,
+        description="File holding a MiraDesign MCP bearer (a MIRADESIGN_MCP_TOKENS entry).")
+    to: list[str] = Field(
+        default_factory=lambda: ["ilari"], min_length=1,
+        description="Handles (or actor keys) a question is directed at.")
+
+    @model_validator(mode="after")
+    def _one_token_source(self) -> "AskHumanMiraDesignSpec":
+        if (self.token_env is None) == (self.token_file is None):
+            raise ValueError("ask_human needs exactly one of token_env / token_file")
+        return self
+
+
+class HarnessSpec(_ProfileModel):
+    posture: Literal["locked", "engineer"] = Field(
+        default="locked",
+        description=(
+            "'locked' (default): the gateway-only Claude Code session — no built-in "
+            "tools, settings, plugins or skills. 'engineer': an unattended software "
+            "engineer (mirarun ADR-041 §4) — built-in tools with bypassPermissions "
+            "(the container is the boundary), user settings (not the repository's) and plugins, a "
+            "git worktree per instance, broker-wired git/gh, subagent depth limit, "
+            "and the ask_human gateway tool."
+        ),
+    )
+    subagent_depth: int = Field(
+        default=1, ge=0, le=5,
+        description=(
+            "engineer: how deep Agent/Task subagents may nest (0 = no subagents, "
+            "1 = the session's own subagents may not spawn more)."
+        ),
+    )
+    subagent_model: Literal["inherit", "pin"] = Field(
+        default="inherit",
+        # Serialized profiles leave out the default, as for agent_type: a v4
+        # runtime (extra=forbid) rejects the key, so dumping "inherit" would
+        # crash-loop every re-submitted harness profile on a v4 image. "pin"
+        # is kept and implies contract 5 (inferred_contract).
+        exclude_if=lambda v: v == "inherit",
+        description=(
+            "engineer: which model subagents run. 'inherit' (default) sets nothing and "
+            "leaves it to Claude Code (subagents follow the session's model unless an "
+            "agent definition or an Agent call names its own). 'pin' sets "
+            "CLAUDE_CODE_SUBAGENT_MODEL to spec.model's id plus "
+            "CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1, so every subagent runs the session's "
+            "model whatever an Agent call or agent definition asks for."
+        ),
+    )
+    plugin_dirs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "engineer: local plugin directories loaded into every session (in "
+            "addition to plugins enabled in <CLAUDE_CONFIG_DIR>/settings.json)."
+        ),
+    )
+    env_passthrough: list[str] = Field(
+        default_factory=list,
+        description=(
+            "engineer: container env var NAMES passed to the claude process (and so "
+            "to plugin hooks and MCP servers), for non-secret configuration such as "
+            "MIRADESIGN_URL. Never overrides a variable the harness sets. Refused: "
+            "ANTHROPIC_*, CLAUDE_*, MIRAGEN_*, GIT_*, GH_*, SSL_*, LD_*, *_API_KEY, "
+            "*_KEY, *_TOKEN, *_SECRET, *_PASSWORD, *_CREDENTIALS, NODE_OPTIONS, "
+            "NODE_EXTRA_CA_CERTS, BASH_ENV, proxies."
+        ),
+    )
+    repositories: list[EngineerRepository] = Field(
+        default_factory=list,
+        description=(
+            "engineer: the lane's repositories. One shared bare clone each under "
+            "<claude_home>/repos/, and one detached worktree per instance at the "
+            "default branch."
+        ),
+    )
+    git_broker: Optional[GitBrokerSpec] = Field(
+        default=None, description="engineer: git/gh reach GitHub only through this broker.")
+    miradesign_agent_per_instance: bool = Field(
+        default=True,
+        description=(
+            "engineer: set MIRADESIGN_AGENT=<instance name> in each instance's claude "
+            "process, so the MiraDesign plugin registers the session as the durable "
+            "actor agent:claude-code/<instance> (MiraRun maps lane instances by it). "
+            "false = the plugin's default per-session actor. Not for one-off runs."
+        ),
+    )
+    ask_human: Optional[AskHumanMiraDesignSpec] = Field(
+        default=None,
+        description=(
+            "engineer: grants the `ask_human` gateway tool, which files a MiraDesign "
+            "question and returns at once (the answer arrives as a later turn)."
+        ),
+    )
+
+    @field_validator("env_passthrough")
+    @classmethod
+    def _passthrough_allowed(cls, names: list[str]) -> list[str]:
+        for name in names:
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                raise ValueError(f"env_passthrough: '{name}' is not an environment variable name")
+            if passthrough_refused(name):
+                raise ValueError(
+                    f"env_passthrough: '{name}' may not be passed to the harness: secrets, "
+                    "provider/billing switches and git/gh/TLS/loader configuration are refused "
+                    "(plugin credentials go in <CLAUDE_CONFIG_DIR>/settings.json)")
+        return names
+
+    @model_validator(mode="after")
+    def _engineer_fields_need_engineer(self) -> "HarnessSpec":
+        if self.posture == "engineer":
+            names = [r.dir_name for r in self.repositories]
+            if len(set(names)) != len(names):
+                raise ValueError("repositories: two entries share a directory name; set `name`")
+            return self
+        # By value, not by presence: a serialized locked block carries every
+        # default and must validate again (EDF resolved_profile round trips).
+        dead = [name for name, value in (
+            ("plugin_dirs", self.plugin_dirs), ("env_passthrough", self.env_passthrough),
+            ("repositories", self.repositories), ("git_broker", self.git_broker),
+            ("ask_human", self.ask_human), ("subagent_depth", self.subagent_depth != 1),
+            ("subagent_model", self.subagent_model != "inherit"),
+            ("miradesign_agent_per_instance", not self.miradesign_agent_per_instance),
+        ) if value]
+        if dead:
+            raise ValueError(f"harness fields {dead} only apply to posture: engineer")
+        return self
+
+
 class AgentSpec(_ProfileModel):
     model: str = Field(
         description="Any pydantic-ai model string, e.g. 'anthropic:claude-sonnet-4-6'.",
@@ -847,6 +1259,17 @@ class AgentSpec(_ProfileModel):
         ge=1,
         description="Maps to UsageLimits(request_limit=N) — caps model round-trips per run.",
     )
+    harness: Optional[HarnessSpec] = Field(
+        default=None,
+        # Declaring the block implies profile contract v4 (older runtimes
+        # reject the key); serialization drops an absent block so a profile
+        # without one dumps back to its original contract.
+        exclude_if=lambda v: v is None,
+        description=(
+            "Harness configuration (claude-code: models only): the session posture. "
+            "Declaring the block implies profile contract v4."
+        ),
+    )
 
     @model_validator(mode="after")
     def one_instructions_source(self) -> "AgentSpec":
@@ -864,15 +1287,22 @@ class Limits(_ProfileModel):
         default=None,
         ge=1,
         description=(
-            "Per-run token cap. Executors and the in-flight reserve count budget_tokens "
-            "(fresh input + output, cache reads excluded); the model tier also hands it to "
-            "PydanticAI as UsageLimits.total_tokens_limit, whose total includes cache reads."
+            "Per-run token cap. Executors and the in-flight reserve count budget_tokens: "
+            "uncached input + output 1:1, cache reads and writes weighted by the model's "
+            "rates from the configured rates source (without one: cache reads left out, "
+            "writes 1:1); the model tier also hands it to PydanticAI as "
+            "UsageLimits.total_tokens_limit, whose total counts cache reads in full."
         ),
     )
     tokens_per_day: Optional[int] = Field(
         default=None,
         ge=1,
-        description="Rolling UTC-day token cap across this agent's run records, enforced by miragen.",
+        description=(
+            "Rolling UTC-day token cap across this agent's run records, enforced by miragen. "
+            "Counts budget_tokens: uncached input + output 1:1, cache reads and writes "
+            "weighted by the model's rates from the configured rates source (without "
+            "one: cache reads left out, writes 1:1)."
+        ),
     )
     on_exceeded: Literal["skip", "notify"] = Field(
         default="skip",
@@ -1517,6 +1947,28 @@ class AgentProfile(_ProfileModel):
             "are kept after loading (oldest dropped first). None = unbounded (today's behaviour)."
         ),
     )
+    credentials: list[Annotated[str, Field(pattern=GRANTABLE_CREDENTIAL_PATTERN)]] = Field(
+        default_factory=list,
+        # Declaring the field implies profile contract v6 (older runtimes
+        # reject the key, extra=forbid); an empty list is left out of
+        # serialized profiles so a profile without grants dumps back to its
+        # original contract.
+        exclude_if=lambda v: not v,
+        description=(
+            "Extra credentials miragend may hand this agent, by env var name "
+            "(each must end in _API_KEY, e.g. TAVILY_API_KEY). The daemon "
+            "forwards the variable and its *_API_KEY_FILE secret only when it "
+            "holds them. Keys the profile already implies need no entry: each "
+            "pydantic-ai model's provider key (openai: -> OPENAI_API_KEY), a "
+            "kimi-code / grok-build executor's metered fallback, a voice "
+            "api_key_env, any *_env field naming a key and any ${..._API_KEY} "
+            "reference. Exception: a claude-code executor gets ANTHROPIC_API_KEY, "
+            "and a codex executor CODEX_API_KEY / OPENAI_API_KEY, only when "
+            "listed here — they run on the subscription, which those keys would "
+            "outrank. Everything else is withheld (docs/credential-grants.md). "
+            "Declaring the field implies profile contract v6."
+        ),
+    )
     spec: Optional[AgentSpec] = Field(
         default=None,
         description="Model-tier backend (miragen owns the loop). Exactly one of spec/executor.",
@@ -1542,6 +1994,17 @@ class AgentProfile(_ProfileModel):
         rejects even `agent_type: internal` as an unknown key. Serialization
         drops the default (exclude_if on the field), so a profile that
         never declared it, or declared `internal`, dumps back to contract 1."""
+        if "credentials" in self.model_fields_set:
+            # By presence, like agent_type: miragend spawns the text as
+            # written, and an older runtime rejects even `credentials: []`.
+            return 6
+        harness = self.spec.harness if self.spec is not None else None
+        if harness is not None and harness.subagent_model == "pin":
+            # By value: "inherit" never reaches a dump (exclude_if), so only
+            # a pin needs a runtime that knows the key.
+            return 5
+        if self.spec is not None and "harness" in self.spec.model_fields_set:
+            return 4
         if "agent_type" in self.model_fields_set:
             return 3
         return 2 if self.executor is not None else 1
@@ -1572,9 +2035,33 @@ class AgentProfile(_ProfileModel):
             raise ValueError(
                 f"profile declares apiVersion {self.api_version} but uses "
                 f"features requiring {format_api_version(inferred)} "
-                "(the executor tier is a v2 surface, agent_type a v3 one) — "
+                "(the executor tier is a v2 surface, agent_type a v3 one, "
+                "spec.harness a v4 one, spec.harness.subagent_model: pin a v5 one, "
+                "credentials a v6 one) — "
                 "a profile must not understate its runtime requirement"
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_harness_block(self) -> AgentProfile:
+        harness = self.spec.harness if self.spec is not None else None
+        if harness is None:
+            return self
+        if not self.spec.model.startswith("claude-code:"):
+            raise ValueError(
+                "spec.harness configures the Claude Code harness; it needs a "
+                "claude-code:<model> spec.model (dead config otherwise)")
+        if harness.posture == "engineer" and self.agent_type != "internal":
+            raise ValueError(
+                "posture: engineer runs built-in tools with bypassPermissions; it is "
+                "refused on external/hybrid agents")
+        if harness.subagent_model == "pin":
+            if self.spec.model == "claude-code:":
+                raise ValueError(
+                    "subagent_model: pin needs a model to pin: claude-code: alone names none")
+            if harness.subagent_depth == 0:
+                raise ValueError(
+                    "subagent_model: pin with subagent_depth: 0 is dead config (no subagents)")
         return self
 
     @model_validator(mode="after")

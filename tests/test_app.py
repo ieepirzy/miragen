@@ -620,6 +620,8 @@ class TestLifespanSchedulerRegistration:
             "test-agent:startup:0",
         }
         assert isinstance(jobs["test-agent:cron"].trigger, APCronTrigger)
+        # UTC by contract, whatever zone the container runs in.
+        assert str(jobs["test-agent:cron"].trigger.timezone) == "UTC"
         assert isinstance(jobs["test-agent:interval:0"].trigger, APIntervalTrigger)
         assert jobs["test-agent:interval:0"].trigger.interval.total_seconds() == 30
         assert jobs["test-agent:interval:1"].trigger.interval.total_seconds() == 60
@@ -964,6 +966,59 @@ class TestBudgetGuardrails:
         assert "110/100" in resp.json()["detail"]
         assert "00:00 UTC" in resp.json()["detail"]
         app_module._agent.run.assert_not_called()
+
+    def _seed_cache_heavy(self, tmp_path):
+        from miragen.models import RunRecord, RunUsage
+        from miragen.runs import RunStore
+
+        store = RunStore(root=tmp_path)
+        store._write(RunRecord(
+            run_id="c" * 32, agent_name="test-agent", trigger="http", status="succeeded",
+            prompt="p", started_at=self._midnight_utc(),
+            usage=RunUsage(requests=1, input_tokens=1000, cached_input_tokens=950,
+                           output_tokens=0),
+        ))
+        return store
+
+    async def test_daily_budget_leaves_cache_reads_out_without_a_rates_source(
+        self, profile_with_daily_limit, tmp_path
+    ):
+        app_module._profile = profile_with_daily_limit
+        app_module._agent = MagicMock(run=AsyncMock(return_value=_mock_run_result()))
+        app_module._run_store = self._seed_cache_heavy(tmp_path)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/run", json={"prompt": "hi"})
+        assert resp.status_code == 200  # 50, as before rates
+
+    async def test_daily_budget_counts_an_unlisted_model_in_full_once_a_source_is_set(
+        self, profile_with_daily_limit, tmp_path
+    ):
+        from miragen import model_rates
+        from miragen.model_rates import StaticRatesSource
+
+        model_rates.configure(StaticRatesSource({}))
+        app_module._profile = profile_with_daily_limit
+        app_module._agent = MagicMock(run=AsyncMock(return_value=_mock_run_result()))
+        app_module._run_store = self._seed_cache_heavy(tmp_path)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/run", json={"prompt": "hi"})
+        assert resp.status_code == 429
+        assert "1000/100" in resp.json()["detail"]
+
+    async def test_daily_budget_weighs_cache_reads_by_the_profile_models_rates(
+        self, profile_with_daily_limit, tmp_path
+    ):
+        from miragen import model_rates
+        from miragen.model_rates import StaticRatesSource, parse_rates_document
+
+        model_rates.configure(StaticRatesSource(parse_rates_document({"models": {
+            "anthropic:claude-haiku-4-5": {"input": "1", "cached_input": "0.02", "output": "5"}}})))
+        app_module._profile = profile_with_daily_limit
+        app_module._agent = MagicMock(run=AsyncMock(return_value=_mock_run_result()))
+        app_module._run_store = self._seed_cache_heavy(tmp_path)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/run", json={"prompt": "hi"})
+        assert resp.status_code == 200  # 50 uncached + 950 x 0.02 = 69 < 100
 
     async def test_run_succeeds_when_under_budget(self, profile_with_daily_limit, tmp_path):
         store = self._seed_usage(tmp_path, started_at=self._midnight_utc(), input_tokens=10, output_tokens=5)
@@ -1315,3 +1370,52 @@ class TestRunsWireCarriesCallUsage:
         for usage in (listed, detail):
             assert usage["cache_write_tokens"] == 2 and usage["cache_write_1h_tokens"] == 1
             assert usage["calls"][0]["model"] == "m" and usage["calls_truncated"] is False
+
+
+class TestLifespanModelRates:
+    """The rates source configured through the real startup path, secret-file
+    loading included (a `*_FILE` name would be consumed by it)."""
+
+    async def _boot(self, tmp_path, check):
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from miragen.runs import RunStore
+
+        profile = _make_profile(mode="autonomous", triggers=[{"type": "cron", "schedule": "0 * * * *"}])
+        with patch("miragen.app.load_profile", return_value=profile), \
+             patch("miragen.app.build_agent", return_value=(MagicMock(), None)), \
+             patch.object(app_module, "_scheduler", AsyncIOScheduler()), \
+             patch("miragen.app.RunStore", lambda **kw: RunStore(root=tmp_path / "runs")):
+            async with app_module.lifespan(app):
+                check()
+
+    async def test_a_rates_path_survives_startup_and_weights_budgets(self, tmp_path, monkeypatch):
+        import json
+        from miragen import model_rates
+        from miragen.models import RunUsage, budget_tokens
+
+        path = tmp_path / "rates.json"
+        path.write_text(json.dumps({"models": {"anthropic:claude-haiku-4-5": {
+            "input": "1", "cached_input": "0.1", "output": "5"}}}))
+        monkeypatch.setenv("MIRAGEN_MODEL_RATES_PATH", str(path))
+        monkeypatch.delenv("MIRAGEN_MODEL_RATES_URL", raising=False)
+
+        def check():
+            assert isinstance(model_rates.configured_source(), model_rates.FileRatesSource)
+            usage = RunUsage(requests=1, input_tokens=1000, cached_input_tokens=900)
+            assert budget_tokens(usage, "anthropic:claude-haiku-4-5") == 190
+
+        await self._boot(tmp_path, check)
+        assert model_rates.configured_source() is None  # cleared on shutdown
+
+    async def test_no_source_logs_one_line_and_keeps_old_budgets(self, tmp_path, monkeypatch, caplog):
+        import logging
+        from miragen import model_rates
+
+        monkeypatch.delenv("MIRAGEN_MODEL_RATES_PATH", raising=False)
+        monkeypatch.delenv("MIRAGEN_MODEL_RATES_URL", raising=False)
+        with caplog.at_level(logging.INFO):
+            await self._boot(tmp_path, lambda: None)
+        lines = [r.getMessage() for r in caplog.records if "No model rates source" in r.getMessage()]
+        assert len(lines) == 1 and "cache reads left out" in lines[0]
+        assert model_rates.configured_source() is None
+

@@ -67,6 +67,25 @@ def build_model_harness(
         )
     else:
         from miragen.harness.codex import CodexHarness as cls, CodexSettings as settings_cls
+    built: dict = {}
+    if name == "claude-code":
+        from miragen.harness.engineer import build_ask_human_tool, harness_spec, is_engineer
+
+        spec = harness_spec(profile)
+
+        def session_for(instance: str) -> str | None:
+            # Bound once the harness exists (it is built after its gateway).
+            harness = built.get("harness")
+            return harness.current_session_id(instance) if harness is not None else None
+
+        if is_engineer(profile) and spec.ask_human is not None:
+            from miragen.harness.gateway import current_call
+
+            # A gateway runtime tool (engineer posture only): files a
+            # MiraDesign question and returns at once.
+            runtime_tools = [*(runtime_tools or []),
+                             build_ask_human_tool(spec.ask_human, profile.name, current_call,
+                                                  session_for)]
     gateway = ToolGateway(profile, runtime_tools=runtime_tools,
                           registered_tools=registered_tools, bind_context=bind_context,
                           native_capabilities=cls.native_capabilities,
@@ -82,8 +101,10 @@ def build_model_harness(
     if seeded:
         logging.getLogger("miragen.harness").info(
             "harness ledger seeded with %d Grok instance(s)", seeded)
-    return cls(profile, gateway, settings_cls.from_env(gateway_url=url),
-               system_guidance=system_guidance, served=served), gateway
+    harness = cls(profile, gateway, settings_cls.from_env(gateway_url=url),
+                  system_guidance=system_guidance, served=served)
+    built["harness"] = harness
+    return harness, gateway
 
 
 def forget_inactive_harnesses(instance: str, *, active: str | None, runs_root: Path) -> list[str]:
