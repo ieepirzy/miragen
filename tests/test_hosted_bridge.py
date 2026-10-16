@@ -424,6 +424,22 @@ class TestBridgeMcp:
             "reason": "user said so", "project": "github.com/org/repo"}))
         assert corrected["status"] == "accepted"
 
+    async def test_an_explicit_project_wins_over_the_session(self, tmp_path):
+        """#104: `project` names the scope; `session` only attributes the
+        note, even when the session belongs to another project."""
+        h, mcp = self._mcp(tmp_path)
+        await h.send("SessionStart", source="startup")
+        remembered = _text(await mcp.call_tool("memory_remember", {
+            "content": "The other repo deploys nightly.", "project": "github.com/org/other",
+            "session": "claude-code:s-1"}))
+        assert remembered["status"] == "accepted"
+        assert remembered["project"] == "github.com/org/other"
+        assert remembered["scope"] != PROJECT_SCOPE
+        # Without `project`, the session still decides.
+        own = _text(await mcp.call_tool("memory_remember", {
+            "content": "This repo deploys on merge.", "session": "claude-code:s-1"}))
+        assert own["scope"] == PROJECT_SCOPE
+
     async def test_default_project_when_none_named(self, tmp_path):
         h, mcp = self._mcp(tmp_path)
         result = _text(await mcp.call_tool("memory_checkpoint", {"state": {"topic": "chat"}}))
