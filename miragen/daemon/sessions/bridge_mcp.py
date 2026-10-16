@@ -213,7 +213,7 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
             session: Session key to attribute the note to (its run ref). Names
                 the scope only when `project` is omitted.
         """
-        if not session and not project:
+        if not session:
             session = _connection_session(ctx)
         # `project` names the scope; `session` only attributes the note.
         plane, identity, lifecycle, write, detail = await _lifecycle(project or session)
