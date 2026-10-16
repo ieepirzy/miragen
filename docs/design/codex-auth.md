@@ -18,8 +18,12 @@ The App Server reads its credentials from a **credential store** on disk —
 populate it:
 
 - **API key** (`CODEX_API_KEY` / `OPENAI_API_KEY`): metered, per-session,
-  zero interaction. `_login()` calls `login_api_key(key)` when the env var is
-  set. No OAuth, no browser. This is the CI / no-subscription path.
+  zero interaction. `_login()` calls `login_api_key(key)` only when the
+  profile grants that key in `credentials:` and it is set; `prepare()`
+  removes an ungranted one from the process so the App Server child never
+  inherits it. A key that is merely present in the environment never
+  replaces the subscription. No OAuth, no browser. This is the CI /
+  no-subscription path (docs/credential-grants.md).
 - **ChatGPT OAuth** (the subscription path): an interactive login writes a
   refreshable OAuth token into `auth.json`. No env var; the App Server just
   finds the file. This is what the SDK migration was *for*.
@@ -164,7 +168,7 @@ Design invariants for whoever builds this:
 
 | | API key | ChatGPT OAuth |
 |---|---|---|
-| Credential | `CODEX_API_KEY` env | `auth.json` in `CODEX_HOME` |
+| Credential | `CODEX_API_KEY` env, granted in `credentials:` | `auth.json` in `CODEX_HOME` |
 | Billing | metered credits | subscription |
 | Interaction | none | one device-code login |
 | Who logs in | — | operator / mirarun button, **once** |

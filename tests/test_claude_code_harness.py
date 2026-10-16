@@ -527,3 +527,72 @@ async def test_subagent_requests_count_when_the_result_includes_them(env):
     result = await env.harness().run(turn("hi"))
     assert result.output == "main"  # subagent text is still not the reply
     assert len(result.usage.calls) == 2
+
+
+# ── MiraRun execution refs (execution-refs/v1) ─────────────────────────────
+
+MIRARUN_REFS = {"agent_session_id": "4f0c2a7e-1d2b-4c5e-9f00-112233445566",
+                "lane_id": "lane-1", "lane_role": "engineer", "lane_slot": "engineer-1"}
+MIRARUN_ENV = {"MIRARUN_AGENT_SESSION_ID": MIRARUN_REFS["agent_session_id"],
+               "MIRARUN_LANE_ID": "lane-1", "MIRARUN_LANE_ROLE": "engineer",
+               "MIRARUN_LANE_SLOT": "engineer-1"}
+
+
+async def test_claude_code_sets_refs_and_keeps_them_through_the_env_allowlist(env):
+    h = env.harness()
+    await h.run(turn("hi", mirarun=MIRARUN_REFS))
+    child = FakeClient.instances[0].options.env
+    assert {k: child[k] for k in MIRARUN_ENV} == MIRARUN_ENV
+    assert set(MIRARUN_ENV) <= set(child["MIRAGEN_ENV_KEEP"].split())
+    assert env.state()["chat"]["mirarun"] == MIRARUN_REFS
+
+
+async def test_claude_code_without_refs_sets_nothing(env):
+    h = env.harness()
+    await h.run(turn("hi"))
+    assert not [k for k in FakeClient.instances[0].options.env if k.startswith("MIRARUN_")]
+    assert "mirarun" not in env.state()["chat"]
+
+
+async def test_a_host_mirarun_var_never_reaches_the_child(env, monkeypatch):
+    # A guard, not a regression test for execution-refs: the base posture's
+    # env allowlist already drops host MIRARUN_* (the engineer posture's
+    # passthrough refusal is pinned in test_claude_code_engineer).
+    monkeypatch.setenv("MIRARUN_RUN_ID", "spoofed")
+    h = env.harness()
+    await h.run(turn("hi"))
+    child = FakeClient.instances[0].options.env
+    assert "MIRARUN_RUN_ID" not in child
+    assert "MIRARUN_RUN_ID" not in child["MIRAGEN_ENV_KEEP"].split()
+
+
+async def test_a_restarted_harness_starts_the_instance_with_its_stored_refs(env):
+    await env.harness().run(turn("hi", mirarun=MIRARUN_REFS))
+    restarted = env.harness()
+    await restarted.run(turn("again", run_id="r2"))  # a turn with no refs
+    child = FakeClient.instances[-1].options.env
+    assert len(FakeClient.instances) == 2
+    assert {k: child[k] for k in MIRARUN_ENV} == MIRARUN_ENV
+
+
+async def test_new_refs_do_not_respawn_a_live_process_but_apply_next_spawn(env):
+    h = env.harness()
+    await h.run(turn("hi", mirarun=MIRARUN_REFS))
+    newer = {**MIRARUN_REFS, "agent_session_id": "next-session"}
+    await h.run(turn("again", run_id="r2", mirarun=newer))
+    assert len(FakeClient.instances) == 1  # same process, same env
+    assert FakeClient.instances[0].options.env["MIRARUN_AGENT_SESSION_ID"] == \
+        MIRARUN_REFS["agent_session_id"]
+    assert env.state()["chat"]["mirarun"] == newer
+    await env.harness().run(turn("after restart", run_id="r3"))
+    assert FakeClient.instances[-1].options.env["MIRARUN_AGENT_SESSION_ID"] == "next-session"
+
+
+async def test_a_one_off_run_gets_refs_but_leaves_no_state(env):
+    h = env.harness()
+    await h.run(turn("once", use_history=False, run_id="eph", mirarun={"run_id": "run-9"}))
+    assert FakeClient.instances[0].options.env["MIRARUN_RUN_ID"] == "run-9"
+    state = env.home / "miragen-instances.json"
+    assert not state.exists() or not any(
+        "mirarun" in entry for entry in json.loads(state.read_text()).values())
+    assert not h.__dict__.get("_mirarun_ephemeral")

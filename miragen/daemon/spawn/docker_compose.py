@@ -178,6 +178,22 @@ class DockerComposeSpawnDriver:
         service = (self._compose_load().get("services") or {}).get(name) or {}
         return service.get("image")
 
+    def current_spec(self, name: str) -> ServiceSpec | None:
+        if not self.compose_file.exists():
+            return None
+        service = (self._compose_load().get("services") or {}).get(name)
+        if not isinstance(service, dict) or not service.get("image"):
+            return None
+        return ServiceSpec(
+            image=service["image"],
+            environment={str(k): str(v) for k, v in (service.get("environment") or {}).items()},
+            labels=dict(service.get("labels") or {}),
+            cpu_limit=str(service.get("cpus", "")),
+            mem_limit=str(service.get("mem_limit", "")),
+            workspace_dir=self.workspace / "agents" / name,
+            secret_names=tuple(service.get("secrets") or ()),
+        )
+
     def endpoint(self, name: str) -> str:
         # Reachable by any container on miragen-net (container-name DNS).
         return f"http://{name}:8000"
