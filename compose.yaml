@@ -78,6 +78,17 @@ services:
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       MIRAGEND_TOKEN: ${MIRAGEND_TOKEN:-}
       MIRAGEN_INTERNAL_TOKEN: ${MIRAGEN_INTERNAL_TOKEN:-}
+      # Providers agent_type: external / hybrid profiles may use (pydantic-ai
+      # provider names, comma-separated); the daemon forwards the list into
+      # every agent it creates. Unset, it defaults to anthropic only: the
+      # transfer analysis for customer chats covers Anthropic alone (mirarun
+      # ADR-036, Decision 5), and mirarun's MIRARUN_CUSTOMER_FACING_PROVIDERS
+      # defaults the same way -- keep the two in step. Add a provider only once
+      # its DPA and transfer basis are covered. `-`, not `:-`: an explicitly
+      # empty value is kept and refuses every external/hybrid profile. (The
+      # code itself still fails closed when the variable is absent, for
+      # deployments that do not start from this file.)
+      MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS: ${MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS-anthropic}
     ports:
       # Loopback-bound by default: mirarun reaches this over the host's own
       # network stack (host.docker.internal), not a shared Docker network,
