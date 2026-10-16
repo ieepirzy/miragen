@@ -240,7 +240,7 @@ class TestWorker:
         assert by_id[bad["id"]]["status"] == "failed"
         assert by_id[good["id"]]["status"] == "done"
         assert bad["status"] == "pending"  # re-queued for retry
-        assert bad["last_error"].startswith("model exploded")
+        assert bad["last_error"] == "[failures=1] model exploded"
 
     async def test_backlog_before_the_cutoff_is_completed_without_a_model_call(
         self, client, service,
@@ -315,6 +315,49 @@ class TestWorker:
                                         limit=5, max_attempts=2, limited=limited)
         assert {r["job_id"]: (r["status"], r["attempts"]) for r in results} == {
             first["id"]: ("failed", 1), second["id"]: ("failed", 1)}
+
+    async def test_counted_failures_survive_a_worker_restart(self, client, service):
+        """#195 review: claims lost to a usage limit are not failures, even
+        after a restart drops the worker's in-process tally."""
+        from miragen.memory.claude_code import ClaudeCodeLimited
+
+        job = self._seed_job(service, _event("first"))
+        mode = {"limit": True}
+
+        async def extract(content, source_kind):
+            if mode["limit"]:
+                raise ClaudeCodeLimited("You've hit your session limit")
+            raise RuntimeError("model exploded")
+
+        for _ in range(6):
+            await run_worker_once(client, extract=extract, check=_checker(True),
+                                  max_attempts=2, limited={})  # a fresh tally each time
+        mode["limit"] = False
+        results = await run_worker_once(client, extract=extract, check=_checker(True),
+                                        max_attempts=2, limited={})
+        assert (results[0]["status"], results[0]["attempts"]) == ("failed", 1)
+        assert job["attempts"] == 7 and job["status"] == "pending"
+        assert job["last_error"].startswith("[failures=1] model exploded")
+
+    async def test_a_store_429_is_not_a_model_limit(self, client, service):
+        """Loimi throttling get_event is a store error: it never short-circuits
+        the sweep as a 'usage limit'."""
+        from miragen.memory.client import MemoryAPIError
+
+        self._seed_job(service, _event("first"))
+        self._seed_job(service, _event("second"))
+        original = client.get_event
+
+        async def throttled(event_id):
+            raise MemoryAPIError(429, {"error": {"message": "slow down"}})
+
+        client.get_event = throttled
+        try:
+            results = await run_worker_once(client, extract=_extractor([]),
+                                            check=_checker(True), limit=5, max_attempts=1)
+        finally:
+            client.get_event = original
+        assert [r["status"] for r in results] == ["abandoned", "abandoned"]
 
     async def test_unreachable_store_claims_nothing_quietly(self, client, service):
         service.fail_with = __import__("httpx").ConnectError("refused")

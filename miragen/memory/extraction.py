@@ -25,6 +25,7 @@ generic advice are non-events, not facts.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -311,9 +312,11 @@ async def run_worker_once(
     so a job that always fails would otherwise run, and spend model quota,
     on every sweep forever. A usage or rate limit is not the job's fault:
     it never counts toward the cap, and the rest of the sweep is released
-    without a model call (status ``limited``). Loimi counts an attempt per
-    claim, so the claims a limit cost are tallied in `limited` (job id →
-    count; pass the same dict on every sweep) and subtracted."""
+    without a model call (status ``limited``); so is a store outage. The
+    count rides in the job's last_error (see _prior_failures), so it
+    survives a restart; `limited` (job id → claims lost to a limit; pass
+    the same dict on every sweep) is only the fallback for a store that
+    does not return last_error with a claimed job."""
     kinds = ["consolidate"] + (["index"] if embed is not None else [])
     try:
         jobs = await client.claim_jobs(
@@ -327,9 +330,11 @@ async def run_worker_once(
     results = []
     hit_limit = False
     for job in jobs:
+        failures = _prior_failures(job, limited)
         if hit_limit:
             limited[job["id"]] = limited.get(job["id"], 0) + 1
-            await _release(client, job, "not attempted: the model's usage limit was hit this sweep")
+            await _release(client, job, _with_failures(
+                failures, "not attempted: the model's usage limit was hit this sweep"))
             results.append({"job_id": job["id"], "status": "limited"})
             continue
         try:
@@ -342,6 +347,7 @@ async def run_worker_once(
                     # Backlog from before this deployment's cutoff: completed
                     # without a model call (each is a paid/limited call).
                     await client.complete_job(job["id"])
+                    limited.pop(job["id"], None)
                     results.append({"job_id": job["id"], "status": "skipped_backlog",
                                     "event_id": event.get("id")} | context)
                     continue
@@ -355,17 +361,23 @@ async def run_worker_once(
                 hit_limit = True
                 limited[job["id"]] = limited.get(job["id"], 0) + 1
                 logger.warning(f"consolidation job {job['id']} hit the usage limit: {exc}")
-                await _release(client, job, str(exc))
+                await _release(client, job, _with_failures(failures, str(exc)))
                 results.append({"job_id": job["id"], "status": "limited", "error": str(exc)})
                 continue
-            attempts = job.get("attempts")
-            counted = attempts - limited.get(job["id"], 0) if isinstance(attempts, int) else None
+            if isinstance(exc, MemoryUnavailable):
+                # The store, not the job: released uncounted, like a limit.
+                logger.warning(f"consolidation job {job['id']}: store unavailable: {exc}")
+                await _release(client, job, _with_failures(failures, str(exc)))
+                results.append({"job_id": job["id"], "status": "failed", "error": str(exc)})
+                continue
+            counted = None if failures is None else failures + 1
             final = counted is not None and counted >= max_attempts
             logger.warning(f"consolidation job {job['id']} failed"
                            + (f" for good after {counted} attempts" if final else "")
                            + f": {exc}")
             try:
-                await client.fail_job(job["id"], error=str(exc)[:500], retry=not final)
+                await client.fail_job(job["id"], error=_with_failures(counted, str(exc)),
+                                      retry=not final)
             except (MemoryUnavailable, MemoryAPIError):
                 pass  # lease expiry re-queues it regardless
             if final:
@@ -376,10 +388,34 @@ async def run_worker_once(
     return results
 
 
+# A job's counted failures ride in its own last_error ("[failures=2] ..."),
+# so they survive a worker restart and a usage limit never adds to them.
+_FAILURES_RE = re.compile(r"^\[failures=(\d+)\] ")
+
+
+def _prior_failures(job: dict, limited: dict[str, int]) -> int | None:
+    """Failures counted before this claim. From last_error when Loimi returns
+    it; otherwise from Loimi's per-claim `attempts` (this one excluded) less
+    the claims this worker process saw lost to a usage limit. None when
+    neither is known: such a job is never abandoned."""
+    if "last_error" in job:
+        match = _FAILURES_RE.match(job.get("last_error") or "")
+        return int(match.group(1)) if match else 0
+    attempts = job.get("attempts")
+    if not isinstance(attempts, int):
+        return None
+    return max(0, attempts - 1 - limited.get(job["id"], 0))
+
+
+def _with_failures(failures: int | None, error: str) -> str:
+    prefix = f"[failures={failures}] " if failures is not None else ""
+    return (prefix + error)[:500]
+
+
 async def _release(client: MemoryClient, job: dict, error: str) -> None:
     """Back to pending, for a later sweep."""
     try:
-        await client.fail_job(job["id"], error=error[:500], retry=True)
+        await client.fail_job(job["id"], error=error, retry=True)
     except (MemoryUnavailable, MemoryAPIError):
         pass  # lease expiry re-queues it regardless
 
@@ -387,11 +423,14 @@ async def _release(client: MemoryClient, job: dict, error: str) -> None:
 def is_rate_limit(exc: BaseException) -> bool:
     """A usage or rate limit refused the model call: transient, and not the
     job's fault. Claude Code's subscription limit, or an HTTP 429 from a
-    PydanticAI provider."""
+    PydanticAI provider. A 429 from Loimi itself is not one: that is the
+    store throttling, which counts like any other store error."""
     from miragen.memory.claude_code import ClaudeCodeLimited
 
     if isinstance(exc, ClaudeCodeLimited):
         return True
+    if isinstance(exc, MemoryAPIError):
+        return False
     return getattr(exc, "status_code", None) == 429
 
 

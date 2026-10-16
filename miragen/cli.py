@@ -376,7 +376,7 @@ def memory_hook(harness: str) -> None:
                    "plus its checks can take a minute).")
 @click.option("--max-backoff", default=900, show_default=True,
               help="Upper bound (seconds) of the pause after sweeps where every job failed.")
-@click.option("--max-attempts", default=5, show_default=True,
+@click.option("--max-attempts", default=5, show_default=True, type=click.IntRange(min=1),
               help="Failures after which a job is failed for good instead of re-queued. "
                    "Usage and rate limits don't count.")
 @click.option("--skip-before", envvar="MIRAGEN_WORKER_SKIP_BEFORE", default=None,
@@ -559,7 +559,9 @@ def next_backoff(current: int, results: list[dict], *, interval: int, ceiling: i
     re-run every job each sweep. A sweep where every job failed (including
     jobs released for a usage limit, or failed for good) doubles the pause
     (from `interval`, up to `ceiling`); any success resets it."""
-    if not results or any(r.get("status") not in _FAILED_STATUSES for r in results):
+    # Skipped backlog made no model call, so it says nothing either way.
+    worked = [r for r in results if r.get("status") != "skipped_backlog"]
+    if not worked or any(r.get("status") not in _FAILED_STATUSES for r in worked):
         return 0
     return min(ceiling, max(interval, current * 2))
 

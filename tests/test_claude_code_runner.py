@@ -277,6 +277,9 @@ def test_worker_backs_off_only_while_every_job_fails():
     # still a sweep that got nothing done.
     assert next_backoff(30, [{"status": "limited"}], interval=30, ceiling=900) == 60
     assert next_backoff(30, [{"status": "abandoned"}], interval=30, ceiling=900) == 60
+    # Skipped backlog in the same sweep doesn't reset the pause.
+    assert next_backoff(30, [{"status": "skipped_backlog"}, {"status": "limited"}],
+                        interval=30, ceiling=900) == 60
 
 
 def test_a_usage_limit_says_so(fake, monkeypatch):
