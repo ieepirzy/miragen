@@ -14,7 +14,7 @@ name: morning-briefing
 mode: autonomous
 triggers:
   - type: cron
-    schedule: "0 9 * * 1-5"
+    schedule: "0 9 * * mon-fri"   # UTC
     default_prompt: |
       Produce the morning briefing.
       Include: weather, calendar events, top headlines.
