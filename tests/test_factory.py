@@ -294,18 +294,16 @@ def _anthropic_reply() -> dict:
     }
 
 
-async def _sent_body(profile, monkeypatch, env=None):
+async def _sent_body(profile, monkeypatch, env=None, stream=False):
     """Run the built agent once against a fake Anthropic endpoint and return
-    the JSON body of the Messages API request."""
+    the JSON body of the Messages API request. `stream` goes through
+    run_stream, the path the pydantic-ai harness uses."""
     import json
 
     import httpx
     from pydantic_ai.models.anthropic import AnthropicModel
     from pydantic_ai.providers.anthropic import AnthropicProvider
 
-    from miragen.agent_type import INFERENCE_GEO_ENV
-
-    monkeypatch.delenv(INFERENCE_GEO_ENV, raising=False)
     # Agent() resolves the provider at build time; the key is never used
     # (the model is overridden onto the fake endpoint below).
     monkeypatch.setenv("ANTHROPIC_API_KEY", "unused")
@@ -316,6 +314,11 @@ async def _sent_body(profile, monkeypatch, env=None):
 
     def handler(request: httpx.Request) -> httpx.Response:
         bodies.append(json.loads(request.content))
+        if stream:
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"},
+                content=_anthropic_sse().encode(),
+            )
         return httpx.Response(200, json=_anthropic_reply())
 
     agent, _ = build_agent(profile)
@@ -325,10 +328,35 @@ async def _sent_body(profile, monkeypatch, env=None):
         provider=AnthropicProvider(api_key="test-key", http_client=client),
     )
     with agent.override(model=model):
-        await agent.run("hello")
+        if stream:
+            async with agent.run_stream("hello") as result:
+                text = "".join([d async for d in result.stream_text(delta=True)])
+            assert text == "ok"
+        else:
+            await agent.run("hello")
     await client.aclose()
     assert len(bodies) == 1
     return bodies[0]
+
+
+def _anthropic_sse() -> str:
+    import json
+
+    events = [
+        ("message_start", {"type": "message_start", "message": {
+            **_anthropic_reply(), "content": [], "stop_reason": None,
+            "usage": {"input_tokens": 1, "output_tokens": 0}}}),
+        ("content_block_start", {"type": "content_block_start", "index": 0,
+                                 "content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                 "delta": {"type": "text_delta", "text": "ok"}}),
+        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        ("message_delta", {"type": "message_delta",
+                           "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                           "usage": {"output_tokens": 1}}),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+    return "".join(f"event: {e}\ndata: {json.dumps(d)}\n\n" for e, d in events)
 
 
 def _public(agent_type="external", model="anthropic:claude-sonnet-4-6"):
@@ -343,18 +371,21 @@ class TestInferenceGeo:
         assert body["inference_geo"] == "us"
 
     @pytest.mark.asyncio
-    async def test_empty_env_still_means_us(self, monkeypatch):
+    @pytest.mark.parametrize("value", ["global", " Global ", "eu", "us; drop", ""])
+    async def test_no_environment_value_moves_the_geo(self, value, monkeypatch):
+        # The pin is not configurable: a geo variable in the environment,
+        # `global` included, neither changes it nor stops the agent building.
         body = await _sent_body(
-            _public(), monkeypatch, {"MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO": "  "}
+            _public(), monkeypatch, {"MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO": value}
         )
         assert body["inference_geo"] == "us"
 
     @pytest.mark.asyncio
-    async def test_env_overrides_the_geo(self, monkeypatch):
-        body = await _sent_body(
-            _public(), monkeypatch, {"MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO": " Global "}
-        )
-        assert body["inference_geo"] == "global"
+    @pytest.mark.parametrize("agent_type", ["external", "hybrid"])
+    async def test_streaming_request_carries_the_geo(self, agent_type, monkeypatch):
+        body = await _sent_body(_public(agent_type), monkeypatch, stream=True)
+        assert body["stream"] is True
+        assert body["inference_geo"] == "us"
 
     @pytest.mark.asyncio
     async def test_kept_alongside_profile_model_settings(self, monkeypatch):
@@ -373,14 +404,7 @@ class TestInferenceGeo:
                                                "instructions": "Test."}), monkeypatch)
         assert "inference_geo" not in body
 
-    def test_malformed_env_refuses_to_build(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "unused")
-        monkeypatch.setenv("MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO", "us; drop")
-        with pytest.raises(ValueError, match="MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO"):
-            build_agent(_public())
-
     def test_other_providers_get_no_extra_body(self, monkeypatch):
-        monkeypatch.delenv("MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO", raising=False)
         monkeypatch.setenv("OPENAI_API_KEY", "unused")
         agent, _ = build_agent(_public(model="openai-chat:gpt-4o"))
         assert "extra_body" not in (agent.model_settings or {})

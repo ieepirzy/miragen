@@ -433,9 +433,10 @@ def test_external_allowlist_forwarded_into_agent_env(tmp_path):
     assert env["MIRAGEN_EXTERNAL_ALLOWED_HOSTS"] == "mcp.example.com"
 
 
-def test_inference_geo_forwarded_into_agent_env(tmp_path):
-    """The Anthropic inference geo is applied where the model requests are
-    made, inside the container, so the daemon's setting must reach it."""
+def test_no_inference_geo_setting_is_forwarded_into_agent_env(tmp_path):
+    """The Anthropic inference geo for public-facing profiles is fixed in code
+    (us), not a deployment setting: a geo variable in the daemon's env does
+    not reach the agents it creates."""
     core = _external_core(tmp_path, {
         "MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS": "anthropic,test",
         "MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO": "global",
@@ -447,7 +448,7 @@ def test_inference_geo_forwarded_into_agent_env(tmp_path):
     env = pyyaml.safe_load((tmp_path / "compose.yml").read_text())["services"]["alpha"][
         "environment"
     ]
-    assert env["MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO"] == "global"
+    assert "MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO" not in env
 
 
 def test_external_profile_refused_at_create_without_daemon_allowlist(tmp_path, monkeypatch):
