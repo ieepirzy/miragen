@@ -565,6 +565,22 @@ class TestHarnessSessionHeader:
                                {"state": {"goal": "g"}, "project": "mcp:default"}, "grok-build:g-1")
             assert other["project"] == "mcp:default"
 
+    async def test_the_connection_session_attributes_a_note_sent_to_another_project(
+            self, tmp_path):
+        """#104 review: an explicit project names the scope, and the
+        connection's session still attributes the note."""
+        h = Harness(tmp_path, config=_config())
+        await h.send("SessionStart", harness="grok-build", session="g-1", source="new")
+        app = create_app(None, token="secret", sessions=h.plane)
+        with TestClient(app) as client:
+            note = self._call(client, "memory_remember",
+                              {"content": "The other repo deploys nightly.",
+                               "project": "mcp:default"}, "grok-build:g-1")
+        assert note["status"] == "accepted" and note["project"] == "mcp:default"
+        event = next(e for e in h.service.events.values()
+                     if "deploys nightly" in json.dumps(e))
+        assert "grok-build:g-1" in json.dumps(event)
+
     async def test_unknown_or_malformed_header_never_invents_a_project(self, tmp_path):
         h = Harness(tmp_path, config=_config())
         app = create_app(None, token="secret", sessions=h.plane)
