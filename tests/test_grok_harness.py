@@ -469,3 +469,35 @@ async def test_http_delete_instance_discards_the_grok_conversation(app_with_grok
         r2 = await c.post("/run", json={"prompt": "HISTORY", "use_history": True, "instance": "chat"})
         assert r2.json()["output"].startswith("turns=1 ")  # a fresh conversation
         assert (await c.delete("/instances/nope")).status_code == 404
+
+
+# ── MiraRun execution refs (execution-refs/v1) ─────────────────────────────
+
+MIRARUN_REFS = {"agent_session_id": "4f0c2a7e-1d2b-4c5e-9f00-112233445566",
+                "lane_id": "lane-1", "lane_role": "engineer", "lane_slot": "engineer-1"}
+MIRARUN_ENV = {"MIRARUN_AGENT_SESSION_ID": MIRARUN_REFS["agent_session_id"],
+               "MIRARUN_LANE_ID": "lane-1", "MIRARUN_LANE_ROLE": "engineer",
+               "MIRARUN_LANE_SLOT": "engineer-1"}
+
+
+def _spy_env(harness) -> list[dict]:
+    seen: list[dict] = []
+    original = harness._env
+
+    def spy(instance):
+        env = original(instance)
+        seen.append(env)
+        return env
+
+    harness._env = spy
+    return seen
+
+
+async def test_grok_spawns_with_refs_and_one_off_runs_keep_none(env):
+    h = env.harness()
+    seen = _spy_env(h)
+    await h.run(turn("hello", mirarun=MIRARUN_REFS))
+    assert seen and {k: seen[0][k] for k in MIRARUN_ENV} == MIRARUN_ENV
+    await h.run(turn("once", use_history=False, run_id="eph", mirarun={"run_id": "run-9"}))
+    assert seen[-1]["MIRARUN_RUN_ID"] == "run-9"
+    assert not h.__dict__.get("_mirarun_ephemeral")

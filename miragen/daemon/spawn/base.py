@@ -121,6 +121,16 @@ class SpawnDriver(Protocol):
         or None if `name` has no definition yet."""
         ...
 
+    def current_spec(self, name: str) -> ServiceSpec | None:
+        """`name`'s stored definition, as the last define_service left it —
+        the environment and secrets its unit runs with — or None when there
+        is none or the driver cannot reconstruct it.
+
+        Optional: `LifecycleCore` treats a driver without this method as
+        reporting None, which makes every config update recreate the unit
+        (it cannot prove the running environment is still right)."""
+        ...
+
     def endpoint(self, name: str) -> str:
         """The base URL this daemon reaches the agent's own HTTP app at."""
         ...

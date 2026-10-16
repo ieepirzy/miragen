@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import os
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -195,22 +195,29 @@ def resolve_capabilities(
 _ENV_RE = re.compile(r"\$\$\{|\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
 
-def interpolate_env(value: Any, path: str = "") -> Any:
-    """Recursively substitute ${VAR}/${VAR:-default} in string values."""
+def interpolate_env(
+    value: Any, path: str = "", *, environ: Mapping[str, str] | None = None
+) -> Any:
+    """Recursively substitute ${VAR}/${VAR:-default} in string values.
+
+    `environ`: the variables to resolve against (None = this process's
+    os.environ). miragend passes the environment the agent's container will
+    actually see, which is not its own."""
+    env = os.environ if environ is None else environ
     if isinstance(value, dict):
         return {
-            key: interpolate_env(v, f"{path}.{key}" if path else str(key))
+            key: interpolate_env(v, f"{path}.{key}" if path else str(key), environ=env)
             for key, v in value.items()
         }
     if isinstance(value, list):
-        return [interpolate_env(v, f"{path}[{i}]") for i, v in enumerate(value)]
+        return [interpolate_env(v, f"{path}[{i}]", environ=env) for i, v in enumerate(value)]
     if isinstance(value, str):
         def _sub(m: re.Match[str]) -> str:
             if m.group(0) == "$${":
                 return "${"
             name, default = m.group(1), m.group(2)
-            if name in os.environ:
-                return os.environ[name]
+            if name in env:
+                return env[name]
             if default is not None:
                 return default
             raise ValueError(
@@ -249,6 +256,8 @@ def load_profile(
     *,
     allowed_providers: Iterable[str] | str | None = None,
     allowed_hosts: Iterable[str] | str | None = None,
+    environ: Mapping[str, str] | None = None,
+    source: str | None = None,
 ) -> AgentProfile:
     """
     Load and validate an agent profile YAML file.
@@ -261,21 +270,26 @@ def load_profile(
     MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS from the process environment.
     `allowed_hosts`: likewise, MIRAGEN_EXTERNAL_ALLOWED_HOSTS — the hosts such
     a profile's MCP servers and http voice endpoint may live on.
+    `environ`: what ${VAR} references resolve against (None = os.environ).
+    `source`: the profile text to load instead of reading `path`; `path`
+    still anchors a relative `spec.instructions_file`.
     """
     path = Path(path)
 
-    if not path.exists():
-        raise FileNotFoundError(f"Agent profile not found: {path}")
-
-    with path.open() as f:
-        raw = yaml.safe_load(f)
+    if source is not None:
+        raw = yaml.safe_load(source)
+    else:
+        if not path.exists():
+            raise FileNotFoundError(f"Agent profile not found: {path}")
+        with path.open() as f:
+            raw = yaml.safe_load(f)
 
     if not isinstance(raw, dict):
         raise ValueError(f"Agent profile must be a YAML mapping, got: {type(raw).__name__}")
 
     # Kept as written: an interpolated model is only visible before expansion.
     uninterpolated = copy.deepcopy(raw)
-    raw = interpolate_env(raw)
+    raw = interpolate_env(raw, environ=environ)
     _resolve_instructions_file(raw, path)
 
     # Validate + coerce via Pydantic

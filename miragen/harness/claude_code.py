@@ -26,6 +26,14 @@ swap between them (``spec.model``) when one is rate limited:
 * **Per-turn context rides the prompt** (decision 6), which also keeps the
   system prompt byte-stable for the prompt cache. Prompts are delivered
   verbatim: no ``@path`` expansion, no slash commands.
+
+All of the above is the default, ``locked`` posture. ``spec.harness.posture:
+engineer`` (mirarun ADR-041 §4) opts a profile out of the tool lockdown:
+Claude Code's own tools with ``bypassPermissions`` (the container is the
+boundary), user settings (never the worktree's), plugins and skills, the gateway as one
+MCP server among others, a git worktree per instance, broker-wired git/gh
+and a subagent depth hook (``miragen/harness/engineer.py``). The
+subscription-only environment rules hold in both postures.
 """
 
 from __future__ import annotations
@@ -47,7 +55,11 @@ from pathlib import Path
 from typing import Any
 
 from miragen.harness.base import (
-    HarnessResult, HarnessTurn, InstanceBusyError, TaskStream, parse_harness_model,
+    HarnessResult, HarnessTurn, InstanceBusyError, MiraRunEnv, TaskStream, parse_harness_model,
+)
+from miragen.harness.engineer import (
+    SubagentDepthPolicy, WorkspaceError, git_env, harness_spec, is_engineer, provision_workspace,
+    remove_workdir, workspace_cwd, write_git_files,
 )
 from miragen.harness.gateway import ToolGateway, _capability_entries
 from miragen.harness.served import ServedLedger
@@ -55,6 +67,27 @@ from miragen.memory.claude_code import SCRUBBED_ENV, WORKER_ENV
 from miragen.models import AgentProfile, CallUsage, RunUsage, anthropic_usage_fields
 
 logger = logging.getLogger("miragen.harness.claude_code")
+
+
+def check_miradesign_actor_name(profile: AgentProfile, instance: str) -> None:
+    """With miradesign_agent_per_instance, the instance name becomes the
+    MiraDesign actor agent:claude-code/<slug(name)>, and MiraDesign's slug
+    (harness/identity.py: lowercase, [^a-z0-9._-] -> '-', strip '-', first
+    48 chars) is lossy: two instance names with the same slug would share one
+    actor. Refuse any name the slug would change."""
+    spec = harness_spec(profile)
+    if spec is None or not spec.miradesign_agent_per_instance:
+        return
+    import re
+
+    slug = re.sub(r"[^a-z0-9._-]+", "-", instance.strip().lower()).strip("-")[:48]
+    if slug != instance:
+        raise ClaudeCodeHarnessError(
+            f"instance name '{instance}' cannot be a MiraDesign actor name: MiraDesign keeps "
+            f"'{slug}' (at most 48 characters, no leading or trailing '-'), so another "
+            "instance could share its actor. Use a shorter name, or set "
+            "spec.harness.miradesign_agent_per_instance: false")
+
 
 NAME = "claude-code"
 # Short on purpose: Claude Code names MCP tools mcp__<server>__<tool>, and
@@ -64,6 +97,12 @@ GATEWAY_TOKEN_ENV = "MIRAGEN_GATEWAY_TOKEN"
 STATE_FILE = "miragen-instances.json"
 WRAPPER_FILE = "miragen-claude"
 KEEP_ENV = "MIRAGEN_ENV_KEEP"
+MIRADESIGN_AGENT_ENV = "MIRADESIGN_AGENT"
+# spec.harness.subagent_model: pin → every subagent runs the session's model.
+SUBAGENT_MODEL_ENV = "CLAUDE_CODE_SUBAGENT_MODEL"
+# Without it an Agent call's own `model` still wins over the variable above
+# (observed, CLI 2.1.299: model "sonnet" ran claude-sonnet-5-5).
+SUBAGENT_MODEL_FORCE_ENV = "CLAUDE_CODE_SUBAGENT_MODEL_FORCE"
 # The only environment a claude process inherits from the container (plus
 # what _env sets). Same list as the Grok harness's.
 ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
@@ -177,14 +216,14 @@ def purge_instance(settings: ClaudeCodeSettings, instance: str) -> list[str]:
             path.unlink()
             shutil.rmtree(path.with_suffix(""), ignore_errors=True)
             removed.append(f"claude_session:{sid}")
-    workdir = settings.workdirs / instance
-    if workdir.is_dir():
-        shutil.rmtree(workdir)
+    # An engineer instance's directory holds git worktrees of shared clones:
+    # remove_workdir also prunes their records there.
+    if remove_workdir(settings.workdirs / instance):
         removed.append("workdir")
     return removed
 
 
-class ClaudeCodeHarness:
+class ClaudeCodeHarness(MiraRunEnv):
     name = NAME
     native_capabilities = frozenset(NATIVE_CAPABILITIES)
 
@@ -211,6 +250,8 @@ class ClaudeCodeHarness:
         self.instructions = with_voice_guidance(profile.spec.instructions or "", system_guidance)
         self._client_factory = client_factory or _sdk_client
         self.served = served
+        self.engineer = is_engineer(profile)
+        self._repo_locks: dict[str, asyncio.Lock] = {}
         # Clock order, as in the Grok harness: approval wait < Claude Code's
         # MCP tool timeout < this harness's turn timeout.
         self.tool_timeout_s: int | None = (
@@ -242,6 +283,8 @@ class ClaudeCodeHarness:
         # The SDK merges the parent's environment into the child's; this
         # wrapper replaces it with an allowlist before exec'ing the CLI.
         wrapper = home / WRAPPER_FILE
+        with contextlib.suppress(FileNotFoundError):
+            wrapper.chmod(0o700)  # an engineer posture left it read-only
         wrapper.write_text(
             f"#!{sys.executable}\n"
             "import os, sys\n"
@@ -250,6 +293,14 @@ class ClaudeCodeHarness:
             "       if k in keep or k.startswith('CLAUDE_AGENT_SDK_')}\n"
             f"os.execve({real!r}, [{real!r}, *sys.argv[1:]], env)\n")
         wrapper.chmod(0o700)
+        if self.engineer:
+            write_git_files(home, self.profile)
+            # Read-only against accidental rewrites by a session (not a
+            # boundary: the same uid can chmod them back; see the docs).
+            wrapper.chmod(0o500)
+            settings_json = home / "settings.json"
+            if settings_json.is_file():
+                settings_json.chmod(0o444)
         if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") and not self._logged_in():
             logger.warning("claude-code harness: no subscription credential (neither the "
                            "setup-token env var nor a login in CLAUDE_CONFIG_DIR); turns will "
@@ -298,8 +349,56 @@ class ClaudeCodeHarness:
             env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(self.settings.auto_compact_window)
         if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
             env["CLAUDE_CODE_OAUTH_TOKEN"] = os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
+        env.update(self._mirarun_env(instance))
         keep = [k for k in ENV_ALLOWLIST if k in os.environ]
         keep += [*env, "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SDK_READS_SESSION_STATE", "PWD"]
+        assert not set(keep) & set(SCRUBBED_ENV)
+        env[KEEP_ENV] = " ".join(keep)
+        return env
+
+    def current_session_id(self, instance: str) -> str | None:
+        """The Claude Code session id serving ``instance`` now (its live
+        process's, else the mapped one): the MiraDesign session key is
+        ``claude-code:<id>``."""
+        agent = self._agents.get(instance)
+        if agent is not None and not agent.dead:
+            return agent.session_id
+        return (self._load_state().get(instance) or {}).get("session_id")
+
+    def _engineer_env(self, instance: str, *, ephemeral: bool = False) -> dict[str, str]:
+        """The locked posture's child environment plus git/gh wiring and the
+        profile's passthrough names; the same allowlist mechanism (and the
+        same refusal of API keys) applies."""
+        spec = harness_spec(self.profile)
+        env = self._env(instance)
+        env.pop(KEEP_ENV)
+        if self.profile.memory is None:
+            # No miragen memory boundary: the miragen-memory plugin's hooks
+            # capture this session (MIRAGEN_WORKER would silence them). With
+            # one, miragen captures and the plugin stays quiet (no doubles).
+            env.pop(WORKER_ENV)
+        env.update(git_env(self.settings.claude_home, self.profile))
+        if spec.miradesign_agent_per_instance and not ephemeral:
+            # The MiraDesign plugin's hooks read this at SessionStart: the
+            # session registers as the durable actor
+            # agent:claude-code/<instance> (miradesign harness/identity.py
+            # actor_key), the name MiraRun's lane supervisor maps instances by.
+            # A one-off run keeps the plugin's default per-session actor.
+            env[MIRADESIGN_AGENT_ENV] = instance
+        if spec.subagent_model == "pin" and self.model:
+            # Every subagent runs the session's model, whatever an agent
+            # definition or an Agent call's `model` asks for. "inherit" sets
+            # nothing: Claude Code's own resolution, as before this option.
+            env[SUBAGENT_MODEL_ENV] = self.model
+            env[SUBAGENT_MODEL_FORCE_ENV] = "1"
+        for name in spec.env_passthrough:
+            # Never over a value the harness set (models.py also refuses the
+            # names it knows; this holds for any it adds later).
+            if name in os.environ and name not in env:
+                env[name] = os.environ[name]
+        keep = [k for k in ENV_ALLOWLIST if k in os.environ]
+        keep += [*env, "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SDK_READS_SESSION_STATE", "PWD"]
+        keep = list(dict.fromkeys(keep))
         assert not set(keep) & set(SCRUBBED_ENV)
         env[KEEP_ENV] = " ".join(keep)
         return env
@@ -335,6 +434,10 @@ class ClaudeCodeHarness:
                     instance, compactions=int(entry.get("compactions") or 0) + 1)
             return {}
 
+        if self.engineer:
+            return self._engineer_options(instance, workdir, resume=resume, new_id=new_id,
+                                          stderr=stderr, pre_compact=pre_compact,
+                                          ephemeral=ephemeral)
         return ClaudeAgentOptions(
             tools=sorted(self.builtins),
             system_prompt=self.instructions,
@@ -360,9 +463,76 @@ class ClaudeCodeHarness:
             stderr=stderr.append,
         )
 
-    async def _spawn(self, instance: str, *, ephemeral: bool) -> _Agent:
+    def _engineer_options(self, instance: str, workdir: Path, *, resume: str | None,
+                          new_id: str | None, stderr: deque, pre_compact,
+                          ephemeral: bool = False):
+        """Launch options for posture: engineer (docs/design/harnesses.md)."""
+        from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+
+        spec = harness_spec(self.profile)
+        depth = SubagentDepthPolicy(spec.subagent_depth)
+        hooks = {"PreCompact": [HookMatcher(hooks=[pre_compact])], **depth.hooks()}
+        system_prompt: dict[str, str] = {"type": "preset", "preset": "claude_code"}
+        if self.instructions:
+            system_prompt["append"] = self.instructions
+        return ClaudeAgentOptions(
+            # Claude Code's own tool set and system prompt: it is a working
+            # engineer, and the built-ins are documented in that prompt.
+            tools={"type": "preset", "preset": "claude_code"},
+            system_prompt=system_prompt,
+            mcp_servers={GATEWAY_SERVER: {
+                "type": "http", "url": self.settings.gateway_url,
+                "headers": {"Authorization": f"Bearer ${{{GATEWAY_TOKEN_ENV}}}"}}},
+            # Plugins' MCP servers (MiraDesign, the memory bridge) load too.
+            strict_mcp_config=False,
+            # <CLAUDE_CONFIG_DIR>/settings.json only (deployment-written:
+            # enabled plugins, marketplaces, hooks). Never "project": a
+            # worktree's .claude/settings.json comes from whatever branch is
+            # checked out (any PR) and could set env, apiKeyHelper or a base
+            # URL that redirects the subscription token, or disableAllHooks;
+            # headless mode shows no trust prompt.
+            setting_sources=["user"],
+            # Flag settings outrank user settings: the depth hooks stay on even
+            # if a session rewrites settings.json.
+            settings=json.dumps({"disableAllHooks": False}),
+            skills="all",
+            plugins=[{"type": "local", "path": p} for p in spec.plugin_dirs],
+            # The container is the boundary. can_use_tool would never be
+            # consulted under bypassPermissions; the depth limit is a hook.
+            permission_mode="bypassPermissions",
+            model=self.model,
+            effort=self.settings.effort,
+            cwd=str(workdir),
+            cli_path=str(self.settings.claude_home / WRAPPER_FILE),
+            env=self._engineer_env(instance, ephemeral=ephemeral),
+            resume=resume,
+            session_id=new_id,
+            verbatim_prompts=True,
+            hooks=hooks,
+            stderr=stderr.append,
+        )
+
+    async def _workspace(self, instance: str, *, ephemeral: bool) -> Path | None:
+        """engineer: the instance's worktree(s), made before its process
+        starts (outside the spawn lock: a first clone can take a while)."""
+        if not self.engineer:
+            return None
+        try:
+            return await provision_workspace(self.settings.claude_home,
+                                             self.settings.workdirs / instance, self.profile,
+                                             self._repo_locks)
+        except WorkspaceError as exc:
+            if ephemeral:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(remove_workdir, self.settings.workdirs / instance,
+                                            ignore_errors=True)
+            raise ClaudeCodeHarnessError(f"workspace for '{instance}': {exc}") from exc
+
+    async def _spawn(self, instance: str, *, ephemeral: bool, cwd: Path | None = None) -> _Agent:
         workdir = self.settings.workdirs / instance
         workdir.mkdir(parents=True, exist_ok=True)
+        if cwd is None:
+            cwd = workspace_cwd(workdir, self.profile) if self.engineer else workdir
         known = None if ephemeral else (self._load_state().get(instance) or {}).get("session_id")
         if known and self._session_file(known) is None:
             logger.warning("claude-code harness: session %s of %s is gone; starting a new one",
@@ -372,7 +542,7 @@ class ClaudeCodeHarness:
         session_id = known or str(uuid.uuid4())
         stderr: deque = deque(maxlen=40)
         client = self._client_factory(self._options(
-            instance, workdir, resume=known, new_id=None if known else session_id, stderr=stderr,
+            instance, cwd, resume=known, new_id=None if known else session_id, stderr=stderr,
             ephemeral=ephemeral))
         try:
             await client.connect()
@@ -385,9 +555,10 @@ class ClaudeCodeHarness:
                 logger.warning("claude-code harness: session %s of %s would not resume (%s); "
                                "starting a new one", known, instance, exc)
                 await self._update_instance(instance, session_id=None, lost=True)
-                return await self._spawn(instance, ephemeral=ephemeral)
+                return await self._spawn(instance, ephemeral=ephemeral, cwd=cwd)
             if ephemeral:
-                shutil.rmtree(workdir, ignore_errors=True)
+                with contextlib.suppress(Exception):
+                    remove_workdir(workdir, ignore_errors=True)
             raise
         if not ephemeral and not known:
             entry = self._load_state().get(instance) or {}
@@ -410,6 +581,11 @@ class ClaudeCodeHarness:
         return int(prev.get("seq") or 0) + 1 if prev else 1
 
     async def _agent_for(self, instance: str, *, ephemeral: bool) -> _Agent:
+        if self.engineer and not ephemeral:
+            check_miradesign_actor_name(self.profile, instance)
+        cwd = None
+        if self.engineer and not (instance in self._agents and not self._agents[instance].dead):
+            cwd = await self._workspace(instance, ephemeral=ephemeral)
         async with self._spawn_lock:
             agent = self._agents.get(instance)
             if agent is not None and not agent.dead:
@@ -418,7 +594,7 @@ class ClaudeCodeHarness:
             if agent is not None:
                 await self._drop(instance)
             await self._evict_for_capacity()
-            agent = await self._spawn(instance, ephemeral=ephemeral)
+            agent = await self._spawn(instance, ephemeral=ephemeral, cwd=cwd)
             agent.reserved += 1
             self._agents[instance] = agent
             self._ensure_reaper()
@@ -473,10 +649,14 @@ class ClaudeCodeHarness:
                 "per-launch MCP credentials are not supported by the claude-code harness "
                 "(the gateway holds deployment-level upstream credentials)")
         instance, ephemeral = self._key(turn)
+        await self._remember_mirarun(instance, ephemeral, turn.mirarun)
         # A `lost` the client could see before this turn is now consumed; one
         # raised while starting this turn must survive it (next turn: fresh).
         lost_before = bool((self._load_state().get(instance) or {}).get("lost"))
-        agent = await self._agent_for(instance, ephemeral=ephemeral)
+        try:
+            agent = await self._agent_for(instance, ephemeral=ephemeral)
+        finally:
+            self._forget_mirarun(instance)
         chunks: list[str] = []
         result: Any = None
         context: int | None = None
@@ -552,7 +732,8 @@ class ClaudeCodeHarness:
                     shutil.rmtree(path.with_suffix(""), ignore_errors=True)
                     with contextlib.suppress(OSError):
                         path.parent.rmdir()
-                shutil.rmtree(self.settings.workdirs / instance, ignore_errors=True)
+                with contextlib.suppress(Exception):
+                    remove_workdir(self.settings.workdirs / instance, ignore_errors=True)
         if result is None:
             raise ClaudeCodeHarnessError("claude ended the turn without a result")
         if not ephemeral:

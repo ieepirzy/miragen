@@ -64,6 +64,7 @@ from miragen.models import (
     ExecutorSpec,
     InterventionRequest,
     RunUsage,
+    budget_model,
     budget_tokens,
     sum_usage,
 )
@@ -256,6 +257,7 @@ class ExecutorBackend(ABC):
         workspace: Path,
         first_turn: bool,
         mcp_secret_env: dict[str, str] | None = None,
+        execution_env: dict[str, str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Run one turn and yield normalized event payloads (see module doc).
 
@@ -266,7 +268,12 @@ class ExecutorBackend(ABC):
         across concurrent runs, so a value that must differ per run cannot
         live in `os.environ` or on `self`. Adapters check this map before
         falling back to the static `os.environ` lookup for servers that use
-        a shared, deployment-level token instead."""
+        a shared, deployment-level token instead.
+
+        `execution_env` is the run's MiraRun identity (MIRARUN_*,
+        execution-refs/v1), for the agent process's environment. Adapters
+        with a per-turn child environment set it there; the others accept
+        it and leave it unset (documented per adapter)."""
 
     # ── Job execution (template) ───────────────────────────────────────────
 
@@ -281,6 +288,7 @@ class ExecutorBackend(ABC):
         prior_usage: RunUsage | None = None,
         repositories: list[RepositoryCheckout] | None = None,
         mcp_secret_env: dict[str, str] | None = None,
+        execution_env: dict[str, str] | None = None,
     ) -> ExecutorResult:
         """Execute one turn of a job bound to an agent-run.
 
@@ -341,6 +349,9 @@ class ExecutorBackend(ABC):
                     workspace=ws,
                     first_turn=first_turn,
                     mcp_secret_env=mcp_secret_env,
+                    # Only when there is one: an adapter written before
+                    # execution-refs/v1 keeps working for runs without refs.
+                    **({"execution_env": execution_env} if execution_env else {}),
                 ):
                     sink.write(payload)
 
@@ -767,7 +778,7 @@ class ExecutorBackend(ABC):
         limits = self.profile.limits
         if limits is None or limits.tokens_per_run is None or usage is None:
             return False
-        return budget_tokens(usage) > limits.tokens_per_run
+        return budget_tokens(usage, budget_model(self.profile)) > limits.tokens_per_run
 
 
 def event_payload(event: Any) -> dict[str, Any]:

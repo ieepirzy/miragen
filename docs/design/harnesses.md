@@ -230,6 +230,372 @@ without any change on the client side.
 - **Lifecycle.** Claude Code compacts on its own. By default that happens near the model's full window (sonnet: 967k, observed), so a persistent agent sets `MIRAGEN_CLAUDE_AUTO_COMPACT_WINDOW` (→ `CLAUDE_CODE_AUTO_COMPACT_WINDOW`; 100000 is Claude Code's floor and compacts at 67k, observed via `get_context_usage`). Its PreCompact hook reaches the memory plane as `context.compacting`. There is no miragen compaction/rotation policy and no handoff note here. `POST /instances/{name}/rotate` starts a new session (the plane sees `context.closed`), and `DELETE /instances/{name}` removes the process, mapping, session files and working directory.
 - **Clock order** as for Grok: with gated tools, `MCP_TOOL_TIMEOUT` is `approval_timeout_s + 120` s and the turn timeout is raised above it.
 
+### Pinning a model
+
+The part after `claude-code:` goes to the CLI as `--model` unchanged, so it
+can be an alias (`sonnet`, `opus`) or a full model id. An alias follows Claude
+Code's newest model of that family: `--model opus` ran `claude-opus-5-5` on
+2026-10-14. To stay on one model, name its full id, e.g.
+`claude-code:claude-opus-4-8` (`examples/profiles/opus-4-8-engineer.yaml`,
+pinned by `tests/test_model_pin_profile.py`). The harness sets no fallback
+model, so an unavailable model fails the turn instead of switching.
+
+Subagents (engineer posture only; the locked posture has no Agent tool) run in
+the same process. Which model they run is `spec.harness.subagent_model`:
+
+- **`inherit`** (default). miragen sets nothing; Claude Code resolves it.
+  Existing lanes launch exactly as before. Observed live on CLI 2.1.299 (the
+  version claude-agent-sdk 0.2.166 bundles), parent `--model claude-opus-4-8`:
+  - a `general-purpose` and an `Explore` subagent ran `claude-opus-4-8`;
+  - an Agent call with `model: "opus"` ran `claude-opus-4-8` (same family as
+    the parent);
+  - an Agent call with `model: "sonnet"` ran `claude-sonnet-5-5`.
+
+  So the session's model holds unless an Agent call or an agent definition
+  names another family. That is CLI behaviour, not a miragen guarantee.
+- **`pin`**. The claude child gets `CLAUDE_CODE_SUBAGENT_MODEL=<spec.model's
+  id>` and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`. The variable alone is not
+  enough: the call with `model: "sonnet"` still ran `claude-sonnet-5-5` with
+  only `CLAUDE_CODE_SUBAGENT_MODEL` set. With FORCE as well it ran
+  `claude-opus-4-8` (both observed on CLI 2.1.299). The CLI also drops an agent
+  definition's own `model:` under FORCE (read from the 2.1.299 bundle, not
+  observed).
+
+  `pin` is refused under `posture: locked`, with `claude-code:` alone (no id
+  to pin) and with `subagent_depth: 0`, since all three would be dead config.
+
+  Points to weigh before pinning:
+  - **Cost.** `pin` covers every subagent, not just the ones you write. That
+    includes `Explore` and any agent a plugin ships, which would otherwise run
+    a cheaper model of their own choosing. All of them run on the pinned
+    model, so usage goes up.
+  - **Aliases.** The pin is whatever `spec.model` names. With an alias such as
+    `claude-code:opus`, `pin` follows whatever that alias resolves to at
+    launch, so it moves when Claude Code's newest Opus changes. To stay on
+    one model, use a full id.
+  - **Untested.** A child `claude -p` that a hook or a plugin starts inherits
+    the environment, but whether it honours
+    `CLAUDE_CODE_SUBAGENT_MODEL` or its own `--model` is untested.
+  - **Contract.** `pin` implies profile contract 5, so miragend never places
+    a pinned profile on an image that can't read the key. The default
+    `inherit` is left out of serialized profiles, so a profile that doesn't
+    pin still runs on a v4 image.
+
+`env_passthrough` refuses `CLAUDE_*`/`ANTHROPIC_*`, so `subagent_model` is the
+only profile-side control. A deployment-written `<claude_home>/settings.json`
+`env` can still set these variables or `ANTHROPIC_DEFAULT_OPUS_MODEL`. Its
+precedence over the child environment is untested.
+
+Profiles that actually run live in the deployment repo, not in this public
+repository. The example here only illustrates the setting.
+
+The executor tier (`executor: {executor: claude-code, model: claude-opus-4-8}`) pins
+separately: `ExecutorSpec.model` goes to the SDK's `model` option the same way.
+
+### Engineer posture
+
+Everything above is the default, `locked` posture. `spec.harness.posture:
+engineer` (mirarun ADR-041 §4–§6; `miragen/harness/engineer.py`) runs the
+same harness as an unattended software engineer: one container per project
+lane, N instances in it, each a long-lived Claude Code session in its own git
+worktree. The container is the boundary.
+
+```yaml
+name: lane-miragen
+mode: hybrid
+triggers: [{type: http}, {type: interval, every_s: 3600}]
+spec:
+  model: claude-code:sonnet
+  instructions: |                # appended to Claude Code's own system prompt
+    You are an unattended engineer on lane miragen…
+  harness:
+    posture: engineer
+    subagent_depth: 1            # default; 0 = no subagents
+    repositories:
+      - url: https://gh-broker.internal:8443/ieepirzy/miragen.git
+    git_broker:
+      host: gh-broker.internal:8443
+      credential_file: /run/secrets/broker_credential   # v1: one per container
+      ca_bundle: /etc/ssl/certs/with-broker-ca.pem       # combined bundle, optional
+    plugin_dirs: [/agent/plugins/miradesign, /agent/plugins/miragen-memory]
+    env_passthrough: [MIRADESIGN_URL]   # non-secret plugin config only
+    miradesign_agent_per_instance: true   # default: actor agent:claude-code/<instance>
+    ask_human:
+      url: https://design.muutto365.fi
+      project: miragen
+      token_file: /run/secrets/miradesign_mcp_token   # a MIRADESIGN_MCP_TOKENS entry
+      to: [ilari]
+```
+
+Declaring `spec.harness` at all implies profile contract v4
+(`miragen/profile_contract.py`). The block is refused on any model other than
+`claude-code:`, engineer fields are refused under `posture: locked` (dead
+config), and `posture: engineer` is refused on external/hybrid agents.
+
+What changes against the locked posture (launch options in
+`ClaudeCodeHarness._engineer_options`; the locked options are pinned
+byte-for-byte by `tests/fixtures/claude_code_locked_options.json`):
+
+| | locked | engineer |
+|---|---|---|
+| Built-in tools | none (`--tools ""`, plus enabled web tools) | Claude Code's default set (`--tools default`): Bash, Read, Edit, Write, Glob, Grep, Agent, TodoWrite, WebFetch, WebSearch… |
+| Permissions | `default` + `can_use_tool` (gateway tools only) | `bypassPermissions`, no `can_use_tool` (it is never consulted under bypass); enforcement is hooks |
+| System prompt | `spec.instructions` only | Claude Code's preset + `spec.instructions` appended |
+| Settings | none (`--setting-sources=`) | `user` only: `<CLAUDE_CONFIG_DIR>/settings.json`, plus flag settings `{"disableAllHooks": false}`; never the repository's `.claude/settings.json` |
+| Skills / plugins | none | `skills="all"`; `plugin_dirs` as SDK local plugins, plus plugins enabled in the user settings |
+| MCP | the gateway only (`--strict-mcp-config`) | the gateway (`gw`) plus plugin/settings MCP servers |
+| Working directory | `<workdirs>/<instance>` | the instance's worktree (one repo) or `<workdirs>/<instance>` holding one worktree per repo |
+| `MIRAGEN_WORKER` | always `1` | `1` only when the profile has `memory:` (miragen captures); otherwise unset so the miragen-memory plugin's hooks capture |
+
+**Approvals.** `approval_required` still gates gateway tools (the gateway
+enforces it), but the built-in tools never pass through the gateway: a glob
+naming `Bash` or `Edit` guards nothing in this posture.
+
+**Loading plugins.** Two ways, both deployment-side (miragen only makes them
+loadable):
+- `plugin_dirs`: directories baked into the image or mounted (e.g. the
+  MiraDesign plugin and `plugins/miragen-memory` from this repository).
+  Loaded with the SDK's `plugins` option on every session.
+- `<CLAUDE_CONFIG_DIR>/settings.json` (`MIRAGEN_CLAUDE_HOME`, one per
+  container): `enabledPlugins` and `extraKnownMarketplaces` pointing at
+  directory marketplaces in the volume, the same as an interactive install.
+Plugins need their own configuration (MiraDesign URL and token, the memory
+bridge's URL and token). The exec wrapper's allowlist strips everything else.
+- **Credentials** go in the deployment-written `settings.json` (`env`) or in
+  files the plugin reads, never through `env_passthrough`.
+- **`env_passthrough`** is for non-secret configuration such as
+  `MIRADESIGN_URL`. It refuses `ANTHROPIC_*`, `CLAUDE_*`, `MIRAGEN_*`, `MIRARUN_*`, `GIT_*`
+  (`GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` could add a credential helper
+  for any host), `GH_*`, `SSL_*`, `LD_*`, `*_KEY`, `*_TOKEN`, `*_SECRET`,
+  `*_PASSWORD`, `*_CREDENTIALS`, `NODE_OPTIONS`, `NODE_EXTRA_CA_CERTS`,
+  `BASH_ENV`/`ENV`, `PYTHONPATH`/`PYTHONSTARTUP`, `PATH`, `HOME`,
+  `MIRADESIGN_AGENT` and the proxies (including `ALL_PROXY`).
+- **At spawn,** a passthrough never overrides a variable the harness set.
+
+The posture is subscription-only like the locked one (`CLAUDE_CODE_OAUTH_TOKEN`
+or a login in `CLAUDE_CONFIG_DIR`).
+
+**Why no project settings.** A worktree's `.claude/settings.json` is whatever
+branch is checked out, including a PR branch from outside. Its `env`,
+`apiKeyHelper` or `ANTHROPIC_BASE_URL` could redirect the subscription token
+or switch billing, and headless mode shows no trust prompt. It could also set
+`disableAllHooks`: the CLI (2.1.299) has messages for hooks being "turned off:
+the project's settings … set disableAllHooks". So `setting_sources` is
+`["user"]`, and the flag-settings layer (highest precedence among
+user-controlled sources) pins `disableAllHooks: false`.
+
+Unverified live:
+- whether `disableAllHooks` would also silence the SDK's in-process callback
+  hooks;
+- whether the flag-level `false` wins over a `true` in user settings.
+
+The repository's `CLAUDE.md`/`AGENTS.md` is therefore not loaded
+automatically. The kickoff tells the agent to read it, so its text stays in
+the conversation, not the system prompt.
+
+**Workspaces.** Each repository gets one shared bare clone,
+`<claude_home>/repos/<name>.git` (`git init --bare` + `origin`, so it holds
+only remote-tracking refs and the agents' own branches). The first spawn of
+an instance creates `<workdirs>/<instance>/<name>` with `git worktree add
+--detach` at the remote's default branch, fetching first, so a new instance
+starts from the latest default branch. An existing worktree is never reset:
+it is the agent's work in progress, and it survives process restarts. The
+clone/fetch runs before the process starts, outside the spawn lock, with one
+lock per shared clone and subprocess timeouts. A failure (git, or an
+`OSError` such as a full disk) fails the turn (`workspace for '<instance>':
+…`). Directory names are plain names: one derived from the URL is validated
+like an explicit `name` (no `.`, `..`, empty or hidden names; URLs carry no
+query or fragment). Provisioning separately refuses any path that does not
+resolve to a direct child of the instance directory, including a worktree
+replaced by a symlink. `DELETE /instances/{name}` removes the
+instance directory and prunes its worktrees from the shared clones. Branches
+the agent created stay in the shared clone. The same holds for ephemeral runs
+after their turn. Requires `git` (and `gh`) in the image (the Dockerfile
+installs both).
+
+**Git and gh through the broker.** The harness writes
+`<claude_home>/miragen-gitconfig` (`GIT_CONFIG_GLOBAL`; `GIT_CONFIG_NOSYSTEM=1`,
+`GIT_TERMINAL_PROMPT=0`). It contains:
+- `url.https://<broker>/.insteadOf` for `https://github.com/`,
+  `git@github.com:` and `ssh://git@github.com/`;
+- a credential helper scoped to `https://<broker>` that prints the
+  credential from `credential_file` at call time
+  (`MIRAGEN_BROKER_CREDENTIAL_FILE`);
+- the commit identity (`commit_name` and `commit_email`, defaulting to the
+  agent name).
+
+No credential is written into a repository's config or onto a command line.
+`gh` gets `GH_HOST=<broker>` and `GH_ENTERPRISE_TOKEN`, read from the same
+file when the process starts, because gh takes tokens only from the
+environment or its hosts file. `ca_bundle` sets `GIT_SSL_CAINFO` and
+`SSL_CERT_FILE`. It must be a combined bundle: `SSL_CERT_FILE` replaces the
+system roots for Python and Go tools. Leave it unset when the broker's CA is
+in the image's trust store. `gh pr …` uses GraphQL, which the broker refuses
+for v1 (ADR-041 §7.3). Pull request operations are the broker's MCP tools.
+
+*Follow-up:* the credential is per container in v1. ADR-041 binds it to (lane,
+session). To get there, the supervisor mints one per session and the harness
+hands it to that instance's process: a per-instance file, the helper keyed on
+the instance, and `GH_ENTERPRISE_TOKEN` per spawn.
+
+**Subagent depth.** Claude Code runs subagents inside the same `claude`
+process, so an environment variable cannot carry depth into them. The limit is
+enforced by SDK hooks (`SubagentDepthPolicy`):
+- `PreToolUse` on `Agent|Task` sees an `agent_id` only when the caller is a
+  subagent (claude-agent-sdk 0.2.166).
+- `SubagentStart` records each subagent's depth.
+- A call that would exceed `subagent_depth` is denied with a reason the model
+  sees.
+
+The CLI does not say which Agent call started a subagent. A starting subagent
+therefore gets the deepest depth among the spawns still in flight, and a
+caller whose depth is unknown counts as at the limit. Both choices err
+towards refusing. Limits:
+- Nested subagents, and hook denies under `bypassPermissions` (the SDK
+  documents PreToolUse as the way to gate tools in that mode), are not yet
+  verified in a live model turn.
+- A `claude` process the agent starts itself through Bash is outside the
+  hook. It has the subscription token, because the token is in its
+  environment.
+
+**Per-instance MiraDesign identity.** With `miradesign_agent_per_instance`
+(default `true`), each instance's `claude` process gets
+`MIRADESIGN_AGENT=<instance name>`. The MiraDesign plugin's hook client reads
+that variable from its environment (`AGENT_ENV_VARS` in
+`plugins/miradesign/miradesign_hook/client.py`) on every event, starting with
+SessionStart. The daemon turns it into the actor key `agent:claude-code/<name>`
+(`miradesign.harness.identity.actor_key`). MiraDesign slugs the name: it
+lowercases it, turns anything outside `[a-z0-9._-]` into `-`, strips leading
+and trailing `-`, and keeps the first 48 characters. That loses information:
+instance names may be up to 63 characters, so `…-engineer-1` and
+`…-engineer-2` past 48 characters would become one actor. With this option
+on, the harness refuses (fails the turn for) any instance name the slug would
+change. So lane instance
+`miragen-engineer-1` is the durable actor `agent:claude-code/miragen-engineer-1`
+in every session it runs, which is the name MiraRun's lane supervisor maps
+instances by. The session key stays `claude-code:<session id>`.
+
+**MiraRun execution refs (execution-refs/v1).** A launch
+(`POST /executor-runs`) or a turn (`POST /instances/{name}/turns`) may carry a
+`mirarun` object: `run_id`, `agent_session_id`, `lane_id`, `lane_role`,
+`lane_slot`. Only those keys are read, each a short id
+(`[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`). A malformed value never costs the
+launch: that key is dropped (logged at warning, without the value) and the
+rest are kept. Any other key is ignored, and requests without the object are
+unchanged. The refs are stored in the run's
+provenance (`provenance.mirarun`), and the agent process is started with
+`MIRARUN_RUN_ID`, `MIRARUN_AGENT_SESSION_ID`, `MIRARUN_LANE_ID`,
+`MIRARUN_LANE_ROLE` and `MIRARUN_LANE_SLOT` for the keys present. Tools inside
+the agent, such as the MiraDesign plugin's hooks, read them, so the agent
+never has to look its ids up.
+
+- **All three CLI harnesses** (claude-code, in both postures, codex and
+  grok-build) set them. A named instance keeps its refs in its state entry
+  (`mirarun` in `miragen-instances.json`), so a process started after a
+  restart or a crash gets them too. A one-off run's refs live only while its
+  process starts.
+- **A live process keeps the environment it started with.** Refs that change
+  on a later turn are stored for the instance's next process; the running one
+  is not restarted. Rotate the instance to apply them at once.
+- **Executor tier:** the claude-code and grok-build executors set them per
+  query, and so does `spawn`. The codex and kimi executors do not yet: they
+  have no per-turn child environment.
+- **Only the harness sets them.** `MIRARUN_*` is a never-passthrough prefix,
+  so a profile cannot forward a host value that would make one run look like
+  another. They are pointers for analysis, not authentication: like
+  `MIRADESIGN_AGENT`, they are reported by the agent's own environment.
+
+**Instance names must be globally unique.** The actor key carries only the
+instance name, not the profile or container. The same name in two profiles
+or two containers is one MiraDesign actor. MiraRun names instances
+`<lane_key>-<role>-<n>`, which is unique as long as lane keys are. The key is
+deliberately not namespaced, because MiraRun's supervisor maps
+`agent:claude-code/<instance>` back to the instance.
+
+The variable is set by the harness, so `env_passthrough` refuses it and could
+never override it. One-off runs (no instance) keep the plugin's default
+per-session actor. `false` turns this off.
+
+**ask_human.** With `ask_human:` set, the gateway serves an `ask_human`
+runtime tool (`mcp__gw__ask_human`) with parameters `question`, `work_item`
+(`12`, `#12` or `project#12`) and `subject`.
+
+**It posts as the calling session.** It calls MiraDesign's MCP `post` tool,
+stateless streamable HTTP at `<url>/mcp/`, with:
+- `kind=question`, `to` from the profile, and `project`;
+- `work_item` normalized to `project#n`, or a `subject` (the question's
+  first line) for a new thread;
+- `session=claude-code:<the instance's current Claude Code session id>`,
+  which the harness knows from the live process or `miragen-instances.json`.
+
+The same key goes in `X-Harness-Session`, which MiraDesign lets win over the
+argument when it names a live session. The question is therefore the
+session's own plugin actor's, and the answer comes back to that session as
+`ANSWER … to your question`.
+
+The bearer (`token_env` or `token_file`) is a MiraDesign MCP bearer, a
+`MIRADESIGN_MCP_TOKENS` entry. miragen reads it and does not pass it to the
+child, but the child can read it anyway (same uid: miragen's
+`/proc/<pid>/environ`, or the file). An MCP bearer keeps MiraDesign's session-key
+rules: the session decides the actor, not the token.
+
+**Failures:**
+- **No session yet:** if the instance has no session id, the call fails and
+  tells the agent to use the plugin's `post` tool directly.
+- **Refusals:** a `refused:` answer (an unknown recipient, no live session)
+  is a tool error, and nothing was filed.
+- **Waiting:** an `ok:` answer is returned as is. MiraDesign's own reply
+  already says not to wait; the tool adds that if it is missing.
+
+**Mentions.** Recipients come from the profile's `to`. MiraDesign refuses a
+post whose body @mentions an unknown handle, and the tool's description tells
+the model not to @mention anyone.
+
+**Idempotency.** `post` takes no idempotency key. The tool dedupes locally on
+(session key, sha256(question, work_item, subject)), keeping the last 256: the same question again in the same session
+returns the first answer without posting. A new session (rotation, restart)
+may ask it again. Remaining retry risk: if the reply to a successful post is
+lost and the tool's process then restarts, the question is asked twice.
+
+The executor tier's `ask_human` (`/mcp/ask-human`, the intervention sentinel)
+is a different tool on a different mount.
+
+**Isolation between instances: the container is the only boundary.** All
+instances of a lane run as one uid in one container, so an instance can
+reach everything the others have:
+- **Other processes' environments.** It can read `/proc/<pid>/environ` of
+  every other `claude` process and of miragen itself, including the
+  subscription token, `GH_ENTERPRISE_TOKEN` and anything else in miragen's
+  container environment.
+- **Shared files it can rewrite.** These persist across spawns and reach
+  the other instances: the exec wrapper, the gitconfig, the credential
+  helper, `<CLAUDE_CONFIG_DIR>/settings.json`, and the shared bare clone's
+  `config`, hooks and refs.
+- **The broker credential.** `GH_ENTERPRISE_TOKEN` is in every child's
+  environment, and `gh … --hostname <any>` sends it to any host it is
+  pointed at. It is a broker credential, not a GitHub token, and the broker
+  binds it to the lane, but anything holding it can use it from anywhere.
+
+- **Settings that persist.** The agent can create, or `chmod` and rewrite,
+  `<CLAUDE_CONFIG_DIR>/settings.json` (hooks, `env`, `apiKeyHelper`, a base
+  URL, `disableAllHooks`). User settings are loaded, so that change takes
+  effect at the next spawn of every instance in the container, including
+  after restarts. The flag-level `disableAllHooks: false` is the only setting
+  pinned against it.
+
+The wrapper, gitconfig and helper (and `settings.json`, when present) are made
+read-only after `prepare()` (`0o500`/`0o400`/`0o444`). That only guards
+against accidental rewrites: the same uid can `chmod` them back.
+
+*Deferred:*
+- Run `claude` as a separate uid, with root-owned harness files and clones
+  whose config the agent cannot write.
+- Keep miragen's container environment free of anything a lane must not see:
+  upstream MCP secrets, other lanes' credentials, the MiraDesign token if the
+  agent should not hold it.
+- A per-session broker credential (above), so a leaked one is scoped to one
+  session.
+
 ### Swapping harnesses
 
 Each harness keeps its own conversation state, so after a swap the next turn

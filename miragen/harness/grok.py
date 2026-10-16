@@ -51,7 +51,7 @@ from grok_build_client import AcpSession
 
 from miragen.executor.grok_hermetic import hermetic_home_dir, write_hermetic_home
 from miragen.harness.base import (
-    HarnessResult, HarnessTurn, InstanceBusyError, TaskStream, parse_harness_model,
+    HarnessResult, HarnessTurn, InstanceBusyError, MiraRunEnv, TaskStream, parse_harness_model,
 )
 from miragen.harness.gateway import ToolGateway
 from miragen.harness.served import ServedLedger
@@ -207,7 +207,7 @@ def builtin_tool_call(params: dict[str, Any], enabled: frozenset[str]) -> str | 
 NATIVE_CAPABILITIES: dict[str, str] = {"WebSearch": "web_search", "WebFetch": "web_fetch"}
 
 
-class GrokHarness:
+class GrokHarness(MiraRunEnv):
     name = NAME
     native_capabilities = frozenset(NATIVE_CAPABILITIES)
 
@@ -316,6 +316,7 @@ class GrokHarness:
             "GROK_HOME": str(self.settings.grok_home),
             GATEWAY_TOKEN_ENV: self.gateway.credential(instance),
         })
+        env.update(self._mirarun_env(instance))
         return env
 
     # ── processes ────────────────────────────────────────────────────────
@@ -461,7 +462,11 @@ class GrokHarness:
         if pending is not None and not ephemeral:
             with contextlib.suppress(Exception):
                 await asyncio.shield(pending)
-        agent = await self._agent_for(instance, ephemeral=ephemeral)
+        await self._remember_mirarun(instance, ephemeral, turn.mirarun)
+        try:
+            agent = await self._agent_for(instance, ephemeral=ephemeral)
+        finally:
+            self._forget_mirarun(instance)
         deliver_update = self._update_pending(instance, ephemeral)
         handoff = None if ephemeral else self._pending_handoff(instance)
         chunks: list[str] = []
