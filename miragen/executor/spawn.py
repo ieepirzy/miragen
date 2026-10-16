@@ -32,8 +32,10 @@ class SpawnExecutor(ExecutorBackend):
         workspace: Path,
         first_turn: bool,
         mcp_secret_env: dict[str, str] | None = None,
+        execution_env: dict[str, str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         del mcp_secret_env  # spawn has no MCP server injection surface
+        env = {**os.environ, **execution_env} if execution_env else None
         assert self.spec.command, "spawn executor requires command (enforced by ExecutorSpec)"
         argv = [
             arg.replace("{workspace}", str(workspace)).replace("{prompt}", prompt)
@@ -47,6 +49,7 @@ class SpawnExecutor(ExecutorBackend):
             stdin=asyncio.subprocess.PIPE if prompt_on_stdin else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            env=env,
             # Own process group: cancellation must take down the whole tree,
             # not just the wrapper — a surviving grandchild would keep mutating
             # a workspace that resume/abandon assumes is quiescent.

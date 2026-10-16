@@ -14,7 +14,7 @@ name: morning-briefing
 mode: autonomous
 triggers:
   - type: cron
-    schedule: "0 9 * * 1-5"
+    schedule: "0 9 * * mon-fri"   # UTC
     default_prompt: |
       Produce the morning briefing.
       Include: weather, calendar events, top headlines.
@@ -315,7 +315,7 @@ agent_type: internal              # optional — internal (default) | external |
 
 triggers:
   - type: cron
-    schedule: "0 9 * * 1-5"      # standard cron expression
+    schedule: "0 9 * * mon-fri"  # 5-field cron, UTC; use weekday names (numeric 0 = Monday)
     default_prompt: |             # optional — injected if no prompt at runtime
       Run the morning briefing.
 
@@ -393,12 +393,13 @@ Profiles are validated **strictly**: unknown keys are rejected with an error nam
 
 An `external` or `hybrid` profile is refused at load (`miragen run`, `miragen validate`, miragend's `/validate`, create, config update and import) unless it meets all of the rules below.
 
-**Providers.** The deployment sets `MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS`, a comma-separated list of pydantic-ai provider names such as `anthropic,openai`. **Unset or empty refuses every external/hybrid profile** (fail closed).
+**Providers.** The deployment sets `MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS`, a comma-separated list of pydantic-ai provider names such as `anthropic`. **Unset or empty refuses every external/hybrid profile** (fail closed). The shipped [compose.yaml](compose.yaml) sets it to `anthropic` when the operator's env leaves it out (an explicitly empty value is kept and refuses): customer chats may use only providers a transfer analysis covers, which today is Anthropic alone (mirarun ADR-036). Keep it in step with mirarun's `MIRARUN_CUSTOMER_FACING_PROVIDERS`.
 - `spec.model` is a pydantic-ai `provider:model` string whose provider (the text before the first `:`) is in the list. The list entries are trimmed and lowercased; the profile's provider is compared exactly as written, so `ANTHROPIC:…` or ` anthropic :…` is refused.
 - Provider families need one entry each: `openai` does not admit `openai-chat` or `openai-responses`, and `google-gla` is not `google-vertex`. List every one you allow.
 - Listing a router or gateway provider (for example `openrouter` or `litellm`), or pointing a provider at a custom base URL through its environment, admits whatever upstream model that router or URL serves. The allowlist only sees the provider name.
 - Subscription harness models (`claude-code:`, `codex:`, `grok-build:`) are refused even if listed: they run on a personal login.
 - Every other model the profile names uses an allowed provider too: the `ImageGeneration` capability's `fallback_model`, and a cloud `voice.provider` (e.g. `openai`, checked by name).
+- **Inference location.** An `anthropic:` model on an external/hybrid profile is sent with the Messages API's `inference_geo` set to `us`, on every request (streaming included). The value is fixed in code and has no environment variable: no deployment setting can widen it, and changing it needs a transfer analysis for the new geography first. It is applied to the agent's model requests when the agent is built. The parameter exists on the Claude 4.6 generation and later; Anthropic's API returns a 400 error for it on older models (Claude Opus 4.5, Sonnet 4.5, Haiku 4.5 and earlier), so such a profile fails on its first request rather than running without the pin. It covers the `anthropic` provider only: Bedrock and Vertex place inference by their own region settings, outside this check. Internal profiles are unaffected.
 
 **Hosts.** Every outbound URL must have its host in `MIRAGEN_EXTERNAL_ALLOWED_HOSTS`: each MCP capability's `url`, an `http` voice provider's `url`, `approval_webhook` (it receives every gated tool call with its arguments, i.e. the public user's details) and `on_complete.post_to` (every run's output). Hostnames are comma-separated and matched exactly (no wildcards, so `mcp.example.com` does not admit `sub.mcp.example.com`). Unset or empty refuses a profile that has any of these URLs; a profile with none needs no host list.
 
@@ -431,7 +432,7 @@ spec:
 
 miragend reads both lists from its own environment and forwards them into every agent it creates, so its `/validate` and the spawned container apply the same lists. **Narrowing a list does not reach agents that already exist** until they are re-checked: miragend checks against its current lists on create, config update and import, and a container keeps the lists it was created with until its service is regenerated (delete and re-create, import, or a config update that recreates the container). A plain restart re-checks the profile only against the container's own, older lists. After narrowing, re-create or re-import your external/hybrid agents.
 
-Declaring `agent_type` at all implies profile contract v3 ([miragen/profile_contract.py](miragen/profile_contract.py)): a control plane can tell a runtime enforces it when `/health` → `profile_contracts`, the image label `io.miragen.profile-contracts`, or `miragen contract` include `3`, and miragend refuses to spawn such a profile onto an older image. Serialized profiles (`model_dump`, an EDF's `resolved_profile`) omit `agent_type: internal`, so a profile that never declared a public type dumps back to its original contract.
+Declaring `agent_type` at all implies profile contract v3 ([miragen/profile_contract.py](miragen/profile_contract.py)): a control plane can tell a runtime enforces it when `/health` → `profile_contracts`, the image label `io.miragen.profile-contracts`, or `miragen contract` include `3`, and miragend refuses to spawn such a profile onto an older image. Serialized profiles (`model_dump`, an EDF's `resolved_profile`) omit `agent_type: internal`, so a profile that never declared a public type dumps back to its original contract. Declaring `spec.harness` (the Claude Code harness posture, [docs/design/harnesses.md](docs/design/harnesses.md#engineer-posture)) implies contract v4 the same way. `spec.harness.subagent_model: pin` implies v5; the default `inherit` is omitted from serialized profiles, so it never raises a profile above v4. Declaring `credentials` (per-profile credential grants, [docs/credential-grants.md](docs/credential-grants.md)) implies v6; an empty list is omitted from serialized profiles.
 
 ### Environment interpolation
 
@@ -452,7 +453,7 @@ spec:
 - `$${VAR}` — escape hatch, renders the literal text `${VAR}`.
 - Interpolation runs on every string value, including inside multi-line `instructions` blocks, but never on dict keys or non-string values (ints, bools stay untouched).
 
-Agent containers already get `*_API_KEY` env vars injected by miragen-mcp's compose management, and file-based `*_FILE` secrets are resolved into the environment before the profile loads — so secrets are interpolatable out of the box. Be careful interpolating secrets into `instructions`, though: that puts them in the model's context window.
+Agent containers managed by miragend get the `*_API_KEY` env vars their profile is entitled to ([docs/credential-grants.md](docs/credential-grants.md)), and a `${FOO_API_KEY}` reference itself entitles the profile to that key. File-based `*_FILE` secrets are resolved into the environment before the profile loads, so secrets are interpolatable out of the box. Be careful interpolating secrets into `instructions`, though: that puts them in the model's context window.
 
 ### Budgets
 
@@ -460,20 +461,64 @@ Autonomous + cron + LLM = unbounded spend. `max_steps` caps round-trips per run,
 
 ```yaml
 limits:
-  tokens_per_run: 200000     # optional, >= 1 — per-run cap, enforced by PydanticAI
+  tokens_per_run: 200000     # optional, >= 1 — per-run cap in budget tokens
   tokens_per_day: 2000000    # optional, >= 1 — rolling UTC-day cap, enforced by miragen
   on_exceeded: skip          # skip (default) | notify — what a blocked scheduled run does
 ```
 
 At least one of `tokens_per_run` / `tokens_per_day` must be set — an empty `limits: {}` block fails `miragen validate` as dead config.
 
-- **`tokens_per_run`** wires straight into PydanticAI's `UsageLimits(total_tokens_limit=...)`. Exceeding it ends the run with PydanticAI's own usage-limit error; the [run record](#run-records) is written with `status: failed` and that error as `error`.
-- **`tokens_per_day`** is a rolling UTC-day sum of `input_tokens + output_tokens` across this agent's run records (a run with no recorded usage — e.g. one that failed before the model responded — counts as 0, not unbounded). Checked before every run starts:
+- **`tokens_per_run`** caps a run's [budget tokens](#what-a-budget-token-is), checked by the executors and the in-flight reserve; the model tier also wires it into PydanticAI's `UsageLimits(total_tokens_limit=...)`, whose total counts cache reads in full. Exceeding it ends the run with PydanticAI's own usage-limit error; the [run record](#run-records) is written with `status: failed` and that error as `error`.
+- **`tokens_per_day`** is a rolling UTC-day sum of budget tokens across this agent's run records (a run with no recorded usage — e.g. one that failed before the model responded — counts as 0, not unbounded). Checked before every run starts:
   - A cron/interval/startup run over budget is **skipped**, with a log line. If `on_exceeded: notify`, the `on_complete.notify` handler fires with a budget-exceeded message (not `log_to` or `post_to` — there's no run output to log).
   - `POST /run` and `POST /run/async` return `429` with the used/limit counts and the UTC reset time in the message.
   - The budget resets at UTC midnight — yesterday's records never count against today.
 
-Cost-in-dollars conversion, per-model pricing, and cross-agent (swarm-wide) budgets are out of scope for now — this is a token-count circuit breaker, not a billing system.
+#### What a budget token is
+
+**Without a rates source** (the default), uncached input, cache writes and output count one budget token per token, and cache reads are left out.
+
+**With a rates source configured** (below), uncached input and output still count one budget token per token, and cache reads and writes are weighted by the model's own rates relative to its fresh-input rate:
+
+| Tokens | Weight |
+|---|---|
+| uncached input, output | 1 |
+| cache reads | `cached_input / input` |
+| cache writes, 5-minute TTL | `cache_write / input` (1 when the source gives no write rate, logged once per model) |
+| cache writes, 1-hour TTL | `cache_write_1h / input` (when absent, the dearest known write weight: the 5-minute weight or 1, whichever is higher; the dearer of the two TTL weights when the run doesn't report the split) |
+
+When a run reports per-request usage (`usage.calls`), each request is weighted by the model it reports; usage the requests don't account for is weighted by the run's model: the model its run record names, else the profile's (`spec.model`, or `<executor>:<executor.model>` on the executor tier). Rates are always the source's current table, so today's spend follows today's rates. Each request rounds up, so the result is always a whole number.
+
+A reported model is matched to a rates entry by, in order: the exact string (or without a provider snapshot date such as `-20260901`); the run's model when the reported id is its id without the `provider:` prefix (`anthropic:claude-x` ↔ `claude-x`); the reported id under the run model's provider prefix; then any entry whose id without the prefix is the reported id (a harness reports the API model behind its selector). When several entries match, each weight is the highest among them.
+
+**With a source, budgets never undercount.** For a model the source doesn't list, or one rated at zero (flat-rate subscription harnesses, whose ratios mean nothing), cache reads and writes count in full. Each such model is logged once.
+
+**Upgrading.** Nothing changes until you configure a source: with none, budgets count exactly as before (cache reads left out), and the agent logs one line at startup saying so. Once a source is configured, cache reads start counting (at the model's ratio, or in full for models it can't weight), so cache-heavy agents spend their budgets faster. Check `tokens_per_run` / `tokens_per_day` on those agents, and make sure the source lists every model they use, harness models included.
+
+MiraGen keeps no rates of its own (`tests/test_telemetry.py` guards against a rate table in the code). It reads them from one configured source:
+
+| Variable | Meaning |
+|---|---|
+| `MIRAGEN_MODEL_RATES_URL` | An http(s) endpoint serving the rates document, typically a control plane's model catalogue. Fetched at startup and on every refresh; the last good copy is kept under the runs directory (`model-rates/rates.json`), so a restart without network still has rates. A failed fetch keeps the last good rates. |
+| `MIRAGEN_MODEL_RATES_TOKEN` | Optional bearer token for the URL (`MIRAGEN_MODEL_RATES_TOKEN_FILE` works like every `*_FILE` secret inside the agent container; miragend forwards only the plain `_TOKEN`). |
+| `MIRAGEN_MODEL_RATES_REFRESH_S` | Refresh interval in seconds; default 900, minimum 30. Each fetch has 10 s of wall clock in total. With no copy on disk, startup waits up to 5 s for a first fetch. |
+| `MIRAGEN_MODEL_RATES_PATH` | A local rates document instead of a URL, for self-hosting. Re-read when it changes. The URL wins when both are set. (Not `_FILE`: that suffix means a secret file, which startup reads into the variable without the suffix.) |
+
+miragend forwards `MIRAGEN_MODEL_RATES_URL`, `_TOKEN` and `_REFRESH_S` from its own environment to every managed agent.
+
+The rates document, per million tokens, decimals as strings. Only the ratios matter, so the currency is irrelevant. Unknown fields are ignored, and a malformed entry is skipped with a log line:
+
+```json
+{"models": {
+  "anthropic:claude-x": {"input": "2.00", "cached_input": "0.10",
+                         "cache_write": "2.50", "cache_write_1h": "4.00", "output": "10.00"},
+  "deepseek:deepseek-x": {"input": "0.15", "cached_input": "0.003", "output": "0.60"}
+}}
+```
+
+`cache_write` and `cache_write_1h` are optional. Other sources plug in through the `RatesSource` protocol in `miragen/model_rates.py`.
+
+Currency conversion and cross-agent (swarm-wide) budgets are out of scope: this is a token-count circuit breaker, not a billing system.
 
 ---
 
@@ -579,7 +624,7 @@ voice:
   voice: alloy                    # default voice id, provider-defined
 ```
 
-The block grants three surfaces: a `speak(text, voice?)` tool on model-tier agents, the `/mcp/voice` MCP mount for executor-tier agents (point an `executor.mcp_servers` entry at it, like `/mcp/ask-human`), and `on_complete.speak: true` to voice a scheduled run's output. Credentials ride the daemon's existing `*_API_KEY` env forwarding.
+The block grants three surfaces: a `speak(text, voice?)` tool on model-tier agents, the `/mcp/voice` MCP mount for executor-tier agents (point an `executor.mcp_servers` entry at it, like `/mcp/ask-human`), and `on_complete.speak: true` to voice a scheduled run's output. Credentials ride the daemon's `*_API_KEY` forwarding: the voice's `api_key_env` (default `OPENAI_API_KEY` for `openai`) is an implied grant ([docs/credential-grants.md](docs/credential-grants.md)).
 
 ---
 
@@ -821,6 +866,7 @@ Without `register_*`, a prompt-injected agent could register a new tool at runti
 ## Security notes
 
 - API keys are mounted as Docker secrets and read into the environment at startup via the `*_API_KEY_FILE` → `*_API_KEY` pattern. Any env var ending in `_API_KEY_FILE` whose value is a readable path is resolved automatically — `ANTHROPIC_API_KEY_FILE`, `OPENAI_API_KEY_FILE`, `GEMINI_API_KEY_FILE`, etc. The `_FILE` var is removed after loading so keys are never visible in the agent's context window or environment dump.
+- miragend gives each managed agent only the keys its profile implies (its models' providers, a kimi-code or grok-build executor's metered fallback, its voice) or grants in `credentials:`, and gives `CLAUDE_CODE_OAUTH_TOKEN` only to agents that run Claude Code; none by default. See [docs/credential-grants.md](docs/credential-grants.md), including the migration steps.
 - Network egress is enforced at the container/firewall level, not in config files.
 - Set `MIRAGEN_INTERNAL_TOKEN` to require a matching `X-Miragen-Token` header on every `/run*` and `/approvals*` request — otherwise access to those endpoints relies entirely on Docker network isolation. Unset by default so single-container deployments stay zero-config; `/health` is never guarded.
 - `approval_required` globs suspend matching tool calls for human approval before execution.
@@ -843,7 +889,7 @@ Backends implement the contract (`executor.executor`):
 - **`grok-build`** — Grok Build via MIT `grok-build-client` (`headless` or `acp` transport; image installs CLI + client). See [docs/design/kimi-and-grok-executors.md](docs/design/kimi-and-grok-executors.md) and [packages/grok-build-client](packages/grok-build-client). A locked-down headless mode (`grok_tools`, `grok_permission_mode`, `grok_allow`/`grok_deny`, `grok_hermetic`, `grok_auth: subscription`) runs Grok with only the profile's MCP servers and no shell/file/web/subagent tools — see §6 Phase C of that doc.
 - **`spawn`** — no-SDK fallback: an argv template (`executor.command`) is spawned in the workspace, stdout becomes the event stream, exit 0 harvests. No resume, no usage reporting.
 
-Auth is per backend and always spawn-time state, never profile content. **Subscription OAuth is the primary path** for Codex, Kimi, and Grok: authenticate **once** into a shared home volume; agent containers mount it and never log in. Codex: `miragen codex-login --codex-home <volume>` or `CODEX_API_KEY`/`OPENAI_API_KEY` (metered) — [docs/design/codex-auth.md](docs/design/codex-auth.md). Kimi: `miragen kimi-login --kimi-home <volume>` or `KIMI_API_KEY`/`MOONSHOT_API_KEY`. Grok: `miragen grok-login --grok-home <volume>` (device-code) or `XAI_API_KEY` — [docs/design/subscription-homes.md](docs/design/subscription-homes.md). Claude Code: `ANTHROPIC_API_KEY` or mounted `~/.claude`. Persistent volumes for homes + `workspace_root` keep credentials and suspended runs alive across container restarts; see `compose.example.yml`.
+Auth is per backend and always spawn-time state, never profile content. **Subscription OAuth is the primary path** for Codex, Kimi, and Grok: authenticate **once** into a shared home volume; agent containers mount it and never log in. Codex: `miragen codex-login --codex-home <volume>` or `CODEX_API_KEY`/`OPENAI_API_KEY` (metered, granted in the profile's `credentials:`) — [docs/design/codex-auth.md](docs/design/codex-auth.md). Kimi: `miragen kimi-login --kimi-home <volume>` or `KIMI_API_KEY`/`MOONSHOT_API_KEY`. Grok: `miragen grok-login --grok-home <volume>` (device-code) or `XAI_API_KEY` — [docs/design/subscription-homes.md](docs/design/subscription-homes.md). Claude Code: `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`), mounted `~/.claude`, or `ANTHROPIC_API_KEY` granted in `credentials:` ([docs/credential-grants.md](docs/credential-grants.md)). Persistent volumes for homes + `workspace_root` keep credentials and suspended runs alive across container restarts; see `compose.example.yml`.
 
 Optionally, `executor.artifact_sink` names a **publication backend** for
 reviewed whole-run graduation (`POST /runs/{id}/publications`). Capability

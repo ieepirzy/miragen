@@ -246,8 +246,11 @@ def test_create_agent_writes_workspace_compose_and_starts(core, runner, tmp_path
     assert service["networks"] == ["miragen-net"]
     # The internal token is forwarded so the agent's /run guard is armed.
     assert service["environment"]["MIRAGEN_INTERNAL_TOKEN"] == "shared-secret"
-    assert service["environment"]["ANTHROPIC_API_KEY_FILE"] == "/run/secrets/anthropic_key"
-    assert compose["secrets"] == {"anthropic_key": {"external": True}}
+    # The daemon holds an Anthropic key, but this profile's model
+    # ('test:whatever') implies none and it grants none: no key, no mount
+    # (per-profile grants, tests/test_credential_grants.py).
+    assert "ANTHROPIC_API_KEY_FILE" not in service["environment"]
+    assert service["secrets"] == []
 
 
 def test_create_agent_forwards_labels_to_the_spawned_unit(core, tmp_path):
@@ -359,6 +362,39 @@ def test_max_concurrent_forwarded_into_agent_env(tmp_path):
     assert env["MIRAGEN_MAX_CONCURRENT"] == "8"
 
 
+def test_model_rates_source_forwarded_into_agent_env(tmp_path):
+    """One rates source on the daemon weights every managed agent's budget
+    (miragen/model_rates.py). A rates file is a host path: not forwarded."""
+    docker_client = FakeDocker()
+    runner = RecordingRunner()
+    runner.on_up = lambda name: docker_client.add(name)
+    core = LifecycleCore(
+        tmp_path,
+        docker_client,
+        base_image="ghcr.io/example/miragen:test",
+        environ={
+            "MIRAGEN_MODEL_RATES_URL": "https://catalogue.example/api/model-rates",
+            "MIRAGEN_MODEL_RATES_TOKEN": "rates-token-example",
+            "MIRAGEN_MODEL_RATES_REFRESH_S": "600",
+            "MIRAGEN_MODEL_RATES_PATH": "/host/rates.json",
+        },
+        runner=runner,
+        not_found=FakeNotFound,
+        sleep=lambda _s: None,
+    )
+    core.create_agent("alpha", _yaml("alpha"))
+
+    import yaml as pyyaml
+
+    env = pyyaml.safe_load((tmp_path / "compose.yml").read_text())["services"]["alpha"][
+        "environment"
+    ]
+    assert env["MIRAGEN_MODEL_RATES_URL"] == "https://catalogue.example/api/model-rates"
+    assert env["MIRAGEN_MODEL_RATES_TOKEN"] == "rates-token-example"
+    assert env["MIRAGEN_MODEL_RATES_REFRESH_S"] == "600"
+    assert "MIRAGEN_MODEL_RATES_PATH" not in env
+
+
 
 EXTERNAL_YAML = VALID_YAML.replace("mode: interactive\n", "mode: interactive\nagent_type: external\n")
 
@@ -395,6 +431,24 @@ def test_external_allowlist_forwarded_into_agent_env(tmp_path):
     ]
     assert env["MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS"] == "anthropic,test"
     assert env["MIRAGEN_EXTERNAL_ALLOWED_HOSTS"] == "mcp.example.com"
+
+
+def test_no_inference_geo_setting_is_forwarded_into_agent_env(tmp_path):
+    """The Anthropic inference geo for public-facing profiles is fixed in code
+    (us), not a deployment setting: a geo variable in the daemon's env does
+    not reach the agents it creates."""
+    core = _external_core(tmp_path, {
+        "MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS": "anthropic,test",
+        "MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO": "global",
+    })
+    core.create_agent("alpha", _yaml("alpha"))
+
+    import yaml as pyyaml
+
+    env = pyyaml.safe_load((tmp_path / "compose.yml").read_text())["services"]["alpha"][
+        "environment"
+    ]
+    assert "MIRAGEN_EXTERNAL_ANTHROPIC_INFERENCE_GEO" not in env
 
 
 def test_external_profile_refused_at_create_without_daemon_allowlist(tmp_path, monkeypatch):
@@ -643,23 +697,36 @@ def test_subscription_token_not_forwarded_to_other_kinds(tmp_path):
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in _service_env(tmp_path, "alpha")
 
 
-def test_subscription_token_resolved_through_profile_interpolation(tmp_path, monkeypatch):
+@pytest.mark.parametrize("forwarded", [True, False])
+def test_subscription_token_resolved_through_profile_interpolation(
+    tmp_path, monkeypatch, forwarded
+):
     """The kind is read through the loader, not the raw file: a profile
     naming its executor via ${VAR:-default} interpolates before validation,
     so the credential lookup must see the resolved kind, not the literal.
 
-    interpolate_env resolves against the process environment (os.environ),
-    which in a real daemon is the same environment the forwarded value comes
-    from — hence monkeypatch here rather than the injected environ dict."""
-    monkeypatch.setenv("EXECUTOR_KIND", "claude-code")
-    core = _executor_kind_core(
-        tmp_path, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-auto"}
-    )
+    And it must resolve as the CONTAINER will: against what the daemon
+    forwards, not the daemon's whole environment. EXECUTOR_KIND forwarded
+    (passthrough) -> claude-code there, so the token goes; held by the
+    daemon but not forwarded -> the container takes the default (codex), so
+    it does not. The injected environ is what is read: os.environ carries a
+    decoy that would flip both answers."""
+    monkeypatch.setenv("EXECUTOR_KIND", "codex" if forwarded else "claude-code")
+    environ = {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-auto", "EXECUTOR_KIND": "claude-code"}
+    if forwarded:
+        environ["MIRAGEND_AGENT_ENV_PASSTHROUGH"] = "EXECUTOR_KIND"
+    core = _executor_kind_core(tmp_path, environ)
     interpolated = EXECUTOR_CLAUDE_YAML.format(name="worker").replace(
         "executor: claude-code", "executor: ${EXECUTOR_KIND:-codex}"
     )
     core.create_agent("worker", interpolated)
-    assert _service_env(tmp_path, "worker")["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-auto"
+    env = _service_env(tmp_path, "worker")
+    if forwarded:
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-auto"
+        assert env["EXECUTOR_KIND"] == "claude-code"
+    else:
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+        assert "EXECUTOR_KIND" not in env
 
 
 def test_update_config_to_claude_code_recreates_with_token(tmp_path):

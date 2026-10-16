@@ -68,6 +68,12 @@ _CURRENT: contextvars.ContextVar[tuple[str | None, str | None]] = contextvars.Co
     "miragen_gateway_current", default=(None, None))
 
 
+def current_call() -> tuple[str | None, str | None]:
+    """(run_id, instance) of the gateway tool call in progress, for runtime
+    tools that need to know who is calling (e.g. ask_human)."""
+    return _CURRENT.get()
+
+
 class GatewayConfigError(ValueError):
     pass
 

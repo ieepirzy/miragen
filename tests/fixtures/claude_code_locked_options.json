@@ -1,0 +1,211 @@
+{
+ "plain": {
+  "env": {
+   "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+   "CLAUDE_CODE_OAUTH_TOKEN": "sk-sub",
+   "CLAUDE_CONFIG_DIR": "<root>/home",
+   "DISABLE_AUTOUPDATER": "1",
+   "ENABLE_TOOL_SEARCH": "false",
+   "HOME": "<root>/home/home",
+   "MIRAGEN_ENV_KEEP": "PATH LANG HOME CLAUDE_CONFIG_DIR MIRAGEN_GATEWAY_TOKEN MIRAGEN_WORKER ENABLE_TOOL_SEARCH DISABLE_AUTOUPDATER CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SDK_READS_SESSION_STATE PWD",
+   "MIRAGEN_GATEWAY_TOKEN": "<gateway-token>",
+   "MIRAGEN_WORKER": "1"
+  },
+  "hooks": {
+   "PreCompact": [
+    {
+     "hooks": 1,
+     "matcher": null
+    }
+   ]
+  },
+  "options": {
+   "add_dirs": [],
+   "agents": null,
+   "allowed_tools": [],
+   "betas": [],
+   "can_use_tool": "<callable>",
+   "cli_path": "<root>/home/miragen-claude",
+   "continue_conversation": false,
+   "cwd": "<root>/work/chat",
+   "debug_stderr": "<stream>",
+   "disallowed_tools": [],
+   "effort": null,
+   "enable_file_checkpointing": false,
+   "env": {
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "CLAUDE_CODE_OAUTH_TOKEN": "sk-sub",
+    "CLAUDE_CONFIG_DIR": "<root>/home",
+    "DISABLE_AUTOUPDATER": "1",
+    "ENABLE_TOOL_SEARCH": "false",
+    "HOME": "<root>/home/home",
+    "MIRAGEN_ENV_KEEP": "PATH LANG HOME CLAUDE_CONFIG_DIR MIRAGEN_GATEWAY_TOKEN MIRAGEN_WORKER ENABLE_TOOL_SEARCH DISABLE_AUTOUPDATER CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SDK_READS_SESSION_STATE PWD",
+    "MIRAGEN_GATEWAY_TOKEN": "<gateway-token>",
+    "MIRAGEN_WORKER": "1"
+   },
+   "extra_args": {},
+   "fallback_model": null,
+   "fork_session": false,
+   "forward_subagent_text": false,
+   "hooks": {
+    "PreCompact": [
+     {
+      "<dataclass>": "HookMatcher",
+      "hooks": [
+       "<callable>"
+      ],
+      "matcher": null,
+      "timeout": null
+     }
+    ]
+   },
+   "include_hook_events": false,
+   "include_partial_messages": false,
+   "load_timeout_ms": 60000,
+   "max_budget_usd": null,
+   "max_buffer_size": null,
+   "max_thinking_tokens": null,
+   "max_turns": null,
+   "mcp_servers": {
+    "gw": {
+     "headers": {
+      "Authorization": "Bearer ${MIRAGEN_GATEWAY_TOKEN}"
+     },
+     "type": "http",
+     "url": "http://127.0.0.1:9/mcp/gateway/"
+    }
+   },
+   "model": "sonnet",
+   "output_format": null,
+   "permission_mode": "default",
+   "permission_prompt_tool_name": null,
+   "plugins": [],
+   "resume": null,
+   "resume_drops_turn": null,
+   "resume_session_at": null,
+   "sandbox": null,
+   "session_id": "00000000-0000-0000-0000-000000000000",
+   "session_store": null,
+   "session_store_flush": "batched",
+   "setting_sources": [],
+   "settings": null,
+   "skills": [],
+   "stderr": "<callable>",
+   "strict_mcp_config": true,
+   "system_prompt": "You are Mira.",
+   "task_budget": null,
+   "thinking": null,
+   "tools": [],
+   "user": null,
+   "verbatim_prompts": true
+  },
+  "wrapper": "#!<python>\nimport os, sys\nkeep = set(os.environ.get('MIRAGEN_ENV_KEEP', '').split())\nenv = {k: v for k, v in os.environ.items()\n       if k in keep or k.startswith('CLAUDE_AGENT_SDK_')}\nos.execve('/usr/bin/env', ['/usr/bin/env', *sys.argv[1:]], env)\n"
+ },
+ "web_and_gated": {
+  "env": {
+   "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+   "CLAUDE_CODE_OAUTH_TOKEN": "sk-sub",
+   "CLAUDE_CONFIG_DIR": "<root>/home",
+   "DISABLE_AUTOUPDATER": "1",
+   "ENABLE_TOOL_SEARCH": "false",
+   "HOME": "<root>/home/home",
+   "MCP_TOOL_TIMEOUT": "420000",
+   "MIRAGEN_ENV_KEEP": "PATH LANG HOME CLAUDE_CONFIG_DIR MIRAGEN_GATEWAY_TOKEN MIRAGEN_WORKER ENABLE_TOOL_SEARCH DISABLE_AUTOUPDATER CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC MCP_TOOL_TIMEOUT CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SDK_READS_SESSION_STATE PWD",
+   "MIRAGEN_GATEWAY_TOKEN": "<gateway-token>",
+   "MIRAGEN_WORKER": "1"
+  },
+  "hooks": {
+   "PreCompact": [
+    {
+     "hooks": 1,
+     "matcher": null
+    }
+   ]
+  },
+  "options": {
+   "add_dirs": [],
+   "agents": null,
+   "allowed_tools": [],
+   "betas": [],
+   "can_use_tool": "<callable>",
+   "cli_path": "<root>/home/miragen-claude",
+   "continue_conversation": false,
+   "cwd": "<root>/work/chat",
+   "debug_stderr": "<stream>",
+   "disallowed_tools": [],
+   "effort": null,
+   "enable_file_checkpointing": false,
+   "env": {
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "CLAUDE_CODE_OAUTH_TOKEN": "sk-sub",
+    "CLAUDE_CONFIG_DIR": "<root>/home",
+    "DISABLE_AUTOUPDATER": "1",
+    "ENABLE_TOOL_SEARCH": "false",
+    "HOME": "<root>/home/home",
+    "MCP_TOOL_TIMEOUT": "420000",
+    "MIRAGEN_ENV_KEEP": "PATH LANG HOME CLAUDE_CONFIG_DIR MIRAGEN_GATEWAY_TOKEN MIRAGEN_WORKER ENABLE_TOOL_SEARCH DISABLE_AUTOUPDATER CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC MCP_TOOL_TIMEOUT CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SDK_READS_SESSION_STATE PWD",
+    "MIRAGEN_GATEWAY_TOKEN": "<gateway-token>",
+    "MIRAGEN_WORKER": "1"
+   },
+   "extra_args": {},
+   "fallback_model": null,
+   "fork_session": false,
+   "forward_subagent_text": false,
+   "hooks": {
+    "PreCompact": [
+     {
+      "<dataclass>": "HookMatcher",
+      "hooks": [
+       "<callable>"
+      ],
+      "matcher": null,
+      "timeout": null
+     }
+    ]
+   },
+   "include_hook_events": false,
+   "include_partial_messages": false,
+   "load_timeout_ms": 60000,
+   "max_budget_usd": null,
+   "max_buffer_size": null,
+   "max_thinking_tokens": null,
+   "max_turns": null,
+   "mcp_servers": {
+    "gw": {
+     "headers": {
+      "Authorization": "Bearer ${MIRAGEN_GATEWAY_TOKEN}"
+     },
+     "type": "http",
+     "url": "http://127.0.0.1:9/mcp/gateway/"
+    }
+   },
+   "model": "sonnet",
+   "output_format": null,
+   "permission_mode": "default",
+   "permission_prompt_tool_name": null,
+   "plugins": [],
+   "resume": null,
+   "resume_drops_turn": null,
+   "resume_session_at": null,
+   "sandbox": null,
+   "session_id": "00000000-0000-0000-0000-000000000000",
+   "session_store": null,
+   "session_store_flush": "batched",
+   "setting_sources": [],
+   "settings": null,
+   "skills": [],
+   "stderr": "<callable>",
+   "strict_mcp_config": true,
+   "system_prompt": "You are Mira.",
+   "task_budget": null,
+   "thinking": null,
+   "tools": [
+    "WebFetch",
+    "WebSearch"
+   ],
+   "user": null,
+   "verbatim_prompts": true
+  },
+  "wrapper": "#!<python>\nimport os, sys\nkeep = set(os.environ.get('MIRAGEN_ENV_KEEP', '').split())\nenv = {k: v for k, v in os.environ.items()\n       if k in keep or k.startswith('CLAUDE_AGENT_SDK_')}\nos.execve('/usr/bin/env', ['/usr/bin/env', *sys.argv[1:]], env)\n"
+ }
+}

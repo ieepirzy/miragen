@@ -12,3 +12,15 @@ def _reset_admission_state():
     app_module._active_runs = 0
     app_module._busy_instances.clear()
     yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_model_rates():
+    """The model rates source is process-global (the lifespan configures
+    it); no test inherits another's, and the log-once memory starts empty."""
+    from miragen import model_rates
+
+    model_rates.configure(None)
+    model_rates._warned.clear()
+    yield
+    model_rates.configure(None)
