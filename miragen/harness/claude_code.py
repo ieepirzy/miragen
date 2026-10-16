@@ -55,7 +55,7 @@ from pathlib import Path
 from typing import Any
 
 from miragen.harness.base import (
-    HarnessResult, HarnessTurn, InstanceBusyError, TaskStream, parse_harness_model,
+    HarnessResult, HarnessTurn, InstanceBusyError, MiraRunEnv, TaskStream, parse_harness_model,
 )
 from miragen.harness.engineer import (
     SubagentDepthPolicy, WorkspaceError, git_env, harness_spec, is_engineer, provision_workspace,
@@ -223,7 +223,7 @@ def purge_instance(settings: ClaudeCodeSettings, instance: str) -> list[str]:
     return removed
 
 
-class ClaudeCodeHarness:
+class ClaudeCodeHarness(MiraRunEnv):
     name = NAME
     native_capabilities = frozenset(NATIVE_CAPABILITIES)
 
@@ -349,6 +349,7 @@ class ClaudeCodeHarness:
             env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(self.settings.auto_compact_window)
         if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
             env["CLAUDE_CODE_OAUTH_TOKEN"] = os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
+        env.update(self._mirarun_env(instance))
         keep = [k for k in ENV_ALLOWLIST if k in os.environ]
         keep += [*env, "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SDK_READS_SESSION_STATE", "PWD"]
         assert not set(keep) & set(SCRUBBED_ENV)
@@ -648,10 +649,14 @@ class ClaudeCodeHarness:
                 "per-launch MCP credentials are not supported by the claude-code harness "
                 "(the gateway holds deployment-level upstream credentials)")
         instance, ephemeral = self._key(turn)
+        await self._remember_mirarun(instance, ephemeral, turn.mirarun)
         # A `lost` the client could see before this turn is now consumed; one
         # raised while starting this turn must survive it (next turn: fresh).
         lost_before = bool((self._load_state().get(instance) or {}).get("lost"))
-        agent = await self._agent_for(instance, ephemeral=ephemeral)
+        try:
+            agent = await self._agent_for(instance, ephemeral=ephemeral)
+        finally:
+            self._forget_mirarun(instance)
         chunks: list[str] = []
         result: Any = None
         context: int | None = None

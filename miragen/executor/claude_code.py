@@ -93,8 +93,13 @@ class ClaudeCodeExecutor(ExecutorBackend):
         workspace: Path,
         first_turn: bool,
         mcp_secret_env: dict[str, str] | None = None,
+        execution_env: dict[str, str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         options = self._options(workspace, thread_id, mcp_secret_env)
+        if execution_env:
+            # Merged over the inherited environment by the SDK, per query: this
+            # executor is shared by concurrent runs, so never os.environ.
+            options["env"] = dict(execution_env)
         async for message in self._query_factory(prompt, options):
             for payload in _normalize(message):
                 yield payload

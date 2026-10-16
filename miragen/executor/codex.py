@@ -149,6 +149,7 @@ class CodexExecutor(ExecutorBackend):
         workspace: Path,
         first_turn: bool,
         mcp_secret_env: dict[str, str] | None = None,
+        execution_env: dict[str, str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         # NOT WIRED YET: unlike the other adapters, Codex's App Server reads
         # `bearer_token_env_var` from its own runtime process environment
@@ -162,6 +163,10 @@ class CodexExecutor(ExecutorBackend):
         # A per-run MiraRun MCP credential therefore does not yet reach a
         # Codex-backed run; it falls back to any statically configured token.
         del mcp_secret_env
+        # Same reason: the App Server's environment is its process's, set
+        # once. MIRARUN_* (execution-refs/v1) is not set for Codex executor
+        # runs yet.
+        del execution_env
         session = self._session_factory(
             prompt,
             thread_id=thread_id,

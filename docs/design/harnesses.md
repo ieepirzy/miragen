@@ -364,7 +364,7 @@ bridge's URL and token). The exec wrapper's allowlist strips everything else.
 - **Credentials** go in the deployment-written `settings.json` (`env`) or in
   files the plugin reads, never through `env_passthrough`.
 - **`env_passthrough`** is for non-secret configuration such as
-  `MIRADESIGN_URL`. It refuses `ANTHROPIC_*`, `CLAUDE_*`, `MIRAGEN_*`, `GIT_*`
+  `MIRADESIGN_URL`. It refuses `ANTHROPIC_*`, `CLAUDE_*`, `MIRAGEN_*`, `MIRARUN_*`, `GIT_*`
   (`GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` could add a credential helper
   for any host), `GH_*`, `SSL_*`, `LD_*`, `*_KEY`, `*_TOKEN`, `*_SECRET`,
   `*_PASSWORD`, `*_CREDENTIALS`, `NODE_OPTIONS`, `NODE_EXTRA_CA_CERTS`,
@@ -474,6 +474,36 @@ change. So lane instance
 `miragen-engineer-1` is the durable actor `agent:claude-code/miragen-engineer-1`
 in every session it runs, which is the name MiraRun's lane supervisor maps
 instances by. The session key stays `claude-code:<session id>`.
+
+**MiraRun execution refs (execution-refs/v1).** A launch
+(`POST /executor-runs`) or a turn (`POST /instances/{name}/turns`) may carry a
+`mirarun` object: `run_id`, `agent_session_id`, `lane_id`, `lane_role`,
+`lane_slot`. Only those keys are read, each a short id
+(`[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`). A malformed value never costs the
+launch: that key is dropped (logged at warning, without the value) and the
+rest are kept. Any other key is ignored, and requests without the object are
+unchanged. The refs are stored in the run's
+provenance (`provenance.mirarun`), and the agent process is started with
+`MIRARUN_RUN_ID`, `MIRARUN_AGENT_SESSION_ID`, `MIRARUN_LANE_ID`,
+`MIRARUN_LANE_ROLE` and `MIRARUN_LANE_SLOT` for the keys present. Tools inside
+the agent, such as the MiraDesign plugin's hooks, read them, so the agent
+never has to look its ids up.
+
+- **All three CLI harnesses** (claude-code, in both postures, codex and
+  grok-build) set them. A named instance keeps its refs in its state entry
+  (`mirarun` in `miragen-instances.json`), so a process started after a
+  restart or a crash gets them too. A one-off run's refs live only while its
+  process starts.
+- **A live process keeps the environment it started with.** Refs that change
+  on a later turn are stored for the instance's next process; the running one
+  is not restarted. Rotate the instance to apply them at once.
+- **Executor tier:** the claude-code and grok-build executors set them per
+  query, and so does `spawn`. The codex and kimi executors do not yet: they
+  have no per-turn child environment.
+- **Only the harness sets them.** `MIRARUN_*` is a never-passthrough prefix,
+  so a profile cannot forward a host value that would make one run look like
+  another. They are pointers for analysis, not authentication: like
+  `MIRADESIGN_AGENT`, they are reported by the agent's own environment.
 
 **Instance names must be globally unique.** The actor key carries only the
 instance name, not the profile or container. The same name in two profiles

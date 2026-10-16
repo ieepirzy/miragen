@@ -872,3 +872,21 @@ async def test_ask_human_reaches_the_gateway_only_for_engineers(tmp_path, monkey
         harness._agents.clear()
     _, gw = build_model_harness(snap.profile({}), runs_root=tmp_path / "locked")
     assert "ask_human" not in gw._local
+
+
+# ── MiraRun execution refs (execution-refs/v1) ─────────────────────────────
+
+MIRARUN_REFS = {"agent_session_id": "4f0c2a7e-1d2b-4c5e-9f00-112233445566",
+                "lane_id": "lane-1", "lane_role": "engineer", "lane_slot": "engineer-1"}
+MIRARUN_ENV = {"MIRARUN_AGENT_SESSION_ID": MIRARUN_REFS["agent_session_id"],
+               "MIRARUN_LANE_ID": "lane-1", "MIRARUN_LANE_ROLE": "engineer",
+               "MIRARUN_LANE_SLOT": "engineer-1"}
+
+
+async def test_the_engineer_posture_carries_refs_too(env):
+    h = env.harness(engineer_profile())
+    await h.run(turn("hi", instance="lane-a-engineer-1", mirarun=MIRARUN_REFS))
+    child = FakeClient.instances[0].options.env
+    assert {k: child[k] for k in MIRARUN_ENV} == MIRARUN_ENV
+    assert child["MIRADESIGN_AGENT"] == "lane-a-engineer-1"
+    assert set(MIRARUN_ENV) <= set(child["MIRAGEN_ENV_KEEP"].split())
