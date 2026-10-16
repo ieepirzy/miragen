@@ -54,3 +54,15 @@ def test_env_file_load_is_still_wholesale():
     # this file (#74). The two coexist: load everything, pin what is ours.
     paths = {entry["path"] for entry in _miragend()["env_file"]}
     assert {".env", "stack.env"} <= paths
+
+
+def test_external_provider_list_defaults_to_anthropic_only():
+    # mirarun ADR-036 (Decision 5): customer chats may use only providers the
+    # transfer analysis covers, which is Anthropic alone; mirarun's
+    # MIRARUN_CUSTOMER_FACING_PROVIDERS defaults the same way. `-` and not
+    # `:-`, so an operator's explicitly empty value is kept (and refuses
+    # every external/hybrid profile) instead of being replaced.
+    environment = _miragend()["environment"]
+    assert environment["MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS"] == (
+        "${MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS-anthropic}"
+    )

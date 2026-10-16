@@ -18,6 +18,10 @@ account backing — and `hybrid` serves both, so it is held to the same rules:
   once the environment is, so it cannot be checked at validation time;
 - no ``memory:`` block: a public-facing agent keeps no long-term memory of
   the people it talks to;
+- a model on the ``anthropic`` provider is sent with the Messages API's
+  ``inference_geo`` pinned to ``us`` (`PUBLIC_INFERENCE_GEO`; not
+  configurable), applied when the agent is built
+  (`miragen.factory.build_agent`), not at load;
 - every outbound URL (MCP servers, an http voice endpoint,
   ``approval_webhook``, ``on_complete.post_to``) has its host in
   ``MIRAGEN_EXTERNAL_ALLOWED_HOSTS`` (exact hostnames; unset refuses any);
@@ -44,6 +48,15 @@ from miragen.models import AgentProfile
 
 ALLOWED_PROVIDERS_ENV = "MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS"
 ALLOWED_HOSTS_ENV = "MIRAGEN_EXTERNAL_ALLOWED_HOSTS"
+# Where Anthropic runs inference for a public-facing profile's model
+# requests: the Messages API's `inference_geo`. Customer chats must stay under
+# EU or US jurisdiction (mirarun ADR-036, Decision 5), and the owner's decision
+# is that they run in the US. The API's only other value, "global", may process
+# anywhere, and leaving the field out defers to the API workspace's default,
+# which can be "global" too. So the value is fixed here rather than read from
+# the environment: a deployment cannot widen it. Changing it is a code change
+# that needs a transfer analysis for the new geography first.
+PUBLIC_INFERENCE_GEO = "us"
 
 PUBLIC_AGENT_TYPES = frozenset({"external", "hybrid"})
 
@@ -120,6 +133,20 @@ def allowed_hosts_from_env(environ: Mapping[str, str] | None = None) -> frozense
     endpoint may live on: exact names, no wildcards."""
     env = os.environ if environ is None else environ
     return parse_allowed_providers(env.get(ALLOWED_HOSTS_ENV))
+
+
+def anthropic_request_extras(profile: AgentProfile) -> dict[str, str] | None:
+    """Extra Messages API request fields for a public-facing profile whose
+    model runs on the `anthropic` provider: `{"inference_geo": "us"}`. None
+    for internal profiles and for any other provider (inference_geo is a
+    first-party Anthropic API parameter; Bedrock and Vertex place inference
+    by region instead)."""
+    if profile.agent_type not in PUBLIC_AGENT_TYPES or profile.spec is None:
+        return None
+    model = profile.spec.model
+    if not isinstance(model, str) or model.partition(":")[0] != "anthropic":
+        return None
+    return {"inference_geo": PUBLIC_INFERENCE_GEO}
 
 
 def _check_url_host(
@@ -224,7 +251,7 @@ def check_agent_type(
         raise ValueError(
             f"{who} needs the deployment's allowed-provider list: set "
             f"{ALLOWED_PROVIDERS_ENV} to comma-separated provider names "
-            "(e.g. 'anthropic,openai'). Unset or empty refuses every "
+            "(e.g. 'anthropic'). Unset or empty refuses every "
             "external/hybrid profile."
         )
 

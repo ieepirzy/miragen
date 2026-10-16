@@ -149,6 +149,7 @@ class GrokBuildExecutor(ExecutorBackend):
         workspace: Path,
         first_turn: bool,
         mcp_secret_env: dict[str, str] | None = None,
+        execution_env: dict[str, str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         transport = self.transport
         if self.leash_enabled and transport == "headless":
@@ -170,6 +171,8 @@ class GrokBuildExecutor(ExecutorBackend):
             transport=transport,
             mcp_secret_env=mcp_secret_env,
         )
+        if execution_env:
+            options["env"].update(execution_env)
         yield {"type": "thread.started", "thread_id": options["session_id"]}
 
         session = self._session_factory(

@@ -8,6 +8,7 @@ from pydantic_ai.capabilities import Instrumentation
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import UsageLimits
 
+from miragen.agent_type import anthropic_request_extras
 from miragen.approval import build_approval_hooks
 from miragen.load import resolve_capabilities
 from miragen.models import AgentProfile
@@ -174,6 +175,19 @@ def build_agent(
         if profile.spec.model_settings.temperature is not None:
             ms["temperature"] = profile.spec.model_settings.temperature
         model_settings = ms or None
+
+    # A public-facing profile on the anthropic provider runs with a pinned
+    # inference_geo (miragen/agent_type.py). pydantic-ai's AnthropicModel
+    # forwards no typed setting for it (pydantic-ai-slim 1.107.7; the SDK's
+    # messages.create does take `inference_geo`), so it rides `extra_body`,
+    # pydantic-ai's own pass-through, which the SDK merges into the top level
+    # of the request JSON: the same wire field as the typed parameter.
+    # Profiles cannot set extra_body themselves (spec.model_settings carries
+    # only max_tokens and temperature), so nothing here can be overridden
+    # from the YAML.
+    extras = anthropic_request_extras(profile)
+    if extras:
+        model_settings = {**(model_settings or {}), "extra_body": extras}
 
     # `extra_instructions` rides the system prompt, NOT message history —
     # this is what makes a per-run memory packet transient (§17.3): it is

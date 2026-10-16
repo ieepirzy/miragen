@@ -17,7 +17,9 @@ before) without importing the SDK.
 Auth: the App Server reads Codex's credential store under CODEX_HOME. Either
 `miragen codex-login` writes ChatGPT OAuth credentials there ONCE (subscription
 path — agent containers then mount that shared store and never log in), or the
-deployment sets CODEX_API_KEY/OPENAI_API_KEY (metered, per session). MCP
+profile grants CODEX_API_KEY/OPENAI_API_KEY in `credentials:` (metered, per
+session). A key the profile does not grant is removed at startup, so it can
+never replace the subscription (docs/credential-grants.md). MCP
 servers are still declared via config.toml in CODEX_HOME, written at startup.
 Full model: docs/design/codex-auth.md.
 """
@@ -29,6 +31,7 @@ import os
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
+from miragen.credentials import granted_explicitly, scrub_subscription_overrides
 from miragen.executor.base import ExecutorBackend
 from miragen.executor.leash import GateOperation
 from miragen.models import AgentProfile
@@ -83,8 +86,17 @@ class CodexExecutor(ExecutorBackend):
     def prepare(self) -> None:
         """Write the executor's MCP/config into CODEX_HOME (idempotent, once at
         startup). The App Server reads CODEX_HOME's config.toml and credential
-        store; auth is provisioned by the deployment (mounted ChatGPT creds or
-        CODEX_API_KEY), never profile content."""
+        store; auth is provisioned by the deployment (mounted ChatGPT creds, or
+        an API key the profile grants in `credentials:`), never profile
+        content."""
+        # Subscription first: an API key the profile does not grant leaves
+        # this process before the App Server child can inherit it.
+        removed = scrub_subscription_overrides(self.profile)
+        if removed:
+            logger.info(
+                f"[{self.profile.name}] withheld {', '.join(removed)} from the codex "
+                "executor (not in credentials:) — it runs on the subscription auth.json"
+            )
         codex_home = Path(self.spec.codex_home)
         codex_home.mkdir(parents=True, exist_ok=True)
         # Profile home wins over any inherited CODEX_HOME (same as kimi/grok).
@@ -111,7 +123,7 @@ class CodexExecutor(ExecutorBackend):
                 f"[{self.profile.name}] no credentials in {codex_home} and no "
                 "CODEX_API_KEY/OPENAI_API_KEY — executor turns will fail auth. Run "
                 "`miragen codex-login --codex-home <shared volume>` once (subscription) "
-                "or set an API key. Agent containers never log in — they mount the "
+                "or grant an API key (credentials: [CODEX_API_KEY]). Agent containers never log in — they mount the "
                 "shared store. See docs/design/codex-auth.md."
             )
 
@@ -137,6 +149,7 @@ class CodexExecutor(ExecutorBackend):
         workspace: Path,
         first_turn: bool,
         mcp_secret_env: dict[str, str] | None = None,
+        execution_env: dict[str, str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         # NOT WIRED YET: unlike the other adapters, Codex's App Server reads
         # `bearer_token_env_var` from its own runtime process environment
@@ -150,6 +163,10 @@ class CodexExecutor(ExecutorBackend):
         # A per-run MiraRun MCP credential therefore does not yet reach a
         # Codex-backed run; it falls back to any statically configured token.
         del mcp_secret_env
+        # Same reason: the App Server's environment is its process's, set
+        # once. MIRARUN_* (execution-refs/v1) is not set for Codex executor
+        # runs yet.
+        del execution_env
         session = self._session_factory(
             prompt,
             thread_id=thread_id,
@@ -265,11 +282,16 @@ class CodexExecutor(ExecutorBackend):
         return AsyncThread(codex, started.thread.id)
 
     async def _login(self, codex: Any) -> None:
-        """Log in with an API key when one is configured; otherwise rely on the
-        mounted ChatGPT credential store (the subscription path)."""
-        key = os.environ.get("CODEX_API_KEY") or os.environ.get("OPENAI_API_KEY")
-        if key:
-            await codex.login_api_key(key)
+        """Log in with an API key only when the profile grants one in
+        `credentials:` (CODEX_API_KEY first, then OPENAI_API_KEY); otherwise
+        rely on the mounted ChatGPT credential store (the subscription path).
+        A key that is merely present — e.g. OPENAI_API_KEY forwarded for an
+        `openai:` memory model — never replaces the subscription."""
+        for name in ("CODEX_API_KEY", "OPENAI_API_KEY"):
+            key = os.environ.get(name)
+            if key and granted_explicitly(self.profile, name):
+                await codex.login_api_key(key)
+                return
 
     # ── Host leash (issue #38) ───────────────────────────────────────────────
 

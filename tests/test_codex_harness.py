@@ -421,3 +421,33 @@ async def test_clear_still_starts_over_when_maintenance_cannot_run(env):
     h2 = env.harness()
     info = await h2.rotate("chat")
     assert info["fresh"] is True and env.state()["chat"]["thread_id"] is None
+
+
+# ── MiraRun execution refs (execution-refs/v1) ─────────────────────────────
+
+MIRARUN_REFS = {"agent_session_id": "4f0c2a7e-1d2b-4c5e-9f00-112233445566",
+                "lane_id": "lane-1", "lane_role": "engineer", "lane_slot": "engineer-1"}
+MIRARUN_ENV = {"MIRARUN_AGENT_SESSION_ID": MIRARUN_REFS["agent_session_id"],
+               "MIRARUN_LANE_ID": "lane-1", "MIRARUN_LANE_ROLE": "engineer",
+               "MIRARUN_LANE_SLOT": "engineer-1"}
+
+
+def _spy_env(harness) -> list[dict]:
+    seen: list[dict] = []
+    original = harness._env
+
+    def spy(instance):
+        env = original(instance)
+        seen.append(env)
+        return env
+
+    harness._env = spy
+    return seen
+
+
+async def test_codex_spawns_with_refs_and_stores_them(env):
+    h = env.harness()
+    seen = _spy_env(h)
+    await h.run(turn("hello", mirarun=MIRARUN_REFS))
+    assert seen and {k: seen[0][k] for k in MIRARUN_ENV} == MIRARUN_ENV
+    assert env.state()["chat"]["mirarun"] == MIRARUN_REFS

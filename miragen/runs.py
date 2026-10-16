@@ -304,10 +304,21 @@ class RunStore:
             path.unlink(missing_ok=True)
 
 
-def tokens_used_since(store: RunStore, since: datetime) -> int:
+def _budget_model(record: RunRecord, model: str | None) -> str | None:
+    # The model the run recorded, so a later profile change doesn't re-weight
+    # earlier runs; the profile's model (`model`) for records without one.
+    # The rates themselves are always the source's current table.
+    return record.model or model
+
+
+def tokens_used_since(store: RunStore, since: datetime, model: str | None = None) -> int:
     """
-    Sum budget tokens (models.budget_tokens: fresh input + output, cache
-    reads excluded) across `store`'s run records with started_at >= since.
+    Sum budget tokens (models.budget_tokens: uncached input + output, cache
+    reads and writes weighted by the model's rates) across `store`'s run
+    records with started_at >= since. Usage without a per-call breakdown is
+    weighted by the record's own model, else `model` (the profile's;
+    models.budget_model), at the source's CURRENT rates: today's spend
+    follows the rates table as it is now, not as it was at each run.
 
     Records with no usage (e.g. a run that failed before the model responded,
     or a fresh `running` record that hasn't finished a turn yet) contribute 0
@@ -321,12 +332,13 @@ def tokens_used_since(store: RunStore, since: datetime) -> int:
     for record in store._iter_records():
         if record.started_at < since or record.usage is None:
             continue
-        total += budget_tokens(record.usage)
+        total += budget_tokens(record.usage, _budget_model(record, model))
     return total
 
 
 def reserved_tokens_in_flight(
-    store: RunStore, since: datetime, per_run_reserve: int | None, remaining_budget: int
+    store: RunStore, since: datetime, per_run_reserve: int | None, remaining_budget: int,
+    model: str | None = None,
 ) -> int:
     """
     Estimated additional token cost of runs started >= since that are still
@@ -353,7 +365,8 @@ def reserved_tokens_in_flight(
             continue
         if per_run_reserve is None:
             return max(remaining_budget, 0)
-        already_used = budget_tokens(record.usage)
+        # The same weighting as tokens_used_since, or the two won't add up.
+        already_used = budget_tokens(record.usage, _budget_model(record, model))
         total += max(per_run_reserve - already_used, 0)
     return total
 
