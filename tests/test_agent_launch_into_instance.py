@@ -122,3 +122,40 @@ async def test_turns_endpoint_is_the_base_tier_name_for_instance_launches(client
     assert dup.json()["turn_id"] == turn_id and agent.run.await_count == 1
     assert (await c.post("/instances/NOT..VALID/turns", json={"prompt": "p",
                                                                "idempotency_key": "t2"})).status_code == 422
+
+
+# ── MiraRun execution refs (execution-refs/v1) ─────────────────────────────
+
+MIRARUN_REFS = {"agent_session_id": "4f0c2a7e-1d2b-4c5e-9f00-112233445566",
+                "lane_id": "lane-1", "lane_role": "engineer", "lane_slot": "engineer-1"}
+MIRARUN_ENV = {"MIRARUN_AGENT_SESSION_ID": MIRARUN_REFS["agent_session_id"],
+               "MIRARUN_LANE_ID": "lane-1", "MIRARUN_LANE_ROLE": "engineer",
+               "MIRARUN_LANE_SLOT": "engineer-1"}
+
+
+async def test_a_turn_carries_its_refs_into_the_run_record(client):
+    import miragen.app as app_module
+
+    c, _agent = client
+    r = await c.post("/instances/lane-1-engineer-1/turns", json={
+        "prompt": "p", "idempotency_key": "t1", "mirarun": {**MIRARUN_REFS, "extra": "ignored"}})
+    assert r.status_code == 202, r.text
+    rec = await _wait(c, r.json()["turn_id"])
+    assert rec["provenance"]["mirarun"] == MIRARUN_REFS
+    record = app_module._run_store.get(rec["run_id"])
+    assert app_module._mirarun_refs(record) == MIRARUN_REFS
+
+
+async def test_a_launch_carries_its_run_id_and_bad_refs_are_refused(client):
+    c, _agent = client
+    r = await c.post("/executor-runs", json={"prompt": "p", "idempotency_key": "k1",
+                                             "mirarun": {"run_id": "4f0c2a7e"}})
+    assert r.status_code == 202, r.text
+    rec = await _wait(c, r.json()["run_id"])
+    assert rec["provenance"]["mirarun"] == {"run_id": "4f0c2a7e"}
+    bad = await c.post("/executor-runs", json={"prompt": "p", "idempotency_key": "k2",
+                                               "mirarun": {"run_id": "no spaces"}})
+    assert bad.status_code == 422
+    none = await c.post("/executor-runs", json={"prompt": "p", "idempotency_key": "k3"})
+    rec = await _wait(c, none.json()["run_id"])
+    assert "mirarun" not in (rec["provenance"] or {})

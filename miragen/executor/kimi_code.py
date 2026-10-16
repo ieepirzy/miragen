@@ -85,7 +85,11 @@ class KimiCodeExecutor(ExecutorBackend):
         workspace: Path,
         first_turn: bool,
         mcp_secret_env: dict[str, str] | None = None,
+        execution_env: dict[str, str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
+        # No per-turn child environment in this adapter: MIRARUN_*
+        # (execution-refs/v1) is not set for Kimi executor runs yet.
+        del execution_env
         options = self._options(workspace, mcp_secret_env)
         session = self._session_factory(
             prompt,

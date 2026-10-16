@@ -353,6 +353,55 @@ class RunProvenance(BaseModel):
     edf_api_version: Optional[str] = None
 
 
+# ── MiraRun execution references (execution-refs/v1) ────────────────────────
+#
+# The ids MiraRun knows a run or session by, handed to the agent as
+# environment so tools inside it (the MiraDesign plugin's hooks) can attribute
+# what the agent records — an impediment, a blocker — to its run without the
+# agent ever looking the id up. Pointers for analysis, not authentication.
+# Only the harness sets these names: MIRARUN_ is a never-passthrough prefix,
+# so a profile cannot forward a host value that would spoof another run.
+
+MIRARUN_REF_ENV = {
+    "run_id": "MIRARUN_RUN_ID",
+    "agent_session_id": "MIRARUN_AGENT_SESSION_ID",
+    "lane_id": "MIRARUN_LANE_ID",
+    "lane_role": "MIRARUN_LANE_ROLE",
+    "lane_slot": "MIRARUN_LANE_SLOT",
+}
+_REF_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+_REF_RE = re.compile(_REF_PATTERN)
+
+
+class MiraRunRefs(BaseModel):
+    """`mirarun` on a launch or turn request. Declared keys are validated;
+    anything else is ignored (a newer MiraRun may send more)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    run_id: Optional[str] = Field(default=None, pattern=_REF_PATTERN)
+    agent_session_id: Optional[str] = Field(default=None, pattern=_REF_PATTERN)
+    lane_id: Optional[str] = Field(default=None, pattern=_REF_PATTERN)
+    lane_role: Optional[str] = Field(default=None, pattern=_REF_PATTERN)
+    lane_slot: Optional[str] = Field(default=None, pattern=_REF_PATTERN)
+
+    def present(self) -> dict[str, str]:
+        return {k: v for k, v in self.model_dump().items() if v}
+
+
+def mirarun_env(refs: Any) -> dict[str, str]:
+    """The MIRARUN_* environment for ``refs`` (a MiraRunRefs or the dict it
+    was persisted as). Re-checked here because the dict may come back from a
+    state file or a run record: a value that does not match is dropped, not
+    passed on."""
+    if isinstance(refs, MiraRunRefs):
+        refs = refs.present()
+    if not isinstance(refs, dict):
+        return {}
+    return {env: str(refs[key]) for key, env in MIRARUN_REF_ENV.items()
+            if isinstance(refs.get(key), str) and _REF_RE.match(refs[key])}
+
+
 class RepositoryRevision(BaseModel):
     """A repository the run's workspace plan includes. `commit` stays None
     until workspace preparation resolves the ref (issue #33 Phase D)."""
@@ -911,14 +960,15 @@ class ModelSettings(_ProfileModel):
 # Prefixes: credentials that outrank the subscription token or switch
 # provider (ANTHROPIC_*, CLAUDE_*; a superset of miragen/memory/claude_code.py's
 # SCRUBBED_ENV, which models.py cannot import without a cycle; a test pins
-# the two), miragen's own secrets and switches (MIRAGEN_*), anything that
+# the two), miragen's own secrets and switches (MIRAGEN_*), the run identity
+# the harness sets from a launch's refs (MIRARUN_*, execution-refs/v1), anything that
 # reconfigures git, gh or TLS trust (GIT_* can add a credential helper for
 # any host, GIT_ASKPASS; GH_*; SSL_*), and the dynamic loader (LD_*).
 # Suffixes: secrets by naming convention. Passthrough is for non-secret
 # plugin configuration; plugin credentials belong in the deployment-written
 # <CLAUDE_CONFIG_DIR>/settings.json or a file the plugin reads.
-_NEVER_PASSTHROUGH_PREFIXES = ("ANTHROPIC_", "CLAUDE_", "MIRAGEN_", "GIT_", "GH_", "SSL_",
-                               "LD_")
+_NEVER_PASSTHROUGH_PREFIXES = ("ANTHROPIC_", "CLAUDE_", "MIRAGEN_", "MIRARUN_", "GIT_", "GH_",
+                               "SSL_", "LD_")
 _NEVER_PASSTHROUGH_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIALS")
 _NEVER_PASSTHROUGH = frozenset({
     # Set by the harness itself, or able to run code in every child.

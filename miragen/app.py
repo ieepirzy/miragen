@@ -57,12 +57,14 @@ from miragen.models import (
     InterventionAnswer,
     InterventionRequest,
     IntervalTrigger as ProfileIntervalTrigger,
+    MiraRunRefs,
     RepositoryRevision,
     RunProvenance,
     RunRecord,
     RunSummary,
     StartupTrigger as ProfileStartupTrigger,
     budget_model,
+    mirarun_env,
     sum_usage,
 )
 from miragen import model_rates
@@ -571,6 +573,16 @@ def _append_history_sidecar(instance: str, run_id: str | None, message_count: in
         logger.warning("Failed to append history sidecar entry")
 
 
+def _mirarun_refs(record: RunRecord | None) -> dict[str, str] | None:
+    """The run's MiraRun ids (execution-refs/v1), as its provenance holds
+    them — so a resumed or retried turn gets the same ones."""
+    provenance = record.provenance if record is not None else None
+    refs = getattr(provenance, "mirarun", None) if provenance is not None else None
+    if isinstance(provenance, dict):
+        refs = provenance.get("mirarun")
+    return refs if isinstance(refs, dict) and refs else None
+
+
 async def run_agent(
     prompt: str,
     use_history: bool = False,
@@ -653,6 +665,7 @@ async def run_agent(
         run_id=record.run_id if record is not None else None,
         secret_env=mcp_secret_env or None,
         extra_instructions=memory_packet.text if memory_packet is not None else None,
+        mirarun=_mirarun_refs(record),
     )
     harness = _model_harness()
 
@@ -802,6 +815,7 @@ async def _run_executor_turn(
         prior_usage=record.usage if record is not None else None,
         repositories=repositories,
         mcp_secret_env=mcp_secret_env,
+        execution_env=mirarun_env(_mirarun_refs(record)) or None,
     )
     timeout_s = _executor.spec.turn_timeout_s
     try:
@@ -2296,6 +2310,9 @@ class ExecutorLaunchRequest(BaseModel):
         "refused (409) if re-resolution at this trust boundary disagrees.",
     )
     provenance: Optional[RunProvenance] = None
+    # MiraRun's ids for this run or session (execution-refs/v1): persisted in
+    # the run's provenance and set as MIRARUN_* in the agent's environment.
+    mirarun: Optional[MiraRunRefs] = None
 
 
 def _edf_compatibility(resolved: ResolvedEDF) -> dict | None:
@@ -2370,6 +2387,10 @@ class TurnRequest(BaseModel):
     prompt: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1, max_length=200)
     provenance: RunProvenance | None = None
+    # The instance's MiraRun ids (execution-refs/v1). A long-lived instance's
+    # process keeps the refs it was started with; new ones apply from its
+    # next process (rotate the instance to apply them at once).
+    mirarun: MiraRunRefs | None = None
 
 
 @app.post("/instances/{name}/turns", status_code=202, dependencies=[_internal_auth])
@@ -2388,7 +2409,8 @@ async def start_turn(name: str, request: TurnRequest, response: Response):
                             "conversation instances; use /executor-runs")
     result = await launch_executor_run(
         ExecutorLaunchRequest(prompt=request.prompt, idempotency_key=request.idempotency_key,
-                              provenance=request.provenance, instance=name, use_history=True),
+                              provenance=request.provenance, instance=name, use_history=True,
+                              mirarun=request.mirarun),
         response)
     return {"turn_id": result["run_id"], "instance": name,
             **{k: v for k, v in result.items() if k in ("status", "duplicate")}}
@@ -2508,6 +2530,8 @@ async def launch_executor_run(request: ExecutorLaunchRequest, response: Response
                 if resolved is not None
                 else {}
             ),
+            **({"mirarun": refs} if (refs := (request.mirarun.present()
+                                               if request.mirarun else None)) else {}),
         }
     )
 
