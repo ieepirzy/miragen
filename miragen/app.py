@@ -1409,7 +1409,10 @@ async def lifespan(app: FastAPI):
             prompt = trigger.default_prompt or "Run."
             _scheduler.add_job(
                 run_agent_scheduled,
-                CronTrigger.from_crontab(trigger.schedule),
+                # UTC by contract, like managed schedules above: the scheduler
+                # has no zone of its own, so without this the container's
+                # local zone decided when a profile's cron fired.
+                CronTrigger.from_crontab(trigger.schedule, timezone=timezone.utc),
                 args=[prompt],
                 kwargs={"instance": trigger.instance},
                 id=f"{_profile.name}:cron",

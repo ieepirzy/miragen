@@ -585,7 +585,11 @@ _TRIGGER_INSTANCE_FIELD = Field(
 class CronTrigger(_ProfileModel):
     type: Literal["cron"]
     schedule: str = Field(
-        description="Standard 5-field cron expression, e.g. '0 9 * * 1-5' (09:00 Mon–Fri).",
+        description=(
+            "Standard 5-field cron expression evaluated in UTC, e.g. "
+            "'0 9 * * mon-fri' (09:00 UTC Mon–Fri). Prefer weekday names: "
+            "numeric day_of_week counts from 0 = Monday, so '1-5' is Tue–Sat."
+        ),
         min_length=1,
     )
     default_prompt: Optional[str] = Field(
@@ -602,7 +606,7 @@ class CronTrigger(_ProfileModel):
         except ValueError as e:
             raise ValueError(
                 f"invalid cron expression '{v}': {e}. "
-                "Expected 5 fields (minute hour day month day_of_week), e.g. '0 9 * * 1-5'."
+                "Expected 5 fields (minute hour day month day_of_week), e.g. '0 9 * * mon-fri'."
             )
         return v
 
