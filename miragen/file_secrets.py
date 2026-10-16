@@ -34,6 +34,11 @@ PATH_VARIABLES = frozenset({
     "NIX_SSL_CERT_FILE",
     "PIP_CONFIG_FILE",
     "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE",
+    # AWS SDKs read these as paths (EKS IRSA sets the web-identity one).
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_CONFIG_FILE",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
 })
 
 # Half of Linux's per-string limit for argv/envp (MAX_ARG_STRLEN, 128 KiB).
@@ -50,6 +55,11 @@ def load_file_secrets(environ: MutableMapping[str, str] | None = None) -> None:
         if not secret_path.exists():
             logger.warning(f"Secret file referenced by {file_var} not found: {path}")
             continue
+        if not secret_path.is_file():
+            # A directory, FIFO or device: never a secret, and reading a FIFO
+            # would block startup.
+            logger.warning(f"Not loading {file_var}: {path} is not a regular file")
+            continue
         target = file_var[: -len("_FILE")]
         try:
             size = secret_path.stat().st_size
@@ -61,5 +71,5 @@ def load_file_secrets(environ: MutableMapping[str, str] | None = None) -> None:
             env[target] = secret_path.read_text().strip()
             del env[file_var]
             logger.info(f"Loaded secret {target} from {file_var}")
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             logger.error(f"Failed to read secret file {path} for {file_var}: {exc}")

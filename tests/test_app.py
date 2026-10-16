@@ -1243,6 +1243,25 @@ class TestLoadFileSecrets:
             assert "SSL_CERT" not in os.environ
             assert "CLOUDSDK_CORE_CUSTOM_CA_CERTS" not in os.environ
 
+    def test_aws_path_variables_untouched(self, tmp_path):
+        token = tmp_path / "token"
+        token.write_text("eyJ.jwt")
+        with patch.dict(os.environ, {"AWS_WEB_IDENTITY_TOKEN_FILE": str(token)}, clear=False):
+            _load_file_secrets()
+            assert os.environ["AWS_WEB_IDENTITY_TOKEN_FILE"] == str(token)
+            assert "AWS_WEB_IDENTITY_TOKEN" not in os.environ
+
+    def test_non_regular_and_undecodable_files_are_skipped(self, tmp_path):
+        fifo = tmp_path / "fifo"
+        os.mkfifo(fifo)
+        binary = tmp_path / "bin"
+        binary.write_bytes(b"\xff\xfe\x00garbage")
+        with patch.dict(os.environ, {"PIPE_KEY_FILE": str(fifo), "DIR_KEY_FILE": str(tmp_path),
+                                     "BIN_KEY_FILE": str(binary)}, clear=False):
+            _load_file_secrets()  # returns: never blocks on the FIFO, never raises
+            for var in ("PIPE_KEY", "DIR_KEY", "BIN_KEY"):
+                assert var not in os.environ and f"{var}_FILE" in os.environ
+
     def test_oversized_file_left_as_path(self, tmp_path):
         """Any env string over 128 KiB makes every subprocess spawn fail with
         E2BIG, so a file that big is never loaded as a secret."""
