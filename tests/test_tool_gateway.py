@@ -374,3 +374,41 @@ async def test_a_shadowed_upstream_tool_is_not_listed(seen):
     # which reaches github_issues: listing it twice would advertise a tool
     # that can't be called.
     assert sorted(names) == ["github_get_me", "github_issues_add_comment"]
+
+
+async def test_an_unfiltered_longer_upstream_does_not_hide_a_tool_it_lacks(seen):
+    """Review of #193: 'github_issues' has no allowed_tools and doesn't serve
+    'list'; github's 'issues_list' must still list and reach 'github'."""
+    github = FastMCP("github")
+
+    @github.tool()
+    def issues_list() -> str:
+        """List issues."""
+        return "issues"
+
+    issues = FastMCP("github_issues")
+
+    @issues.tool()
+    def add_comment(body: str) -> str:
+        """Comment on an issue."""
+        return f"commented:{body}"
+
+    servers = {"http://gh/mcp": github, "http://ghi/mcp": issues}
+
+    @contextlib.asynccontextmanager
+    async def factory(url, headers=None):
+        async with memory_client_factory(servers[url], [])(url, headers) as streams:
+            yield streams
+
+    p = profile(spec={"model": "grok-build:x", "instructions": "i", "capabilities": [
+        {"MCP": {"url": "http://gh/mcp", "name": "github"}},
+        {"MCP": {"url": "http://ghi/mcp", "name": "github_issues"}},
+    ]})
+    gw = ToolGateway(p, env={}, upstream_client=factory)
+    names = sorted(t.name for t in await gw._list_tools())
+    assert names == ["github_issues_add_comment", "github_issues_list"]
+    with gw.turn("inst", "r"):
+        listed = await gw.call_tool("github_issues_list", {}, instance="inst")
+        comment = await gw.call_tool("github_issues_add_comment", {"body": "x"}, instance="inst")
+    assert text(listed) == "issues" and not listed.isError
+    assert text(comment) == "commented:x"

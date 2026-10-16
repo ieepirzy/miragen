@@ -237,6 +237,9 @@ class ToolGateway:
             self._add_local(tool_name, _plain_signature_tool(
                 registered_tools[tool_name], tool_name, self._shim_for(tool_name)), runtime=False)
 
+        self._by_prefix_length = sorted(self._upstreams.values(),
+                                        key=lambda u: len(u.name), reverse=True)
+        self._shadow_warned: set[tuple[str, str]] = set()
         self.server = Server("miragen-gateway")
         self.server.list_tools()(self._list_tools)
         self.server.call_tool(validate_input=True)(self._call_tool_handler)
@@ -333,19 +336,24 @@ class ToolGateway:
             t = local.fn_tool
             out.append(types.Tool(name=t.name, description=t.description or "",
                                   inputSchema=t.parameters))
+        # Fetch every upstream first: whether a name is shadowed depends on
+        # what the other upstreams actually serve (see _resolve).
+        listed: list[tuple[_Upstream, list[types.Tool]]] = []
         for up in self._upstreams.values():
             try:
-                tools = await self._upstream_tools(up)
+                listed.append((up, await self._upstream_tools(up)))
             except Exception as exc:  # one dead upstream must not hide the rest
                 logger.warning("gateway: listing %s failed: %s", up.name, type(exc).__name__)
-                continue
+        for up, tools in listed:
             for t in tools:
                 name = f"{up.name}_{t.name}"
                 if self._resolve(name)[1] is not up:
-                    # Shadowed: a local tool or a longer upstream prefix owns
-                    # this name, so a call would never reach this tool.
-                    logger.warning("gateway: %s's tool '%s' is shadowed as '%s'; not listed",
-                                   up.name, t.name, name)
+                    # Shadowed: a local tool or a longer upstream prefix that
+                    # serves this name owns it; a call would never get here.
+                    if (up.name, t.name) not in self._shadow_warned:
+                        self._shadow_warned.add((up.name, t.name))
+                        logger.warning("gateway: %s's tool '%s' is shadowed as '%s'; not listed",
+                                       up.name, t.name, name)
                     continue
                 out.append(t.model_copy(update={"name": name}))
         return out
@@ -356,13 +364,18 @@ class ToolGateway:
             return "local", self._local[name], name
         # Longest prefix first: with upstreams 'github' and 'github_issues',
         # 'github_issues_add_comment' belongs to 'github_issues', whatever
-        # order the capabilities were declared in.
-        for up in sorted(self._upstreams.values(), key=lambda u: len(u.name), reverse=True):
+        # order the capabilities were declared in. An upstream whose listing
+        # is known and lacks the tool is passed over, so 'github_issues_list'
+        # still reaches 'github' when only 'github' serves 'issues_list'.
+        for up in self._by_prefix_length:
             prefix = f"{up.name}_"
             if name.startswith(prefix):
                 raw = name[len(prefix):]
-                if up.allowed is None or raw in up.allowed:
-                    return "upstream", up, raw
+                if up.allowed is not None and raw not in up.allowed:
+                    continue
+                if up.fetched_at and raw not in {t.name for t in up.tools}:
+                    continue
+                return "upstream", up, raw
         raise KeyError(name)
 
     # ── calls ────────────────────────────────────────────────────────────
