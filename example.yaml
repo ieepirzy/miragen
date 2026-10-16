@@ -24,7 +24,7 @@ mode: autonomous                        # autonomous | interactive | hybrid
 
 triggers:
   - type: cron
-    schedule: "0 9 * * 1-5"            # standard cron expression (weekdays at 09:00)
+    schedule: "0 9 * * mon-fri"        # 5-field cron in UTC (weekdays at 09:00 UTC)
 
     #optional
     default_prompt: |

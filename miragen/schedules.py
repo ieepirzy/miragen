@@ -58,7 +58,7 @@ class ScheduleSpec(BaseModel):
         except ValueError as e:
             raise ValueError(
                 f"invalid cron expression '{v}': {e}. "
-                "Expected 5 fields (minute hour day month day_of_week), e.g. '0 9 * * 1-5'."
+                "Expected 5 fields (minute hour day month day_of_week), e.g. '0 9 * * mon-fri'."
             )
         return v
 

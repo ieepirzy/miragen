@@ -620,6 +620,8 @@ class TestLifespanSchedulerRegistration:
             "test-agent:startup:0",
         }
         assert isinstance(jobs["test-agent:cron"].trigger, APCronTrigger)
+        # UTC by contract, whatever zone the container runs in.
+        assert str(jobs["test-agent:cron"].trigger.timezone) == "UTC"
         assert isinstance(jobs["test-agent:interval:0"].trigger, APIntervalTrigger)
         assert jobs["test-agent:interval:0"].trigger.interval.total_seconds() == 30
         assert jobs["test-agent:interval:1"].trigger.interval.total_seconds() == 60

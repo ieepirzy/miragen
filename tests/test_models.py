@@ -53,7 +53,7 @@ class TestCronValidation:
     def test_error_message_names_expression_and_example(self):
         with pytest.raises(ValidationError, match=r"0 9 \* \*") as exc_info:
             CronTrigger(type="cron", schedule="0 9 * *")
-        assert "0 9 * * 1-5" in str(exc_info.value)
+        assert "0 9 * * mon-fri" in str(exc_info.value)
 
 
 class TestHttpTrigger:

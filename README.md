@@ -14,7 +14,7 @@ name: morning-briefing
 mode: autonomous
 triggers:
   - type: cron
-    schedule: "0 9 * * 1-5"
+    schedule: "0 9 * * mon-fri"   # UTC
     default_prompt: |
       Produce the morning briefing.
       Include: weather, calendar events, top headlines.
@@ -315,7 +315,7 @@ agent_type: internal              # optional — internal (default) | external |
 
 triggers:
   - type: cron
-    schedule: "0 9 * * 1-5"      # standard cron expression
+    schedule: "0 9 * * mon-fri"  # 5-field cron, UTC; use weekday names (numeric 0 = Monday)
     default_prompt: |             # optional — injected if no prompt at runtime
       Run the morning briefing.
 
