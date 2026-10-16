@@ -144,18 +144,35 @@ async def test_a_turn_carries_its_refs_into_the_run_record(client):
     assert rec["provenance"]["mirarun"] == MIRARUN_REFS
     record = app_module._run_store.get(rec["run_id"])
     assert app_module._mirarun_refs(record) == MIRARUN_REFS
+    # One bad ref: the turn still runs, the good keys are kept.
+    r = await c.post("/instances/lane-1-engineer-1/turns", json={
+        "prompt": "p", "idempotency_key": "t2",
+        "mirarun": {**MIRARUN_REFS, "lane_slot": "bad slot; rm -rf"}})
+    assert r.status_code == 202, r.text
+    rec = await _wait(c, r.json()["turn_id"])
+    assert rec["status"] == "succeeded"
+    assert rec["provenance"]["mirarun"] == {
+        k: v for k, v in MIRARUN_REFS.items() if k != "lane_slot"}
+    # ...and the agent's environment is built from what was kept.
+    from miragen.models import mirarun_env
+
+    env = mirarun_env(app_module._mirarun_refs(app_module._run_store.get(rec["run_id"])))
+    assert env == {k: v for k, v in MIRARUN_ENV.items() if k != "MIRARUN_LANE_SLOT"}
 
 
-async def test_a_launch_carries_its_run_id_and_bad_refs_are_refused(client):
+async def test_a_launch_carries_its_run_id_and_a_bad_ref_never_costs_it(client):
     c, _agent = client
     r = await c.post("/executor-runs", json={"prompt": "p", "idempotency_key": "k1",
                                              "mirarun": {"run_id": "4f0c2a7e"}})
     assert r.status_code == 202, r.text
     rec = await _wait(c, r.json()["run_id"])
     assert rec["provenance"]["mirarun"] == {"run_id": "4f0c2a7e"}
+    # A malformed pointer never costs the launch: that key is dropped.
     bad = await c.post("/executor-runs", json={"prompt": "p", "idempotency_key": "k2",
                                                "mirarun": {"run_id": "no spaces"}})
-    assert bad.status_code == 422
+    assert bad.status_code == 202, bad.text
+    rec = await _wait(c, bad.json()["run_id"])
+    assert rec["status"] == "succeeded" and "mirarun" not in (rec["provenance"] or {})
     none = await c.post("/executor-runs", json={"prompt": "p", "idempotency_key": "k3"})
     rec = await _wait(c, none.json()["run_id"])
     assert "mirarun" not in (rec["provenance"] or {})

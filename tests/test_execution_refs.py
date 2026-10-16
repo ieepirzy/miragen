@@ -7,10 +7,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
 
 from miragen.models import (
-    HarnessSpec, MiraRunRefs, RunProvenance, mirarun_env, passthrough_refused,
+    HarnessSpec,
+    MiraRunRefs,
+    RunProvenance,
+    mirarun_env,
+    passthrough_refused,
 )
 from tests.test_executor_adapters import _claude_executor, _spawn_executor
 
@@ -27,12 +30,19 @@ ENV = {"MIRARUN_AGENT_SESSION_ID": REFS["agent_session_id"], "MIRARUN_LANE_ID": 
 # ── the contract ───────────────────────────────────────────────────────────
 
 
-def test_declared_keys_are_validated_and_others_ignored():
+def test_declared_keys_are_checked_and_others_ignored():
     refs = MiraRunRefs.model_validate({"run_id": "run-1f2e", "future_key": "whatever"})
     assert refs.present() == {"run_id": "run-1f2e"}
-    for bad in ("", "has space", "semi;colon", "x" * 129, "$(id)", "-leading"):
-        with pytest.raises(ValidationError):
-            MiraRunRefs.model_validate({"run_id": bad})
+
+
+@pytest.mark.parametrize("bad", ["", "has space", "semi;colon", "x" * 129, "$(id)", "-leading",
+                                 42, ["run-1"], {"id": "run-1"}])
+def test_a_malformed_ref_is_dropped_never_refused(bad, caplog):
+    refs = MiraRunRefs.model_validate({"run_id": bad, "lane_id": "lane-1"})
+    assert refs.present() == {"lane_id": "lane-1"}
+    assert "run_id" in caplog.text and "dropped" in caplog.text
+    if isinstance(bad, str) and bad:
+        assert bad not in caplog.text  # the value itself is never logged
 
 
 def test_env_maps_only_valid_declared_refs():

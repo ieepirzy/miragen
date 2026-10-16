@@ -479,8 +479,10 @@ instances by. The session key stays `claude-code:<session id>`.
 (`POST /executor-runs`) or a turn (`POST /instances/{name}/turns`) may carry a
 `mirarun` object: `run_id`, `agent_session_id`, `lane_id`, `lane_role`,
 `lane_slot`. Only those keys are read, each a short id
-(`[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`); any other key is ignored, and requests
-without the object are unchanged. The refs are stored in the run's
+(`[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`). A malformed value never costs the
+launch: that key is dropped (logged at warning, without the value) and the
+rest are kept. Any other key is ignored, and requests without the object are
+unchanged. The refs are stored in the run's
 provenance (`provenance.mirarun`), and the agent process is started with
 `MIRARUN_RUN_ID`, `MIRARUN_AGENT_SESSION_ID`, `MIRARUN_LANE_ID`,
 `MIRARUN_LANE_ROLE` and `MIRARUN_LANE_SLOT` for the keys present. Tools inside

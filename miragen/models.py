@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import re
 from datetime import datetime
@@ -371,19 +372,32 @@ MIRARUN_REF_ENV = {
 }
 _REF_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
 _REF_RE = re.compile(_REF_PATTERN)
+_log = logging.getLogger("miragen.mirarun_refs")
 
 
 class MiraRunRefs(BaseModel):
-    """`mirarun` on a launch or turn request. Declared keys are validated;
-    anything else is ignored (a newer MiraRun may send more)."""
+    """`mirarun` on a launch or turn request. Declared keys are checked;
+    anything else is ignored (a newer MiraRun may send more).
+
+    A malformed pointer never costs a launch: a value that is not a short id
+    is dropped (logged without the value) and the request goes ahead with
+    the keys that are."""
 
     model_config = ConfigDict(extra="ignore")
 
-    run_id: Optional[str] = Field(default=None, pattern=_REF_PATTERN)
-    agent_session_id: Optional[str] = Field(default=None, pattern=_REF_PATTERN)
-    lane_id: Optional[str] = Field(default=None, pattern=_REF_PATTERN)
-    lane_role: Optional[str] = Field(default=None, pattern=_REF_PATTERN)
-    lane_slot: Optional[str] = Field(default=None, pattern=_REF_PATTERN)
+    run_id: Optional[str] = None
+    agent_session_id: Optional[str] = None
+    lane_id: Optional[str] = None
+    lane_role: Optional[str] = None
+    lane_slot: Optional[str] = None
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _drop_malformed(cls, value: Any, info: Any) -> Any:
+        if value is None or (isinstance(value, str) and _REF_RE.match(value)):
+            return value
+        _log.warning("mirarun ref %s is not a short id; dropped", info.field_name)
+        return None
 
     def present(self) -> dict[str, str]:
         return {k: v for k, v in self.model_dump().items() if v}

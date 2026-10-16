@@ -555,6 +555,9 @@ async def test_claude_code_without_refs_sets_nothing(env):
 
 
 async def test_a_host_mirarun_var_never_reaches_the_child(env, monkeypatch):
+    # A guard, not a regression test for execution-refs: the base posture's
+    # env allowlist already drops host MIRARUN_* (the engineer posture's
+    # passthrough refusal is pinned in test_claude_code_engineer).
     monkeypatch.setenv("MIRARUN_RUN_ID", "spoofed")
     h = env.harness()
     await h.run(turn("hi"))
