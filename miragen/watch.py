@@ -140,9 +140,14 @@ class Inbox:
         try:
             raw = await asyncio.wait_for(self.read_tool(spec.tool, dict(spec.arguments)),
                                          timeout=POLL_TIMEOUT_S)
-            items = _dig(payload_of(raw), spec.items)
+            payload = payload_of(raw)
+            items = _dig(payload, spec.items)
             if isinstance(items, dict) and items.get("ok") is False:
                 raise WatchError(f"tool reported failure: {str(items.get('error'))[:300]}")
+            # A tool that answers {"error": "..."} in place of its data (admin-mcp's
+            # output-size guard did, 2026-10-17): say what it said, not "not a list".
+            if not isinstance(items, list) and isinstance(payload, dict) and payload.get("error"):
+                raise WatchError(f"tool reported failure: {str(payload['error'])[:300]}")
             if not isinstance(items, list):
                 raise WatchError(f"'{spec.items or 'result'}' is not a list")
         except Exception as exc:  # fail open: the consumer sees status=error

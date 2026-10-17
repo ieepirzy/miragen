@@ -125,6 +125,16 @@ async def test_a_failed_poll_is_status_error_never_nothing_new(tmp_path, bad):
     assert inbox.view()["sources"]["email"]["status"] == "ok"
 
 
+async def test_an_error_answer_is_reported_as_the_tools_own_words(tmp_path):
+    inbox, tool, _ = make(tmp_path, mails(("a", "x", "1")))
+    await inbox.poll("email")
+    tool.result = {"error": "ERROR: response serialized to 95581 characters (limit 50000)."}
+    await inbox.poll("email")
+    src = inbox.view()["sources"]["email"]
+    assert src["status"] == "error"
+    assert "tool reported failure: ERROR: response serialized to 95581" in src["last_error"]
+
+
 async def test_entries_stay_until_acknowledged_and_survive_a_restart(tmp_path):
     inbox, tool, clock = make(tmp_path, mails(("a", "x", "1")))
     await inbox.poll("email")
