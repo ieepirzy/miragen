@@ -351,15 +351,19 @@ class AcpSession:
             # its exit status and last stderr lines into the error: without
             # them a startup failure is just "ACP agent closed".
             reason = "ACP agent closed"
-            if not self._closed:
-                with contextlib.suppress(Exception):
-                    reason = await self._death_reason()
-                self.close_reason = reason
-            for fut in self._pending.values():
-                if not fut.done():
-                    fut.set_exception(ConnectionError(reason))
-            self._pending.clear()
-            await self._updates.put(None)
+            try:
+                if not self._closed:
+                    with contextlib.suppress(Exception):
+                        reason = await self._death_reason()
+                    self.close_reason = reason
+            finally:
+                # Always runs, even when a close() cancels the reason-gathering
+                # above (CancelledError): waiters must never be left hanging.
+                for fut in self._pending.values():
+                    if not fut.done():
+                        fut.set_exception(ConnectionError(reason))
+                self._pending.clear()
+                self._updates.put_nowait(None)
 
     async def _death_reason(self) -> str:
         # stdout hit EOF; the stderr drain and the exit status trail it a little.
