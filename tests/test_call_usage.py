@@ -321,3 +321,29 @@ def test_api_path_reports_cache_zero_only_when_the_provider_sent_the_key():
     anthropic_zero = run(details={"cache_read_input_tokens": 0, "cache_creation_input_tokens": 0})
     assert anthropic_zero.cached_input_tokens == 0 and anthropic_zero.cache_write_tokens == 0
     assert anthropic_zero.calls[0].cache_write_tokens == 0
+
+
+def test_grok_harness_usage_picks_alternative_cache_keys_and_logs_keys_once(caplog):
+    import logging
+
+    import miragen.harness.grok as grok
+
+    grok._usage_keys_logged = False
+    with caplog.at_level(logging.INFO, logger="miragen.harness.grok"):
+        u = grok._usage({"inputTokens": 900, "outputTokens": 3, "cacheReadTokens": 700,
+                         "cacheWriteTokens": 20}, context_tokens=900)
+        grok._usage({"inputTokens": 1, "cachedTokens": 1})
+    assert (u.cached_input_tokens, u.cache_write_tokens, u.context_tokens) == (700, 20, 900)
+    assert grok._usage({"inputTokens": 5, "cachedTokens": 4}).cached_input_tokens == 4
+    logged = [r.getMessage() for r in caplog.records if "end usage keys" in r.getMessage()]
+    assert logged == ["grok harness: end usage keys: ['cacheReadTokens', 'cacheWriteTokens', "
+                      "'inputTokens', 'outputTokens']"]
+
+
+def test_sum_usage_keeps_the_latest_context():
+    from miragen.models import RunUsage, sum_usage
+
+    a = RunUsage(requests=1, context_tokens=100)
+    b = RunUsage(requests=2, context_tokens=250)
+    assert sum_usage(a, b).context_tokens == 250
+    assert sum_usage(b, RunUsage(requests=1)).context_tokens == 250

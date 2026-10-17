@@ -501,3 +501,20 @@ async def test_grok_spawns_with_refs_and_one_off_runs_keep_none(env):
     await h.run(turn("once", use_history=False, run_id="eph", mirarun={"run_id": "run-9"}))
     assert seen[-1]["MIRARUN_RUN_ID"] == "run-9"
     assert not h.__dict__.get("_mirarun_ephemeral")
+
+
+async def test_usage_counts_model_requests_and_records_context(env):
+    """requests = model requests the turn really made (response_completed per
+    call, at least one per tool round + 1), not a hard-coded 1; context_tokens
+    = the last request's prompt size."""
+    h = env.harness()
+    plain = await h.run(turn("hello", run_id="r1"))
+    assert plain.usage.requests == 1
+    assert plain.usage.context_tokens is not None and plain.usage.context_tokens > 0
+    # A tool round with no per-call usage of its own still costs a second request.
+    tool = await h.run(turn('SAY Checking.\nCALL speak {"text": "x"}\nSAY done', run_id="r2"))
+    assert tool.usage.requests == 2
+    # Three reported model calls in one turn are three requests.
+    rounds = await h.run(turn("ROUND\nROUND\nSAY ok", run_id="r3"))
+    assert rounds.usage.requests == 3
+    assert rounds.usage.context_tokens > plain.usage.context_tokens  # the context grew
