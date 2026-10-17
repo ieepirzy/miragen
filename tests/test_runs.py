@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from miragen.models import RunRecord, RunUsage, ToolCallRecord
+from miragen.models import RunRecord, RunUsage, ToolCallRecord, sum_usage
 from miragen.runs import (
     AmbiguousRunIdError,
     RunStore,
@@ -563,3 +563,66 @@ class TestReservedTokensInFlight:
         used += reserved_tokens_in_flight(store, base, per_run_reserve=600, remaining_budget=limit - used)
 
         assert used == 600
+
+
+def test_finish_keeps_the_turn_timings_and_adds_the_dispatch_gap(tmp_path):
+    """Mira#86: the time between the run's acceptance and its harness turn."""
+    store = RunStore(root=tmp_path)
+    record = store.start(agent_name="a", trigger="http", prompt="hi")
+    turn_started = record.started_at + timedelta(milliseconds=1500)
+    timings = {"started_at": turn_started.isoformat().replace("+00:00", "Z"), "cold": False,
+               "total_ms": 10.0, "spans": [], "summary": {"total_ms": 10.0}}
+    updated = store.finish(record, status="succeeded", output="ok", timings=timings)
+    assert updated.timings["summary"]["dispatch_ms"] == 1500.0
+    assert updated.timings["summary"]["total_ms"] == 10.0
+    reread = json.loads(next(tmp_path.glob("*.json")).read_text())
+    assert reread["timings"]["cold"] is False
+    # a finish without timings keeps none; nothing invented
+    plain = store.finish(store.start(agent_name="a", trigger="http", prompt="x"), status="succeeded")
+    assert plain.timings is None
+
+
+def test_summed_usage_adds_reasoning_api_time_and_cost():
+    a = RunUsage(requests=1, reasoning_tokens=5, api_duration_ms=1000, cost_usd_ticks=7)
+    b = RunUsage(requests=2, reasoning_tokens=None, api_duration_ms=500, cost_usd_ticks=3)
+    total = sum_usage(a, b)
+    assert (total.reasoning_tokens, total.api_duration_ms, total.cost_usd_ticks) == (5, 1500, 10)
+
+
+def test_dispatch_is_left_out_on_a_resumed_run_and_odd_timestamps_never_raise(tmp_path):
+    """Review on #209: reopen() keeps the first started_at, so a resumed
+    turn's 'dispatch' would include earlier turns and the blocked time."""
+    store = RunStore(root=tmp_path)
+    record = store.start(agent_name="a", trigger="http", prompt="hi")
+    t = {"started_at": (record.started_at + timedelta(hours=2)).isoformat(), "spans": [],
+         "summary": {"total_ms": 1.0}}
+    resumed = record.model_copy(update={"resume_count": 1})
+    assert "dispatch_ms" not in store.finish(resumed, status="succeeded", timings=t).timings["summary"]
+    naive = {"started_at": "2026-10-18T00:00:00", "spans": [], "summary": {}}   # no tz
+    assert store.finish(record, status="succeeded", timings=naive).timings == naive
+    junk = {"started_at": "not a time", "spans": [], "summary": {}}
+    assert store.finish(record, status="succeeded", timings=junk).timings == junk
+
+
+def test_a_finish_without_timings_clears_an_earlier_turns(tmp_path):
+    store = RunStore(root=tmp_path)
+    record = store.start(agent_name="a", trigger="http", prompt="hi")
+    first = store.finish(record, status="succeeded", timings={"spans": [], "summary": {}})
+    assert store.finish(first, status="failed", error="cancelled").timings is None
+
+
+def test_turn_timer_summary_counts_spans_past_the_cap():
+    import time as _time
+
+    from miragen.harness import timing
+    t = timing.TurnTimer()
+    now = _time.monotonic()
+    for i in range(timing.SPANS_CAP + 50):
+        t.add("tool_call", now, now + 0.001)
+    out = t.as_dict()
+    assert len(out["spans"]) == timing.SPANS_CAP and out["spans_truncated"]
+    assert out["summary"]["tools_ms"] == round((timing.SPANS_CAP + 50) * 1.0, 1)
+    late = timing.TurnTimer()
+    late.add("first_update", late.t0 + 2.0)
+    late.add("first_update", late.t0 + 1.0)                     # arrived later, started earlier
+    assert late.as_dict()["summary"]["first_update_ms"] == 1000.0

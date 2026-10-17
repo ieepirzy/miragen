@@ -698,7 +698,8 @@ async def run_agent(
                                            result.usage.cache_write_tokens)
     except Exception as e:
         if record is not None and _run_store is not None:
-            _run_store.finish(record, status="failed", error=str(e))
+            _run_store.finish(record, status="failed", error=str(e),
+                              timings=getattr(e, "timings", None))
             _write_model_run_events(record.run_id, error=str(e))
             _record_audio_artifacts(record.run_id)
             if _memory is not None:
@@ -729,6 +730,7 @@ async def run_agent(
             # which backend ran the agent.
             tool_call_count=len(tool_calls),
             tool_call_failures=sum(1 for c in tool_calls if not c.ok),
+            timings=getattr(result, "timings", None),
         )
         _write_model_run_events(record.run_id, tool_calls=tool_calls, usage=usage, output=output)
         _record_audio_artifacts(record.run_id)
@@ -3078,7 +3080,8 @@ async def run_stream(request: RunRequest):
                     stream_result = stream.result
             except Exception as e:
                 if record is not None and _run_store is not None:
-                    _run_store.finish(record, status="failed", error=str(e), output="".join(chunks) or None)
+                    _run_store.finish(record, status="failed", error=str(e), output="".join(chunks) or None,
+                                      timings=getattr(e, "timings", None))
                     _write_model_run_events(record.run_id, error=str(e))
                     if _memory is not None:
                         await _memory.finish_turn(
@@ -3096,6 +3099,7 @@ async def run_stream(request: RunRequest):
                     tool_calls=tool_calls,
                     tool_call_count=len(tool_calls),
                     tool_call_failures=sum(1 for c in tool_calls if not c.ok),
+                    timings=getattr(stream_result, "timings", None),
                 )
                 _write_model_run_events(
                     record.run_id, tool_calls=tool_calls, usage=usage, output="".join(chunks)

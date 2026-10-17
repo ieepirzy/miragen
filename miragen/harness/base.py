@@ -71,6 +71,9 @@ class HarnessResult:
     output: str
     usage: RunUsage | None = None
     tool_calls: list[ToolCallRecord] = field(default_factory=list)
+    # Where the turn's time went (miragen/harness/timing.py), when the harness
+    # measures it; lands on RunRecord.timings.
+    timings: dict | None = None
 
 
 class HarnessStream(Protocol):

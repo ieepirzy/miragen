@@ -14,6 +14,7 @@ import json
 import os
 import re
 import signal
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -83,6 +84,8 @@ class AcpSession:
     _stderr_tail: collections.deque = field(default_factory=lambda: collections.deque(maxlen=50), init=False, repr=False)
     # Why the agent went away ("ACP agent closed (exit N); stderr: ..."), once it has.
     close_reason: str | None = field(default=None, init=False)
+    # How long start() took: process spawn, then the ACP initialize handshake (ms).
+    start_timings: dict = field(default_factory=dict, init=False)
 
     async def __aenter__(self) -> "AcpSession":
         await self.start()
@@ -94,12 +97,16 @@ class AcpSession:
     async def start(self) -> None:
         if self._reader is not None:
             return
+        t0 = time.monotonic()
         if self._transport_factory is not None:
             self._reader, self._writer, self._kill = await self._transport_factory()
         else:
             await self._spawn()
+        t1 = time.monotonic()
+        self.start_timings["spawn_ms"] = round((t1 - t0) * 1000, 1)
         self._reader_task = asyncio.create_task(self._read_loop(), name="grok-acp-reader")
         await self._handshake()
+        self.start_timings["initialize_ms"] = round((time.monotonic() - t1) * 1000, 1)
 
     async def _spawn(self) -> None:
         grok = resolve_grok_bin(self.grok_bin)

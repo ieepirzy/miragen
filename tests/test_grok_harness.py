@@ -518,3 +518,139 @@ async def test_usage_counts_model_requests_and_records_context(env):
     rounds = await h.run(turn("ROUND\nROUND\nSAY ok", run_id="r3"))
     assert rounds.usage.requests == 3
     assert rounds.usage.context_tokens > plain.usage.context_tokens  # the context grew
+
+
+def _names(timings):
+    return [s["name"] for s in timings["spans"]]
+
+
+async def test_a_turn_records_where_its_time_went_cold_then_warm(env):
+    """Mira#86: spawn / initialize / session open on the turn that started
+    the agent, then prompt, first update, model responses, tool calls."""
+    h = env.harness()
+    cold = await h.run(turn('SAY Checking.\nCALL speak {"text": "x"}\nSAY done', run_id="r1"))
+    t = cold.timings
+    assert t["cold"] is True and t["total_ms"] > 0 and t["started_at"].endswith("Z")
+    names = _names(t)
+    for name in ("agent", "spawn", "initialize", "session_open", "lock_wait", "compose",
+                 "prompt_sent", "first_update", "model_response", "tool_call", "end"):
+        assert name in names, name
+    session = next(s for s in t["spans"] if s["name"] == "session_open")
+    assert session["detail"]["mode"] == "new"
+    call = next(s for s in t["spans"] if s["name"] == "tool_call")
+    assert call["detail"]["tool"] == "speak" and call["duration_ms"] is not None
+    assert [s["start_ms"] for s in t["spans"]] == sorted(s["start_ms"] for s in t["spans"])
+    s = t["summary"]
+    assert s["spawn_ms"] >= 0 and s["first_update_ms"] > 0 and s["total_ms"] == t["total_ms"]
+    assert s["tools_ms"] == call["duration_ms"]
+
+    warm = await h.run(turn("hello again", run_id="r2"))
+    assert warm.timings["cold"] is False
+    assert not {"spawn", "initialize", "session_open"} & set(_names(warm.timings))
+
+
+async def test_a_failed_turn_carries_its_timings_and_tool_calls_on_the_error(env):
+    """Review on #209: the timed-out turn with a slow tool is the one most
+    worth a waterfall, so its tool_call spans must survive the timeout."""
+    h = env.harness(turn_timeout_s=0.5)
+    with pytest.raises(GrokHarnessError) as err:
+        await h.run(turn('CALL speak {"text": "x"}\nSLEEP', run_id="r1"))
+    t = err.value.timings
+    assert t["cold"] is True and "prompt_sent" in _names(t) and "end" not in _names(t)
+    assert "tool_call" in _names(t) and t["summary"]["tools_ms"] >= 0
+
+
+async def test_another_instances_listing_is_not_claimed_by_this_turn(env):
+    """Review on #209 (probe): b's agent listing tools while a's turn runs
+    must not land in a's waterfall; a listing by a's own session does."""
+    import time as _time
+    h = env.harness()
+    await asyncio.gather(h.run(turn("hi", instance="a", run_id="a0")),
+                         h.run(turn("hi", instance="b", run_id="b0")))
+
+    async def listings_during_a():
+        while "a" not in h.gateway._active:
+            await asyncio.sleep(0)
+        for who in ("b", "a"):
+            now = _time.monotonic()
+            h.gateway.listings.append({"upstream": "home", "instance": who, "start": now,
+                                       "end": now + 0.01, "cached": False,
+                                       "backing_off": False, "ok": True})
+    ra, _ = await asyncio.gather(h.run(turn("hello", instance="a", run_id="a1")),
+                                 listings_during_a())
+    claimed = [sp for sp in ra.timings["spans"] if sp["name"] == "list_tools"]
+    assert len(claimed) == 1 and claimed[0]["detail"]["upstream"] == "home"
+    assert ra.timings["summary"]["list_tools_ms"] == claimed[0]["duration_ms"]
+
+
+async def test_timing_trouble_never_fails_a_turn_or_masks_its_error(env, monkeypatch):
+    h = env.harness()
+
+    def broken(*a, **kw):
+        raise RuntimeError("timing bug")
+    monkeypatch.setattr(h, "_finish_timings", broken)
+    ok = await h.run(turn("hello", run_id="r1"))
+    assert ok.output == "echo: hello\n" and ok.timings is None
+    h.settings.turn_timeout_s = 0.3
+    with pytest.raises(GrokHarnessError, match="exceeded"):   # the real error, not the timing one
+        await h.run(turn("SLEEP", run_id="r2"))
+
+
+async def test_spawn_spans_start_when_the_spawn_did_not_when_the_wait_began(env):
+    """Review on #209: _agent_for first waits on the spawn lock (another
+    instance spawning); the spawn spans sit after that wait."""
+    h = env.harness()
+
+    async def hold_spawn_lock():
+        async with h._spawn_lock:
+            await asyncio.sleep(0.4)
+    holder = asyncio.create_task(hold_spawn_lock())
+    await asyncio.sleep(0)
+    result = await h.run(turn("hello", run_id="r1"))
+    await holder
+    spans = {sp["name"]: sp for sp in result.timings["spans"]}
+    assert spans["spawn"]["start_ms"] - spans["agent"]["start_ms"] >= 300
+    assert spans["agent"]["duration_ms"] >= 400
+
+
+async def test_the_run_record_carries_the_turns_timings_over_http(app_with_grok):
+    """app.py wiring: /run's record has the harness timings (+ dispatch_ms),
+    a failed run's record has the error's, the stream path too."""
+    from httpx import ASGITransport, AsyncClient
+    app_module = app_with_grok
+    async with AsyncClient(transport=ASGITransport(app=app_module.app), base_url="http://t") as c:
+        body = (await c.post("/run", json={"prompt": "hi", "use_history": True,
+                                           "instance": "chat"})).json()
+        rec = (await c.get(f"/runs/{body['run_id']}")).json()
+        assert rec["timings"]["cold"] is True and "dispatch_ms" in rec["timings"]["summary"]
+        async with c.stream("POST", "/run/stream", json={"prompt": "streamed", "use_history": True,
+                                                         "instance": "chat"}) as resp:
+            [line async for line in resp.aiter_lines()]
+
+        async def by_prompt(text):
+            runs = (await c.get("/runs")).json()
+            runs = runs["runs"] if isinstance(runs, dict) else runs
+            rid = next(r["run_id"] for r in runs if text in (r.get("prompt_preview") or ""))
+            return (await c.get(f"/runs/{rid}")).json()
+        rec = await by_prompt("streamed")
+        assert rec["timings"]["cold"] is False
+        app_module._harness.settings.turn_timeout_s = 0.3
+        failed = await c.post("/run", json={"prompt": "SLEEP", "use_history": True,
+                                            "instance": "chat"})
+        assert failed.status_code >= 400
+        rec = await by_prompt("SLEEP")
+        assert rec["status"] == "failed" and "prompt_sent" in _names(rec["timings"])
+
+
+async def test_grok_end_usage_fills_model_calls_cache_reasoning_api_time_and_cost(env):
+    # grok 1.0.62's end usage keys, as logged live (2026-10-18).
+    (env.home / "fake-end-usage.json").write_text(json.dumps({
+        "inputTokens": 10442, "outputTokens": 34, "cachedReadTokens": 9856,
+        "cacheCreationTokens": 12, "reasoningTokens": 20, "apiDurationMs": 15123,
+        "costUsdTicks": 777, "modelCalls": 3, "numTurns": 1, "totalTokens": 10476}))
+    h = env.harness()
+    result = await h.run(turn("hello", run_id="r1"))
+    u = result.usage
+    assert (u.cached_input_tokens, u.cache_write_tokens, u.reasoning_tokens) == (9856, 12, 20)
+    assert (u.api_duration_ms, u.cost_usd_ticks, u.requests) == (15123, 777, 3)
+    assert result.timings["summary"]["model_api_ms"] == 15123

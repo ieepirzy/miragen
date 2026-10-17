@@ -55,6 +55,7 @@ from miragen.harness.base import (
 )
 from miragen.harness.gateway import ToolGateway
 from miragen.harness.served import ServedLedger
+from miragen.harness.timing import TurnTimer
 from miragen.harness.grok_lifecycle import (
     Decision, Handoff, Ledger, LifecyclePolicy, SessionStats, ThresholdPolicy,
     accepted_memory_writes, load_policy, memory_save_prompt, rotation_prompt,
@@ -129,6 +130,9 @@ class _Agent:
     # Turns that hold this agent (reserved under the spawn lock, before the
     # turn takes `lock`): eviction and the reaper never touch a reserved agent.
     reserved: int = 0
+    # How starting it went (spawn / initialize / session_open, ms; the
+    # session mode), until the turn it was started for records it.
+    startup: dict | None = None
 
     @property
     def busy(self) -> bool:
@@ -340,23 +344,31 @@ class GrokHarness(MiraRunEnv):
             cwd=str(workdir),
             strict_auth=True,
         )
+        startup: dict = {"t_spawn": time.monotonic()}
         try:
             await acp.start()
-            session_id = await self._open_session(acp, instance, str(workdir), ephemeral=ephemeral)
+            opened = time.monotonic()
+            session_id = await self._open_session(acp, instance, str(workdir), ephemeral=ephemeral,
+                                                  startup=startup)
+            startup.update(getattr(acp, "start_timings", None) or {})
+            startup["session_open_ms"] = round((time.monotonic() - opened) * 1000, 1)
         except BaseException:
             if acp.close_reason:  # it died on its own: say why, not just "closed"
                 logger.warning("grok harness: agent for %s died while starting: %s",
                                instance, acp.close_reason)
             await acp.close()  # never leave a half-started agent running
             raise
-        return _Agent(instance=instance, acp=acp, session_id=session_id, ephemeral=ephemeral)
+        return _Agent(instance=instance, acp=acp, session_id=session_id, ephemeral=ephemeral,
+                      startup=startup)
 
     async def _open_session(self, acp: AcpSession, instance: str, cwd: str, *,
-                            ephemeral: bool) -> str:
+                            ephemeral: bool, startup: dict | None = None) -> str:
+        startup = {} if startup is None else startup
         rules = {"rules": self.instructions} if self.instructions else {}
         known = None if ephemeral else self._load_state().get(instance)
         if known:
             if known.get("instructions_sha") == instructions_hash(self.instructions):
+                startup["session_mode"] = "load"
                 return await acp.session_load(known["session_id"], cwd, mcp_servers=[])
             # Instructions changed. Grok fixes a session's system rules at
             # session/new — neither fork nor load accepts new ones (verified
@@ -368,6 +380,7 @@ class GrokHarness(MiraRunEnv):
                     "mcpServers": []})
                 session_id = str((forked or {}).get("newSessionId") or "")
                 if session_id:
+                    startup["session_mode"] = "fork"
                     await acp.session_load(session_id, cwd, mcp_servers=[])
                     await self._save_instance(instance, session_id, update_pending=True)
                     logger.info("grok harness: forked %s for new instructions", instance)
@@ -375,6 +388,7 @@ class GrokHarness(MiraRunEnv):
             except Exception as exc:
                 logger.warning("grok harness: fork of %s failed (%s); starting a new session",
                                instance, exc)
+        startup["session_mode"] = "new"
         session_id = await acp.session_new(cwd, mcp_servers=[], yolo=False, meta=rules)
         if not ephemeral:
             await self._save_instance(instance, session_id)
@@ -454,22 +468,80 @@ class GrokHarness(MiraRunEnv):
         return "\n\n".join(parts)
 
     async def _turn(self, turn: HarnessTurn, on_text: Callable[[str], None] | None) -> HarnessResult:
+        """One turn, timed (Mira#86): the result (or the error) carries where
+        the time went, and one INFO line says it."""
+        timer = TurnTimer()
+        try:
+            result = await self._timed_turn(turn, on_text, timer)
+        except Exception as exc:
+            timings = self._safe_timings(timer, None, turn, failed=True)
+            with contextlib.suppress(Exception):
+                exc.timings = timings  # type: ignore[attr-defined]
+            raise
+        result.timings = self._safe_timings(timer, result.usage, turn, failed=False)
+        return result
+
+    def _safe_timings(self, timer: TurnTimer, usage: RunUsage | None, turn: HarnessTurn, *,
+                      failed: bool) -> dict | None:
+        """The turn's timings and its log line; measurement never fails a
+        turn, nor replaces a failed turn's real error."""
+        try:
+            timings = self._finish_timings(timer, usage, timer.instance)
+            logger.info("grok harness: turn %s %s%s", turn.run_id,
+                        "failed after " if failed else "", timer.summary_line(timings["summary"]))
+            return timings
+        except Exception:  # measurement must never fail a turn
+            logger.debug("grok harness: timings for %s failed", turn.run_id, exc_info=True)
+            return None
+
+    def _finish_timings(self, timer: TurnTimer, usage: RunUsage | None,
+                        instance: str | None) -> dict:
+        # Tool listings THIS instance's agent ran during this turn (its
+        # tools/list on spawn); another instance's spawn is not this turn's.
+        for entry in list(self.gateway.listings):
+            if entry.get("instance") == instance and entry["start"] >= timer.t0:
+                timer.add("list_tools", entry["start"], entry.get("end"),
+                          upstream=entry["upstream"], ok=entry.get("ok"),
+                          cached=entry["cached"] or None, backing_off=entry["backing_off"] or None,
+                          error=entry.get("error"))
+        timer.spans.sort(key=lambda sp: sp["start_ms"])
+        api = usage.api_duration_ms if usage is not None else None
+        return timer.as_dict(model_api_ms=api)
+
+    async def _timed_turn(self, turn: HarnessTurn, on_text: Callable[[str], None] | None,
+                          timer: TurnTimer) -> HarnessResult:
         if turn.secret_env:
             raise GrokHarnessError(
                 "per-launch MCP credentials are not supported by the grok-build harness "
                 "yet (the gateway holds deployment-level upstream credentials)")
         instance, ephemeral = self._key(turn)
+        timer.instance = instance
         # A compaction or rotation still running for this instance finishes
         # first: the turn must land in the session it leaves behind.
         pending = self._maintenance.get(instance)
         if pending is not None and not ephemeral:
-            with contextlib.suppress(Exception):
+            with timer.span("lifecycle_wait"), contextlib.suppress(Exception):
                 await asyncio.shield(pending)
         await self._remember_mirarun(instance, ephemeral, turn.mirarun)
+        acquired = time.monotonic()
         try:
             agent = await self._agent_for(instance, ephemeral=ephemeral)
         finally:
             self._forget_mirarun(instance)
+        timer.add("agent", acquired, time.monotonic())
+        startup, agent.startup = agent.startup, None
+        timer.cold = startup is not None
+        if startup is not None:
+            # Spawned for this turn: process, ACP initialize, then the session,
+            # from when the spawn really began (after any wait on the spawn
+            # lock and capacity eviction inside the `agent` span).
+            at = startup.get("t_spawn", acquired)
+            for name in ("spawn", "initialize", "session_open"):
+                ms = startup.get(f"{name}_ms")
+                if ms is not None:
+                    timer.add(name, at, at + ms / 1000,
+                              mode=startup.get("session_mode") if name == "session_open" else None)
+                    at += ms / 1000
         deliver_update = self._update_pending(instance, ephemeral)
         handoff = None if ephemeral else self._pending_handoff(instance)
         chunks: list[str] = []
@@ -479,20 +551,30 @@ class GrokHarness(MiraRunEnv):
         tool_rounds = 0
         native_compactions: list[dict] = []
         try:
+            waited = time.monotonic()
             async with agent.lock:
+                timer.add("lock_wait", waited, time.monotonic())
                 agent.last_used = time.monotonic()
                 with self.gateway.turn(instance, turn.run_id) as log:
                     try:
                         async with asyncio.timeout(self.settings.turn_timeout_s):
                             after_tool = False
-                            async for update in agent.acp.prompt(
-                                    agent.session_id, self._compose(
-                                        turn, instructions_update=deliver_update,
-                                        handoff=handoff)):
+                            with timer.span("compose"):
+                                text_in = self._compose(turn, instructions_update=deliver_update,
+                                                        handoff=handoff)
+                            timer.event("prompt_sent", chars=len(text_in))
+                            first = True
+                            async for update in agent.acp.prompt(agent.session_id, text_in):
                                 kind = update.get("type")
+                                if first:
+                                    timer.event("first_update", type=kind)
+                                    first = False
                                 if kind == "usage":
                                     context_tokens = update["context_tokens"]
                                     responses.append(update.get("usage") or {})
+                                    timer.event("model_response", context_tokens=context_tokens,
+                                                output_tokens=(update.get("usage") or {}).get(
+                                                    "output_tokens"))
                                 elif kind == "compacted":
                                     native_compactions.append(update)
                                 elif kind == "tool_call":
@@ -515,12 +597,21 @@ class GrokHarness(MiraRunEnv):
                                         f"stderr: {' | '.join(agent.acp.stderr_tail()[-5:])}")
                                 elif kind == "end":
                                     end = update
+                                    timer.event("end", stop=update.get("stopReason"))
                     except TimeoutError:
                         with contextlib.suppress(Exception):
                             await agent.acp.cancel(agent.session_id)
                         await self._drop(instance)
                         raise GrokHarnessError(
                             f"turn exceeded {self.settings.turn_timeout_s:.0f}s; cancelled") from None
+                    finally:
+                        # Also when the turn timed out or the agent died: the
+                        # slow tool is what a failed turn's waterfall is for.
+                        for t in log.timings:
+                            timer.add("tool_call", t["start"], t.get("end"), tool=t.get("tool"),
+                                      upstream=t.get("upstream"), ok=t.get("ok"),
+                                      connect_ms=t.get("connect_ms"), call_ms=t.get("call_ms"),
+                                      reauthorized=t.get("reauthorized"))
                     calls = list(log.calls)
                 agent.last_used = time.monotonic()
         finally:
@@ -539,8 +630,9 @@ class GrokHarness(MiraRunEnv):
                 await self._update_instance(instance, seq=seq)
             self.served.mark(instance, NAME, seq)
         if not ephemeral and self.settings.lifecycle and stop not in ("cancelled", "refusal"):
-            await self._after_turn(instance, context_tokens, native_compactions, calls,
-                                   handoff_delivered=handoff is not None)
+            with timer.span("after_turn"):
+                await self._after_turn(instance, context_tokens, native_compactions, calls,
+                                       handoff_delivered=handoff is not None)
         if stop == "cancelled":
             raise GrokHarnessError("turn was cancelled")
         if stop == "refusal":
@@ -874,12 +966,19 @@ def _usage(raw: dict[str, Any], *, responses: list[dict] | None = None, tool_rou
         return RunUsage(requests=requests, **anthropic_usage_fields(raw), **extra)
     # ACP PromptUsage (`_meta.usage`): inputTokens is already the FULL prompt
     # (grok docs, "token field policy"), cache buckets are subsets.
+    # grok's own count of model calls, when it reports one (1.0.62: modelCalls).
+    calls_reported = pick("modelCalls")
+    if calls_reported is not None:
+        requests = max(requests, calls_reported)
     return RunUsage(requests=requests,
                     input_tokens=pick("inputTokens", "promptTokens"),
                     output_tokens=pick("outputTokens", "completionTokens"),
                     cached_input_tokens=pick("cachedReadTokens", "cacheReadInputTokens",
                                              "cachedInputTokens", "cacheReadTokens",
                                              "cachedTokens"),
-                    cache_write_tokens=pick("cachedWriteTokens", "cacheCreationInputTokens",
-                                            "cacheWriteTokens"),
+                    cache_write_tokens=pick("cacheCreationTokens", "cachedWriteTokens",
+                                            "cacheCreationInputTokens", "cacheWriteTokens"),
+                    reasoning_tokens=pick("reasoningTokens"),
+                    api_duration_ms=pick("apiDurationMs"),
+                    cost_usd_ticks=pick("costUsdTicks"),
                     **extra)
