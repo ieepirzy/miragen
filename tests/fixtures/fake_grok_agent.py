@@ -216,8 +216,11 @@ def handle_prompt(rid, params):
     update(sid, {"sessionUpdate": "response_completed", "usage": {
         "input_tokens": data["context"] - 100, "output_tokens": 5,
         "cache_read_input_tokens": 100, "cache_creation_input_tokens": 0}})
-    send({"jsonrpc": "2.0", "id": rid, "result": {
-        "stopReason": stop, "_meta": {"usage": {"inputTokens": 10, "outputTokens": 5}}}})
+    # A test can hand the end usage grok reports (fake-end-usage.json).
+    end_usage = HOME / "fake-end-usage.json"
+    usage = json.loads(end_usage.read_text()) if end_usage.exists() else {
+        "inputTokens": 10, "outputTokens": 5}
+    send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": stop, "_meta": {"usage": usage}}})
 
 
 def main():

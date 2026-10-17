@@ -412,3 +412,36 @@ async def test_an_unfiltered_longer_upstream_does_not_hide_a_tool_it_lacks(seen)
         comment = await gw.call_tool("github_issues_add_comment", {"body": "x"}, instance="inst")
     assert text(listed) == "issues" and not listed.isError
     assert text(comment) == "commented:x"
+
+
+async def test_listings_are_timed_per_upstream_with_cache_and_failure(seen):
+    """Mira#86: which upstream's tools/list a turn waited on, and for how long."""
+    gw = make(seen)
+    await gw._list_tools()
+    await gw._list_tools()                                      # inside the 300 s TTL
+    first, second = list(gw.listings)
+    assert first["upstream"] == "home" and first["ok"] and not first["cached"]
+    assert first["end"] >= first["start"]
+    assert second["cached"] and second["ok"]
+
+    @contextlib.asynccontextmanager
+    async def dead(url, headers=None):
+        raise ConnectionError("upstream down")
+        yield  # pragma: no cover
+    broken = ToolGateway(profile(), env={"HOME_TOKEN": "t"}, upstream_client=dead)
+    await broken._list_tools()
+    await broken._list_tools()                                  # inside the backoff
+    failed, backing_off = list(broken.listings)
+    assert failed["ok"] is False and failed["error"] and not failed["backing_off"]
+    assert backing_off["ok"] is False and backing_off["backing_off"]
+
+
+async def test_tool_calls_are_timed_with_the_upstream_connect_apart(seen):
+    gw = make(seen)
+    with gw.turn("inst", "r") as log:
+        await gw.call_tool("home_lookup", {"key": "k"}, instance="inst")
+        await gw.call_tool("speak", {"text": "x"}, instance="inst")
+    up, local = log.timings
+    assert up["tool"] == "home_lookup" and up["upstream"] == "home" and up["ok"]
+    assert up["connect_ms"] >= 0 and up["call_ms"] >= 0 and up["end"] >= up["start"]
+    assert local["tool"] == "speak" and local["upstream"] is None and "connect_ms" not in local

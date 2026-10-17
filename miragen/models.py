@@ -114,6 +114,11 @@ class RunUsage(BaseModel):
     # Prompt size of the LAST model request (the context the model saw), where
     # the adapter can see it; input_tokens is the sum over all requests.
     context_tokens: Optional[int] = None
+    # Where the adapter reports them (grok's end usage: reasoningTokens,
+    # apiDurationMs = time spent in model API calls, costUsdTicks).
+    reasoning_tokens: Optional[int] = None
+    api_duration_ms: Optional[int] = None
+    cost_usd_ticks: Optional[int] = None
     # Written on every record since the inclusive convention. A stored record
     # without it predates the change: RunRecord normalises it on load
     # (legacy_usage) so old and new rows add up the same way.
@@ -284,6 +289,9 @@ def sum_usage(a: Optional[RunUsage], b: Optional[RunUsage]) -> Optional[RunUsage
         calls_truncated=calls is not None and (a.calls_truncated or b.calls_truncated),
         # The later turn's context is the current one.
         context_tokens=b.context_tokens if b.context_tokens is not None else a.context_tokens,
+        reasoning_tokens=_add_optional(a.reasoning_tokens, b.reasoning_tokens),
+        api_duration_ms=_add_optional(a.api_duration_ms, b.api_duration_ms),
+        cost_usd_ticks=_add_optional(a.cost_usd_ticks, b.cost_usd_ticks),
     )
 
 
@@ -524,6 +532,9 @@ class RunRecord(BaseModel):
     duration_s: Optional[float] = None
     usage: Optional[RunUsage] = None
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
+    # Where the last turn's time went, when the harness measures it
+    # (miragen/harness/timing.py: started_at, cold, total_ms, spans, summary).
+    timings: Optional[dict] = None
     use_history: bool = False
     # The named instance this run belongs to (instance model ADR). None =
     # an ephemeral run with no persistent state scope — the default for

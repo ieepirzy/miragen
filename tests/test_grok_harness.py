@@ -518,3 +518,54 @@ async def test_usage_counts_model_requests_and_records_context(env):
     rounds = await h.run(turn("ROUND\nROUND\nSAY ok", run_id="r3"))
     assert rounds.usage.requests == 3
     assert rounds.usage.context_tokens > plain.usage.context_tokens  # the context grew
+
+
+def _names(timings):
+    return [s["name"] for s in timings["spans"]]
+
+
+async def test_a_turn_records_where_its_time_went_cold_then_warm(env):
+    """Mira#86: spawn / initialize / session open on the turn that started
+    the agent, then prompt, first update, model responses, tool calls."""
+    h = env.harness()
+    cold = await h.run(turn('SAY Checking.\nCALL speak {"text": "x"}\nSAY done', run_id="r1"))
+    t = cold.timings
+    assert t["cold"] is True and t["total_ms"] > 0 and t["started_at"].endswith("Z")
+    names = _names(t)
+    for name in ("agent", "spawn", "initialize", "session_open", "lock_wait", "compose",
+                 "prompt_sent", "first_update", "model_response", "tool_call", "end"):
+        assert name in names, name
+    session = next(s for s in t["spans"] if s["name"] == "session_open")
+    assert session["detail"]["mode"] == "new"
+    call = next(s for s in t["spans"] if s["name"] == "tool_call")
+    assert call["detail"]["tool"] == "speak" and call["duration_ms"] is not None
+    assert [s["start_ms"] for s in t["spans"]] == sorted(s["start_ms"] for s in t["spans"])
+    s = t["summary"]
+    assert s["spawn_ms"] >= 0 and s["first_update_ms"] > 0 and s["total_ms"] == t["total_ms"]
+    assert s["tools_ms"] == call["duration_ms"]
+
+    warm = await h.run(turn("hello again", run_id="r2"))
+    assert warm.timings["cold"] is False
+    assert not {"spawn", "initialize", "session_open"} & set(_names(warm.timings))
+
+
+async def test_a_failed_turn_carries_its_timings_on_the_error(env):
+    h = env.harness(turn_timeout_s=0.5)
+    with pytest.raises(GrokHarnessError) as err:
+        await h.run(turn("SLEEP", run_id="r1"))
+    t = err.value.timings
+    assert t["cold"] is True and "prompt_sent" in _names(t) and "end" not in _names(t)
+
+
+async def test_grok_end_usage_fills_model_calls_cache_reasoning_api_time_and_cost(env):
+    # grok 1.0.62's end usage keys, as logged live (2026-10-18).
+    (env.home / "fake-end-usage.json").write_text(json.dumps({
+        "inputTokens": 10442, "outputTokens": 34, "cachedReadTokens": 9856,
+        "cacheCreationTokens": 12, "reasoningTokens": 20, "apiDurationMs": 15123,
+        "costUsdTicks": 777, "modelCalls": 3, "numTurns": 1, "totalTokens": 10476}))
+    h = env.harness()
+    result = await h.run(turn("hello", run_id="r1"))
+    u = result.usage
+    assert (u.cached_input_tokens, u.cache_write_tokens, u.reasoning_tokens) == (9856, 12, 20)
+    assert (u.api_duration_ms, u.cost_usd_ticks, u.requests) == (15123, 777, 3)
+    assert result.timings["summary"]["model_api_ms"] == 15123

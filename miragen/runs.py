@@ -118,6 +118,7 @@ class RunStore:
         tool_call_count: int | None = None,
         tool_call_failures: int | None = None,
         pending_intervention: InterventionRequest | None = None,
+        timings: dict | None = None,
     ) -> RunRecord:
         """Telemetry params (`setup_s`, tool-call counts) are the run's
         ACCUMULATED values — callers sum across turns before passing; None
@@ -125,6 +126,7 @@ class RunStore:
         report a metric never zeroes it)."""
         finished_at = datetime.now(timezone.utc)
         duration_s = (finished_at - record.started_at).total_seconds()
+        timings = _with_dispatch(timings, record.started_at)
         updated = record.model_copy(update={
             "status": status,
             "output": output[:_OUTPUT_MAX] if output is not None else None,
@@ -161,6 +163,7 @@ class RunStore:
             # set on suspension (exit_reason 'intervention'); cleared by reopen()
             "pending_intervention": pending_intervention
             if pending_intervention is not None else record.pending_intervention,
+            "timings": timings if timings is not None else record.timings,
         })
         self._write(updated)
         self._prune()
@@ -539,3 +542,18 @@ def simplify_history_messages(messages: Sequence[Any]) -> list[dict[str, str]]:
                 texts.append(str(part.content))
         simplified.append({"role": role, "content": "\n".join(t for t in texts if t)})
     return simplified
+
+
+def _with_dispatch(timings: dict | None, run_started: datetime) -> dict | None:
+    """The gap between the run's acceptance and its harness turn starting
+    (admission, the background task, history and memory setup), in the
+    summary as dispatch_ms."""
+    if not isinstance(timings, dict) or not timings.get("started_at"):
+        return timings
+    try:
+        turn_started = datetime.fromisoformat(str(timings["started_at"]))
+    except ValueError:
+        return timings
+    summary = dict(timings.get("summary") or {})
+    summary["dispatch_ms"] = round((turn_started - run_started).total_seconds() * 1000, 1)
+    return {**timings, "summary": summary}

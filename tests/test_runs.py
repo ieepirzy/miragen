@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from miragen.models import RunRecord, RunUsage, ToolCallRecord
+from miragen.models import RunRecord, RunUsage, ToolCallRecord, sum_usage
 from miragen.runs import (
     AmbiguousRunIdError,
     RunStore,
@@ -563,3 +563,27 @@ class TestReservedTokensInFlight:
         used += reserved_tokens_in_flight(store, base, per_run_reserve=600, remaining_budget=limit - used)
 
         assert used == 600
+
+
+def test_finish_keeps_the_turn_timings_and_adds_the_dispatch_gap(tmp_path):
+    """Mira#86: the time between the run's acceptance and its harness turn."""
+    store = RunStore(root=tmp_path)
+    record = store.start(agent_name="a", trigger="http", prompt="hi")
+    turn_started = record.started_at + timedelta(milliseconds=1500)
+    timings = {"started_at": turn_started.isoformat().replace("+00:00", "Z"), "cold": False,
+               "total_ms": 10.0, "spans": [], "summary": {"total_ms": 10.0}}
+    updated = store.finish(record, status="succeeded", output="ok", timings=timings)
+    assert updated.timings["summary"]["dispatch_ms"] == 1500.0
+    assert updated.timings["summary"]["total_ms"] == 10.0
+    reread = json.loads(next(tmp_path.glob("*.json")).read_text())
+    assert reread["timings"]["cold"] is False
+    # a finish without timings keeps none; nothing invented
+    plain = store.finish(store.start(agent_name="a", trigger="http", prompt="x"), status="succeeded")
+    assert plain.timings is None
+
+
+def test_summed_usage_adds_reasoning_api_time_and_cost():
+    a = RunUsage(requests=1, reasoning_tokens=5, api_duration_ms=1000, cost_usd_ticks=7)
+    b = RunUsage(requests=2, reasoning_tokens=None, api_duration_ms=500, cost_usd_ticks=3)
+    total = sum_usage(a, b)
+    assert (total.reasoning_tokens, total.api_duration_ms, total.cost_usd_ticks) == (5, 1500, 10)

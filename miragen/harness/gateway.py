@@ -23,6 +23,7 @@ run is the one turn admission allows at a time.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import contextvars
 import inspect
@@ -104,6 +105,10 @@ class _LocalTool:
 class TurnLog:
     run_id: str | None
     calls: list[ToolCallRecord] = field(default_factory=list)
+    # One per tool call, for the turn's timings (Mira#86): monotonic start/end,
+    # and for an upstream call the session open (auth + initialize) apart from
+    # the call itself.
+    timings: list[dict] = field(default_factory=list)
 
 
 def _capability_entries(profile: AgentProfile) -> list[tuple[str, dict]]:
@@ -240,6 +245,9 @@ class ToolGateway:
         self._by_prefix_length = sorted(self._upstreams.values(),
                                         key=lambda u: len(u.name), reverse=True)
         self._shadow_warned: set[tuple[str, str]] = set()
+        # Recent tool listings, per upstream (Mira#86): a harness attaches the
+        # ones that happened during a turn (an agent's tools/list on spawn).
+        self.listings: collections.deque[dict] = collections.deque(maxlen=200)
         self.server = Server("miragen-gateway")
         self.server.list_tools()(self._list_tools)
         self.server.call_tool(validate_input=True)(self._call_tool_handler)
@@ -340,10 +348,19 @@ class ToolGateway:
         # what the other upstreams actually serve (see _resolve).
         listed: list[tuple[_Upstream, list[types.Tool]]] = []
         for up in self._upstreams.values():
+            start = time.monotonic()
+            cached = bool(up.tools) and start - up.fetched_at < _UPSTREAM_TOOLS_TTL_S
+            backing_off = not cached and start < up.failed_until
+            entry = {"upstream": up.name, "start": start, "cached": cached,
+                     "backing_off": backing_off}
             try:
                 listed.append((up, await self._upstream_tools(up)))
+                entry["ok"] = True
             except Exception as exc:  # one dead upstream must not hide the rest
+                entry.update(ok=False, error=type(exc).__name__)
                 logger.warning("gateway: listing %s failed: %s", up.name, type(exc).__name__)
+            entry["end"] = time.monotonic()
+            self.listings.append(entry)
         for up, tools in listed:
             for t in tools:
                 name = f"{up.name}_{t.name}"
@@ -412,11 +429,18 @@ class ToolGateway:
                 logger.warning("gateway: %s approved after its turn ended; not executed", name)
                 return self._record(log, name, arguments, ok=False, result=_error(
                     f"'{name}' was approved only after this turn had ended; it was not run"))
+        timing: dict = {"tool": name, "upstream": target.name if kind == "upstream" else None,
+                        "start": time.monotonic()}
         try:
-            result = await self._execute(kind, target, raw, arguments, log.run_id, instance)
+            result = await self._execute(kind, target, raw, arguments, log.run_id, instance,
+                                         timing=timing)
         except Exception as exc:
             logger.warning("gateway tool %s failed: %s", name, exc)
+            timing.update(end=time.monotonic(), ok=False)
+            log.timings.append(timing)
             return self._record(log, name, arguments, ok=False, result=_error(f"{type(exc).__name__}: {exc}"))
+        timing.update(end=time.monotonic(), ok=not result.isError)
+        log.timings.append(timing)
         if response is not None and response.prompt:
             result = result.model_copy(update={"content": [
                 types.TextContent(type="text", text=with_approver_note(response, "").rstrip())
@@ -424,22 +448,33 @@ class ToolGateway:
         return self._record(log, name, arguments, ok=not result.isError, result=result)
 
     async def _execute(self, kind: str, target: Any, raw: str, arguments: dict,
-                       run_id: str | None, instance: str | None) -> types.CallToolResult:
+                       run_id: str | None, instance: str | None, *,
+                       timing: dict | None = None) -> types.CallToolResult:
         token = _CURRENT.set((run_id, instance))
+        timing = {} if timing is None else timing
+
+        async def call() -> types.CallToolResult:
+            opened = time.monotonic()
+            async with self._session(target) as session:
+                ready = time.monotonic()
+                timing["connect_ms"] = round(timing.get("connect_ms", 0) + (ready - opened) * 1000, 1)
+                try:
+                    return await session.call_tool(raw, arguments)
+                finally:
+                    timing["call_ms"] = round((time.monotonic() - ready) * 1000, 1)
         try:
             with self._bind(run_id, instance):
                 if kind == "local":
                     return _text_result(await target.fn_tool.run(arguments))
                 try:
-                    async with self._session(target) as session:
-                        return await session.call_tool(raw, arguments)
+                    return await call()
                 except Exception:
                     if target.auth is None:
                         raise
                     # An expired or revoked token: one fresh authorization.
                     target.auth.invalidate()
-                    async with self._session(target) as session:
-                        return await session.call_tool(raw, arguments)
+                    timing["reauthorized"] = True
+                    return await call()
         finally:
             _CURRENT.reset(token)
 
