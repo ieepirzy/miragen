@@ -587,3 +587,42 @@ def test_summed_usage_adds_reasoning_api_time_and_cost():
     b = RunUsage(requests=2, reasoning_tokens=None, api_duration_ms=500, cost_usd_ticks=3)
     total = sum_usage(a, b)
     assert (total.reasoning_tokens, total.api_duration_ms, total.cost_usd_ticks) == (5, 1500, 10)
+
+
+def test_dispatch_is_left_out_on_a_resumed_run_and_odd_timestamps_never_raise(tmp_path):
+    """Review on #209: reopen() keeps the first started_at, so a resumed
+    turn's 'dispatch' would include earlier turns and the blocked time."""
+    store = RunStore(root=tmp_path)
+    record = store.start(agent_name="a", trigger="http", prompt="hi")
+    t = {"started_at": (record.started_at + timedelta(hours=2)).isoformat(), "spans": [],
+         "summary": {"total_ms": 1.0}}
+    resumed = record.model_copy(update={"resume_count": 1})
+    assert "dispatch_ms" not in store.finish(resumed, status="succeeded", timings=t).timings["summary"]
+    naive = {"started_at": "2026-10-18T00:00:00", "spans": [], "summary": {}}   # no tz
+    assert store.finish(record, status="succeeded", timings=naive).timings == naive
+    junk = {"started_at": "not a time", "spans": [], "summary": {}}
+    assert store.finish(record, status="succeeded", timings=junk).timings == junk
+
+
+def test_a_finish_without_timings_clears_an_earlier_turns(tmp_path):
+    store = RunStore(root=tmp_path)
+    record = store.start(agent_name="a", trigger="http", prompt="hi")
+    first = store.finish(record, status="succeeded", timings={"spans": [], "summary": {}})
+    assert store.finish(first, status="failed", error="cancelled").timings is None
+
+
+def test_turn_timer_summary_counts_spans_past_the_cap():
+    import time as _time
+
+    from miragen.harness import timing
+    t = timing.TurnTimer()
+    now = _time.monotonic()
+    for i in range(timing.SPANS_CAP + 50):
+        t.add("tool_call", now, now + 0.001)
+    out = t.as_dict()
+    assert len(out["spans"]) == timing.SPANS_CAP and out["spans_truncated"]
+    assert out["summary"]["tools_ms"] == round((timing.SPANS_CAP + 50) * 1.0, 1)
+    late = timing.TurnTimer()
+    late.add("first_update", late.t0 + 2.0)
+    late.add("first_update", late.t0 + 1.0)                     # arrived later, started earlier
+    assert late.as_dict()["summary"]["first_update_ms"] == 1000.0

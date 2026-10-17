@@ -31,20 +31,30 @@ class TurnTimer:
         self.t0 = time.monotonic()
         self.started_at = datetime.now(UTC)
         self.cold: bool | None = None
+        self.instance: str | None = None   # whose turn: listings are claimed by it
         self.spans: list[dict[str, Any]] = []
         self.truncated = False
+        # Per-name totals and first starts over EVERY span, kept or not: the
+        # summary stays whole when the span list hits SPANS_CAP.
+        self._totals: dict[str, float] = {}
+        self._firsts: dict[str, float] = {}
 
     def ms(self, t: float | None = None) -> float:
         return round(((time.monotonic() if t is None else t) - self.t0) * 1000, 1)
 
     def add(self, name: str, start: float, end: float | None = None, **detail: Any) -> None:
+        duration = None if end is None else round((end - start) * 1000, 1)
+        at = self.ms(start)
+        self._firsts[name] = min(self._firsts.get(name, at), at)   # spans can arrive late
+        if duration is not None:
+            self._totals[name] = self._totals.get(name, 0.0) + duration
         if len(self.spans) >= SPANS_CAP:
             self.truncated = True
             return
         self.spans.append({
             "name": name,
-            "start_ms": self.ms(start),
-            "duration_ms": None if end is None else round((end - start) * 1000, 1),
+            "start_ms": at,
+            "duration_ms": duration,
             "detail": {k: v for k, v in detail.items() if v is not None},
         })
 
@@ -62,12 +72,11 @@ class TurnTimer:
             self.add(name, start, time.monotonic(), **detail, **extra)
 
     def _sum(self, *names: str) -> float | None:
-        vals = [s["duration_ms"] for s in self.spans
-                if s["name"] in names and s["duration_ms"] is not None]
+        vals = [self._totals[n] for n in names if n in self._totals]
         return round(sum(vals), 1) if vals else None
 
     def _first(self, name: str) -> float | None:
-        return next((s["start_ms"] for s in self.spans if s["name"] == name), None)
+        return self._firsts.get(name)
 
     def as_dict(self, *, model_api_ms: float | None = None) -> dict[str, Any]:
         total = self.ms()

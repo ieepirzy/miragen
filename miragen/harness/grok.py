@@ -344,7 +344,7 @@ class GrokHarness(MiraRunEnv):
             cwd=str(workdir),
             strict_auth=True,
         )
-        startup: dict = {}
+        startup: dict = {"t_spawn": time.monotonic()}
         try:
             await acp.start()
             opened = time.monotonic()
@@ -474,21 +474,32 @@ class GrokHarness(MiraRunEnv):
         try:
             result = await self._timed_turn(turn, on_text, timer)
         except Exception as exc:
-            timings = self._finish_timings(timer, None)
+            timings = self._safe_timings(timer, None, turn, failed=True)
             with contextlib.suppress(Exception):
                 exc.timings = timings  # type: ignore[attr-defined]
-            logger.info("grok harness: turn %s failed after %s", turn.run_id,
-                        timer.summary_line(timings["summary"]))
             raise
-        result.timings = self._finish_timings(timer, result.usage)
-        logger.info("grok harness: turn %s %s", turn.run_id,
-                    timer.summary_line(result.timings["summary"]))
+        result.timings = self._safe_timings(timer, result.usage, turn, failed=False)
         return result
 
-    def _finish_timings(self, timer: TurnTimer, usage: RunUsage | None) -> dict:
-        # Tool listings that ran during this turn (an agent's tools/list on spawn).
+    def _safe_timings(self, timer: TurnTimer, usage: RunUsage | None, turn: HarnessTurn, *,
+                      failed: bool) -> dict | None:
+        """The turn's timings and its log line; measurement never fails a
+        turn, nor replaces a failed turn's real error."""
+        try:
+            timings = self._finish_timings(timer, usage, timer.instance)
+            logger.info("grok harness: turn %s %s%s", turn.run_id,
+                        "failed after " if failed else "", timer.summary_line(timings["summary"]))
+            return timings
+        except Exception:  # measurement must never fail a turn
+            logger.debug("grok harness: timings for %s failed", turn.run_id, exc_info=True)
+            return None
+
+    def _finish_timings(self, timer: TurnTimer, usage: RunUsage | None,
+                        instance: str | None) -> dict:
+        # Tool listings THIS instance's agent ran during this turn (its
+        # tools/list on spawn); another instance's spawn is not this turn's.
         for entry in list(self.gateway.listings):
-            if entry["start"] >= timer.t0:
+            if entry.get("instance") == instance and entry["start"] >= timer.t0:
                 timer.add("list_tools", entry["start"], entry.get("end"),
                           upstream=entry["upstream"], ok=entry.get("ok"),
                           cached=entry["cached"] or None, backing_off=entry["backing_off"] or None,
@@ -504,6 +515,7 @@ class GrokHarness(MiraRunEnv):
                 "per-launch MCP credentials are not supported by the grok-build harness "
                 "yet (the gateway holds deployment-level upstream credentials)")
         instance, ephemeral = self._key(turn)
+        timer.instance = instance
         # A compaction or rotation still running for this instance finishes
         # first: the turn must land in the session it leaves behind.
         pending = self._maintenance.get(instance)
@@ -520,8 +532,10 @@ class GrokHarness(MiraRunEnv):
         startup, agent.startup = agent.startup, None
         timer.cold = startup is not None
         if startup is not None:
-            # Spawned for this turn: process, ACP initialize, then the session.
-            at = acquired
+            # Spawned for this turn: process, ACP initialize, then the session,
+            # from when the spawn really began (after any wait on the spawn
+            # lock and capacity eviction inside the `agent` span).
+            at = startup.get("t_spawn", acquired)
             for name in ("spawn", "initialize", "session_open"):
                 ms = startup.get(f"{name}_ms")
                 if ms is not None:
@@ -590,12 +604,15 @@ class GrokHarness(MiraRunEnv):
                         await self._drop(instance)
                         raise GrokHarnessError(
                             f"turn exceeded {self.settings.turn_timeout_s:.0f}s; cancelled") from None
+                    finally:
+                        # Also when the turn timed out or the agent died: the
+                        # slow tool is what a failed turn's waterfall is for.
+                        for t in log.timings:
+                            timer.add("tool_call", t["start"], t.get("end"), tool=t.get("tool"),
+                                      upstream=t.get("upstream"), ok=t.get("ok"),
+                                      connect_ms=t.get("connect_ms"), call_ms=t.get("call_ms"),
+                                      reauthorized=t.get("reauthorized"))
                     calls = list(log.calls)
-                    for t in log.timings:
-                        timer.add("tool_call", t["start"], t.get("end"), tool=t.get("tool"),
-                                  upstream=t.get("upstream"), ok=t.get("ok"),
-                                  connect_ms=t.get("connect_ms"), call_ms=t.get("call_ms"),
-                                  reauthorized=t.get("reauthorized"))
                 agent.last_used = time.monotonic()
         finally:
             agent.reserved -= 1

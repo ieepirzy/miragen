@@ -347,11 +347,12 @@ class ToolGateway:
         # Fetch every upstream first: whether a name is shadowed depends on
         # what the other upstreams actually serve (see _resolve).
         listed: list[tuple[_Upstream, list[types.Tool]]] = []
+        caller = self._caller_instance()
         for up in self._upstreams.values():
             start = time.monotonic()
             cached = bool(up.tools) and start - up.fetched_at < _UPSTREAM_TOOLS_TTL_S
             backing_off = not cached and start < up.failed_until
-            entry = {"upstream": up.name, "start": start, "cached": cached,
+            entry = {"upstream": up.name, "instance": caller, "start": start, "cached": cached,
                      "backing_off": backing_off}
             try:
                 listed.append((up, await self._upstream_tools(up)))
@@ -396,6 +397,17 @@ class ToolGateway:
         raise KeyError(name)
 
     # ── calls ────────────────────────────────────────────────────────────
+    def _caller_instance(self) -> str | None:
+        """The instance whose harness session made this MCP request (by its
+        gateway bearer); None outside an MCP request (direct calls, tests)."""
+        try:
+            request = getattr(self.server.request_context, "request", None)
+        except LookupError:
+            return None
+        header = request.headers.get("authorization", "") if request is not None else ""
+        token = header[7:] if header.lower().startswith("bearer ") else None
+        return self.instance_for(token)
+
     async def _call_tool_handler(self, name: str, arguments: dict) -> types.CallToolResult:
         ctx = self.server.request_context
         request = getattr(ctx, "request", None)

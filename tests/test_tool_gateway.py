@@ -445,3 +445,45 @@ async def test_tool_calls_are_timed_with_the_upstream_connect_apart(seen):
     assert up["tool"] == "home_lookup" and up["upstream"] == "home" and up["ok"]
     assert up["connect_ms"] >= 0 and up["call_ms"] >= 0 and up["end"] >= up["start"]
     assert local["tool"] == "speak" and local["upstream"] is None and "connect_ms" not in local
+
+
+async def test_a_listing_over_mcp_is_tagged_with_the_calling_instance(seen):
+    """Review on #209: listings are shared per gateway; each names whose
+    harness session asked, so a turn only claims its own agent's listing."""
+    import asyncio
+    import socket
+
+    import uvicorn
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    gw = make(seen)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(gw.asgi, host="127.0.0.1", port=port,
+                                           log_level="warning", lifespan="off", interface="asgi3"))
+    stop = asyncio.Event()
+
+    async def serve():
+        async with gw.running():
+            task = asyncio.create_task(server.serve())
+            await stop.wait()
+            server.should_exit = True
+            await task
+    bg = asyncio.create_task(serve())
+    try:
+        while not server.started:
+            await asyncio.sleep(0.02)
+        token = gw.credential("inst-b")
+        async with asyncio.timeout(10), streamablehttp_client(
+                f"http://127.0.0.1:{port}/", headers={"Authorization": f"Bearer {token}"}) as (r, w, _):
+            async with ClientSession(r, w) as session:
+                await session.initialize()
+                await session.list_tools()
+    finally:
+        stop.set()
+        await bg
+    assert [e["instance"] for e in gw.listings] == ["inst-b"]
+    await gw._list_tools()                                       # not over MCP: nobody's
+    assert list(gw.listings)[-1]["instance"] is None
