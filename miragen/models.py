@@ -111,6 +111,9 @@ class RunUsage(BaseModel):
     cache_write_1h_tokens: Optional[int] = None
     calls: Optional[list[CallUsage]] = None
     calls_truncated: bool = False
+    # Prompt size of the LAST model request (the context the model saw), where
+    # the adapter can see it; input_tokens is the sum over all requests.
+    context_tokens: Optional[int] = None
     # Written on every record since the inclusive convention. A stored record
     # without it predates the change: RunRecord normalises it on load
     # (legacy_usage) so old and new rows add up the same way.
@@ -279,6 +282,8 @@ def sum_usage(a: Optional[RunUsage], b: Optional[RunUsage]) -> Optional[RunUsage
         ),
         calls=calls,
         calls_truncated=calls is not None and (a.calls_truncated or b.calls_truncated),
+        # The later turn's context is the current one.
+        context_tokens=b.context_tokens if b.context_tokens is not None else a.context_tokens,
     )
 
 

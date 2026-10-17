@@ -344,6 +344,9 @@ class GrokHarness(MiraRunEnv):
             await acp.start()
             session_id = await self._open_session(acp, instance, str(workdir), ephemeral=ephemeral)
         except BaseException:
+            if acp.close_reason:  # it died on its own: say why, not just "closed"
+                logger.warning("grok harness: agent for %s died while starting: %s",
+                               instance, acp.close_reason)
             await acp.close()  # never leave a half-started agent running
             raise
         return _Agent(instance=instance, acp=acp, session_id=session_id, ephemeral=ephemeral)
@@ -472,6 +475,8 @@ class GrokHarness(MiraRunEnv):
         chunks: list[str] = []
         end: dict[str, Any] = {}
         context_tokens: int | None = None
+        responses: list[dict] = []  # one per model request (response_completed)
+        tool_rounds = 0
         native_compactions: list[dict] = []
         try:
             async with agent.lock:
@@ -487,9 +492,12 @@ class GrokHarness(MiraRunEnv):
                                 kind = update.get("type")
                                 if kind == "usage":
                                     context_tokens = update["context_tokens"]
+                                    responses.append(update.get("usage") or {})
                                 elif kind == "compacted":
                                     native_compactions.append(update)
                                 elif kind == "tool_call":
+                                    if not after_tool:
+                                        tool_rounds += 1
                                     after_tool = True
                                 elif kind == "text":
                                     text = update["data"]
@@ -537,7 +545,9 @@ class GrokHarness(MiraRunEnv):
             raise GrokHarnessError("turn was cancelled")
         if stop == "refusal":
             raise GrokHarnessError("the model refused the turn")
-        return HarnessResult(output="".join(chunks), usage=_usage(end.get("usage") or {}),
+        return HarnessResult(output="".join(chunks), usage=_usage(end.get("usage") or {}, responses=responses,
+                                                  tool_rounds=tool_rounds,
+                                                  context_tokens=context_tokens),
                              tool_calls=calls)
 
     async def run(self, turn: HarnessTurn) -> HarnessResult:
@@ -836,20 +846,40 @@ def purge_instance(settings: GrokSettings, instance: str) -> list[str]:
     return removed
 
 
-def _usage(raw: dict[str, Any]) -> RunUsage:
+_usage_keys_logged = False
+
+
+def _usage(raw: dict[str, Any], *, responses: list[dict] | None = None, tool_rounds: int = 0,
+           context_tokens: int | None = None) -> RunUsage:
+    global _usage_keys_logged
+    if not _usage_keys_logged:
+        # Once per process: which keys grok's end usage really carries (cache buckets?).
+        logger.info("grok harness: end usage keys: %s", sorted(raw))
+        _usage_keys_logged = True
+
     def pick(*keys):
         for k in keys:
             if isinstance(raw.get(k), int):
                 return raw[k]
         return None
+    responses = responses or []
+    # Every response_completed is one model request; every tool round needs one
+    # more request after it, so a turn is at least rounds + 1 requests.
+    requests = max(len(responses), tool_rounds + 1)
+    # No per-call breakdown: grok's end totals and its per-call figures are not
+    # known to reconcile, and budget weighting trusts `calls` when present.
+    extra = {"context_tokens": context_tokens}
     if "inputTokens" not in raw and "input_tokens" in raw:
         # Anthropic-style snake_case: input_tokens is the UNCACHED part.
-        return RunUsage(requests=1, **anthropic_usage_fields(raw))
+        return RunUsage(requests=requests, **anthropic_usage_fields(raw), **extra)
     # ACP PromptUsage (`_meta.usage`): inputTokens is already the FULL prompt
     # (grok docs, "token field policy"), cache buckets are subsets.
-    return RunUsage(requests=1,
+    return RunUsage(requests=requests,
                     input_tokens=pick("inputTokens", "promptTokens"),
                     output_tokens=pick("outputTokens", "completionTokens"),
                     cached_input_tokens=pick("cachedReadTokens", "cacheReadInputTokens",
-                                             "cachedInputTokens"),
-                    cache_write_tokens=pick("cachedWriteTokens", "cacheCreationInputTokens"))
+                                             "cachedInputTokens", "cacheReadTokens",
+                                             "cachedTokens"),
+                    cache_write_tokens=pick("cachedWriteTokens", "cacheCreationInputTokens",
+                                            "cacheWriteTokens"),
+                    **extra)

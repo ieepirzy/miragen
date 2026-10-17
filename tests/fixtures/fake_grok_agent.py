@@ -196,6 +196,10 @@ def handle_prompt(rid, params):
             if ev.wait(30):
                 stop = "cancelled"
                 break
+        elif line == "ROUND":  # one more model request mid-turn (e.g. before a tool call)
+            update(sid, {"sessionUpdate": "response_completed", "usage": {
+                "input_tokens": data["context"] - 100, "output_tokens": 5,
+                "cache_read_input_tokens": 100, "cache_creation_input_tokens": 0}})
         elif line == "HISTORY":
             chunk(sid, f"turns={len(data['turns'])} rules={data.get('rules')!r}\n")
         elif line.startswith("GROW "):

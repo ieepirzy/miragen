@@ -79,7 +79,7 @@ def normalize_acp_update(params: dict[str, Any]) -> list[dict[str, Any]]:
         usage = update.get("usage") if isinstance(update.get("usage"), dict) else {}
         context = sum(int(usage.get(k) or 0) for k in (
             "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
-        return [{"type": "usage", "context_tokens": context, "raw": params}] if usage else []
+        return [{"type": "usage", "context_tokens": context, "usage": usage, "raw": params}] if usage else []
 
     if kind == "auto_compact_completed":
         return [{"type": "compacted", "tokens_before": update.get("tokens_before"),

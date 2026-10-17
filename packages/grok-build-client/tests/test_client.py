@@ -112,3 +112,92 @@ async def test_headless_session_passes_flags_and_env_to_the_process(tmp_path):
     assert seen["argv"][seen["argv"].index("--tools") + 1] == "search_tool,use_tool"
     assert "--always-approve" not in seen["argv"]
     assert seen["argv"][seen["argv"].index("--max-turns") + 1] == "3"
+
+
+async def test_acp_agent_dying_before_initialize_reports_exit_and_stderr(tmp_path):
+    """A `grok agent` that exits at startup: the error names the exit code and
+    its last stderr lines (ANSI stripped), not just "ACP agent closed"."""
+    import asyncio
+    import os
+    import stat
+
+    import pytest
+
+    from grok_build_client import AcpSession
+
+    fake = tmp_path / "grok"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "sys.stderr.write('booting\\n\\x1b[31mERROR\\x1b[0m config.toml: unknown field `x`\\n')\n"
+        "sys.exit(3)\n"
+    )
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    acp = AcpSession(grok_bin=str(fake), env={"PATH": os.environ.get("PATH", "")}, cwd=str(tmp_path))
+    with pytest.raises(ConnectionError) as err:
+        await asyncio.wait_for(acp.start(), timeout=10)
+    await acp.close()
+    assert str(err.value) == (
+        "ACP agent closed (exit 3); stderr: booting | ERROR config.toml: unknown field `x`")
+    assert acp.close_reason == str(err.value)
+
+
+def _fake_grok(tmp_path, body: str):
+    import stat
+
+    fake = tmp_path / "grok"
+    fake.write_text("#!/usr/bin/env python3\nimport os, sys, time\n" + body)
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    return str(fake)
+
+
+async def test_acp_close_during_death_grace_still_fails_waiters(tmp_path):
+    """close() landing while the reader gathers the death reason (a grandchild
+    holds stderr open, so the drain waits the full grace) must not leave
+    start() hanging: the waiters still fail, with the plain reason."""
+    import asyncio
+    import os
+
+    import pytest
+
+    from grok_build_client import AcpSession
+
+    grok = _fake_grok(tmp_path, (
+        "if os.fork() == 0:\n"
+        "    os.close(1); time.sleep(5); os._exit(0)\n"
+        "sys.stdin.readline()\n"
+        "sys.stderr.write('dying\\n'); sys.stderr.flush()\n"
+        "os._exit(3)\n"))
+    acp = AcpSession(grok_bin=grok, env={"PATH": os.environ.get("PATH", "")}, cwd=str(tmp_path))
+    start = asyncio.create_task(acp.start())
+    await asyncio.sleep(0.4)  # the agent has died; the reader is in its grace window
+    await acp.close()
+    with pytest.raises(ConnectionError) as err:
+        await asyncio.wait_for(start, timeout=3)
+    assert str(err.value) == "ACP agent closed"
+    assert acp.close_reason is None
+
+
+async def test_acp_our_own_close_is_not_reported_as_a_death(tmp_path):
+    """A close() we make is not the agent dying: no exit/stderr gathering,
+    no close_reason, and a pending request fails with the plain reason."""
+    import asyncio
+    import os
+
+    import pytest
+
+    from grok_build_client import AcpSession
+
+    grok = _fake_grok(tmp_path, (
+        "sys.stderr.write('noise on stderr\\n'); sys.stderr.flush()\n"
+        "sys.stdin.readline()\n"
+        "time.sleep(30)\n"))
+    acp = AcpSession(grok_bin=grok, env={"PATH": os.environ.get("PATH", "")}, cwd=str(tmp_path))
+    start = asyncio.create_task(acp.start())
+    await asyncio.sleep(0.4)  # initialize sent, never answered
+    await asyncio.wait_for(acp.close(), timeout=10)
+    with pytest.raises((ConnectionError, asyncio.CancelledError)) as err:
+        await asyncio.wait_for(start, timeout=3)
+    if isinstance(err.value, ConnectionError):
+        assert str(err.value) == "ACP agent closed"
+    assert acp.close_reason is None
