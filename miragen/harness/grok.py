@@ -344,6 +344,9 @@ class GrokHarness(MiraRunEnv):
             await acp.start()
             session_id = await self._open_session(acp, instance, str(workdir), ephemeral=ephemeral)
         except BaseException:
+            if acp.close_reason:  # it died on its own: say why, not just "closed"
+                logger.warning("grok harness: agent for %s died while starting: %s",
+                               instance, acp.close_reason)
             await acp.close()  # never leave a half-started agent running
             raise
         return _Agent(instance=instance, acp=acp, session_id=session_id, ephemeral=ephemeral)

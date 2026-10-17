@@ -12,6 +12,7 @@ import collections
 import contextlib
 import json
 import os
+import re
 import signal
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -21,6 +22,10 @@ from grok_build_client.normalize import normalize_acp_update
 from grok_build_client.util import resolve_grok_bin
 
 PermissionDecision = Literal["allow", "deny"]
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# How long a dead agent's stderr / exit status may take to land after stdout EOF.
+_DEATH_GRACE_S = 1.0
 
 
 class AcpAuthError(RuntimeError):
@@ -76,6 +81,8 @@ class AcpSession:
     _closed: bool = field(default=False, init=False, repr=False)
     _stderr_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
     _stderr_tail: collections.deque = field(default_factory=lambda: collections.deque(maxlen=50), init=False, repr=False)
+    # Why the agent went away ("ACP agent closed (exit N); stderr: ..."), once it has.
+    close_reason: str | None = field(default=None, init=False)
 
     async def __aenter__(self) -> "AcpSession":
         await self.start()
@@ -340,12 +347,34 @@ class AcpSession:
                     continue
                 await self._dispatch(msg)
         finally:
-            # Unblock waiters
+            # Unblock waiters. An agent that died on its own (not close()) gets
+            # its exit status and last stderr lines into the error: without
+            # them a startup failure is just "ACP agent closed".
+            reason = "ACP agent closed"
+            if not self._closed:
+                with contextlib.suppress(Exception):
+                    reason = await self._death_reason()
+                self.close_reason = reason
             for fut in self._pending.values():
                 if not fut.done():
-                    fut.set_exception(ConnectionError("ACP agent closed"))
+                    fut.set_exception(ConnectionError(reason))
             self._pending.clear()
             await self._updates.put(None)
+
+    async def _death_reason(self) -> str:
+        # stdout hit EOF; the stderr drain and the exit status trail it a little.
+        if self._stderr_task is not None:
+            await asyncio.wait({self._stderr_task}, timeout=_DEATH_GRACE_S)
+        code = None
+        if self._proc is not None:
+            with contextlib.suppress(Exception):
+                code = await asyncio.wait_for(self._proc.wait(), timeout=_DEATH_GRACE_S)
+        reason = "ACP agent closed" if code is None else f"ACP agent closed (exit {code})"
+        tail = [_ANSI.sub("", line).strip() for line in self.stderr_tail()[-5:]]
+        tail = [line for line in tail if line]
+        if tail:
+            reason += f"; stderr: {' | '.join(tail)}"
+        return reason
 
     async def _dispatch(self, msg: dict[str, Any]) -> None:
         # Response to our request

@@ -112,3 +112,31 @@ async def test_headless_session_passes_flags_and_env_to_the_process(tmp_path):
     assert seen["argv"][seen["argv"].index("--tools") + 1] == "search_tool,use_tool"
     assert "--always-approve" not in seen["argv"]
     assert seen["argv"][seen["argv"].index("--max-turns") + 1] == "3"
+
+
+async def test_acp_agent_dying_before_initialize_reports_exit_and_stderr(tmp_path):
+    """A `grok agent` that exits at startup: the error names the exit code and
+    its last stderr lines (ANSI stripped), not just "ACP agent closed"."""
+    import asyncio
+    import os
+    import stat
+
+    import pytest
+
+    from grok_build_client import AcpSession
+
+    fake = tmp_path / "grok"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "sys.stderr.write('booting\\n\\x1b[31mERROR\\x1b[0m config.toml: unknown field `x`\\n')\n"
+        "sys.exit(3)\n"
+    )
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    acp = AcpSession(grok_bin=str(fake), env={"PATH": os.environ.get("PATH", "")}, cwd=str(tmp_path))
+    with pytest.raises(ConnectionError) as err:
+        await asyncio.wait_for(acp.start(), timeout=10)
+    await acp.close()
+    assert str(err.value) == (
+        "ACP agent closed (exit 3); stderr: booting | ERROR config.toml: unknown field `x`")
+    assert acp.close_reason == str(err.value)
