@@ -112,9 +112,15 @@ class GrokSettings:
     # is ~15 s). No model call is made. Empty: none.
     prewarm: tuple[str, ...] = ()
     prewarm_max: int = 1
+    # Idle limit by instance name, overriding `idle_s`: a chat kept warm for
+    # days next to background lanes that stop as soon as their turn is done.
+    instance_idle_s: dict[str, float] = field(default_factory=dict)
 
     def effort_for(self, instance: str) -> str | None:
         return self.instance_effort.get(instance, self.effort)
+
+    def idle_for(self, instance: str) -> float:
+        return self.instance_idle_s.get(instance, self.idle_s)
 
     @classmethod
     def from_env(cls, *, gateway_url: str) -> "GrokSettings":
@@ -138,6 +144,7 @@ class GrokSettings:
             prewarm=tuple(p.strip() for p in env.get("MIRAGEN_GROK_PREWARM", "").split(",")
                           if p.strip()),
             prewarm_max=int(env.get("MIRAGEN_GROK_PREWARM_MAX", "1")),
+            instance_idle_s=_instance_idles(env.get("MIRAGEN_GROK_INSTANCE_IDLE_S", "")),
         )
 
 
@@ -161,6 +168,21 @@ def _instance_efforts(raw: str) -> dict[str, str]:
             raise ValueError(f"MIRAGEN_GROK_INSTANCE_EFFORT: expected instance=level, got '{item}'")
         efforts[name.strip()] = _effort(level, f"MIRAGEN_GROK_INSTANCE_EFFORT ({name.strip()})")
     return efforts
+
+
+def _instance_idles(raw: str) -> dict[str, float]:
+    """``MIRAGEN_GROK_INSTANCE_IDLE_S=mira-heartbeat=120,mira-events=1800``."""
+    idles: dict[str, float] = {}
+    for item in filter(None, (part.strip() for part in raw.split(","))):
+        name, sep, seconds = item.partition("=")
+        try:
+            value = float(seconds) if sep and name.strip() else -1.0
+        except ValueError:
+            value = -1.0
+        if not value >= 0:  # also NaN, which would never compare as idle
+            raise ValueError(f"MIRAGEN_GROK_INSTANCE_IDLE_S: expected instance=seconds, got '{item}'")
+        idles[name.strip()] = value
+    return idles
 
 
 @dataclass
@@ -525,11 +547,12 @@ class GrokHarness(MiraRunEnv):
             self._reaper = asyncio.create_task(self._reap_idle(), name="grok-harness-reaper")
 
     async def _reap_idle(self) -> None:
+        shortest = min([self.settings.idle_s, *self.settings.instance_idle_s.values()])
         while self._agents:
-            await asyncio.sleep(min(60.0, max(1.0, self.settings.idle_s / 4)))
+            await asyncio.sleep(min(60.0, max(1.0, shortest / 4)))
             now = time.monotonic()
             for agent in list(self._agents.values()):
-                if not agent.busy and now - agent.last_used > self.settings.idle_s:
+                if not agent.busy and now - agent.last_used > self.settings.idle_for(agent.instance):
                     logger.info("grok harness: stopping idle process for %s", agent.instance)
                     async with self._spawn_lock:
                         # Re-checked under the lock: a turn may have taken it.

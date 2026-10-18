@@ -9,6 +9,7 @@ import json
 import os
 import socket
 import stat
+import time
 import sys
 from pathlib import Path
 
@@ -686,6 +687,30 @@ def test_effort_settings_from_env(monkeypatch):
     monkeypatch.setenv("MIRAGEN_GROK_INSTANCE_EFFORT", "mira-heartbeat=lowest")
     with pytest.raises(ValueError, match="unknown reasoning effort 'lowest'"):
         GrokSettings.from_env(gateway_url="http://x/")
+
+
+async def test_instance_idle_stops_a_background_lane_and_keeps_the_chat(env):
+    # Mira (2026-10-18): the chat stays warm for a week, the heartbeat's
+    # process stops as soon as its beat is done.
+    h = env.harness(idle_s=3600.0, instance_idle_s={"mira-heartbeat": 1.0})
+    await h.run(turn("one", instance="chat"))
+    await h.run(turn("one", instance="mira-heartbeat", run_id="r2"))
+    deadline = time.monotonic() + 10
+    while "mira-heartbeat" in h.status()["processes"] and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+    assert h.status()["processes"] == ["chat"]
+
+
+def test_instance_idle_settings_from_env(monkeypatch):
+    monkeypatch.setenv("MIRAGEN_GROK_IDLE_S", "604800")
+    monkeypatch.setenv("MIRAGEN_GROK_INSTANCE_IDLE_S", "mira-heartbeat=120, mira-events=1800")
+    s = GrokSettings.from_env(gateway_url="http://x/")
+    assert s.idle_for("conv_x") == 604800 and s.idle_for("mira-heartbeat") == 120
+    assert s.idle_for("mira-events") == 1800
+    for bad in ("mira-heartbeat", "mira-heartbeat=soon", "=60", "x=-1", "x=nan"):
+        monkeypatch.setenv("MIRAGEN_GROK_INSTANCE_IDLE_S", bad)
+        with pytest.raises(ValueError, match="expected instance=seconds"):
+            GrokSettings.from_env(gateway_url="http://x/")
 
 
 async def test_prewarm_starts_the_most_recent_matching_instance_and_its_turn_is_warm(env):
