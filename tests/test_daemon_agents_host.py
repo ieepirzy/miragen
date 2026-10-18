@@ -317,7 +317,7 @@ from miragen.daemon.spawn.docker_compose import private_bridge  # noqa: E402
 # both sides must derive the same token, or every lane turn is a 401.
 GOLDEN_MASTER = "golden-master-secret"
 GOLDEN_NAME = "lane-example"
-GOLDEN_TOKEN = "fbf6e59573900be8c15296dd15eebb47f241481fe4cc168baba816d54e50c69a"
+GOLDEN_DIGEST = "fbf6e59573900be8c15296dd15eebb47f241481fe4cc168baba816d54e50c69a"  # gitleaks:allow (a published test vector, not a credential)
 
 
 class FakeNetwork:
@@ -379,7 +379,7 @@ def _isolated_core(tmp_path, extra=None):
 
 
 def test_the_derived_agent_token_matches_the_golden_vector():
-    assert derive_agent_token(GOLDEN_MASTER, GOLDEN_NAME) == GOLDEN_TOKEN
+    assert derive_agent_token(GOLDEN_MASTER, GOLDEN_NAME) == GOLDEN_DIGEST
 
 
 def test_an_isolated_agent_holds_its_own_token_never_the_daemons(tmp_path):

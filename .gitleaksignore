@@ -11,3 +11,7 @@
 # whenever a push's "before" SHA lands on or after it, so the historical
 # finding needs an explicit ignore entry to stop resurfacing.
 30dd1bd3e115142d1740b4330b8501278004da2d:miragen/app.py:generic-api-key:465
+# The per-agent token derivation's golden test vector (HMAC of a fixed test
+# master; shared with mirarun's tests), not a credential. Introduced in this
+# commit under a name the generic rule matches; renamed and annotated since.
+fa1f21034b7cbe9e7557bcd7eeac575ba8bab9af:tests/test_daemon_agents_host.py:generic-api-key:305

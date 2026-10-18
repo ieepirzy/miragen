@@ -56,7 +56,9 @@ jobs:
             --tmpfs /tmp:size=512m,mode=1777
             --tmpfs /run/engineer:uid=1000,gid=1000,mode=0700,size=16m"
           ws=$(mktemp -d); mkdir -p "$ws/agent"
-          printf 'name: lane-check\nmode: interactive\ntriggers:\n  - type: http\nspec:\n  model: "test:whatever"\n  instructions: "check"\n' > "$ws/agent/agent.yaml"
+          # A real provider with a fake key: the agent builds and serves /health
+          # without a model call.
+          printf 'name: lane-check\nmode: interactive\ntriggers:\n  - type: http\nspec:\n  model: "openai:gpt-4o"\n  instructions: "check"\n' > "$ws/agent/agent.yaml"
           sudo chown -R 1000:1000 "$ws/agent"
           # The entrypoint end to end, with no daemon reachable: credentials
           # become files and leave the environment, miragen-memory installs
@@ -80,7 +82,7 @@ jobs:
           # miragen itself under the same hardening: it boots and serves
           # /health, and PID 1's environment holds no credential value.
           docker run -d --name engineer-check $HARDEN -v "$ws/agent:/agent" \
-            -e MIRAGEN_INTERNAL_TOKEN=fake-agent-token miragen-engineer:check
+            -e MIRAGEN_INTERNAL_TOKEN=fake-agent-token -e OPENAI_API_KEY=sk-fake-check miragen-engineer:check
           ok=0
           for i in $(seq 1 30); do
             if docker exec engineer-check curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then ok=1; break; fi
@@ -88,6 +90,6 @@ jobs:
           done
           docker logs engineer-check 2>&1 | tail -40
           test "$ok" = 1
-          ! docker exec engineer-check sh -c 'tr "\0" "\n" < /proc/1/environ' | grep -q fake-agent-token
+          ! docker exec engineer-check sh -c 'tr "\0" "\n" < /proc/1/environ' | grep -q -e fake-agent-token -e sk-fake-check
           docker rm -f engineer-check
           docker image inspect miragen-engineer:check --format '{{ index .Config.Labels "io.miragen.profile-contracts" }}' | grep -q 4
