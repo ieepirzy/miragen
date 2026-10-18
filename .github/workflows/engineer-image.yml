@@ -54,12 +54,12 @@ jobs:
           # capabilities, no-new-privileges, a pid limit.
           HARDEN="--read-only --cap-drop ALL --security-opt no-new-privileges:true --pids-limit 512
             --tmpfs /tmp:size=512m,mode=1777
-            --tmpfs /run/engineer:uid=1000,gid=1000,mode=0700,size=16m"
+            --tmpfs /run/engineer:uid=10000,gid=10000,mode=0700,size=16m"
           ws=$(mktemp -d); mkdir -p "$ws/agent"
           # A real provider with a fake key: the agent builds and serves /health
           # without a model call.
           printf 'name: lane-check\nmode: interactive\ntriggers:\n  - type: http\nspec:\n  model: "openai:gpt-4o"\n  instructions: "check"\n' > "$ws/agent/agent.yaml"
-          sudo chown -R 1000:1000 "$ws/agent"
+          sudo chown -R 10000:10000 "$ws/agent"
           # The entrypoint end to end, with no daemon reachable: credentials
           # become files and leave the environment, miragen-memory installs
           # from the baked marketplace, then it execs the given command.
@@ -70,6 +70,7 @@ jobs:
             -e MIRAGEN_INTERNAL_TOKEN=fake-agent-token \
             miragen-engineer:check sh -c '
               set -eu
+              test "$(id -u)" = 10000
               cat /run/engineer/status.json
               test -z "${MIRAGEN_BRIDGE_API_KEY:-}${GH_BROKER_CHECK_API_KEY:-}${MIRAGEN_INTERNAL_TOKEN:-}"
               test "$(cat "$MIRAGEN_INTERNAL_TOKEN_FILE")" = fake-agent-token

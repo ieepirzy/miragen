@@ -598,3 +598,17 @@ def test_an_isolated_workspace_is_group_writable_only(tmp_path):
     core, _ = _isolated_core(tmp_path)
     core.create_agent("lane-a", _yaml("lane-a"))
     assert (tmp_path / "agents" / "lane-a").stat().st_mode & 0o777 == 0o770
+
+
+
+def test_the_gateway_runs_unprivileged_and_hardened():
+    gateway = _stack()["services"]["lanes-gateway"]
+    assert gateway["image"].split(":-", 1)[1].startswith("nginxinc/nginx-unprivileged:")
+    assert "@sha256:" in gateway["image"]
+    assert gateway["cap_drop"] == ["ALL"]
+    assert gateway["pids_limit"] <= 256
+    assert gateway["read_only"] is True
+    assert "no-new-privileges:true" in gateway["security_opt"]
+    content = _stack()["configs"]["lanes-gateway-nginx"]["content"]
+    assert "pid /tmp/nginx.pid;" in content
+    assert '"listener":"$$server_addr:$$server_port"' in content

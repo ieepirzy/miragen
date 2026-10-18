@@ -67,10 +67,37 @@ RUN_DIR = Path(os.environ.get("ENGINEER_RUN_DIR", "/run/engineer"))
 # session transcripts and miragen's harness files (claude_code.py,
 # engineer.py). Everything else under CLAUDE_CONFIG_DIR is removed.
 KEEP_IN_CONFIG_DIR = frozenset({
-    "projects", "repos", "workspaces", "home", "todos",
+    "projects", "repos", "workspaces", "todos",
     "miragen-claude", "miragen-instances.json", "miragen-gitconfig",
     ".claude.json",
 })
+# `.claude.json` is rebuilt from these top-level keys only (no projects, no
+# MCP servers, no per-project allowed tools).
+CLAUDE_JSON_KEEP = frozenset({
+    "userID", "firstStartTime", "hasCompletedOnboarding", "lastOnboardingVersion",
+    "numStartups", "installMethod",
+})
+# What survives in each shared bare clone's config (repos/<name>.git): the
+# repository format and the remote the harness set. Hooks, filters, aliases,
+# fsmonitor, credential helpers, includes, url rewrites are dropped.
+GIT_CONFIG_KEEP = re.compile(
+    r"^(core\.(repositoryformatversion|filemode|bare|logallrefupdates)"
+    r"|remote\.origin\.(url|fetch)|extensions\.objectformat)$")
+# User settings every boot starts from. The env applies to every Claude Code
+# session and the tools it runs: no auto memory (a session could plant
+# instructions for later ones), and git never runs hooks or an fsmonitor,
+# whatever a repository's own config says (GIT_CONFIG_* is command-line
+# precedence).
+BASE_SETTINGS = {
+    "env": {
+        "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "core.hooksPath",
+        "GIT_CONFIG_VALUE_0": "/dev/null",
+        "GIT_CONFIG_KEY_1": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_1": "false",
+    },
+}
 # Credential-looking variables turned into files before miragen starts.
 SECRET_SUFFIXES = ("_TOKEN", "_API_KEY", "_SECRET", "_PASSWORD")
 SYSTEM_ROOTS = Path("/etc/ssl/certs/ca-certificates.crt")
@@ -243,10 +270,13 @@ def _remove(path: Path) -> None:
         path.unlink()
 
 
-def reset_claude_config(config_dir: Path) -> list[str]:
+def reset_claude_config(config_dir: Path, *, git: str = "git") -> list[str]:
     """Rebuild the user-level Claude Code configuration on the agent's
-    volume: remove everything but KEEP_IN_CONFIG_DIR, and strip MCP servers
-    from `.claude.json`. Returns what was removed (names only)."""
+    volume. Everything a session could plant to run in a later one goes:
+    every entry but KEEP_IN_CONFIG_DIR (settings, hooks, plugins, secrets,
+    CLAUDE.md, home/ with its dotfiles), auto memory under projects/,
+    `.claude.json` beyond an allowlist, and hooks and config in the shared
+    bare clones. Returns what was removed (names only)."""
     removed = []
     config_dir.mkdir(parents=True, exist_ok=True)
     for entry in config_dir.iterdir():
@@ -254,6 +284,15 @@ def reset_claude_config(config_dir: Path) -> list[str]:
             continue
         _remove(entry)
         removed.append(entry.name)
+
+    projects = config_dir / "projects"
+    if projects.is_dir() and not projects.is_symlink():
+        for project in projects.iterdir():
+            memory = project / "memory"
+            if memory.exists() or memory.is_symlink():
+                _remove(memory)
+                removed.append(f"projects/{project.name}/memory")
+
     state = config_dir / ".claude.json"
     if state.is_symlink():
         state.unlink()
@@ -263,19 +302,60 @@ def reset_claude_config(config_dir: Path) -> list[str]:
             data = json.loads(state.read_text())
         except ValueError:
             data = None
-        if not isinstance(data, dict):
-            state.unlink()
-            removed.append(".claude.json")
-        else:
-            changed = data.pop("mcpServers", None) is not None
-            for project in (data.get("projects") or {}).values():
-                if isinstance(project, dict):
-                    for key in ("mcpServers", "enabledMcpjsonServers", "allowedTools"):
-                        changed |= project.pop(key, None) is not None
-            if changed:
-                _write_private(state, json.dumps(data), mode=0o600)
-                removed.append(".claude.json:mcpServers")
+        kept = {k: v for k, v in data.items() if k in CLAUDE_JSON_KEEP} \
+            if isinstance(data, dict) else {}
+        if kept != data:
+            _write_private(state, json.dumps(kept), mode=0o600)
+            removed.append(".claude.json:rebuilt")
+
+    repos = config_dir / "repos"
+    if repos.is_dir() and not repos.is_symlink():
+        for repo in repos.iterdir():
+            if repo.is_symlink() or not repo.is_dir():
+                _remove(repo)
+                removed.append(f"repos/{repo.name}")
+                continue
+            removed += [f"repos/{repo.name}/{x}" for x in reset_bare_repo(repo, git=git)]
+
+    _write_private(config_dir / "settings.json", json.dumps(BASE_SETTINGS), mode=0o644)
     return removed
+
+
+def reset_bare_repo(repo: Path, *, git: str = "git") -> list[str]:
+    """Empty hooks/ and rebuild config from GIT_CONFIG_KEEP."""
+    changed = []
+    hooks = repo / "hooks"
+    if hooks.is_symlink() or (hooks.exists() and any(hooks.iterdir())):
+        _remove(hooks)
+        changed.append("hooks")
+    if not hooks.exists():
+        hooks.mkdir()
+    config = repo / "config"
+    if config.is_symlink():
+        config.unlink()
+        changed.append("config")
+    if config.is_file():
+        listing = subprocess.run(
+            [git, "config", "--file", str(config), "--null", "--list"],
+            capture_output=True, timeout=30, check=False)
+        entries = []
+        for item in listing.stdout.decode("utf-8", "replace").split("\0"):
+            if not item:
+                continue
+            key, _, value = item.partition("\n")
+            entries.append((key, value))
+        kept = [(k, v) for k, v in entries if GIT_CONFIG_KEEP.match(k)]
+        if kept != entries:
+            fresh = repo / ".config.miragen-reset"
+            fresh.unlink(missing_ok=True)
+            for key, value in kept:
+                subprocess.run([git, "config", "--file", str(fresh), "--add", key, value],
+                               capture_output=True, timeout=30, check=True)
+            if not kept:
+                fresh.write_text("")
+            os.replace(fresh, config)
+            changed.append("config")
+    return changed
 
 
 def secrets_to_files(environ: MutableMapping[str, str], run_dir: Path) -> list[str]:

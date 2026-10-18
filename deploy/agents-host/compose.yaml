@@ -110,21 +110,24 @@ services:
       - no-new-privileges:true
 
   lanes-gateway:
-    image: ${GATEWAY_IMAGE:-nginx:1.27.5-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10}
+    # Unprivileged nginx (uid 101, no root master), pinned by digest.
+    image: ${GATEWAY_IMAGE:-nginxinc/nginx-unprivileged:1.27.5-alpine@sha256:65e3e85dbaed8ba248841d9d58a899b6197106c23cb0ff1a132b7bfe0547e4c0}
     container_name: lanes-gateway
     restart: unless-stopped
     read_only: true
+    cap_drop: [ALL]
+    pids_limit: 128
     tmpfs:
       - /tmp
-      - /var/cache/nginx
-      - /var/run
     command: ["nginx", "-c", "/etc/lanes-gateway/nginx.conf", "-g", "daemon off;"]
     configs:
       - source: lanes-gateway-nginx
         target: /etc/lanes-gateway/nginx.conf
     volumes:
-      # Access log of every proxied agent call (turns included): JSON lines.
-      - gateway-logs:/var/log/lanes-gateway
+      # nginx's cache dir (owned by its uid in the image, so the fresh
+      # volume is too) holds its temp files and the JSON access logs of
+      # every proxied agent call (turns included) and broker connection.
+      - gateway-logs:/var/cache/nginx
     ports:
       - ${AGENTS_HOST_BIND_ADDRESS}:${GATEWAY_PUBLISH_PORT:-8001}:8001
     networks:
@@ -155,7 +158,7 @@ configs:
   lanes-gateway-nginx:
     content: |
       worker_processes 1;
-      pid /var/run/nginx.pid;
+      pid /tmp/nginx.pid;
       error_log stderr warn;
       events { worker_connections 256; }
 
@@ -163,8 +166,8 @@ configs:
       # private network); the bytes go to MiraRun's broker over WireGuard
       # untouched. TLS is end to end: the gateway sees no credential.
       stream {
-        log_format broker escape=json '{"ts":"$$time_iso8601","client":"$$remote_addr","upstream":"$$upstream_addr","status":$$status,"sent":$$bytes_sent,"received":$$bytes_received,"duration_s":$$session_time}';
-        access_log /var/log/lanes-gateway/broker.jsonl broker;
+        log_format broker escape=json '{"ts":"$$time_iso8601","client":"$$remote_addr","listener":"$$server_addr:$$server_port","upstream":"$$upstream_addr","status":$$status,"sent":$$bytes_sent,"received":$$bytes_received,"duration_s":$$session_time}';
+        access_log /var/cache/nginx/broker.jsonl broker;
         server {
           listen 8080;
           proxy_pass ${BROKER_UPSTREAM:?set BROKER_UPSTREAM (broker address:port on the MiraRun host)};
@@ -191,13 +194,16 @@ configs:
           default "";
         }
         log_format turns escape=json '{"ts":"$$time_iso8601","client":"$$remote_addr","agent":"$$lane_agent","method":"$$request_method","path":"$$lane_rest","status":$$status,"bytes":$$body_bytes_sent,"duration_s":$$request_time}';
-        access_log /var/log/lanes-gateway/agents.jsonl turns;
+        access_log /var/cache/nginx/agents.jsonl turns;
         client_max_body_size 16m;
 
         server {
           listen 8001;
-          # MiraRun's address only (the WireGuard peer). Agents reach this
-          # listener on their private network and get 403 here. The
+          # MiraRun's WireGuard address only. Note: that is the VPS host's
+          # address, so it admits ANY container on the VPS whose traffic is
+          # masqueraded through it; the VPS-side DOCKER-USER rule in the
+          # README (step 6) narrows that to MiraRun's services. Agents reach
+          # this listener on their private network and get 403 here. The
           # agent's own token (X-Miragen-Token) is still checked by the agent.
           allow ${MIRARUN_SOURCE_ADDRESS:?set MIRARUN_SOURCE_ADDRESS (MiraRun host's WireGuard address)};
           deny all;

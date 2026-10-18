@@ -44,6 +44,15 @@ COPY deploy/engineer/engineer_setup.py /opt/engineer/engineer_setup.py
 
 # /run/engineer: credential files and the CA bundle, container-local (never
 # on the /agent volume, so never exported or served by miragend's file API).
+# The agent user gets a high uid/gid (10000): host uid 1000 is a login user
+# (sudo, docker group), and an agent's files on the host must not look like
+# that user's. miragend gives isolated agents its own gid as a supplementary
+# group for their secret files and workspace (AgentIsolation.shared_gid).
+RUN usermod -u 10000 agentuser \
+    && groupmod -g 10000 agentuser \
+    && find / -xdev \( -user 1000 -o -group 1000 \) -exec chown -h 10000:10000 {} + \
+    && test "$(id -u agentuser)" = 10000
+
 # No setuid/setgid binaries: nothing in a lane container may gain privileges
 # (miragend also sets no-new-privileges and drops every capability).
 RUN find / -xdev -type f -perm /6000 -exec chmod a-s {} + \

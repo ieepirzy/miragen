@@ -22,7 +22,7 @@ The stack runs miragend with `MIRAGEND_ISOLATED_AGENTS=on`.
   - No agent shares a network with miragend or with another agent.
   - `lanes-egress` is the agents' internet route. It is `lna-egress` on the host, with container-to-container traffic off.
 - **`lanes-gateway`**:
-  - accepts only `MIRARUN_SOURCE_ADDRESS` on `:8001` (agents get a 403 there);
+  - accepts only `MIRARUN_SOURCE_ADDRESS` on `:8001` (agents get a 403 there). That address is the VPS **host**, so it admits any VPS container whose traffic leaves through it. The VPS-side rule in step 6 narrows it to MiraRun's own services;
   - routes `/a/lane-<name>/…` on the raw request URI;
   - is `github-broker` on each agent's network, forwarding to MiraRun's broker over WireGuard.
 - **Host egress guard** (`AGENTS-EGRESS`, step 4): lane bridges (`lna+`) can't open connections to the mesh, `10.0.0.0/16`, the metadata service, the host itself (INPUT), or any port published on the WireGuard address (DNAT, `--ctorigdst`). The one exception is the broker line in `/etc/agents-egress-allow`.
@@ -31,7 +31,7 @@ The stack runs miragend with `MIRAGEND_ISOLATED_AGENTS=on`.
 - **Agent tokens.** Each agent's `MIRAGEN_INTERNAL_TOKEN` is HMAC-SHA256(master, `miragen-agent-token/v1\0<name>`). The master is this stack's `miragen_internal_token`, which equals MiraRun's `MIRARUN_LANES_MIRAGEN_TOKEN`. MiraRun derives the same value per lane agent, and no agent ever holds the master. One agent's token is worth nothing against another.
 - **Delivery as files.** miragend writes each granted credential (agent token, subscription token, plugin tokens, broker credential) to `<workspace>/agent-secrets/<name>/` and mounts it read-only at `/run/miragen-secrets`. The container's environment holds only `*_FILE` paths, so `docker inspect`, `compose.yml` and `/proc/1/environ` show no values.
   - The engineer entrypoint turns any remaining credential value into a file before `miragen run` starts.
-  - Inside the container, the files are readable by the agent's own uid. That is the agent's own credential set.
+  - Inside the container, the files are readable by the agent (uid 10000, with miragend's gid as a supplementary group; files 0440, directory 0750). That is the agent's own credential set, including its own token. So an agent can call its **own** guarded API, which gives it nothing it doesn't already have.
 - **No GitHub token anywhere.** git and gh go through the broker.
 
 **Container hardening and config hygiene**
@@ -51,6 +51,8 @@ The stack runs miragend with `MIRAGEND_ISOLATED_AGENTS=on`.
 
 **Accepted for v1**
 - Instances in one lane container share a uid (miragen#198, "Isolation").
+- **Uids:** agents run as uid 10000, never host uid 1000 (`ila`, sudo and docker). miragend still runs as uid 1000 (its image), so its workspace files are 1000-owned on the host.
+- **Never run git (or any tool that reads repository config) in an agent's directory on the host,** as `ila` or root. A lane writes its own hooks and config there. Inspect with `cat`/`less`, or copy the files out first.
 - Egress to the internet is open.
 
 ## Ilari steps, in order
@@ -95,6 +97,7 @@ The stack runs miragend with `MIRAGEND_ISOLATED_AGENTS=on`.
 
    Optional: `MIRAGEND_MAX_AGENTS` (4), `MIRAGEND_AGENT_MEM_LIMIT` (3g), `MIRAGEND_AGENT_CPU_LIMIT` (2), `MIRAGEND_AGENT_PIDS_LIMIT` (512) and `GATEWAY_PUBLISH_PORT` (8001).
 6. **MiraRun (stack 52).** Set the broker agent listener (#188) and the `MIRARUN_LANES_MIRAGEND_*` variables (#190) from mirarun `docs/runbook-agents-host.md`. Leave `MIRARUN_MIRAGEND_URL` and `MIRARUN_MIRAGEN_TOKEN` as they are.
+   - **VPS-side rule.** On the VPS, only MiraRun's `web`, `dispatcher` and `projector` containers may open connections to `AGENTS_WG`. Any other VPS container would otherwise pass the gateway's `allow` as the VPS host. In the VPS's `DOCKER-USER` chain, insert: ACCEPT from those containers' addresses (or their bridge's subnet, if it holds only them) to `AGENTS_WG` ports 8000 and 8001, then REJECT `-d AGENTS_WG/32 --ctstate NEW` from every other container. Persist it the way the VPS persists its other DOCKER-USER rules.
 7. **Create the lane's managed agent** through MiraRun. Use a profile like `examples/profiles/lane-engineer-agents-host.yaml`, named `lane-<key>`. MiraRun routes only `lane-*` names to this host.
 
 ## Live check
@@ -121,7 +124,7 @@ Run these once steps 1–7 are done. Each line is something to see, not assume. 
    Each of these must succeed:
    - `curl -m5 https://api.anthropic.com` connects;
    - `github-broker:8080` connects (TLS to the broker).
-8. **Gateway recreate.** Recreate `lanes-gateway` (redeploy the stack, or `docker rm -f lanes-gateway` and up). Then restart a lane agent through MiraRun, or restart miragend: the agent's network again lists `lanes-gateway` with alias `github-broker`, and turns work.
+8. **Gateway recreate.** Recreate `lanes-gateway` (redeploy the stack, or `docker rm -f lanes-gateway` and up), and touch nothing else. Within `MIRAGEND_PEER_RECONCILE_S` (30 s), miragend re-attaches it: `docker network inspect miragen-agent-<name>` lists `lanes-gateway` with alias `github-broker`, and turns work again. An agent restart (`restart` or `start`) also re-attaches it at once.
 9. **First lane session.** MiraRun starts it, and MiraDesign shows the actor `agent:claude-code/lane-<key>-engineer-1`. The supervisor's turn appears in `gateway-logs/agents.jsonl` with a 200.
 10. **Git through the broker.** The agent's `git fetch` works through the broker. `broker.jsonl` shows the connection, and the broker's audit shows the call under the lane's credential. A push to a ref outside `agent/<lane>/…` is refused.
 11. **Audit.** `miragend.jsonl` has `agent.create` and `agent.start` succeeded, plus `agent.credentials.granted` listing the profile's grants as `secret_files` names, with no values.
@@ -129,4 +132,11 @@ Run these once steps 1–7 are done. Each line is something to see, not assume. 
     - a subagent beyond `subagent_depth` is refused;
     - `ask_human` posts a question that reaches the attention queue;
     - MiraDesign's idle wake starts no turn on its own.
-13. **Tampering doesn't survive a restart.** Write `{"hooks":{"SessionStart":[…]}}` into `/agent/claude-home/settings.json` from inside `L`, then restart `L`. The hook is gone, its worktree and branch survive, and with MiraDesign unreachable the container stops instead of starting without the plugin.
+13. **Tampering doesn't survive a restart.** From inside `L`, plant all of these:
+    - a hook in `/agent/claude-home/settings.json`;
+    - a `~/.bashrc` line under `/agent/claude-home/home/`;
+    - a `projects/<p>/memory/MEMORY.md`;
+    - an `mcpServers` entry in `/agent/claude-home/.claude.json`;
+    - in each shared clone `/agent/claude-home/repos/*.git`: a `hooks/post-checkout`, plus `core.hooksPath`, `core.fsmonitor` and an `alias` in its `config`.
+
+    Restart `L`. Every one of them is gone (`status.json` lists them under `config_reset`), and the worktree and its branch survive. Inside a session, `git config --get core.hooksPath` prints `/dev/null` (settings `env`). With MiraDesign unreachable, the container stops instead of starting without the plugin.
