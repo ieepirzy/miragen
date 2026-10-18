@@ -173,8 +173,11 @@ def test_a_planted_fifo_or_directory_is_refused_without_hanging(setup):
     os.mkfifo(workspace / "pipe")
     (workspace / "adir").mkdir()
 
+    class Hung(BaseException):  # not an OSError: nothing may swallow it
+        pass
+
     def hung(*_):
-        raise TimeoutError("the daemon blocked on a FIFO")
+        raise Hung("the daemon blocked on a FIFO")
 
     old = signal.signal(signal.SIGALRM, hung)
     signal.alarm(5)
