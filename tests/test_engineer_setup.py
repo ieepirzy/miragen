@@ -353,3 +353,10 @@ def test_no_credential_value_stays_in_the_environment(tmp_path):
         assert value not in env.values()
     assert Path(env["MIRAGEN_INTERNAL_TOKEN_FILE"]).read_text() == "agent-tok"
     assert env["MIRADESIGN_URL"] == "https://d"
+
+
+def test_a_configured_plugin_failure_is_fatal_by_default():
+    plugins = {"miradesign": {"installed": False, "configured": True, "error": "down"},
+               "miragen-memory": {"installed": False, "error": "MIRAGEN_MEMORY_URL unset"}}
+    assert es.fatal_failures(plugins, {}) == ["miradesign"]
+    assert es.fatal_failures(plugins, {"ENGINEER_SETUP_STRICT": "0"}) == []

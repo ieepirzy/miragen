@@ -396,6 +396,14 @@ def setup_plugins(environ: Mapping[str, str], secrets: Mapping[str, Path], cli: 
     return status
 
 
+def fatal_failures(plugins: Mapping[str, dict], environ: Mapping[str, str]) -> list[str]:
+    """Configured plugins that failed: fatal unless ENGINEER_SETUP_STRICT=0."""
+    if environ.get("ENGINEER_SETUP_STRICT", "1") == "0":
+        return []
+    return [name for name, entry in plugins.items()
+            if entry.get("configured") and not entry.get("installed")]
+
+
 # ── main ────────────────────────────────────────────────────────────────────
 
 def main(argv: list[str]) -> None:
@@ -424,9 +432,8 @@ def main(argv: list[str]) -> None:
     }
     (RUN_DIR / "status.json").write_text(json.dumps(status, indent=1, sort_keys=True))
     log(json.dumps(status, sort_keys=True))
-    failed = [name for name, entry in plugins.items()
-              if entry.get("configured") and not entry.get("installed")]
-    if failed and environ.get("ENGINEER_SETUP_STRICT", "1") != "0":
+    failed = fatal_failures(plugins, environ)
+    if failed:
         raise SystemExit(f"engineer-setup: plugins not set up: {', '.join(failed)}")
 
     os.execvpe(argv[0], argv, environ)
