@@ -16,6 +16,8 @@ maps codes back to its LLM-facing guidance.
 from __future__ import annotations
 
 import ast
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -40,7 +42,13 @@ from miragen.daemon.spawn.base import (
     SpawnUnitNotFound,
 )
 from miragen.daemon.audit import AuditLog, NullAuditLog, audit_log_from_env, names
-from miragen.daemon.spawn.docker_compose import DEFAULT_AGENT_NETWORK, DockerComposeSpawnDriver
+from miragen.daemon.spawn.docker_compose import (
+    DEFAULT_AGENT_NETWORK,
+    DEFAULT_TMPFS,
+    SECRET_FILES_DIR,
+    AgentIsolation,
+    DockerComposeSpawnDriver,
+)
 from miragen.agent_type import (
     ALLOWED_HOSTS_ENV,
     ALLOWED_PROVIDERS_ENV,
@@ -107,6 +115,20 @@ RESERVED_AGENT_NAMES = frozenset({"miragend", "miragen-mcp", "lanes-gateway"})
 #   for the agent name, e.g. http://10.8.0.15:8001/a/{name}. miragend's own
 #   calls (schedule re-triggers) keep the driver's internal address.
 AGENT_NETWORKS_ENV = "MIRAGEND_AGENT_NETWORKS"
+# MIRAGEND_ISOLATED_AGENTS=on: the agents host's mode (AgentIsolation in
+# spawn/docker_compose.py, plus): each agent's MIRAGEN_INTERNAL_TOKEN is its
+# own, derived from the daemon's (derive_agent_token), so no agent holds a
+# credential another agent or the daemon accepts; credentials reach agents
+# as files; the run-control contract and managed schedules are not served.
+ISOLATED_AGENTS_ENV = "MIRAGEND_ISOLATED_AGENTS"
+# container[=alias[+alias...]] entries, comma-separated: who joins each
+# agent's private network, e.g. lanes-gateway=github-broker.
+AGENT_NETWORK_PEERS_ENV = "MIRAGEND_AGENT_NETWORK_PEERS"
+AGENT_PIDS_LIMIT_ENV = "MIRAGEND_AGENT_PIDS_LIMIT"
+AGENT_TMPFS_ENV = "MIRAGEND_AGENT_TMPFS"
+AGENT_TOKEN_CONTEXT = b"miragen-agent-token/v1\0"
+# Values that become secret files under isolation.
+SECRET_ENV_NAMES = frozenset({"MIRAGEN_INTERNAL_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"})
 AGENT_ENDPOINT_TEMPLATE_ENV = "MIRAGEND_AGENT_ENDPOINT_TEMPLATE"
 
 # A Claude Code credentials store (an interactive login, or plugin secrets
@@ -590,8 +612,10 @@ class LifecycleCore:
             not_found=self._not_found,
             sleep=sleep,
             networks=agent_networks(self._environ),
+            isolation=agent_isolation(self._environ),
         )
         self._endpoint_template = endpoint_template(self._environ)
+        self.isolated = isolated_agents(self._environ)
         self.audit = audit if audit is not None else audit_log_from_env(self._environ)
         # create_agent/import_agent both do a check-then-act against
         # _agent_count() before committing a new agent (mkdir / shutil.move).
@@ -676,6 +700,12 @@ class LifecycleCore:
             raise InvalidPath("path traversal not allowed")
         if full.name in CREDENTIAL_STORE_FILES:
             raise InvalidPath("credential stores are not served")
+        try:
+            if full.is_file() and full.stat().st_nlink > 1:
+                # A hard link can name a file outside the workspace.
+                raise InvalidPath("hard-linked files are not served")
+        except OSError:
+            pass
         return full
 
     def _safe_export_path(self, archive_path: str) -> Path:
@@ -1076,11 +1106,17 @@ class LifecycleCore:
             return None
 
     @staticmethod
-    def _delivered(spec: ServiceSpec | None) -> tuple[dict[str, str], frozenset[str]] | None:
-        """What a unit hands its process: environment and mounted secrets."""
+    def _delivered(spec: ServiceSpec | None) -> tuple | None:
+        """What a unit hands its process: environment, mounted secrets, and
+        secret files (by digest)."""
         if spec is None:
             return None
-        return dict(spec.environment), frozenset(spec.secret_names)
+        return (
+            dict(spec.environment),
+            frozenset(spec.secret_names),
+            frozenset((k, hashlib.sha256(v.encode()).hexdigest())
+                      for k, v in spec.secret_files.items()),
+        )
 
     def _labels_path(self, name: str) -> Path:
         return self._agent_dir(name) / "labels.json"
@@ -1119,8 +1155,12 @@ class LifecycleCore:
             # Enable the agent's own /run* guard with the same shared token
             # this daemon (and its clients) authenticate with. Without it a
             # managed agent boots unprotected while callers send
-            # X-Miragen-Token — the header is required by no one.
-            env["MIRAGEN_INTERNAL_TOKEN"] = self._internal_token
+            # X-Miragen-Token — the header is required by no one. Isolated:
+            # the agent's own derived token, never the daemon's.
+            env["MIRAGEN_INTERNAL_TOKEN"] = (
+                derive_agent_token(self._internal_token, name)
+                if self.isolated else self._internal_token
+            )
         # Per-profile credential grants: only the keys this profile implies
         # or declares (miragen/credentials.py), never the daemon's whole
         # *_API_KEY / *_API_KEY_FILE set. NAME_FILE rides with its secret
@@ -1154,6 +1194,9 @@ class LifecycleCore:
         # Every managed agent gets a default resource ceiling so a single
         # runaway container can't starve the host — overridable per-deployment
         # via MIRAGEND_AGENT_CPU_LIMIT / MIRAGEND_AGENT_MEM_LIMIT (see #57).
+        secret_files: dict[str, str] = {}
+        if self.isolated:
+            env, secret_files = _as_secret_files(env)
         cpu_limit = self._environ.get("MIRAGEND_AGENT_CPU_LIMIT", DEFAULT_AGENT_CPU_LIMIT)
         mem_limit = self._environ.get("MIRAGEND_AGENT_MEM_LIMIT", DEFAULT_AGENT_MEM_LIMIT)
 
@@ -1179,6 +1222,7 @@ class LifecycleCore:
             mem_limit=mem_limit,
             workspace_dir=self._agent_dir(name),
             secret_names=tuple(secret_names),
+            secret_files=secret_files,
         )
 
     def _compose_add_service(
@@ -1207,6 +1251,7 @@ class LifecycleCore:
                 if k in (CLAUDE_CODE_TOKEN_ENV, "MIRAGEN_INTERNAL_TOKEN")
             ),
             secrets=names(spec.secret_names),
+            secret_files=names(spec.secret_files),
             image=spec.image,
         )
 
@@ -1758,7 +1803,13 @@ class LifecycleCore:
                 if fp.is_symlink():
                     skipped.append({"path": str(rel), "reason": "symlink not exported"})
                     continue
-                size = fp.stat().st_size
+                st = fp.stat()
+                if st.st_nlink > 1:
+                    # A hard link may name a file outside the workspace (the
+                    # agent can create one); its contents are not the agent's.
+                    skipped.append({"path": str(rel), "reason": "hard link not exported"})
+                    continue
+                size = st.st_size
                 if size > MAX_EXPORT_FILE_BYTES:
                     skipped.append(
                         {"path": str(rel), "reason": f"exceeds 10 MB cap ({size} bytes)"}
@@ -1949,3 +2000,62 @@ def endpoint_template(environ: Mapping[str, str]) -> str | None:
     ).count("}"):
         raise ValueError(f"{AGENT_ENDPOINT_TEMPLATE_ENV} must contain exactly one {{name}}")
     return raw.rstrip("/")
+
+
+def derive_agent_token(master: str, name: str) -> str:
+    """An isolated agent's own MIRAGEN_INTERNAL_TOKEN: HMAC-SHA256(master,
+    "miragen-agent-token/v1\\0" + name), hex. MiraRun derives the same value
+    from its lanes agent token (mirarun adapters/miragen/routing.py); a
+    golden vector in both test suites keeps the two in step."""
+    return hmac.new(master.encode("utf-8"), AGENT_TOKEN_CONTEXT + name.encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def isolated_agents(environ: Mapping[str, str]) -> bool:
+    raw = (environ.get(ISOLATED_AGENTS_ENV) or "").strip().lower()
+    if raw in ("", "off", "0", "false", "no"):
+        return False
+    if raw in ("on", "1", "true", "yes"):
+        return True
+    raise ValueError(f"{ISOLATED_AGENTS_ENV} must be on or off")
+
+
+def agent_isolation(environ: Mapping[str, str]) -> AgentIsolation | None:
+    if not isolated_agents(environ):
+        return None
+    peers = []
+    for entry in (environ.get(AGENT_NETWORK_PEERS_ENV) or "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        container, _, aliases = entry.partition("=")
+        alias_list = tuple(a for a in aliases.split("+") if a)
+        for value in (container, *alias_list):
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
+                raise ValueError(f"{AGENT_NETWORK_PEERS_ENV}: invalid entry {entry!r}")
+        peers.append((container, alias_list))
+    if not peers:
+        raise ValueError(
+            f"{ISOLATED_AGENTS_ENV}=on needs {AGENT_NETWORK_PEERS_ENV}: without a peer "
+            "nothing can reach an isolated agent")
+    tmpfs_raw = (environ.get(AGENT_TMPFS_ENV) or "").strip()
+    tmpfs = tuple(t.strip() for t in tmpfs_raw.split(";") if t.strip()) or DEFAULT_TMPFS
+    return AgentIsolation(
+        peers=tuple(peers),
+        pids_limit=int(environ.get(AGENT_PIDS_LIMIT_ENV) or 512),
+        tmpfs=tmpfs,
+    )
+
+
+def _as_secret_files(env: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+    """Move credential values out of the environment: NAME=value becomes
+    NAME_FILE=<SECRET_FILES_DIR>/<name> plus a file with the value."""
+    out: dict[str, str] = {}
+    files: dict[str, str] = {}
+    for key, value in env.items():
+        if key in SECRET_ENV_NAMES or GRANTABLE_RE.fullmatch(key):
+            files[key] = value
+            out[f"{key}_FILE"] = f"{SECRET_FILES_DIR}/{key.lower()}"
+        else:
+            out[key] = value
+    return out, files

@@ -289,3 +289,234 @@ def test_the_example_engineer_profile_validates():
     profile = yaml.safe_load(EXAMPLE.read_text())
     assert profile["spec"]["harness"]["posture"] == "engineer"
     assert profile["spec"]["harness"]["git_broker"]["credential_file"].startswith("/run/engineer/")
+
+
+# ── isolated agents (MIRAGEND_ISOLATED_AGENTS, the agents host) ──────────────
+
+import hashlib as _hashlib  # noqa: E402
+
+from miragen.daemon.core import derive_agent_token  # noqa: E402
+from miragen.daemon.spawn.docker_compose import private_bridge  # noqa: E402
+
+# Shared with mirarun's tests (tests/unit/test_lanes_miragend_routing.py):
+# both sides must derive the same token, or every lane turn is a 401.
+GOLDEN_MASTER = "golden-master-secret"
+GOLDEN_NAME = "lane-example"
+GOLDEN_TOKEN = "fbf6e59573900be8c15296dd15eebb47f241481fe4cc168baba816d54e50c69a"
+
+
+class FakeNetwork:
+    def __init__(self, name, **kw):
+        self.name = name
+        self.kw = kw
+        self.members: dict[str, list[str]] = {}
+        self.removed = False
+
+    def connect(self, container, aliases=None):
+        if container in self.members:
+            raise RuntimeError(f"endpoint with name {container} already exists in network")
+        self.members[container] = list(aliases or [])
+
+    def disconnect(self, container, force=False):
+        self.members.pop(container, None)
+
+    def remove(self):
+        self.removed = True
+
+
+class IsolationDocker(FakeDocker):
+    def __init__(self):
+        super().__init__()
+        self.networks_created.append("lanes-egress")
+        self.net_objects: dict[str, FakeNetwork] = {}
+        outer = self
+        base = self.networks
+
+        class _Networks:
+            def get(self, name):
+                if name in outer.net_objects and not outer.net_objects[name].removed:
+                    return outer.net_objects[name]
+                return base.get(name)
+
+            def create(self, name, **kw):
+                outer.networks_created.append(name)
+                net = FakeNetwork(name, **kw)
+                outer.net_objects[name] = net
+                return net
+
+            def list(self, filters=None):
+                return [n for n in outer.net_objects.values() if not n.removed]
+
+        self.networks = _Networks()
+
+
+ISOLATED = {
+    "MIRAGEND_ISOLATED_AGENTS": "on",
+    "MIRAGEND_AGENT_NETWORKS": "lanes-egress",
+    "MIRAGEND_AGENT_NETWORK_PEERS": "lanes-gateway=github-broker",
+}
+
+
+def _isolated_core(tmp_path, extra=None):
+    docker_client = IsolationDocker()
+    core = _core(tmp_path, {**ISOLATED, **(extra or {})}, docker_client)
+    return core, docker_client
+
+
+def test_the_derived_agent_token_matches_the_golden_vector():
+    assert derive_agent_token(GOLDEN_MASTER, GOLDEN_NAME) == GOLDEN_TOKEN
+
+
+def test_an_isolated_agent_holds_its_own_token_never_the_daemons(tmp_path):
+    core, _ = _isolated_core(tmp_path)
+    core.create_agent("lane-a", _yaml("lane-a"))
+    core.create_agent("lane-b", _yaml("lane-b"))
+    files = {n: tmp_path / "agent-secrets" / n / "miragen_internal_token"
+             for n in ("lane-a", "lane-b")}
+    a, b = (files[n].read_text() for n in ("lane-a", "lane-b"))
+    assert a == derive_agent_token("shared-secret", "lane-a")
+    assert b == derive_agent_token("shared-secret", "lane-b")
+    assert len({a, b, "shared-secret"}) == 3
+
+
+def test_isolated_credentials_are_files_not_environment_values(tmp_path):
+    core, _ = _isolated_core(tmp_path, {"OPENAI_API_KEY": "sk-the-value",
+                                         "CLAUDE_CODE_OAUTH_TOKEN": "oauth-value"})
+    core.create_agent("lane-a", _yaml("lane-a", model="openai:gpt-4o"))
+    compose_text = (tmp_path / "compose.yml").read_text()
+    for value in ("sk-the-value", "shared-secret", derive_agent_token("shared-secret", "lane-a")):
+        assert value not in compose_text
+    service = _service(tmp_path, "lane-a")
+    env = service["environment"]
+    assert env["OPENAI_API_KEY_FILE"] == "/run/miragen-secrets/openai_api_key"
+    assert env["MIRAGEN_INTERNAL_TOKEN_FILE"] == "/run/miragen-secrets/miragen_internal_token"
+    assert "OPENAI_API_KEY" not in env and "MIRAGEN_INTERNAL_TOKEN" not in env
+    secret = tmp_path / "agent-secrets" / "lane-a" / "openai_api_key"
+    assert secret.read_text() == "sk-the-value"
+    assert secret.stat().st_mode & 0o777 == 0o400
+    assert "./agent-secrets/lane-a:/run/miragen-secrets:ro" in service["volumes"]
+    # Never under the agent's own workspace (file API, export).
+    assert not list((tmp_path / "agents" / "lane-a").rglob("openai_api_key"))
+
+
+def test_a_revoked_grant_leaves_no_file_and_an_unchanged_update_no_recreate(tmp_path):
+    core, _ = _isolated_core(tmp_path, {"OPENAI_API_KEY": "sk"})
+    core.create_agent("lane-a", _yaml("lane-a", model="openai:gpt-4o"))
+    spec = core._current_spec("lane-a")
+    again = core._build_service_spec("lane-a", spec.image,
+                                     profile_text=_yaml("lane-a", model="openai:gpt-4o"))
+    assert core._delivered(spec) == core._delivered(again)
+    core._define_service("lane-a", core._build_service_spec(
+        "lane-a", spec.image, profile_text=_yaml("lane-a")))
+    assert not (tmp_path / "agent-secrets" / "lane-a" / "openai_api_key").exists()
+
+
+def test_each_isolated_agent_gets_a_private_network_shared_only_with_peers(tmp_path):
+    core, docker_client = _isolated_core(tmp_path)
+    core.create_agent("lane-a", _yaml("lane-a"))
+    core.create_agent("lane-b", _yaml("lane-b"))
+    a = _service(tmp_path, "lane-a")
+    b = _service(tmp_path, "lane-b")
+    assert a["networks"] == ["miragen-agent-lane-a", "lanes-egress"]
+    assert b["networks"] == ["miragen-agent-lane-b", "lanes-egress"]
+    net = docker_client.net_objects["miragen-agent-lane-a"]
+    assert net.kw["internal"] is True
+    assert net.kw["options"]["com.docker.network.bridge.name"] == private_bridge("lane-a")
+    assert len(private_bridge("lane-a")) <= 15 and private_bridge("lane-a").startswith("lna")
+    assert net.members == {"lanes-gateway": ["github-broker"]}  # never another agent
+
+
+def test_a_recreated_gateway_is_reattached_on_agent_start(tmp_path):
+    core, docker_client = _isolated_core(tmp_path)
+    core.create_agent("lane-a", _yaml("lane-a"))
+    net = docker_client.net_objects["miragen-agent-lane-a"]
+    net.members.clear()  # the gateway container was recreated
+    core.start_agent("lane-a")
+    assert "lanes-gateway" in net.members
+    net.members.clear()
+    core.ensure_network()  # daemon start
+    assert "lanes-gateway" in net.members
+
+
+def test_deleting_an_isolated_agent_removes_its_network_and_secrets(tmp_path):
+    core, docker_client = _isolated_core(tmp_path)
+    core.create_agent("lane-a", _yaml("lane-a"))
+    core.delete_agent("lane-a")
+    assert docker_client.net_objects["miragen-agent-lane-a"].removed
+    assert not (tmp_path / "agent-secrets" / "lane-a").exists()
+
+
+def test_isolated_units_are_hardened(tmp_path):
+    core, _ = _isolated_core(tmp_path)
+    core.create_agent("lane-a", _yaml("lane-a"))
+    service = _service(tmp_path, "lane-a")
+    assert service["security_opt"] == ["no-new-privileges:true"]
+    assert service["cap_drop"] == ["ALL"]
+    assert service["pids_limit"] == 512
+    assert service["read_only"] is True
+    assert any(t.startswith("/run/engineer:uid=1000") for t in service["tmpfs"])
+
+
+def test_isolation_needs_a_peer():
+    from miragen.daemon.core import agent_isolation
+
+    with pytest.raises(ValueError):
+        agent_isolation({"MIRAGEND_ISOLATED_AGENTS": "on"})
+    assert agent_isolation({}) is None
+
+
+def test_an_isolated_daemon_serves_no_contract_and_no_schedules(tmp_path):
+    from miragen.daemon.schedules import ScheduleStore
+    from tests.test_daemon_api import FakeScheduler
+
+    core, _ = _isolated_core(tmp_path / "ws")
+    app = create_app(core, ScheduleStore(FakeScheduler()), token="daemon-token",
+                     internal_token="shared-secret")
+    client = TestClient(app)
+    caps = client.get("/health").json()["capabilities"]
+    assert "schedules/v1" not in caps and "executor-launch/v1" not in caps
+    for method, path in (("post", "/executor-runs"), ("post", "/profiles/resolve"),
+                         ("get", "/runs/x"), ("post", "/runs/x/resume")):
+        response = client.request(method.upper(), path,
+                                  headers={"X-Miragen-Token": "shared-secret"}, json={})
+        assert response.status_code in (404, 405), (path, response.status_code)
+    authed = {"Authorization": "Bearer daemon-token"}
+    assert client.get("/schedules", headers=authed).status_code in (404, 405)
+
+
+def test_a_normal_daemon_still_serves_the_contract(tmp_path):
+    core = _core(tmp_path, {})
+    client = TestClient(create_app(core, token="daemon-token", internal_token="shared-secret"))
+    assert "executor-launch/v1" in client.get("/health").json()["capabilities"]
+    assert client.post("/profiles/resolve", json={}).status_code == 401
+
+
+def test_contract_calls_and_agent_reads_are_audited(tmp_path):
+    log = tmp_path / "audit.jsonl"
+    core = _core(tmp_path / "ws", {"MIRAGEND_AUDIT_LOG": str(log)})
+    client = TestClient(create_app(core, token="daemon-token", internal_token="shared-secret"))
+    client.headers["Authorization"] = "Bearer daemon-token"
+    client.post("/agents", json={"name": "alpha", "yaml_source": _yaml()})
+    client.post("/profiles/resolve", json={})
+    client.get("/agents/alpha/files", params={"path": "agent.yaml"})
+    client.get("/agents/alpha/logs")
+    client.post("/agents/alpha/export")
+    actions = [(r["action"], r["outcome"]) for r in _records(log)]
+    assert ("contract.call", "refused") in actions
+    assert ("agent.file.read", "succeeded") in actions
+    assert ("agent.logs.read", "succeeded") in actions
+    assert ("agent.export", "succeeded") in actions
+
+
+def test_hard_links_are_neither_served_nor_exported(tmp_path):
+    import os as _os
+
+    core = _core(tmp_path, {})
+    core.create_agent("alpha", _yaml())
+    outside = tmp_path / "outside-secret"
+    outside.write_text("host secret")
+    _os.link(outside, tmp_path / "agents" / "alpha" / "innocent.txt")
+    with pytest.raises(InvalidPath):
+        core.read_file("alpha", "innocent.txt")
+    result = core.export_agent("alpha")
+    assert "innocent.txt" not in result["included"]

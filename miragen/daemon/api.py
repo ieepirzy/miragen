@@ -151,6 +151,7 @@ def create_app(
     Grok Build / Codex on this machine joined (miragen/daemon/harness_setup.py);
     its status is on /health."""
     app = FastAPI(title="miragend", version=_miragen_version())
+    isolated = bool(getattr(core, "isolated", False))
 
     async def require_token(request: Request) -> None:
         if not token:
@@ -189,7 +190,11 @@ def create_app(
     @app.get("/health")
     def health() -> dict:
         capabilities = list(DAEMON_CAPABILITIES) if core is not None else []
-        if core is not None and internal_token:
+        if isolated:
+            # Neither schedules nor the run-control contract are served on an
+            # isolated daemon (core.py ISOLATED_AGENTS_ENV).
+            capabilities = [c for c in capabilities if c != "schedules/v1"]
+        if core is not None and internal_token and not isolated:
             # The run-control contract is served only when the shared agent
             # token exists to authenticate it (and to forward downstream), so
             # it is advertised only then — a capability string is a promise.
@@ -297,9 +302,11 @@ def create_app(
 
     @app.get("/agents/{name}/logs", dependencies=guarded)
     def agent_logs(
-        name: str, tail: int = Query(default=50, ge=1, le=1000)
+        request: Request, name: str, tail: int = Query(default=50, ge=1, le=1000)
     ) -> dict:
-        return {"name": name, "logs": core.agent_logs(name, tail=tail)}
+        logs = audited("agent.logs.read", name, request,
+                       lambda: core.agent_logs(name, tail=tail), tail=tail)
+        return {"name": name, "logs": logs}
 
     # -- tool management ----------------------------------------------------
 
@@ -335,8 +342,10 @@ def create_app(
     # -- workspace files ----------------------------------------------------
 
     @app.get("/agents/{name}/files", dependencies=guarded)
-    def read_file(name: str, path: str = Query(min_length=1)) -> dict:
-        return {"path": path, "content": core.read_file(name, path)}
+    def read_file(request: Request, name: str, path: str = Query(min_length=1)) -> dict:
+        content = audited("agent.file.read", name, request,
+                          lambda: core.read_file(name, path), path=path)
+        return {"path": path, "content": content}
 
     @app.put("/agents/{name}/files", dependencies=guarded)
     def write_file(name: str, body: WriteFileBody, request: Request) -> dict:
@@ -354,8 +363,8 @@ def create_app(
     # -- export / import ----------------------------------------------------
 
     @app.post("/agents/{name}/export", dependencies=guarded)
-    def export_agent(name: str) -> dict:
-        return core.export_agent(name)
+    def export_agent(name: str, request: Request) -> dict:
+        return audited("agent.export", name, request, lambda: core.export_agent(name))
 
     @app.post("/agents/import", status_code=201, dependencies=guarded)
     def import_agent(body: ImportBody, request: Request) -> dict:
@@ -375,7 +384,7 @@ def create_app(
 
     # -- schedules ----------------------------------------------------------
 
-    if schedules is not None:
+    if schedules is not None and not isolated:
 
         @app.post("/schedules", status_code=201, dependencies=guarded)
         def set_schedule(body: ScheduleBody) -> dict:
@@ -404,9 +413,14 @@ def create_app(
     # "unconfigured" rather than 404 — a client can tell "daemon too old"
     # from "daemon missing its token". Capabilities advertise only when
     # configured (see health()).
-    register_contract_routes(
-        app, core, internal_token=internal_token, transport=contract_transport
-    )
+    # An isolated daemon (the agents host) serves none of it: its agents
+    # are driven directly by the control plane through the gateway, and the
+    # contract's shared-token routes are exactly what an agent could use to
+    # run another agent's profile.
+    if not isolated:
+        register_contract_routes(
+            app, core, internal_token=internal_token, transport=contract_transport
+        )
 
     return app
 
@@ -719,7 +733,12 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
 
     schedules_module.set_endpoint_resolver(core.endpoint)
 
-    schedules = ScheduleStore(build_scheduler(workspace / "retriggers.sqlite"))
+    # An isolated daemon shares no network with its agents, so a re-trigger
+    # could never reach one: no schedules there.
+    schedules = (
+        None if core.isolated
+        else ScheduleStore(build_scheduler(workspace / "retriggers.sqlite"))
+    )
     app = create_app(
         core,
         schedules,
@@ -733,13 +752,14 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
         harness_setup=harness_setup,
     )
 
-    @app.router.on_event("startup")
-    async def _start_scheduler() -> None:
-        schedules.start()
+    if schedules is not None:
+        @app.router.on_event("startup")
+        async def _start_scheduler() -> None:
+            schedules.start()
 
-    @app.router.on_event("shutdown")
-    async def _stop_scheduler() -> None:
-        schedules.shutdown()
+        @app.router.on_event("shutdown")
+        async def _stop_scheduler() -> None:
+            schedules.shutdown()
 
     uvicorn.run(
         app,

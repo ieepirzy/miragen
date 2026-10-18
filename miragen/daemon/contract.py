@@ -107,7 +107,7 @@ def register_contract_routes(
     # allowed to be lost on restart — never a source of truth.
     run_owners: dict[str, str] = {}
 
-    def _authorized(request: Request) -> Response | None:
+    def _check(request: Request) -> Response | None:
         if not internal_token:
             return JSONResponse(
                 status_code=503,
@@ -131,6 +131,21 @@ def register_contract_routes(
                 },
             )
         return None
+
+    def _authorized(request: Request) -> Response | None:
+        """The token check, audited: every contract call, accepted or not,
+        leaves a record (miragen/daemon/audit.py; fail-open)."""
+        denied = _check(request)
+        audit = getattr(core, "audit", None)
+        if audit is not None:
+            audit.record(
+                "contract.call",
+                outcome="refused" if denied is not None else "accepted",
+                method=request.method,
+                path=request.url.path,
+                client=request.client.host if request.client else None,
+            )
+        return denied
 
     def _managed_profile(name: str) -> AgentProfile | None:
         try:
