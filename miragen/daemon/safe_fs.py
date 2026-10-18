@@ -91,8 +91,10 @@ def open_regular(base: Path, rel: str | os.PathLike) -> int:
     *dirs, name = _parts(rel)
     with _dir_fd(base, dirs) as dfd:
         try:
-            fd = os.open(name, os.O_RDONLY | _NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-                         dir_fd=dfd)
+            # O_NONBLOCK: opening a FIFO the agent planted must not hang the
+            # daemon; fstat below refuses it (regular files ignore the flag).
+            fd = os.open(name, os.O_RDONLY | _NOFOLLOW | os.O_NONBLOCK
+                         | getattr(os, "O_CLOEXEC", 0), dir_fd=dfd)
         except OSError as exc:
             if isinstance(exc, FileNotFoundError):
                 raise

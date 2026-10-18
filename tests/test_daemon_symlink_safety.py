@@ -164,3 +164,49 @@ def test_the_check_and_the_use_are_the_same_fd(tmp_path):
         os.close(fd)
     with pytest.raises(safe_fs.UnsafeAgentPath):
         safe_fs.read_text(base, "f")
+
+
+def test_a_planted_fifo_or_directory_is_refused_without_hanging(setup):
+    import signal
+
+    core, workspace, _ = setup
+    os.mkfifo(workspace / "pipe")
+    (workspace / "adir").mkdir()
+
+    def hung(*_):
+        raise TimeoutError("the daemon blocked on a FIFO")
+
+    old = signal.signal(signal.SIGALRM, hung)
+    signal.alarm(5)
+    try:
+        for rel in ("pipe", "adir"):
+            with pytest.raises(InvalidPath):
+                core.read_file("lane-x", rel)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def test_export_archives_the_checked_fd_even_if_the_name_is_swapped(setup, monkeypatch):
+    import tarfile
+
+    from miragen.daemon import core as core_module
+
+    core, workspace, secret = setup
+    (workspace / "notes.txt").write_text("plain")
+    real_open = tarfile.open
+
+    def swap_then_open(*args, **kwargs):
+        # After the walk checked notes.txt, before it is archived.
+        (workspace / "notes.txt").unlink()
+        (workspace / "notes.txt").symlink_to(secret)
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(core_module.tarfile, "open", swap_then_open)
+    result = core.export_agent("lane-x")
+    monkeypatch.setattr(core_module.tarfile, "open", real_open)
+    with tarfile.open(result["archive_path"]) as tar:
+        for member in tar.getmembers():
+            if member.isfile():
+                assert SECRET.encode() not in tar.extractfile(member).read()
+    assert "notes.txt" not in result["included"]
