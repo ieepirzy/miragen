@@ -1480,9 +1480,18 @@ async def lifespan(app: FastAPI):
             inbox_stop = asyncio.Event()
             inbox_task = (asyncio.create_task(_inbox.run(inbox_stop), name="inbox")
                           if _inbox is not None else None)
+            # Harness processes started ahead of their first turn (Grok:
+            # MIRAGEN_GROK_PREWARM); it runs while the server starts serving.
+            prewarm = getattr(_harness, "prewarm", None)
+            prewarm_task = (asyncio.create_task(prewarm(), name="harness-prewarm")
+                            if prewarm is not None else None)
             try:
                 yield
             finally:
+                if prewarm_task is not None and not prewarm_task.done():
+                    prewarm_task.cancel()
+                    with suppress(BaseException):
+                        await prewarm_task
                 inbox_stop.set()
                 if inbox_task is not None:
                     with suppress(Exception):

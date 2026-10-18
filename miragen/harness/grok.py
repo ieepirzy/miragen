@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fnmatch
 import hashlib
 import json
 import logging
@@ -105,6 +106,12 @@ class GrokSettings:
     # grok's default for the model (grok-4.6: high).
     effort: str | None = None
     instance_effort: dict[str, str] = field(default_factory=dict)
+    # Instances (glob patterns) started in the background when miragen
+    # starts, most recently used first, at most `prewarm_max`: the first turn
+    # after a restart finds its process running (grok's start + session/load
+    # is ~15 s). No model call is made. Empty: none.
+    prewarm: tuple[str, ...] = ()
+    prewarm_max: int = 1
 
     def effort_for(self, instance: str) -> str | None:
         return self.instance_effort.get(instance, self.effort)
@@ -128,6 +135,9 @@ class GrokSettings:
                                     if env.get("MIRAGEN_GROK_NATIVE_COMPACT_PERCENT") else 90),
             effort=_effort(env.get("MIRAGEN_GROK_EFFORT") or None, "MIRAGEN_GROK_EFFORT"),
             instance_effort=_instance_efforts(env.get("MIRAGEN_GROK_INSTANCE_EFFORT", "")),
+            prewarm=tuple(p.strip() for p in env.get("MIRAGEN_GROK_PREWARM", "").split(",")
+                          if p.strip()),
+            prewarm_max=int(env.get("MIRAGEN_GROK_PREWARM_MAX", "1")),
         )
 
 
@@ -435,6 +445,12 @@ class GrokHarness(MiraRunEnv):
         return session_id
 
     async def _agent_for(self, instance: str, *, ephemeral: bool) -> _Agent:
+        # A running process needs no lock: a warm turn must never wait behind
+        # another instance's spawn (a prewarm holds the lock for ~15 s).
+        agent = self._agents.get(instance)
+        if agent is not None and agent.acp.alive:
+            agent.reserved += 1
+            return agent
         async with self._spawn_lock:
             agent = self._agents.get(instance)
             if agent is not None and agent.acp.alive:
@@ -451,11 +467,52 @@ class GrokHarness(MiraRunEnv):
             self._ensure_reaper()
             return agent
 
+    async def prewarm(self) -> list[str]:
+        """Start the configured instances' processes ahead of their first
+        turn (see GrokSettings.prewarm). Best effort: a failure is logged and
+        the turn starts the process as it would have anyway."""
+        patterns = self.settings.prewarm
+        if not patterns or self.settings.prewarm_max <= 0:
+            return []
+        state = self._load_state()
+        ranked = sorted(
+            # Not an instance with MiraRun execution refs: its process must
+            # start with the refs of the turn that needs it.
+            (name for name, entry in state.items()
+             if entry.get("session_id") and not entry.get("mirarun")
+             and any(fnmatch.fnmatchcase(name, p) for p in patterns)),
+            key=lambda name: float(state[name].get("updated_at")
+                                   or state[name].get("session_started_at") or 0),
+            reverse=True)
+        # Never more than the process cap allows without evicting the others.
+        room = max(0, self.settings.max_processes - len(self._agents))
+        warmed: list[str] = []
+        for name in ranked[:min(self.settings.prewarm_max, room)]:
+            if name in self._agents:
+                continue
+            started = time.monotonic()
+            try:
+                agent = await self._agent_for(name, ephemeral=False)
+            except Exception as exc:  # noqa: BLE001 — best effort; the turn spawns it
+                logger.warning("grok harness: prewarm of %s failed: %s", name, exc)
+                continue
+            agent.reserved -= 1
+            # Started ahead of time: its first turn is warm, not this start's.
+            agent.startup = None
+            agent.last_used = time.monotonic()
+            warmed.append(name)
+            logger.info("grok harness: prewarmed %s in %.1f s", name, time.monotonic() - started)
+        return warmed
+
     async def _evict_for_capacity(self) -> None:
         idle = sorted((a for a in self._agents.values() if not a.busy),
                       key=lambda a: a.last_used)
         while len(self._agents) >= self.settings.max_processes and idle:
-            await self._drop(idle.pop(0).instance)
+            victim = idle.pop(0)
+            # Reserved since the list was made (the lock-free path above)?
+            if victim.busy or self._agents.get(victim.instance) is not victim:
+                continue
+            await self._drop(victim.instance)
 
     async def _drop(self, instance: str) -> None:
         agent = self._agents.pop(instance, None)
@@ -475,7 +532,9 @@ class GrokHarness(MiraRunEnv):
                 if not agent.busy and now - agent.last_used > self.settings.idle_s:
                     logger.info("grok harness: stopping idle process for %s", agent.instance)
                     async with self._spawn_lock:
-                        await self._drop(agent.instance)
+                        # Re-checked under the lock: a turn may have taken it.
+                        if not agent.busy and self._agents.get(agent.instance) is agent:
+                            await self._drop(agent.instance)
 
     # ── turns ────────────────────────────────────────────────────────────
     def _key(self, turn: HarnessTurn) -> tuple[str, bool]:

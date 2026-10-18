@@ -686,3 +686,56 @@ def test_effort_settings_from_env(monkeypatch):
     monkeypatch.setenv("MIRAGEN_GROK_INSTANCE_EFFORT", "mira-heartbeat=lowest")
     with pytest.raises(ValueError, match="unknown reasoning effort 'lowest'"):
         GrokSettings.from_env(gateway_url="http://x/")
+
+
+async def test_prewarm_starts_the_most_recent_matching_instance_and_its_turn_is_warm(env):
+    # Mira#86: most of Ilari's messages came hours apart, after a deploy or an
+    # idle reap, and paid ~15 s of grok start + session/load.
+    h = env.harness()
+    await h.run(turn("one", instance="conv_old", run_id="r1"))
+    await h.run(turn("one", instance="mira-heartbeat", run_id="r2"))
+    await h.run(turn("one", instance="conv_new", run_id="r3"))
+    await h.aclose()
+    h2 = env.harness(prewarm=("conv_*",), prewarm_max=1)
+    assert await h2.prewarm() == ["conv_new"]
+    assert h2.status()["processes"] == ["conv_new"]
+    res = await h2.run(turn("HISTORY", instance="conv_new", run_id="r4"))
+    assert res.output.startswith("turns=2")          # the same conversation, resumed
+    assert res.timings["cold"] is False              # its process was already running
+
+
+async def test_prewarm_is_off_by_default_and_never_exceeds_the_process_cap(env):
+    h = env.harness()
+    await h.run(turn("one", instance="conv_a", run_id="r1"))
+    await h.run(turn("one", instance="conv_b", run_id="r2"))
+    await h.aclose()
+    assert await env.harness().prewarm() == []
+    capped = env.harness(prewarm=("conv_*",), prewarm_max=5, max_processes=1)
+    assert len(await capped.prewarm()) == 1
+
+
+def test_prewarm_settings_from_env(monkeypatch):
+    monkeypatch.setenv("MIRAGEN_GROK_PREWARM", "conv_*, chat")
+    monkeypatch.setenv("MIRAGEN_GROK_PREWARM_MAX", "2")
+    s = GrokSettings.from_env(gateway_url="http://x/")
+    assert s.prewarm == ("conv_*", "chat") and s.prewarm_max == 2
+
+
+async def test_a_warm_turn_never_waits_behind_another_spawn(env):
+    # Review of #215: a prewarm holds the spawn lock for a whole spawn
+    # (~15 s); a turn whose process is already running must not wait on it.
+    import asyncio
+
+    h = env.harness()
+    await h.run(turn("one", instance="warm", run_id="r1"))
+    async with h._spawn_lock:                  # someone else is spawning
+        res = await asyncio.wait_for(h.run(turn("two", instance="warm", run_id="r2")), 5)
+    assert res.timings["cold"] is False
+
+
+async def test_prewarm_skips_instances_with_mirarun_refs(env):
+    h = env.harness()
+    await h.run(turn("one", instance="conv_a", run_id="r1"))
+    await h._update_instance("conv_a", mirarun={"MIRARUN_RUN_ID": "x"})
+    await h.aclose()
+    assert await env.harness(prewarm=("conv_*",)).prewarm() == []
