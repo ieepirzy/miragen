@@ -719,3 +719,23 @@ def test_prewarm_settings_from_env(monkeypatch):
     monkeypatch.setenv("MIRAGEN_GROK_PREWARM_MAX", "2")
     s = GrokSettings.from_env(gateway_url="http://x/")
     assert s.prewarm == ("conv_*", "chat") and s.prewarm_max == 2
+
+
+async def test_a_warm_turn_never_waits_behind_another_spawn(env):
+    # Review of #215: a prewarm holds the spawn lock for a whole spawn
+    # (~15 s); a turn whose process is already running must not wait on it.
+    import asyncio
+
+    h = env.harness()
+    await h.run(turn("one", instance="warm", run_id="r1"))
+    async with h._spawn_lock:                  # someone else is spawning
+        res = await asyncio.wait_for(h.run(turn("two", instance="warm", run_id="r2")), 5)
+    assert res.timings["cold"] is False
+
+
+async def test_prewarm_skips_instances_with_mirarun_refs(env):
+    h = env.harness()
+    await h.run(turn("one", instance="conv_a", run_id="r1"))
+    await h._update_instance("conv_a", mirarun={"MIRARUN_RUN_ID": "x"})
+    await h.aclose()
+    assert await env.harness(prewarm=("conv_*",)).prewarm() == []

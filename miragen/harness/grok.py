@@ -445,6 +445,12 @@ class GrokHarness(MiraRunEnv):
         return session_id
 
     async def _agent_for(self, instance: str, *, ephemeral: bool) -> _Agent:
+        # A running process needs no lock: a warm turn must never wait behind
+        # another instance's spawn (a prewarm holds the lock for ~15 s).
+        agent = self._agents.get(instance)
+        if agent is not None and agent.acp.alive:
+            agent.reserved += 1
+            return agent
         async with self._spawn_lock:
             agent = self._agents.get(instance)
             if agent is not None and agent.acp.alive:
@@ -470,8 +476,11 @@ class GrokHarness(MiraRunEnv):
             return []
         state = self._load_state()
         ranked = sorted(
+            # Not an instance with MiraRun execution refs: its process must
+            # start with the refs of the turn that needs it.
             (name for name, entry in state.items()
-             if entry.get("session_id") and any(fnmatch.fnmatchcase(name, p) for p in patterns)),
+             if entry.get("session_id") and not entry.get("mirarun")
+             and any(fnmatch.fnmatchcase(name, p) for p in patterns)),
             key=lambda name: float(state[name].get("updated_at")
                                    or state[name].get("session_started_at") or 0),
             reverse=True)
@@ -499,7 +508,11 @@ class GrokHarness(MiraRunEnv):
         idle = sorted((a for a in self._agents.values() if not a.busy),
                       key=lambda a: a.last_used)
         while len(self._agents) >= self.settings.max_processes and idle:
-            await self._drop(idle.pop(0).instance)
+            victim = idle.pop(0)
+            # Reserved since the list was made (the lock-free path above)?
+            if victim.busy or self._agents.get(victim.instance) is not victim:
+                continue
+            await self._drop(victim.instance)
 
     async def _drop(self, instance: str) -> None:
         agent = self._agents.pop(instance, None)
@@ -519,7 +532,9 @@ class GrokHarness(MiraRunEnv):
                 if not agent.busy and now - agent.last_used > self.settings.idle_s:
                     logger.info("grok harness: stopping idle process for %s", agent.instance)
                     async with self._spawn_lock:
-                        await self._drop(agent.instance)
+                        # Re-checked under the lock: a turn may have taken it.
+                        if not agent.busy and self._agents.get(agent.instance) is agent:
+                            await self._drop(agent.instance)
 
     # ── turns ────────────────────────────────────────────────────────────
     def _key(self, turn: HarnessTurn) -> tuple[str, bool]:
