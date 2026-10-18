@@ -46,9 +46,12 @@ AGENT_NETWORK_LABEL = "io.miragen.agent-network"
 # Host bridge names of per-agent networks start with this, so one host rule
 # (`-i lna+`) covers every lane bridge, including ones created later.
 LANE_BRIDGE_PREFIX = "lna"
+# The engineer image's agent user (Dockerfile.engineer): a high uid, so an
+# agent's files on the host belong to no login user.
+AGENT_UID = 10000
 DEFAULT_TMPFS = (
     "/tmp:size=512m,mode=1777",
-    "/run/engineer:uid=1000,gid=1000,mode=0700,size=16m",
+    f"/run/engineer:uid={AGENT_UID},gid={AGENT_UID},mode=0700,size=16m",
 )
 
 
@@ -70,6 +73,10 @@ class AgentIsolation:
     pids_limit: int = 512
     read_only: bool = True
     tmpfs: tuple[str, ...] = DEFAULT_TMPFS
+    # miragend's own gid: the agent gets it as a supplementary group, so it
+    # can read the secret files miragend writes (0440) and write its own
+    # workspace (0770), while running as a uid of its own.
+    shared_gid: int | None = None
 
 
 def private_network(name: str) -> str:
@@ -153,9 +160,13 @@ class DockerComposeSpawnDriver:
         shutil.rmtree(target, ignore_errors=True)  # a revoked grant leaves nothing
         target.mkdir(parents=True, mode=0o700)
         target.chmod(0o700)
+        if self.isolation is not None and self.isolation.shared_gid is not None:
+            # Group-readable for the agent (supplementary gid), nobody else.
+            target.chmod(0o750)
         for var, value in files.items():
             path = target / var.lower()
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+            mode = 0o440 if self.isolation is not None and self.isolation.shared_gid is not None else 0o400
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
             with os.fdopen(fd, "w") as handle:
                 handle.write(value)
 
@@ -174,6 +185,7 @@ class DockerComposeSpawnDriver:
         network_name = private_network(name)
         try:
             network = self._docker.networks.get(network_name)
+            self._verify_private_network(network, name)
         except self._not_found:
             network = self._docker.networks.create(
                 network_name,
@@ -184,6 +196,22 @@ class DockerComposeSpawnDriver:
             )
         self._connect_peers(network)
         return network_name
+
+    def _verify_private_network(self, network, name: str) -> None:
+        """A network with the agent's network name that miragend did not make
+        for this agent (not internal, or another label) is refused, never
+        reused: it could give the agent a route or a neighbour."""
+        attrs = getattr(network, "attrs", None)
+        if attrs is None:
+            kw = getattr(network, "kw", {})  # test fakes
+            internal, labels = kw.get("internal"), kw.get("labels") or {}
+        else:
+            internal = attrs.get("Internal")
+            labels = attrs.get("Labels") or {}
+        if internal is not True or labels.get(AGENT_NETWORK_LABEL) != name:
+            raise SpawnOperationFailed(
+                f"network '{network.name}' exists but is not this agent's private "
+                "network (internal, labelled by miragend); refusing to reuse it")
 
     def _connect_peers(self, network) -> None:
         for container, aliases in self.isolation.peers:
@@ -267,6 +295,8 @@ class DockerComposeSpawnDriver:
             service["volumes"].append(f"./agent-secrets/{name}:{SECRET_FILES_DIR}:ro")
             service["security_opt"] = ["no-new-privileges:true"]
             service["cap_drop"] = ["ALL"]
+            if self.isolation.shared_gid is not None:
+                service["group_add"] = [str(self.isolation.shared_gid)]
             service["pids_limit"] = self.isolation.pids_limit
             if self.isolation.read_only:
                 service["read_only"] = True
@@ -340,6 +370,9 @@ class DockerComposeSpawnDriver:
         return logs.decode("utf-8", errors="replace")
 
     def restart(self, name: str) -> None:
+        if self.isolation is not None:
+            # Same as up(): a recreated gateway lost its attachment.
+            self._ensure_private_network(name)
         try:
             self._docker.containers.get(name).restart()
         except self._not_found:

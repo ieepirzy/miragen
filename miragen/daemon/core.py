@@ -130,6 +130,12 @@ AGENT_TMPFS_ENV = "MIRAGEND_AGENT_TMPFS"
 AGENT_TOKEN_CONTEXT = b"miragen-agent-token/v1\0"
 # Values that become secret files under isolation.
 SECRET_ENV_NAMES = frozenset({"MIRAGEN_INTERNAL_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"})
+# Any variable named like a credential also becomes a file under isolation
+# (the model rates token, a passthrough token).
+SECRET_ENV_SUFFIXES = ("_TOKEN", "_API_KEY", "_SECRET", "_PASSWORD")
+# Tells an isolated agent's app that an empty MIRAGEN_INTERNAL_TOKEN is an
+# error, not "no auth" (miragen/app.py).
+INTERNAL_AUTH_ENV = "MIRAGEN_INTERNAL_AUTH"
 AGENT_ENDPOINT_TEMPLATE_ENV = "MIRAGEND_AGENT_ENDPOINT_TEMPLATE"
 
 # A Claude Code credentials store (an interactive login, or plugin secrets
@@ -744,6 +750,31 @@ class LifecycleCore:
             "oom_killed": getattr(lifecycle, "oom_killed", None),
         }
 
+    def reconcile_peers(self) -> None:
+        """Re-attach the gateway to every agent's private network (isolated
+        mode). Cheap and idempotent; run periodically so a recreated gateway
+        gets its attachments back without an agent restart."""
+        reconnect = getattr(self._spawn_driver, "reconnect_peers", None)
+        if reconnect is None:
+            return
+        try:
+            reconnect()
+        except Exception as exc:  # the next pass retries
+            logger.warning("peer reconcile failed: %s", exc)
+
+    def start_peer_reconciler(self, interval_s: float | None = None) -> threading.Thread:
+        interval = interval_s if interval_s is not None else float(
+            self._environ.get("MIRAGEND_PEER_RECONCILE_S") or 30)
+
+        def loop() -> None:
+            while True:
+                self._sleep(interval)
+                self.reconcile_peers()
+
+        thread = threading.Thread(target=loop, name="miragend-peer-reconcile", daemon=True)
+        thread.start()
+        return thread
+
     def ensure_network(self) -> None:
         self._spawn_driver.ensure_ready()
 
@@ -1253,6 +1284,7 @@ class LifecycleCore:
         # via MIRAGEND_AGENT_CPU_LIMIT / MIRAGEND_AGENT_MEM_LIMIT (see #57).
         secret_files: dict[str, str] = {}
         if self.isolated:
+            env[INTERNAL_AUTH_ENV] = "required"
             env, secret_files = _as_secret_files(env)
         cpu_limit = self._environ.get("MIRAGEND_AGENT_CPU_LIMIT", DEFAULT_AGENT_CPU_LIMIT)
         mem_limit = self._environ.get("MIRAGEND_AGENT_MEM_LIMIT", DEFAULT_AGENT_MEM_LIMIT)
@@ -1431,6 +1463,10 @@ class LifecycleCore:
                 )
             try:
                 d.mkdir(parents=True)
+                if self.isolated:
+                    # The agent runs as its own uid with miragend's gid as a
+                    # supplementary group (AgentIsolation.shared_gid).
+                    d.chmod(0o770)
             except Exception as exc:
                 raise DaemonError(str(exc)) from exc
 
@@ -2117,7 +2153,21 @@ def agent_isolation(environ: Mapping[str, str]) -> AgentIsolation | None:
         peers=tuple(peers),
         pids_limit=int(environ.get(AGENT_PIDS_LIMIT_ENV) or 512),
         tmpfs=tmpfs,
+        shared_gid=os.getgid(),
     )
+
+
+def check_isolated_tokens(daemon_token: str, master: str) -> None:
+    """An isolated daemon (the agents host) must have both tokens, and they
+    must differ: an empty MIRAGEND_TOKEN leaves the lifecycle API open on
+    the WireGuard address, an empty master leaves every agent's API open,
+    and equal ones make the agents' master the daemon's credential."""
+    if not daemon_token:
+        raise SystemExit(f"{ISOLATED_AGENTS_ENV}=on needs MIRAGEND_TOKEN")
+    if not master:
+        raise SystemExit(f"{ISOLATED_AGENTS_ENV}=on needs MIRAGEN_INTERNAL_TOKEN")
+    if hmac.compare_digest(daemon_token, master):
+        raise SystemExit("MIRAGEND_TOKEN and MIRAGEN_INTERNAL_TOKEN must differ")
 
 
 def _as_secret_files(env: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
@@ -2126,7 +2176,9 @@ def _as_secret_files(env: dict[str, str]) -> tuple[dict[str, str], dict[str, str
     out: dict[str, str] = {}
     files: dict[str, str] = {}
     for key, value in env.items():
-        if key in SECRET_ENV_NAMES or GRANTABLE_RE.fullmatch(key):
+        if key in SECRET_ENV_NAMES or GRANTABLE_RE.fullmatch(key) or (
+            key.endswith(SECRET_ENV_SUFFIXES) and not key.endswith("_FILE")
+        ):
             files[key] = value
             out[f"{key}_FILE"] = f"{SECRET_FILES_DIR}/{key.lower()}"
         else:

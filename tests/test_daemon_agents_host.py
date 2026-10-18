@@ -408,7 +408,10 @@ def test_isolated_credentials_are_files_not_environment_values(tmp_path):
     assert "OPENAI_API_KEY" not in env and "MIRAGEN_INTERNAL_TOKEN" not in env
     secret = tmp_path / "agent-secrets" / "lane-a" / "openai_api_key"
     assert secret.read_text() == "sk-the-value"
-    assert secret.stat().st_mode & 0o777 == 0o400
+    # Group-readable: the agent runs as its own uid with miragend's gid.
+    assert secret.stat().st_mode & 0o777 == 0o440
+    assert secret.parent.stat().st_mode & 0o777 == 0o750
+    assert service["group_add"] == [str(__import__("os").getgid())]
     assert "./agent-secrets/lane-a:/run/miragen-secrets:ro" in service["volumes"]
     # Never under the agent's own workspace (file API, export).
     assert not list((tmp_path / "agents" / "lane-a").rglob("openai_api_key"))
@@ -535,3 +538,63 @@ def test_hard_links_are_neither_served_nor_exported(tmp_path):
         core.read_file("alpha", "innocent.txt")
     result = core.export_agent("alpha")
     assert "innocent.txt" not in result["included"]
+
+
+
+# ── review round 2 ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("daemon_token,master", [("", "m"), ("d", ""), ("same", "same")])
+def test_an_isolated_daemon_refuses_missing_or_equal_tokens(daemon_token, master):
+    from miragen.daemon.core import check_isolated_tokens
+
+    with pytest.raises(SystemExit):
+        check_isolated_tokens(daemon_token, master)
+    check_isolated_tokens("daemon", "master")
+
+
+def test_isolated_agents_are_told_an_empty_token_is_an_error(tmp_path):
+    core, _ = _isolated_core(tmp_path)
+    core.create_agent("lane-a", _yaml("lane-a"))
+    assert _service(tmp_path, "lane-a")["environment"]["MIRAGEN_INTERNAL_AUTH"] == "required"
+
+
+def test_any_credential_named_variable_becomes_a_file(tmp_path):
+    core, _ = _isolated_core(tmp_path, {"MIRAGEN_MODEL_RATES_TOKEN": "rates-secret",
+                                         "MIRAGEN_MODEL_RATES_URL": "https://rates.example"})
+    core.create_agent("lane-a", _yaml("lane-a"))
+    env = _service(tmp_path, "lane-a")["environment"]
+    assert "rates-secret" not in (tmp_path / "compose.yml").read_text()
+    assert env["MIRAGEN_MODEL_RATES_TOKEN_FILE"].startswith("/run/miragen-secrets/")
+    assert env["MIRAGEN_MODEL_RATES_URL"] == "https://rates.example"
+
+
+def test_restart_reattaches_the_gateway(tmp_path):
+    core, docker_client = _isolated_core(tmp_path)
+    core.create_agent("lane-a", _yaml("lane-a"))
+    net = docker_client.net_objects["miragen-agent-lane-a"]
+    net.members.clear()
+    core.restart_agent("lane-a")
+    assert "lanes-gateway" in net.members
+
+
+def test_the_reconciler_reattaches_without_any_agent_action(tmp_path):
+    core, docker_client = _isolated_core(tmp_path)
+    core.create_agent("lane-a", _yaml("lane-a"))
+    net = docker_client.net_objects["miragen-agent-lane-a"]
+    net.members.clear()
+    core.reconcile_peers()
+    assert "lanes-gateway" in net.members
+
+
+def test_a_foreign_network_with_the_agents_name_is_not_reused(tmp_path):
+    core, docker_client = _isolated_core(tmp_path)
+    docker_client.networks.create("miragen-agent-lane-a", internal=False, labels={})
+    with pytest.raises(Exception, match="refusing to reuse"):
+        core.create_agent("lane-a", _yaml("lane-a"))
+
+
+def test_an_isolated_workspace_is_group_writable_only(tmp_path):
+    core, _ = _isolated_core(tmp_path)
+    core.create_agent("lane-a", _yaml("lane-a"))
+    assert (tmp_path / "agents" / "lane-a").stat().st_mode & 0o777 == 0o770

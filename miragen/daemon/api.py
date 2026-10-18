@@ -727,6 +727,11 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
         internal_token=os.getenv("MIRAGEN_INTERNAL_TOKEN", ""),
         spawn_driver=spawn_driver,
     )
+    if core.isolated:
+        from miragen.daemon.core import check_isolated_tokens
+
+        check_isolated_tokens(token, os.getenv("MIRAGEN_INTERNAL_TOKEN", ""))
+        core.start_peer_reconciler()
     core.ensure_network()
 
     import miragen.daemon.schedules as schedules_module
