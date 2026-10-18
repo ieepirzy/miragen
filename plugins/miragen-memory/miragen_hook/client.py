@@ -713,6 +713,12 @@ def _forward(
             write_recall_marker(event.session_id, pending, environ)
         else:
             clear_recall_marker(event.session_id, environ)
+    elif event.name in CONTEXT_OPENING and harness in ASYNC_RECALL_HARNESSES:
+        # The open's recall runs in the background: its number lets the first
+        # turn's tool results claim it (a one-prompt run would miss it else).
+        pending = answer.get("recall_pending")
+        if isinstance(pending, int) and not isinstance(pending, bool):
+            write_recall_marker(event.session_id, pending, environ)
     context = answer.get("context")
     if context and event.name in CONTEXT_BEARING:
         if deferred:

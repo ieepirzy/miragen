@@ -864,6 +864,35 @@ class TestOpenRecallInBackground:
         assert plane_preamble() in claim["context"] and "vault mounted" in claim["context"]
         assert h.plane.stats.open_recalls_delivered == 1
 
+    async def test_a_one_prompt_session_claims_it_from_its_first_tool_result(self, tmp_path):
+        import asyncio as _asyncio
+
+        gate = _asyncio.Event()
+        h = await self._seeded(tmp_path, self.picking(gate))
+        caps = {"capabilities": ["async-recall"]}
+        opened = await h.send("SessionStart", source="startup", session="s-2", client_extra=caps)
+        assert opened.recall_pending == 0                       # the adapter's marker
+        prompt = await h.send("UserPromptSubmit", session="s-2", prompt="ok", prompt_id="p-1",
+                              client_extra=caps)
+        assert prompt.recall_pending == opened.recall_pending   # no prompt recall: keep pointing at it
+        seq = prompt.recall_pending
+        assert (await h.plane.claim_recall("claude-code", "s-2", seq))["state"] == "pending"
+        gate.set()
+        await h.drain()
+        stop = await h.plane.claim_recall("claude-code", "s-2", seq, wait=5)
+        assert stop["state"] == "deferred"                      # a Stop is never blocked for it
+        claim = await h.plane.claim_recall("claude-code", "s-2", seq)
+        assert claim["state"] == "ready" and "vault mounted" in claim["context"]
+        assert h.plane.stats.open_recalls_delivered == 1
+        again = await h.plane.claim_recall("claude-code", "s-2", seq)
+        assert again["state"] == "stale"                        # delivered once
+
+    async def test_a_client_without_async_recall_gets_no_marker(self, tmp_path):
+        h = await self._seeded(tmp_path, self.picking())
+        opened = await h.send("SessionStart", source="startup", session="s-2")
+        assert opened.recall_pending is None
+        await h.drain()
+
     async def test_compaction_drops_a_running_open_recall(self, tmp_path):
         import asyncio as _asyncio
 
@@ -1189,6 +1218,7 @@ class TestAsyncRecall:
     async def test_nothing_stored_means_no_notice_and_nothing_pending(self, tmp_path):
         h = Harness(tmp_path, selector=_vault_selector())
         await h.send("SessionStart", source="startup", client_extra=ASYNC)
+        await h.drain()   # the open's own recall: no goal, nothing to claim
         result = await h.send("UserPromptSubmit", prompt="why does the hel1 deploy fail",
                               client_extra=ASYNC)
         assert result.recall_pending is None

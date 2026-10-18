@@ -523,6 +523,18 @@ class TestBackgroundRecall:
         assert self._run(tool, ready, env) == harness_output("claude-code", "PostToolUse", "RECALLED")
         assert read_recall_marker(LIVE["session_id"], env) is None
 
+    def test_the_opens_recall_is_claimable_from_the_first_turns_tools(self, env):
+        from miragen_hook.client import read_recall_marker
+
+        start = _router({self.EVENTS: {"context": "STATE", "recall_pending": 0}})
+        self._run({"hook_event_name": "SessionStart", "source": "startup"}, start, env)
+        assert read_recall_marker(LIVE["session_id"], env) == 0  # the open's own number
+        ready = _router({self.CLAIM: {"state": "ready", "context": "OPEN MEMORIES"}})
+        tool = {"hook_event_name": "PostToolUse", "tool_name": "Bash"}
+        assert self._run(tool, ready, env) == harness_output("claude-code", "PostToolUse",
+                                                             "OPEN MEMORIES")
+        assert read_recall_marker(LIVE["session_id"], env) is None
+
     def test_no_marker_means_no_request_at_all(self, env):
         silent = _router({})
         assert self._run({"hook_event_name": "PostToolUse", "tool_name": "Bash"}, silent, env) is None
