@@ -179,7 +179,7 @@ def _instance_idles(raw: str) -> dict[str, float]:
             value = float(seconds) if sep and name.strip() else -1.0
         except ValueError:
             value = -1.0
-        if value < 0:
+        if not value >= 0:  # also NaN, which would never compare as idle
             raise ValueError(f"MIRAGEN_GROK_INSTANCE_IDLE_S: expected instance=seconds, got '{item}'")
         idles[name.strip()] = value
     return idles

@@ -707,7 +707,7 @@ def test_instance_idle_settings_from_env(monkeypatch):
     s = GrokSettings.from_env(gateway_url="http://x/")
     assert s.idle_for("conv_x") == 604800 and s.idle_for("mira-heartbeat") == 120
     assert s.idle_for("mira-events") == 1800
-    for bad in ("mira-heartbeat", "mira-heartbeat=soon", "=60", "x=-1"):
+    for bad in ("mira-heartbeat", "mira-heartbeat=soon", "=60", "x=-1", "x=nan"):
         monkeypatch.setenv("MIRAGEN_GROK_INSTANCE_IDLE_S", bad)
         with pytest.raises(ValueError, match="expected instance=seconds"):
             GrokSettings.from_env(gateway_url="http://x/")
