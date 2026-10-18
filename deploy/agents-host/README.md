@@ -73,12 +73,12 @@ The stack runs miragend with `MIRAGEND_ISOLATED_AGENTS=on`.
    | `gh_broker_<lane>` | One per lane: that lane's broker credential, minted by MiraRun |
 
    For each lane, also add `GH_BROKER_<LANE>_API_KEY_FILE=/run/agents-host-secrets/gh_broker_<lane>` to stack.env. The lane's profile then lists `GH_BROKER_<LANE>_API_KEY` under `credentials:`.
-4. **Host egress guard.** Edit `/usr/local/sbin/agents-egress-guard`. The cloud-init change is movingfirm-infra#38, on top of #37.
+4. **Host egress guard.** Install movingfirm-infra#38's `/usr/local/sbin/agents-egress-guard` and the `docker.service.d/20-egress-guard.conf` drop-in on the live host (cloud-init only runs at first boot), then run `systemctl daemon-reload`. Docker then applies the guard before it starts, every time, and fails closed if the guard fails. The cloud-init change is movingfirm-infra#38, on top of #37.
    - **Allowlist:** add `<VPS_WG> <MIRARUN_BROKER_AGENT_PUBLISH_PORT>` to `/etc/agents-egress-allow`. Allowlist lines stay first.
    - **Reject the link:** if the point-to-point link is outside `10.8.0.0/24`, add a REJECT for its subnet (or `VPS_WG/32`).
-   - **Reject from lane bridges** (`lna+`), all `--ctstate NEW`:
-     - in `DOCKER-USER`, `-m conntrack --ctorigdst` for the mesh, the link and `AGENTS_WG/32`, which covers published ports hairpinned by DNAT;
-     - in `INPUT`, everything, which covers sshd, the Portainer agent and the bridge gateway IPs.
+   - **Reject from lane bridges** (`lna+`), all `--ctstate NEW` (the #38 script does this):
+     - in `DOCKER-USER`, leaving the lane's own bridge, every RFC1918, CGNAT and link-local destination by `--ctorigdst`, plus the host's `wg*` addresses. This covers published ports hairpinned by DNAT, and any WireGuard link whatever its range;
+     - in `INPUT` (v4 and v6), everything, which covers sshd, the Portainer agent and the bridge gateway IPs.
    - Then run `systemctl restart agents-egress-guard`.
 5. **Portainer stack** on environment 10, from this repository, with compose path `deploy/agents-host/compose.yaml`. Its stack.env holds names and addresses only:
 
