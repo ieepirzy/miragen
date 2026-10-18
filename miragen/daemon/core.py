@@ -39,7 +39,8 @@ from miragen.daemon.spawn.base import (
     SpawnOperationFailed,
     SpawnUnitNotFound,
 )
-from miragen.daemon.spawn.docker_compose import DockerComposeSpawnDriver
+from miragen.daemon.audit import AuditLog, NullAuditLog, audit_log_from_env, names
+from miragen.daemon.spawn.docker_compose import DEFAULT_AGENT_NETWORK, DockerComposeSpawnDriver
 from miragen.agent_type import (
     ALLOWED_HOSTS_ENV,
     ALLOWED_PROVIDERS_ENV,
@@ -93,14 +94,32 @@ RESERVED_LABEL_PREFIX = "io.miragen."
 
 # Names an agent may never take: they collide with the management containers
 # on miragen-net (container-name DNS), letting an agent shadow the daemon.
-RESERVED_AGENT_NAMES = frozenset({"miragend", "miragen-mcp"})
+RESERVED_AGENT_NAMES = frozenset({"miragend", "miragen-mcp", "lanes-gateway"})
+
+# Deployment knobs for a daemon whose control plane is on another host (the
+# agents host, mirarun ADR-041 §8). Both unset = the single-host behaviour.
+#
+# MIRAGEND_AGENT_NETWORKS: comma-separated Docker networks every agent joins,
+#   the first one shared with miragend. Unset = miragen-net. Networks other
+#   than miragen-net must already exist (their options are the isolation).
+# MIRAGEND_AGENT_ENDPOINT_TEMPLATE: the agent address miragend ADVERTISES to
+#   its clients (`endpoint` in GET /agents and /agents/{name}), with `{name}`
+#   for the agent name, e.g. http://10.8.0.15:8001/a/{name}. miragend's own
+#   calls (schedule re-triggers) keep the driver's internal address.
+AGENT_NETWORKS_ENV = "MIRAGEND_AGENT_NETWORKS"
+AGENT_ENDPOINT_TEMPLATE_ENV = "MIRAGEND_AGENT_ENDPOINT_TEMPLATE"
+
+# A Claude Code credentials store (an interactive login, or plugin secrets
+# a deployment wrote: pluginSecrets). Never served by the file API, never
+# exported.
+CREDENTIAL_STORE_FILES = frozenset({".credentials.json"})
 
 # Agent export/import. Exports are tarballs of an agent workspace, excluding
 # run history and caches; imports must come from the workspace exports/
 # directory and extract with tarfile's "data" filter (rejects absolute paths,
 # traversal, and links).
 EXPORT_EXCLUDE_DIRS = frozenset({"runs", "__pycache__"})
-EXPORT_EXCLUDE_FILES = frozenset({"history.json"})
+EXPORT_EXCLUDE_FILES = frozenset({"history.json", *CREDENTIAL_STORE_FILES})
 MAX_EXPORT_FILE_BYTES = 10 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 50 * 1024 * 1024
 
@@ -547,6 +566,7 @@ class LifecycleCore:
         not_found: type[Exception] | None = None,
         sleep: Callable = time.sleep,
         spawn_driver: object | None = None,
+        audit: AuditLog | NullAuditLog | None = None,
     ) -> None:
         self.workspace = Path(workspace)
         self.agents_dir = self.workspace / "agents"
@@ -569,7 +589,10 @@ class LifecycleCore:
             runner=runner,
             not_found=self._not_found,
             sleep=sleep,
+            networks=agent_networks(self._environ),
         )
+        self._endpoint_template = endpoint_template(self._environ)
+        self.audit = audit if audit is not None else audit_log_from_env(self._environ)
         # create_agent/import_agent both do a check-then-act against
         # _agent_count() before committing a new agent (mkdir / shutil.move).
         # The daemon's request handlers can run concurrently in separate
@@ -651,6 +674,8 @@ class LifecycleCore:
         full = (base / p).resolve()
         if not str(full).startswith(str(base) + os.sep) and full != base:
             raise InvalidPath("path traversal not allowed")
+        if full.name in CREDENTIAL_STORE_FILES:
+            raise InvalidPath("credential stores are not served")
         return full
 
     def _safe_export_path(self, archive_path: str) -> Path:
@@ -695,7 +720,15 @@ class LifecycleCore:
         self._spawn_driver.ensure_ready()
 
     def endpoint(self, name: str) -> str:
+        """The address miragend itself uses to reach the agent."""
         return self._spawn_driver.endpoint(name)
+
+    def advertised_endpoint(self, name: str) -> str:
+        """The address miragend tells its clients (MIRAGEND_AGENT_ENDPOINT_TEMPLATE),
+        else the internal one."""
+        if self._endpoint_template:
+            return self._endpoint_template.replace("{name}", name)
+        return self.endpoint(name)
 
     def _compose_up(self, name: str) -> None:
         try:
@@ -1157,6 +1190,25 @@ class LifecycleCore:
     def _define_service(self, name: str, spec: ServiceSpec) -> None:
         self.ensure_network()
         self._spawn_driver.define_service(name, spec)
+        # What this container is given, by name: the provider keys and
+        # tokens in its environment and the secrets mounted into it. Taken
+        # from the applied unit itself, so it is what runs, not what was
+        # planned.
+        self.audit.record(
+            "agent.credentials.granted",
+            agent=name,
+            keys=names(k for k in spec.environment if GRANTABLE_RE.fullmatch(k)),
+            key_files=names(
+                k for k in spec.environment
+                if k.endswith("_FILE") and GRANTABLE_RE.fullmatch(k[: -len("_FILE")])
+            ),
+            tokens=names(
+                k for k in spec.environment
+                if k in (CLAUDE_CODE_TOKEN_ENV, "MIRAGEN_INTERNAL_TOKEN")
+            ),
+            secrets=names(spec.secret_names),
+            image=spec.image,
+        )
 
     def _compose_remove_service(self, name: str) -> None:
         self._spawn_driver.remove_service(name)
@@ -1189,7 +1241,7 @@ class LifecycleCore:
                         # from the agent; addressing is the driver's call —
                         # container-name DNS on miragen-net for Compose, a
                         # different scheme for other substrates.
-                        "endpoint": self.endpoint(name),
+                        "endpoint": self.advertised_endpoint(name),
                         # started_at / finished_at / exit_code / oom_killed,
                         # each None when unknown.
                         **self.container_lifecycle(name),
@@ -1205,7 +1257,7 @@ class LifecycleCore:
             "yaml": yaml_path.read_text() if yaml_path.exists() else "",
             "status": self.container_status(name),
             "has_tools": (d / "tools.py").exists(),
-            "endpoint": self.endpoint(name),
+            "endpoint": self.advertised_endpoint(name),
             **self.container_lifecycle(name),
         }
 
@@ -1869,3 +1921,31 @@ class LifecycleCore:
         finally:
             if staging is not None:
                 shutil.rmtree(staging, ignore_errors=True)
+
+
+def agent_networks(environ: Mapping[str, str]) -> tuple[str, ...]:
+    """MIRAGEND_AGENT_NETWORKS, parsed: names in order, de-duplicated."""
+    raw = environ.get(AGENT_NETWORKS_ENV, "") or ""
+    seen: list[str] = []
+    for part in raw.split(","):
+        name = part.strip()
+        if name and name not in seen:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", name):
+                raise ValueError(f"{AGENT_NETWORKS_ENV}: invalid network name {name!r}")
+            seen.append(name)
+    return tuple(seen) or (DEFAULT_AGENT_NETWORK,)
+
+
+def endpoint_template(environ: Mapping[str, str]) -> str | None:
+    """MIRAGEND_AGENT_ENDPOINT_TEMPLATE, checked: an http(s) URL with one
+    `{name}` and nothing else to format."""
+    raw = (environ.get(AGENT_ENDPOINT_TEMPLATE_ENV) or "").strip()
+    if not raw:
+        return None
+    if not re.match(r"^https?://[^/\s{}]+", raw):
+        raise ValueError(f"{AGENT_ENDPOINT_TEMPLATE_ENV} must be an http(s) URL")
+    if raw.count("{name}") != 1 or raw.replace("{name}", "").count("{") or raw.replace(
+        "{name}", ""
+    ).count("}"):
+        raise ValueError(f"{AGENT_ENDPOINT_TEMPLATE_ENV} must contain exactly one {{name}}")
+    return raw.rstrip("/")

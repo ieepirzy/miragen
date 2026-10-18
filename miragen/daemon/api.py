@@ -230,6 +230,23 @@ def create_app(
     if core is None:
         return app
 
+    def audited(action: str, agent: str, request: Request, fn, **fields):
+        """Run one lifecycle mutation and leave an audit record of it,
+        whatever its outcome (miragen/daemon/audit.py)."""
+        client = request.client.host if request.client else None
+        try:
+            result = fn()
+        except DaemonError as exc:
+            core.audit.record(action, outcome="refused", agent=agent, client=client,
+                              code=exc.code, **fields)
+            raise
+        except Exception as exc:
+            core.audit.record(action, outcome="failed", agent=agent, client=client,
+                              error=type(exc).__name__, **fields)
+            raise
+        core.audit.record(action, agent=agent, client=client, **fields)
+        return result
+
     # -- registry -----------------------------------------------------------
 
     @app.get("/agents", dependencies=guarded)
@@ -244,34 +261,38 @@ def create_app(
     # -- lifecycle ----------------------------------------------------------
 
     @app.post("/agents", status_code=201, dependencies=guarded)
-    def create_agent(body: CreateAgentBody) -> dict:
-        core.create_agent(
-            body.name, body.yaml_source, body.tools_source, labels=body.labels
+    def create_agent(body: CreateAgentBody, request: Request) -> dict:
+        audited(
+            "agent.create", body.name, request,
+            lambda: core.create_agent(
+                body.name, body.yaml_source, body.tools_source, labels=body.labels
+            ),
         )
         return {"name": body.name, "status": core.container_status(body.name)}
 
     @app.put("/agents/{name}/config", dependencies=guarded)
-    def update_agent_config(name: str, body: YamlBody) -> dict:
-        return core.update_agent_config(name, body.yaml_source)
+    def update_agent_config(name: str, body: YamlBody, request: Request) -> dict:
+        return audited("agent.config.update", name, request,
+                       lambda: core.update_agent_config(name, body.yaml_source))
 
     @app.post("/agents/{name}/start", dependencies=guarded)
-    def start_agent(name: str) -> dict:
-        core.start_agent(name)
+    def start_agent(name: str, request: Request) -> dict:
+        audited("agent.start", name, request, lambda: core.start_agent(name))
         return {"name": name, "status": core.container_status(name)}
 
     @app.post("/agents/{name}/stop", dependencies=guarded)
-    def stop_agent(name: str) -> dict:
-        core.stop_agent(name)
+    def stop_agent(name: str, request: Request) -> dict:
+        audited("agent.stop", name, request, lambda: core.stop_agent(name))
         return {"name": name, "status": core.container_status(name)}
 
     @app.post("/agents/{name}/restart", dependencies=guarded)
-    def restart_agent(name: str) -> dict:
-        core.restart_agent(name)
+    def restart_agent(name: str, request: Request) -> dict:
+        audited("agent.restart", name, request, lambda: core.restart_agent(name))
         return {"name": name, "status": core.container_status(name)}
 
     @app.delete("/agents/{name}", dependencies=guarded)
-    def delete_agent(name: str) -> dict:
-        core.delete_agent(name)
+    def delete_agent(name: str, request: Request) -> dict:
+        audited("agent.delete", name, request, lambda: core.delete_agent(name))
         return {"name": name, "deleted": True}
 
     @app.get("/agents/{name}/logs", dependencies=guarded)
@@ -292,18 +313,23 @@ def create_app(
         return {"tool_name": tool_name, "source": core.tool_source(name, tool_name)}
 
     @app.post("/agents/{name}/tools", status_code=201, dependencies=guarded)
-    def register_tool(name: str, body: RegisterToolBody) -> dict:
-        core.register_tool(name, body.tool_name, body.source)
+    def register_tool(name: str, body: RegisterToolBody, request: Request) -> dict:
+        audited("agent.tool.register", name, request,
+                lambda: core.register_tool(name, body.tool_name, body.source),
+                tool=body.tool_name)
         return {"tool_name": body.tool_name, "registered": True}
 
     @app.patch("/agents/{name}/tools/{tool_name}", dependencies=guarded)
-    def edit_tool(name: str, tool_name: str, body: EditBody) -> dict:
-        core.edit_tool(name, tool_name, body.old_str, body.new_str)
+    def edit_tool(name: str, tool_name: str, body: EditBody, request: Request) -> dict:
+        audited("agent.tool.edit", name, request,
+                lambda: core.edit_tool(name, tool_name, body.old_str, body.new_str),
+                tool=tool_name)
         return {"tool_name": tool_name, "edited": True}
 
     @app.delete("/agents/{name}/tools/{tool_name}", dependencies=guarded)
-    def delete_tool(name: str, tool_name: str) -> dict:
-        core.delete_tool(name, tool_name)
+    def delete_tool(name: str, tool_name: str, request: Request) -> dict:
+        audited("agent.tool.delete", name, request,
+                lambda: core.delete_tool(name, tool_name), tool=tool_name)
         return {"tool_name": tool_name, "deleted": True}
 
     # -- workspace files ----------------------------------------------------
@@ -313,13 +339,16 @@ def create_app(
         return {"path": path, "content": core.read_file(name, path)}
 
     @app.put("/agents/{name}/files", dependencies=guarded)
-    def write_file(name: str, body: WriteFileBody) -> dict:
-        core.write_file(name, body.path, body.content)
+    def write_file(name: str, body: WriteFileBody, request: Request) -> dict:
+        audited("agent.file.write", name, request,
+                lambda: core.write_file(name, body.path, body.content), path=body.path)
         return {"path": body.path, "written": True}
 
     @app.patch("/agents/{name}/files", dependencies=guarded)
-    def edit_file(name: str, body: EditFileBody) -> dict:
-        core.edit_file(name, body.path, body.old_str, body.new_str)
+    def edit_file(name: str, body: EditFileBody, request: Request) -> dict:
+        audited("agent.file.edit", name, request,
+                lambda: core.edit_file(name, body.path, body.old_str, body.new_str),
+                path=body.path)
         return {"path": body.path, "edited": True}
 
     # -- export / import ----------------------------------------------------
@@ -329,8 +358,10 @@ def create_app(
         return core.export_agent(name)
 
     @app.post("/agents/import", status_code=201, dependencies=guarded)
-    def import_agent(body: ImportBody) -> dict:
-        core.import_agent(body.name, body.archive_path, start=body.start)
+    def import_agent(body: ImportBody, request: Request) -> dict:
+        audited("agent.import", body.name, request,
+                lambda: core.import_agent(body.name, body.archive_path, start=body.start),
+                start=body.start)
         return {"name": body.name, "imported": True, "started": body.start}
 
     # -- validation ---------------------------------------------------------

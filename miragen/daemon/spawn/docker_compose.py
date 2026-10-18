@@ -26,6 +26,17 @@ from miragen.daemon.spawn.base import (
 )
 
 
+# The network every agent joins unless the deployment names others
+# (MIRAGEND_AGENT_NETWORKS). miragend creates it when it is missing.
+DEFAULT_AGENT_NETWORK = "miragen-net"
+
+
+class AgentNetworkMissing(SpawnOperationFailed):
+    """A network named in MIRAGEND_AGENT_NETWORKS does not exist. miragend
+    never creates those: their options (internal, inter-container traffic)
+    are the isolation, so the deployment that owns them declares them."""
+
+
 class DockerComposeSpawnDriver:
     def __init__(
         self,
@@ -35,6 +46,7 @@ class DockerComposeSpawnDriver:
         runner: Callable = subprocess.run,
         not_found: type[Exception],
         sleep: Callable = time.sleep,
+        networks: tuple[str, ...] = (DEFAULT_AGENT_NETWORK,),
     ) -> None:
         self.workspace = Path(workspace)
         self.compose_file = self.workspace / "compose.yml"
@@ -42,6 +54,13 @@ class DockerComposeSpawnDriver:
         self._run = runner
         self._sleep = sleep
         self._not_found = not_found
+        # The networks each agent container joins, in order. The first is
+        # the one miragend shares with its agents (container-name DNS for
+        # endpoint()); the rest are the agent's own (e.g. an egress-only
+        # network on the agents host, mirarun ADR-041).
+        if not networks:
+            raise ValueError("an agent must join at least one network")
+        self.networks = tuple(networks)
 
     # -- compose.yml (this driver's persisted service definitions) ----------
 
@@ -59,20 +78,29 @@ class DockerComposeSpawnDriver:
         return {
             "secrets": {},
             "services": {},
-            "networks": {"miragen-net": {"external": True}},
+            "networks": self._networks_block(),
         }
+
+    def _networks_block(self) -> dict:
+        return {n: {"external": True} for n in self.networks}
 
     # -- SpawnDriver ----------------------------------------------------------
 
     def ensure_ready(self) -> None:
-        try:
-            self._docker.networks.get("miragen-net")
-        except self._not_found:
-            self._docker.networks.create("miragen-net", driver="bridge", attachable=True)
+        for network in self.networks:
+            try:
+                self._docker.networks.get(network)
+            except self._not_found:
+                if network != DEFAULT_AGENT_NETWORK:
+                    raise AgentNetworkMissing(
+                        f"agent network '{network}' (MIRAGEND_AGENT_NETWORKS) does not "
+                        "exist; the deployment that owns it must create it first"
+                    ) from None
+                self._docker.networks.create(network, driver="bridge", attachable=True)
 
     def define_service(self, name: str, spec: ServiceSpec) -> None:
         data = self._compose_load()
-        data["networks"] = {"miragen-net": {"external": True}}
+        data["networks"] = self._networks_block()
         data.setdefault("secrets", {}).update(
             {s: {"external": True} for s in spec.secret_names}
         )
@@ -83,7 +111,7 @@ class DockerComposeSpawnDriver:
             "secrets": list(spec.secret_names),
             "environment": dict(spec.environment),
             "volumes": [f"./agents/{name}:/agent"],
-            "networks": ["miragen-net"],
+            "networks": list(self.networks),
             "cpus": spec.cpu_limit,
             "mem_limit": spec.mem_limit,
             "labels": dict(spec.labels),
@@ -195,7 +223,8 @@ class DockerComposeSpawnDriver:
         )
 
     def endpoint(self, name: str) -> str:
-        # Reachable by any container on miragen-net (container-name DNS).
+        # Reachable by any container on the first agent network
+        # (container-name DNS), miragend included.
         return f"http://{name}:8000"
 
 
