@@ -1,0 +1,56 @@
+# An engineer lane on the agents host (mirarun ADR-041; deploy/agents-host).
+#
+# Runs on the miragen-engineer image, which miragend on the agents host uses
+# for every agent (MIRAGEN_BASE_IMAGE). The name starts with `lane-`, the
+# prefix lanes-gateway proxies MiraRun's calls to.
+#
+# This is an example. Profiles that actually run live in the deployment
+# repository. No secret is in this file:
+#   - the subscription token reaches the container because the model is
+#     `claude-code:` (docs/credential-grants.md); nothing else gets it;
+#   - the plugin tokens and this lane's broker credential reach it because
+#     `credentials:` lists them; the image's entrypoint writes each one to
+#     /run/engineer/secrets/<name> and removes it from the environment;
+#   - git and gh reach GitHub only through MiraRun's broker
+#     (`github-broker`, the same name on both hosts). No GitHub token exists
+#     in the container.
+# `credentials:` implies profile contract 6, `spec.harness` contract 4: the
+# engineer image must be built from a miragen image that supports both.
+name: lane-mirarun-housekeeping
+mode: hybrid
+triggers:
+  - type: http
+credentials:
+  - MIRADESIGN_API_KEY                         # MiraDesign plugin + ask_human
+  - MIRAGEN_BRIDGE_API_KEY                     # miragen-memory plugin
+  - GH_BROKER_MIRARUN_HOUSEKEEPING_API_KEY     # this lane's broker credential
+spec:
+  # A full id, so a new Claude Code alias never changes the lane's model.
+  model: claude-code:claude-opus-4-8
+  instructions: |
+    You are an unattended software engineer on the lane
+    mirarun-housekeeping. MiraRun's lane supervisor sends your turns; work
+    only on MiraDesign items you claimed, on branches
+    agent/mirarun-housekeeping/<item>-<slug>, and open pull requests through
+    the broker. Never merge or deploy. Read the repository's CLAUDE.md or
+    AGENTS.md before you change anything.
+  harness:
+    posture: engineer
+    subagent_depth: 1
+    repositories:
+      - url: https://github-broker:8080/ieepirzy/mirarun.git
+    git_broker:
+      host: github-broker:8080
+      credential_file: /run/engineer/secrets/broker_credential
+      # Only when the broker's certificate is from a private CA
+      # (ENGINEER_EXTRA_CA_B64 on the agents host); omit it otherwise.
+      ca_bundle: /run/engineer/ca-bundle.pem
+      commit_name: mirarun-housekeeping agent
+      commit_email: lane-mirarun-housekeeping@agents.muutto365.invalid
+    # Both plugins come from the user settings the entrypoint writes, so no
+    # plugin_dirs here.
+    ask_human:
+      url: https://design.muutto365.fi
+      project: mirarun
+      token_file: /run/engineer/secrets/miradesign_api_key
+      to: [ilari]

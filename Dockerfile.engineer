@@ -1,0 +1,65 @@
+# ── miragen-engineer: the engineer-lane agent image (mirarun ADR-041) ───────
+# The miragen runtime plus what an unattended engineer needs, for profiles in
+# the Claude Code harness's engineer posture (docs/design/harnesses.md):
+#   - Claude Code from the native installer, pinned, and selected with
+#     CLAUDE_BIN (otherwise the SDK's bundled CLI would run);
+#   - git and gh (from the base image), with no GitHub token anywhere: the
+#     harness points both at MiraRun's GitHub broker;
+#   - the miragen-memory plugin as a directory marketplace in the image;
+#   - the MiraDesign plugin, fetched from the MiraDesign daemon at start
+#     (deploy/engineer/engineer_setup.py: this image is public, the plugin
+#     is not, and the daemon's own bundle always matches its protocol);
+#   - an entrypoint that turns granted credentials into files and configures
+#     both plugins from the environment before `miragen run`.
+# Non-root (agentuser). Each instance works in its own git worktree under
+# /agent/claude-home/workspaces/<instance>/<repo>, from one shared bare
+# clone per repository in /agent/claude-home/repos (the harness does this).
+#
+# publish.yml builds it FROM the miragen image it has just published (by
+# digest) → ghcr.io/<owner>/miragen-engineer. Never built on a host.
+
+ARG MIRAGEN_IMAGE=ghcr.io/ieepirzy/miragen:latest
+FROM ${MIRAGEN_IMAGE}
+
+# The version the plugin setup was checked against (`claude plugin
+# configure --values-stdin`, user-scope marketplaces). Bump deliberately.
+ARG CLAUDE_CODE_VERSION=2.1.302
+
+USER root
+
+RUN set -o pipefail \
+    && curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh \
+    && bash /tmp/claude-install.sh "$CLAUDE_CODE_VERSION" \
+    && cp -L /root/.local/bin/claude /usr/local/bin/claude \
+    && chmod 0755 /usr/local/bin/claude \
+    && rm -rf /root/.local/share/claude /root/.local/bin/claude /tmp/claude-install.sh \
+    && /usr/local/bin/claude --version | grep -F "$CLAUDE_CODE_VERSION"
+
+# miragen-memory, as the directory marketplace the repository publishes.
+COPY .claude-plugin/marketplace.json /opt/engineer/marketplaces/miragen/.claude-plugin/marketplace.json
+COPY plugins/miragen-memory /opt/engineer/marketplaces/miragen/plugins/miragen-memory
+COPY deploy/engineer/engineer_setup.py /opt/engineer/engineer_setup.py
+
+# /run/engineer: credential files and the CA bundle, container-local (never
+# on the /agent volume, so never exported or served by miragend's file API).
+RUN chmod -R a+rX /opt/engineer \
+    && chmod 0755 /opt/engineer/engineer_setup.py \
+    && mkdir -p /run/engineer \
+    && chown agentuser /run/engineer \
+    && chmod 0700 /run/engineer
+
+LABEL io.miragen.engineer-image="1" \
+      io.miragen.claude-code-version="${CLAUDE_CODE_VERSION}"
+
+ENV CLAUDE_BIN=/usr/local/bin/claude \
+    DISABLE_AUTOUPDATER=1 \
+    MIRAGEN_CLAUDE_HOME=/agent/claude-home
+
+USER agentuser
+
+# The agent user can run the pinned CLI, and the entrypoint parses.
+RUN claude --version \
+    && python -c "import ast; ast.parse(open('/opt/engineer/engineer_setup.py').read())"
+
+ENTRYPOINT ["python", "/opt/engineer/engineer_setup.py"]
+CMD ["miragen", "run"]

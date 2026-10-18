@@ -229,3 +229,63 @@ def test_credential_stores_are_neither_served_nor_exported(tmp_path):
         members = tar.getnames()
     assert not any(m.endswith(".credentials.json") for m in members)
     assert any(m.endswith("agent.yaml") for m in members)
+
+
+# ── the deployable stack and the example profile ─────────────────────────────
+
+ROOT = __import__("pathlib").Path(__file__).parent.parent
+STACK = ROOT / "deploy" / "agents-host" / "compose.yaml"
+EXAMPLE = ROOT / "examples" / "profiles" / "lane-engineer-agents-host.yaml"
+
+
+def _stack() -> dict:
+    return yaml.safe_load(STACK.read_text())
+
+
+def test_the_stack_publishes_only_on_the_wireguard_address():
+    services = _stack()["services"]
+    for name in ("miragend", "lanes-gateway"):
+        for port in services[name]["ports"]:
+            assert port.startswith("${AGENTS_HOST_BIND_ADDRESS"), (name, port)
+
+
+def test_agents_never_join_miragen_net_or_the_stack_default():
+    stack = _stack()
+    env = stack["services"]["miragend"]["environment"]
+    networks = env["MIRAGEND_AGENT_NETWORKS"].split(",")
+    assert "miragen-net" not in networks and "default" not in networks
+    declared = stack["networks"]
+    for name in networks:
+        assert declared[name]["name"] == name  # fixed names: miragend attaches by name
+    assert declared["lanes-control"]["internal"] is True
+    assert declared["lanes-broker"]["internal"] is True
+    assert declared["lanes-egress"]["driver_opts"][
+        "com.docker.network.bridge.enable_icc"] == "false"
+    # The broker's name on the engineers' broker network is the gateway.
+    gateway = stack["services"]["lanes-gateway"]["networks"]
+    assert gateway["lanes-broker"]["aliases"] == ["github-broker"]
+    assert "lanes-egress" not in gateway
+
+
+def test_the_stack_holds_no_secret_values():
+    env = _stack()["services"]["miragend"]["environment"]
+    for key, value in env.items():
+        if any(word in key for word in ("TOKEN", "API_KEY", "SECRET")):
+            assert key.endswith("_FILE") and str(value).startswith("/run/agents-host-secrets/"), key
+    assert "MIRAGEND_AUDIT_LOG" in env
+    assert "{name}" in env["MIRAGEND_AGENT_ENDPOINT_TEMPLATE"]
+    assert endpoint_template({"MIRAGEND_AGENT_ENDPOINT_TEMPLATE": env[
+        "MIRAGEND_AGENT_ENDPOINT_TEMPLATE"].replace(
+            "${AGENTS_HOST_BIND_ADDRESS:?set AGENTS_HOST_BIND_ADDRESS (this host's WireGuard address)}",
+            "10.0.0.1").replace("${GATEWAY_PUBLISH_PORT:-8001}", "8001")})
+
+
+def test_the_example_engineer_profile_validates():
+    from miragen.daemon.core import validate_profile_text
+
+    summary = validate_profile_text(EXAMPLE.read_text(), environ={})
+    assert summary["model"].startswith("claude-code:")
+    assert summary["name"].startswith("lane-")
+    profile = yaml.safe_load(EXAMPLE.read_text())
+    assert profile["spec"]["harness"]["posture"] == "engineer"
+    assert profile["spec"]["harness"]["git_broker"]["credential_file"].startswith("/run/engineer/")
