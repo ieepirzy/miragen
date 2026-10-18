@@ -49,7 +49,10 @@ lane container ──lanes-egress──▶ internet (Anthropic, design.muutto365
    | `gh_broker_<lane>` | One per lane: that lane's broker credential, minted by MiraRun |
 
    For each lane, also add `GH_BROKER_<LANE>_API_KEY_FILE=/run/agents-host-secrets/gh_broker_<lane>` to stack.env. The lane's profile then lists `GH_BROKER_<LANE>_API_KEY` under `credentials:`.
-4. **Egress allowlist.** Add `<VPS_WG> <MIRARUN_BROKER_AGENT_PUBLISH_PORT>` to `/etc/agents-egress-allow`, then `systemctl restart agents-egress-guard`.
+4. **Egress guard.**
+   - Add `<VPS_WG> <MIRARUN_BROKER_AGENT_PUBLISH_PORT>` to `/etc/agents-egress-allow`.
+   - **If the point-to-point link is outside `10.8.0.0/24`, extend the guard to cover it.** Today `AGENTS-EGRESS` rejects only the mesh, `10.0.0.0/16` and the metadata address. Without the extension, lane containers could open connections to anything listening on the VPS end of the new link. Add `iptables -A AGENTS-EGRESS -d <link subnet or VPS_WG/32> -m conntrack --ctstate NEW -j REJECT` to `/usr/local/sbin/agents-egress-guard`, after the allowlist loop, so the broker's `RETURN` stays first. Carry the same rule into movingfirm-infra `agents-host/cloud-init.yaml`.
+   - Run `systemctl restart agents-egress-guard`.
 5. **Portainer stack** on environment 10, from this repository, with compose path `deploy/agents-host/compose.yaml`. Its stack.env holds names and addresses only:
 
    | Variable | Value |
@@ -73,7 +76,7 @@ lane container ──lanes-egress──▶ internet (Anthropic, design.muutto365
 
 Run these once steps 1–7 are done. Each line is something to see, not assume.
 
-1. From the VPS, `curl -s http://AGENTS_WG:8000/health` returns `"service":"miragend"`, and `GET /agents` without the bearer returns 401.
+1. From the VPS, `curl -s http://AGENTS_WG:8000/health` returns `"service":"miragend"`, and `GET /agents` without the bearer returns 401. **If it does not return 401, stop the stack at once.** The usual cause is a `miragend_token` file that uid 1000 cannot read: the loader then logs an error, and the daemon serves unguarded on the WireGuard address.
 2. From any other mesh peer, ports 8000 and 8001 on `AGENTS_WG` do not answer (the link is point-to-point).
 3. `curl http://AGENTS_WG:8001/healthz` returns `ok` from the VPS, and 403 from anywhere else.
 4. MiraRun's agent list shows the lane agent. Its `endpoint` is `http://AGENTS_WG:8001/a/lane-<key>`, and `GET <endpoint>/health` from the VPS returns 200.
@@ -81,6 +84,7 @@ Run these once steps 1–7 are done. Each line is something to see, not assume.
 6. `docker exec lane-<key> cat /run/engineer/status.json` shows both plugins `installed: true` and `miradesign.source: daemon`.
 7. Inside the container, as agentuser:
    - `curl -m5 http://10.8.0.4` fails (egress guard);
+   - a VPS port on the point-to-point address other than the broker's is refused, and the broker's port connects;
    - `curl -m5 https://api.anthropic.com` connects (egress open);
    - `curl -m5 http://miragend:8000/agents` answers 401 (miragend is reachable on `lanes-control`; its token guards it).
 8. A first lane session: MiraRun starts it, and MiraDesign shows the actor `agent:claude-code/lane-<key>-engineer-1` registered. The supervisor's turn appears in `gateway-logs/agents.jsonl` with a 200.
