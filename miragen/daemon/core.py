@@ -41,6 +41,7 @@ from miragen.daemon.spawn.base import (
     SpawnOperationFailed,
     SpawnUnitNotFound,
 )
+from miragen.daemon import safe_fs
 from miragen.daemon.audit import AuditLog, NullAuditLog, audit_log_from_env, names
 from miragen.daemon.spawn.docker_compose import (
     DEFAULT_AGENT_NETWORK,
@@ -688,25 +689,22 @@ class LifecycleCore:
             raise AgentNotFound(f"agent '{name}' not found")
         return d
 
-    def _safe_path(self, agent: str, rel: str) -> Path:
-        if ".." in rel:
+    def _safe_rel(self, rel: str) -> str:
+        """A workspace-relative path for the file API: no traversal, no
+        absolute path, never a credential store. Symlinks and hard links are
+        refused where the file is opened (safe_fs), on the same fd, so
+        nothing changes between the check and the use."""
+        if ".." in rel or "\x00" in rel:
             raise InvalidPath("path traversal not allowed")
         p = Path(rel)
         if p.is_absolute():
             raise InvalidPath("path traversal not allowed")
-        base = self._agent_dir(agent).resolve()
-        full = (base / p).resolve()
-        if not str(full).startswith(str(base) + os.sep) and full != base:
+        parts = [part for part in p.parts if part not in ("", ".")]
+        if not parts:
             raise InvalidPath("path traversal not allowed")
-        if full.name in CREDENTIAL_STORE_FILES:
+        if parts[-1] in CREDENTIAL_STORE_FILES:
             raise InvalidPath("credential stores are not served")
-        try:
-            if full.is_file() and full.stat().st_nlink > 1:
-                # A hard link can name a file outside the workspace.
-                raise InvalidPath("hard-linked files are not served")
-        except OSError:
-            pass
-        return full
+        return "/".join(parts)
 
     def _safe_export_path(self, archive_path: str) -> Path:
         if ".." in archive_path:
@@ -1067,6 +1065,49 @@ class LifecycleCore:
     # every mount and is written only after a create, import or update has
     # booted. A rollback restores it, and the update path reads the agent's
     # previous executor kind from it, never from the agent-writable file.
+    # -- agent-workspace file access (miragen/daemon/safe_fs.py) -------------
+    # The workspace is the agent's own, read-write: never follow a link in
+    # it, never write through one, never trust a file that is not regular.
+
+    def _agent_read(self, name: str, rel: str) -> str:
+        try:
+            return safe_fs.read_text(self._agent_dir(name), rel)
+        except safe_fs.UnsafeAgentPath as exc:
+            raise InvalidPath(str(exc)) from None
+
+    def _agent_read_or_none(self, name: str, rel: str) -> str | None:
+        try:
+            return safe_fs.read_text(self._agent_dir(name), rel)
+        except (FileNotFoundError, NotADirectoryError, safe_fs.UnsafeAgentPath,
+                UnicodeDecodeError):
+            return None
+
+    def _agent_write(self, name: str, rel: str, content: str) -> None:
+        try:
+            safe_fs.write_text(self._agent_dir(name), rel, content)
+        except safe_fs.UnsafeAgentPath as exc:
+            raise InvalidPath(str(exc)) from None
+
+    def _agent_exists(self, name: str, rel: str) -> bool:
+        return safe_fs.exists(self._agent_dir(name), rel)
+
+    def _agent_yaml_data(self, name: str) -> dict:
+        text = self._agent_read_or_none(name, "agent.yaml")
+        if text is None:
+            return {}
+        data = yaml.safe_load(text) or {}
+        return data if isinstance(data, dict) else {}
+
+    def _profile_text(self, name: str) -> str | None:
+        """The profile this daemon last applied (outside every mount), else
+        the workspace's agent.yaml read without following links. What
+        clients are shown is the daemon's copy, never a file the agent can
+        point anywhere."""
+        last_good = self._last_good(name)
+        if last_good is not None:
+            return last_good
+        return self._agent_read_or_none(name, "agent.yaml")
+
     def _last_good_path(self, name: str) -> Path:
         return self.workspace / ".miragend" / "profiles" / f"{name}.yaml"
 
@@ -1119,23 +1160,42 @@ class LifecycleCore:
         )
 
     def _labels_path(self, name: str) -> Path:
-        return self._agent_dir(name) / "labels.json"
+        # Daemon-owned, outside the agent's mount: labels carry access
+        # grants a control plane assigns, so the agent must not write them.
+        return self.workspace / ".miragend" / "labels" / f"{name}.json"
 
     def _read_agent_labels(self, name: str) -> dict[str, str]:
         path = self._labels_path(name)
-        if not path.exists():
+        try:
+            text = path.read_text()
+        except FileNotFoundError:
+            # An agent created before labels moved: its workspace copy, read
+            # without following links, migrated once to the daemon's place.
+            text = self._agent_read_or_none(name, "labels.json")
+            if text is None:
+                return {}
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+            except OSError:
+                pass
+        except OSError:
             return {}
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(text)
         except Exception:
             return {}
         return data if isinstance(data, dict) else {}
 
     def _write_agent_labels(self, name: str, labels: Mapping[str, str]) -> None:
+        path = self._labels_path(name)
         if labels:
-            self._labels_path(name).write_text(json.dumps(dict(labels)))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(dict(labels)))
+            os.replace(tmp, path)
         else:
-            self._labels_path(name).unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
 
     def _build_service_spec(
         self, name: str, image_ref: str | None = None, *, profile_text: str | None = None
@@ -1144,10 +1204,7 @@ class LifecycleCore:
         from — the text the caller is applying. None reads the agent's
         agent.yaml, which create and import have just written themselves."""
         if profile_text is None:
-            try:
-                profile_text = (self._agent_dir(name) / "agent.yaml").read_text()
-            except OSError:
-                profile_text = None
+            profile_text = self._agent_read_or_none(name, "agent.yaml")
         plan = self._credentials_for(name, profile_text)
         secret_names = self._secret_names(plan)
         env = {"AGENT_PROFILE": "agent.yaml"}
@@ -1268,14 +1325,13 @@ class LifecycleCore:
                     continue
                 name = entry.name
                 mode = model = ""
-                yaml_path = entry / "agent.yaml"
-                if yaml_path.exists():
-                    try:
-                        data = self._read_yaml(yaml_path)
+                try:
+                    data = yaml.safe_load(self._profile_text(name) or "") or {}
+                    if isinstance(data, dict):
                         mode = data.get("mode", "")
                         model = (data.get("spec") or {}).get("model", "")
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
                 result.append(
                     {
                         "name": name,
@@ -1295,13 +1351,14 @@ class LifecycleCore:
         return result
 
     def get_agent(self, name: str) -> dict:
-        d = self._require_agent(name)
-        yaml_path = d / "agent.yaml"
+        self._require_agent(name)
         return {
             "name": name,
-            "yaml": yaml_path.read_text() if yaml_path.exists() else "",
+            # The daemon's own copy of the profile it applied, never the
+            # agent-writable workspace file (which may be a link to a secret).
+            "yaml": self._profile_text(name) or "",
             "status": self.container_status(name),
-            "has_tools": (d / "tools.py").exists(),
+            "has_tools": self._agent_exists(name, "tools.py"),
             "endpoint": self.advertised_endpoint(name),
             **self.container_lifecycle(name),
         }
@@ -1378,8 +1435,9 @@ class LifecycleCore:
                 raise DaemonError(str(exc)) from exc
 
         try:
-            (d / "agent.yaml").write_text(yaml_source)
-            (d / "tools.py").write_text(
+            self._agent_write(name, "agent.yaml", yaml_source)
+            self._agent_write(
+                name, "tools.py",
                 tools_source
                 if tools_source is not None
                 else f"from miragen import register\n\n# Tools for {name}\n"
@@ -1408,8 +1466,7 @@ class LifecycleCore:
 
     def update_agent_config(self, name: str, yaml_source: str) -> dict:
         d = self._require_agent(name)
-        yaml_path = d / "agent.yaml"
-        if not yaml_path.exists():
+        if self._last_good(name) is None and not self._agent_exists(name, "agent.yaml"):
             raise AgentNotFound(f"agent '{name}' has no agent.yaml")
 
         summary = validate_profile_text(yaml_source, environ=self._environ)
@@ -1430,7 +1487,7 @@ class LifecycleCore:
         # daemon's own copy: agents/<name>/ is mounted rw into the agent, so
         # the on-disk agent.yaml may say anything by now. Agents applied
         # before that copy existed fall back to the file (see rollback).
-        original = yaml_path.read_text()
+        original = self._agent_read_or_none(name, "agent.yaml") or ""
         last_good = self._last_good(name)
         previous = last_good if last_good is not None else original
         old_kind = self._profile_kind(name, previous)
@@ -1484,7 +1541,7 @@ class LifecycleCore:
         new_spec = self._build_service_spec(name, apply_ref, profile_text=yaml_source)
         recreate = will_recreate or self._delivered(previous_spec) != self._delivered(new_spec)
 
-        yaml_path.write_text(yaml_source)
+        self._agent_write(name, "agent.yaml", yaml_source)
         try:
             if recreate:
                 self._define_service(name, new_spec)
@@ -1536,7 +1593,7 @@ class LifecycleCore:
         rw /agent mount. Only when the driver cannot report a previous
         definition is the unit recomposed from `previous_text` on the image
         the agent ran (`image_ref`)."""
-        (self._agent_dir(name) / "agent.yaml").write_text(previous_text)
+        self._agent_write(name, "agent.yaml", previous_text)
         try:
             if not recreate:
                 self.restart_agent(name)
@@ -1590,43 +1647,46 @@ class LifecycleCore:
     # -- tool management ----------------------------------------------------
 
     def list_tools(self, agent: str) -> list[dict]:
-        d = self._require_agent(agent)
-        p = d / "tools.py"
-        if not p.exists():
+        self._require_agent(agent)
+        source = self._agent_read_or_none(agent, "tools.py")
+        if source is None:
             return []
-        return parse_registered_tools(p.read_text())
+        return parse_registered_tools(source)
+
+    def _tools_source(self, agent: str) -> str:
+        source = self._agent_read_or_none(agent, "tools.py")
+        if source is None:
+            raise WorkspaceFileNotFound(f"tools.py not found for agent '{agent}'")
+        return source
 
     def tool_source(self, agent: str, tool_name: str) -> str:
-        d = self._require_agent(agent)
-        p = d / "tools.py"
-        if not p.exists():
-            raise WorkspaceFileNotFound(f"tools.py not found for agent '{agent}'")
-        source = p.read_text()
+        self._require_agent(agent)
+        source = self._tools_source(agent)
         span = find_function_span(source, tool_name)
         if span is None:
             raise ToolNotFound(f"tool '{tool_name}' not found in {agent}/tools.py")
         lines = source.splitlines(keepends=True)
         return "".join(lines[span[0] : span[1]])
 
-    def _public_agent_type(self, d: Path) -> str | None:
-        """'external'/'hybrid' when the stored profile is public-facing, else
-        None. Read as written: the loader refuses an interpolated
-        agent_type, so the raw value is the real one."""
+    def _public_agent_type(self, agent: str) -> str | None:
+        """'external'/'hybrid' when the profile this daemon applied is
+        public-facing, else None. The daemon's copy, not the workspace file
+        the agent could rewrite to unlock tools. Read as written: the loader
+        refuses an interpolated agent_type, so the raw value is the real one."""
         try:
-            agent_type = self._read_yaml(d / "agent.yaml").get("agent_type")
+            data = yaml.safe_load(self._profile_text(agent) or "") or {}
+            agent_type = data.get("agent_type") if isinstance(data, dict) else None
         except Exception:
             return None
         return agent_type if agent_type in PUBLIC_AGENT_TYPES else None
 
-    def _refuse_code_write_on_public_agent(self, agent: str, full: Path) -> None:
+    def _refuse_code_write_on_public_agent(self, agent: str, rel: str) -> None:
         """write_file/edit_file is a side door around both the tool refusal
         and profile validation: a public agent takes no code file, and its
         agent.yaml changes only through update_agent_config (validated)."""
-        d = self._agent_dir(agent)
-        agent_type = self._public_agent_type(d)
+        agent_type = self._public_agent_type(agent)
         if agent_type is None:
             return
-        rel = full.relative_to(d.resolve()).as_posix()
         if rel == "agent.yaml":
             why = "profile changes go through config update, which validates them"
         elif is_code_path(rel):
@@ -1637,10 +1697,10 @@ class LifecycleCore:
             f"agent '{agent}' is agent_type: {agent_type}; refusing to write '{rel}' ({why})"
         )
 
-    def _refuse_tools_on_public_agent(self, agent: str, d: Path) -> None:
+    def _refuse_tools_on_public_agent(self, agent: str) -> None:
         """Live tool injection is custom code; a public-facing agent takes
         none."""
-        agent_type = self._public_agent_type(d)
+        agent_type = self._public_agent_type(agent)
         if agent_type is not None:
             raise PublicAgentRefused(
                 f"agent '{agent}' is agent_type: {agent_type}; it takes no "
@@ -1648,13 +1708,29 @@ class LifecycleCore:
                 "container has)"
             )
 
+    def _update_agent_tools_list(self, agent: str, *, add: str | None = None,
+                                 remove: str | None = None) -> None:
+        text = self._agent_read_or_none(agent, "agent.yaml")
+        if text is None:
+            return
+        data = yaml.safe_load(text) or {}
+        if not isinstance(data, dict):
+            return
+        tools_list: list = data.get("tools", []) or []
+        if add is not None and add not in tools_list:
+            tools_list.append(add)
+        elif remove is not None and remove in tools_list:
+            tools_list.remove(remove)
+        else:
+            return
+        data["tools"] = tools_list
+        self._agent_write(agent, "agent.yaml", yaml.dump(
+            data, default_flow_style=False, allow_unicode=True, sort_keys=False))
+
     def register_tool(self, agent: str, tool_name: str, source: str) -> None:
-        d = self._require_agent(agent)
-        self._refuse_tools_on_public_agent(agent, d)
-        tools_path = d / "tools.py"
-        yaml_path = d / "agent.yaml"
-        if not tools_path.exists():
-            raise WorkspaceFileNotFound(f"tools.py not found for agent '{agent}'")
+        self._require_agent(agent)
+        self._refuse_tools_on_public_agent(agent)
+        original_tools = self._tools_source(agent)
 
         try:
             ast.parse(source)
@@ -1668,40 +1744,31 @@ class LifecycleCore:
                 f"registered as '{tool_name}' (found: {found})"
             )
 
-        original_tools = tools_path.read_text()
-        original_yaml = yaml_path.read_text() if yaml_path.exists() else None
+        original_yaml = self._agent_read_or_none(agent, "agent.yaml")
+
+        def restore() -> None:
+            self._agent_write(agent, "tools.py", original_tools)
+            if original_yaml is not None:
+                self._agent_write(agent, "agent.yaml", original_yaml)
+
         try:
-            tools_path.write_text(
-                original_tools.rstrip("\n") + "\n\n" + source.strip() + "\n"
-            )
-            if yaml_path.exists():
-                data = self._read_yaml(yaml_path)
-                tools_list: list = data.get("tools", [])
-                if tool_name not in tools_list:
-                    tools_list.append(tool_name)
-                    data["tools"] = tools_list
-                    self._write_yaml(yaml_path, data)
+            self._agent_write(
+                agent, "tools.py", original_tools.rstrip("\n") + "\n\n" + source.strip() + "\n")
+            self._update_agent_tools_list(agent, add=tool_name)
             self.restart_agent(agent)
         except DaemonError as exc:
-            tools_path.write_text(original_tools)
-            if original_yaml is not None:
-                yaml_path.write_text(original_yaml)
+            restore()
             raise RestartFailed(
                 f"tool written but restart failed (rolled back): {exc}"
             ) from exc
         except Exception as exc:
-            tools_path.write_text(original_tools)
-            if original_yaml is not None:
-                yaml_path.write_text(original_yaml)
+            restore()
             raise DaemonError(str(exc)) from exc
 
     def edit_tool(self, agent: str, tool_name: str, old_str: str, new_str: str) -> None:
-        d = self._require_agent(agent)
-        self._refuse_tools_on_public_agent(agent, d)
-        tools_path = d / "tools.py"
-        if not tools_path.exists():
-            raise WorkspaceFileNotFound(f"tools.py not found for agent '{agent}'")
-        source = tools_path.read_text()
+        self._require_agent(agent)
+        self._refuse_tools_on_public_agent(agent)
+        source = self._tools_source(agent)
         span = find_function_span(source, tool_name)
         if span is None:
             raise ToolNotFound(f"tool '{tool_name}' not found")
@@ -1721,56 +1788,44 @@ class LifecycleCore:
                 f"old_str appears {count} times within tool '{tool_name}' — must be unique",
                 occurrences=count,
             )
-        tools_path.write_text(before + target.replace(old_str, new_str, 1) + after)
+        self._agent_write(agent, "tools.py", before + target.replace(old_str, new_str, 1) + after)
         self.restart_agent(agent)
 
     def delete_tool(self, agent: str, tool_name: str) -> None:
-        d = self._require_agent(agent)
-        tools_path = d / "tools.py"
-        yaml_path = d / "agent.yaml"
-        if not tools_path.exists():
-            raise WorkspaceFileNotFound(f"tools.py not found for agent '{agent}'")
-        source = tools_path.read_text()
+        self._require_agent(agent)
+        source = self._tools_source(agent)
         span = find_function_span(source, tool_name)
         if span is None:
             raise ToolNotFound(f"tool '{tool_name}' not found")
 
         lines = source.splitlines(keepends=True)
-        tools_path.write_text("".join(lines[: span[0]] + lines[span[1] :]))
-
-        if yaml_path.exists():
-            data = self._read_yaml(yaml_path)
-            tools_list: list = data.get("tools", [])
-            if tool_name in tools_list:
-                tools_list.remove(tool_name)
-                data["tools"] = tools_list
-                self._write_yaml(yaml_path, data)
+        self._agent_write(agent, "tools.py", "".join(lines[: span[0]] + lines[span[1] :]))
+        self._update_agent_tools_list(agent, remove=tool_name)
         self.restart_agent(agent)
 
     # -- workspace files ----------------------------------------------------
 
     def read_file(self, agent: str, path: str) -> str:
         self._require_agent(agent)
-        full = self._safe_path(agent, path)
+        rel = self._safe_rel(path)
         try:
-            return full.read_text()
-        except FileNotFoundError:
+            return self._agent_read(agent, rel)
+        except (FileNotFoundError, NotADirectoryError):
             raise WorkspaceFileNotFound(f"file not found: {path}") from None
 
     def write_file(self, agent: str, path: str, content: str) -> None:
         self._require_agent(agent)
-        full = self._safe_path(agent, path)
-        self._refuse_code_write_on_public_agent(agent, full)
-        full.parent.mkdir(parents=True, exist_ok=True)
-        full.write_text(content)
+        rel = self._safe_rel(path)
+        self._refuse_code_write_on_public_agent(agent, rel)
+        self._agent_write(agent, rel, content)
 
     def edit_file(self, agent: str, path: str, old_str: str, new_str: str) -> None:
         self._require_agent(agent)
-        full = self._safe_path(agent, path)
-        self._refuse_code_write_on_public_agent(agent, full)
+        rel = self._safe_rel(path)
+        self._refuse_code_write_on_public_agent(agent, rel)
         try:
-            content = full.read_text()
-        except FileNotFoundError:
+            content = self._agent_read(agent, rel)
+        except (FileNotFoundError, NotADirectoryError):
             raise WorkspaceFileNotFound(f"file not found: {path}") from None
         count = content.count(old_str)
         if count == 0:
@@ -1779,7 +1834,7 @@ class LifecycleCore:
             raise EditConflict(
                 f"old_str appears {count} times — must be unique", occurrences=count
             )
-        full.write_text(content.replace(old_str, new_str, 1))
+        self._agent_write(agent, rel, content.replace(old_str, new_str, 1))
 
     # -- export / import ----------------------------------------------------
 
@@ -1819,8 +1874,26 @@ class LifecycleCore:
 
         with tarfile.open(archive_path, "w:gz") as tar:
             for fp, arcname in members:
-                tar.add(fp, arcname=arcname, recursive=False)
-                included.append(arcname[len(agent) + 1 :])
+                # Opened again through safe_fs, on the fd that is archived:
+                # a file swapped for a link (or hard-linked) after the walk
+                # above is skipped, never followed.
+                rel = arcname[len(agent) + 1 :]
+                try:
+                    fd = safe_fs.open_regular(d, rel)
+                except (OSError, safe_fs.UnsafeAgentPath):
+                    skipped.append({"path": rel, "reason": "changed or not a plain file"})
+                    continue
+                with os.fdopen(fd, "rb") as handle:
+                    st = os.fstat(handle.fileno())
+                    if st.st_size > MAX_EXPORT_FILE_BYTES:
+                        skipped.append({"path": rel, "reason": "grew past the 10 MB cap"})
+                        continue
+                    info = tarfile.TarInfo(arcname)
+                    info.size = st.st_size
+                    info.mtime = int(st.st_mtime)
+                    info.mode = st.st_mode & 0o644
+                    tar.addfile(info, handle)
+                included.append(rel)
 
         size_bytes = archive_path.stat().st_size
         if size_bytes > MAX_ARCHIVE_BYTES:
@@ -1944,7 +2017,7 @@ class LifecycleCore:
                 shutil.move(str(src_root), str(d))
                 created_dir = True
 
-            imported_text = (d / "agent.yaml").read_text()
+            imported_text = self._agent_read(name, "agent.yaml")
             self._compose_add_service(name, spawn_ref, profile_text=imported_text)
             added_service = True
 
