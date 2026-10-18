@@ -535,6 +535,22 @@ class TestBackgroundRecall:
                                                              "OPEN MEMORIES")
         assert read_recall_marker(LIVE["session_id"], env) is None
 
+    def test_a_finished_claim_moves_the_marker_to_the_running_open_recall(self, env):
+        from miragen_hook.client import read_recall_marker, write_recall_marker
+
+        write_recall_marker(LIVE["session_id"], 2, env)
+        tool = {"hook_event_name": "PostToolUse", "tool_name": "Bash"}
+        self._run(tool, _router({self.CLAIM: {"state": "empty", "recall_pending": 0}}), env)
+        assert read_recall_marker(LIVE["session_id"], env) == 0
+
+    def test_an_open_without_recall_clears_an_old_marker(self, env):
+        from miragen_hook.client import read_recall_marker, write_recall_marker
+
+        write_recall_marker(LIVE["session_id"], 4, env)
+        self._run({"hook_event_name": "SessionStart", "source": "resume"},
+                  _router({self.EVENTS: {"context": "STATE"}}), env)
+        assert read_recall_marker(LIVE["session_id"], env) is None
+
     def test_no_marker_means_no_request_at_all(self, env):
         silent = _router({})
         assert self._run({"hook_event_name": "PostToolUse", "tool_name": "Bash"}, silent, env) is None

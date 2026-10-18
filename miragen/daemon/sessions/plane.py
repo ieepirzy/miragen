@@ -1340,7 +1340,7 @@ class SessionPlane:
         if not job.done.is_set():
             return {"state": "pending"}
         if job.delivered is not None:
-            return {"state": "delivered"}
+            return self._point_at_open({"state": "delivered"}, key, wait=wait)
         answer = self._claim_prompt_recall(key, job)
         session = self.registry.get(key)
         # A Stop claim (wait > 0) that found nothing for the prompt must not
@@ -1351,6 +1351,17 @@ class SessionPlane:
             prompt_context = answer.get("context") if answer["state"] in ("ready", "failed") else None
             return {"state": "ready",
                     "context": "\n".join(part for part in (opened, prompt_context) if part)}
+        return self._point_at_open(answer, key, wait=wait)
+
+    def _point_at_open(self, answer: dict[str, Any], key: str, *,
+                       wait: float) -> dict[str, Any]:
+        """A prompt's claim is over, but the open's recall still runs: the
+        answer names it, so the adapter's marker moves to it instead of being
+        cleared (in a one-prompt run both selectors start together, and the
+        open's often finishes second)."""
+        opening = self._open_recalls.get(key)
+        if wait <= 0 and opening is not None and not opening.done.is_set():
+            return {**answer, "recall_pending": opening.seq}
         return answer
 
     def _claim_prompt_recall(self, key: str, job: RecallJob) -> dict[str, Any]:

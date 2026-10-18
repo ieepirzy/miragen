@@ -887,6 +887,38 @@ class TestOpenRecallInBackground:
         again = await h.plane.claim_recall("claude-code", "s-2", seq)
         assert again["state"] == "stale"                        # delivered once
 
+    async def test_a_prompt_claim_hands_the_marker_on_to_a_running_open_recall(self, tmp_path):
+        import asyncio as _asyncio
+
+        gate = _asyncio.Event()
+        calls = []
+
+        async def selector(request, cards):
+            calls.append(request)
+            if "lunch" in request:
+                return SelectionResult(selections=[])   # the prompt's: finishes first, empty
+            await gate.wait()                           # the open's: still running
+            return SelectionResult(selections=[
+                Selection(record_id=c["record_id"], reason="x") for c in cards])
+
+        h = await self._seeded(tmp_path, selector)
+        caps = {"capabilities": ["async-recall"]}
+        await h.send("SessionStart", source="startup", session="s-2", client_extra=caps)
+        prompt = await h.send("UserPromptSubmit", session="s-2", prompt="what about lunch today",
+                              prompt_id="p-1", client_extra=caps)
+        assert prompt.recall_pending == 1
+        for _ in range(50):
+            job = h.plane._recalls.get("claude-code:s-2")
+            if job is not None and job.done.is_set():
+                break
+            await _asyncio.sleep(0.01)
+        first = await h.plane.claim_recall("claude-code", "s-2", 1)
+        assert first["state"] == "empty" and first["recall_pending"] == 0
+        gate.set()
+        await h.drain()
+        claim = await h.plane.claim_recall("claude-code", "s-2", 0)
+        assert claim["state"] == "ready" and "vault mounted" in claim["context"]
+
     async def test_a_client_without_async_recall_gets_no_marker(self, tmp_path):
         h = await self._seeded(tmp_path, self.picking())
         opened = await h.send("SessionStart", source="startup", session="s-2")
