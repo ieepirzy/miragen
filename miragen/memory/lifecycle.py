@@ -21,6 +21,7 @@ and the packet says so rather than inventing a recollection.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -165,8 +166,13 @@ class MemoryLifecycle:
 
     async def prepare_context(
         self, *, instance: str | None, run_id: str | None, trigger: str,
-        prompt_hint: str | None = None,
+        prompt_hint: str | None = None, recall: bool = True,
+        recall_timeout_s: float | None = None,
     ) -> MemoryPacket:
+        """Working state (required) plus the optional recall lane. `recall`
+        False skips the lane (the caller opted out of injected memories);
+        `recall_timeout_s` bounds it, so a slow selector costs the lane, not
+        the working state."""
         effective_instance = instance or DEFAULT_INSTANCE
         try:
             context = await self._ensure_context(effective_instance)
@@ -193,9 +199,21 @@ class MemoryLifecycle:
             }],
         )
 
-        optional_status = await self._optional_lane(
-            packet, effective_instance, context, prompt_hint
-        )
+        if not recall:
+            optional_status = "declined"
+        else:
+            try:
+                optional_status = await asyncio.wait_for(
+                    self._optional_lane(packet, effective_instance, context, prompt_hint),
+                    timeout=recall_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                self._degrade("optional recall timed out")
+                packet.text += (
+                    "\n[optional recall degraded — relevance selection timed out; "
+                    "memories were not injected]"
+                )
+                optional_status = "degraded: recall timed out"
         packet.optional_status = optional_status
         # The manifest records what was ACTUALLY injected (§8.6); its write
         # is best-effort — a manifest failure must not fail the turn.
