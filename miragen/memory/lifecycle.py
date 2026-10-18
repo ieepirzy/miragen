@@ -210,8 +210,8 @@ class MemoryLifecycle:
             except asyncio.TimeoutError:
                 self._degrade("optional recall timed out")
                 packet.text += (
-                    "\n[optional recall degraded — relevance selection timed out; "
-                    "memories were not injected]"
+                    "\n[optional recall degraded — recall timed out (search or "
+                    "relevance selection); memories were not injected]"
                 )
                 optional_status = "degraded: recall timed out"
         packet.optional_status = optional_status
@@ -229,7 +229,7 @@ class MemoryLifecycle:
                 "policy": {
                     "guidance_version": GUIDANCE_VERSION,
                     "trigger": trigger,
-                    "lane": "required+optional",
+                    "lane": "required" if optional_status == "declined" else "required+optional",
                     "state_revision": context["state_revision"],
                     "optional_status": optional_status,
                 },

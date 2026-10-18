@@ -104,8 +104,9 @@ class BridgeMemory:
             answer = await self._post(self._envelope(
                 instance, "input.received", "UserPromptSubmit", content=prompt,
                 ids={"prompt_id": run_id} if run_id else None))
-            # recall.enabled: false keeps the capture but not the per-prompt
-            # context (an older plane may still answer with recall).
+            # recall.enabled: false keeps the capture but no recalled
+            # memories, here or at the open (no-prompt-recall; an older plane
+            # may still answer with recall).
             if answer.get("context") and self.spec.recall.enabled:
                 parts.append(answer["context"])
         except Exception as exc:  # the plane is optional to a turn, never fatal

@@ -1131,7 +1131,7 @@ class SessionPlane:
                       if self.config.recall.on_prompt else
                       "automatic recall on, but only at session open (not per prompt)")
         elif status == "declined":
-            recall = "no memories are injected into this session (its client opted out)" + (
+            recall = "no recalled memories are injected into this session (its client opted out)" + (
                 "; memory_recall searches on demand" if self.config.mcp.enabled else "")
         elif status in ("unconfigured", "disabled"):
             recall = "automatic recall is OFF on this bridge — nothing is injected on its own" + (

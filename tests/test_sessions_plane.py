@@ -825,10 +825,11 @@ class TestOpenRecallBudget:
 
         h = await self._seeded(tmp_path, selector)
         monkeypatch.setattr(plane_mod, "OPEN_RECALL_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(plane_mod, "RETRIEVAL_TIMEOUT_S", 0.5)  # the selector outlasts the open
         slow["on"] = True
         opened = await h.send("SessionStart", source="startup", session="s-2")
         assert "fix the vault deploy" in opened.context  # the working state still arrives
-        assert "relevance selection timed out" in opened.context
+        assert "recall timed out" in opened.context
         assert "recall DEGRADED" in opened.context.splitlines()[-1]
         assert h.plane.registry.get("claude-code:s-2").counters.injections == 1
         late = h.plane.stats.late_opens
@@ -849,6 +850,8 @@ class TestOpenRecallBudget:
         assert len(calls) == before  # the selector never ran for it
         assert "fix the vault deploy" in opened.context
         assert "its client opted out" in opened.context.splitlines()[-1]
+        manifest = h.service.manifests[-1]
+        assert manifest["policy"]["lane"] == "required"
 
 
 def test_only_rendered_recall_entries_are_tracked():
