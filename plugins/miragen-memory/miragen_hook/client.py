@@ -676,7 +676,10 @@ def _deliver_recall(
     answer = claim_recall(harness, session_id, seq, wait=wait, daemon_url=daemon_url,
                           token=token, opener=opener)
     context, keep = _claim_output(event_name, answer)
-    if not keep:
+    following = (answer or {}).get("recall_pending")
+    if isinstance(following, int) and not isinstance(following, bool) and following != seq:
+        write_recall_marker(session_id, following, environ)   # the open's, still running
+    elif not keep:
         clear_recall_marker(session_id, environ)
     return context
 
@@ -712,6 +715,16 @@ def _forward(
         if isinstance(pending, int) and not isinstance(pending, bool):
             write_recall_marker(event.session_id, pending, environ)
         else:
+            clear_recall_marker(event.session_id, environ)
+    elif event.name in CONTEXT_OPENING and harness in ASYNC_RECALL_HARNESSES:
+        # The open's recall runs in the background: its number lets the first
+        # turn's tool results claim it (a one-prompt run would miss it else).
+        pending = answer.get("recall_pending")
+        if isinstance(pending, int) and not isinstance(pending, bool):
+            write_recall_marker(event.session_id, pending, environ)
+        else:
+            # A resumed/compacted session must not claim a pre-resume
+            # prompt's result into its restored context.
             clear_recall_marker(event.session_id, environ)
     context = answer.get("context")
     if context and event.name in CONTEXT_BEARING:

@@ -68,6 +68,9 @@ RETRIEVAL_TIMEOUT_S = 8.0
 # (ieepirzy/Mira#86, miragen#211). The open answers with working state and
 # the guide; what recall finds arrives with the session's next prompt (or an
 # async-recall adapter's next claim).
+# The claim number of the open's background recall (an async-recall
+# adapter's marker; prompt recalls count from 1).
+OPEN_RECALL_SEQ = 0
 OPEN_RECALL_PREAMBLE = (
     "[memory] Recall from this session's start finished in the background; "
     "these memories may bear on the work:")
@@ -531,6 +534,7 @@ class SessionPlane:
         async with self._lock(session.key):
             if event.name in CONTEXT_OPENING:
                 context, detail = await self._open_context(session, envelope)
+                recall_pending = self._open_recall_claimable(session, envelope)
             elif event.name == "input.received":
                 if session.nudge_state is not None:
                     # A new prompt instead of an answer: the ask is over (it
@@ -560,6 +564,12 @@ class SessionPlane:
                 for part in (opened, recalled):
                     if part:
                         context = f"{context}\n{part}" if context else part
+                if recall_pending is None:
+                    # No recall for this prompt, but the open's may still be
+                    # running: the adapter's marker must point at it, or its
+                    # first tool result can't claim it (a one-prompt session
+                    # would never see it).
+                    recall_pending = self._open_recall_claimable(session, envelope)
                 detail = "; ".join(part for part in (detail, recall_detail) if part) or None
             elif event.name == "turn.finished":
                 session.note_turn(event.content)
@@ -1314,6 +1324,9 @@ class SessionPlane:
         session lock — a Stop waiting here must not stall captures."""
         key = session_key(harness, session_id)
         job = self._recalls.get(key)
+        opening = self._open_recalls.get(key)
+        if opening is not None and opening.seq == seq and (job is None or job.seq != seq):
+            return self._claim_open_recall(key, opening, wait=wait)
         if job is None or job.seq != seq:
             return {"state": "stale"}
         if not job.done.is_set() and wait > 0:
@@ -1327,7 +1340,7 @@ class SessionPlane:
         if not job.done.is_set():
             return {"state": "pending"}
         if job.delivered is not None:
-            return {"state": "delivered"}
+            return self._point_at_open({"state": "delivered"}, key, wait=wait)
         answer = self._claim_prompt_recall(key, job)
         session = self.registry.get(key)
         # A Stop claim (wait > 0) that found nothing for the prompt must not
@@ -1338,6 +1351,17 @@ class SessionPlane:
             prompt_context = answer.get("context") if answer["state"] in ("ready", "failed") else None
             return {"state": "ready",
                     "context": "\n".join(part for part in (opened, prompt_context) if part)}
+        return self._point_at_open(answer, key, wait=wait)
+
+    def _point_at_open(self, answer: dict[str, Any], key: str, *,
+                       wait: float) -> dict[str, Any]:
+        """A prompt's claim is over, but the open's recall still runs: the
+        answer names it, so the adapter's marker moves to it instead of being
+        cleared (in a one-prompt run both selectors start together, and the
+        open's often finishes second)."""
+        opening = self._open_recalls.get(key)
+        if wait <= 0 and opening is not None and not opening.done.is_set():
+            return {**answer, "recall_pending": opening.seq}
         return answer
 
     def _claim_prompt_recall(self, key: str, job: RecallJob) -> dict[str, Any]:
@@ -1372,7 +1396,9 @@ class SessionPlane:
                            envelope: EventEnvelope) -> None:
         self._drop_open_recall(session.key)
         job = RecallJob(
-            seq=0, key=session.key, scope=lifecycle.spec.scopes.default_write,
+            # OPEN_RECALL_SEQ: prompt recalls count from 1, and a newer open
+            # replaces this job, so 0 always names the session's current one.
+            seq=OPEN_RECALL_SEQ, key=session.key, scope=lifecycle.spec.scopes.default_write,
             trigger=f"hook:{envelope.event.original_event.lower()}:open-async",
             candidates=RecallCandidates("pending"), lifecycle=lifecycle,
         )
@@ -1442,6 +1468,30 @@ class SessionPlane:
                     "may exist that were not checked. Use memory_recall if you need one. "
                     "(Said once per session.)")
         return None
+
+    def _open_recall_claimable(self, session: ExternalSession,
+                               envelope: EventEnvelope) -> int | None:
+        """The running open recall's number, for an adapter that claims
+        background recall (its marker); None when there is nothing to claim."""
+        job = self._open_recalls.get(session.key)
+        if (job is None or job.done.is_set()
+                or ASYNC_RECALL_CAPABILITY not in envelope.client.capabilities):
+            return None
+        return job.seq
+
+    def _claim_open_recall(self, key: str, job: RecallJob, *, wait: float) -> dict[str, Any]:
+        """A claim for the open's own recall. Never waits and never answers a
+        Stop (wait > 0): blocking the end of a turn for memories nobody asked
+        for costs an extra turn; they go with the next prompt instead."""
+        if wait > 0:
+            return {"state": "deferred"}
+        if not job.done.is_set():
+            return {"state": "pending"}
+        session = self.registry.get(key)
+        opened = self._take_open_recall(session) if session is not None else None
+        if opened:
+            return {"state": "ready", "context": opened}
+        return {"state": "empty"}
 
     def _drop_open_recall(self, key: str) -> None:
         job = self._open_recalls.pop(key, None)
