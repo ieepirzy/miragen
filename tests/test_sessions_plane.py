@@ -890,6 +890,63 @@ class TestOpenRecallInBackground:
         assert "its client opted out" in opened.context.splitlines()[-1]
         assert h.service.manifests[-1]["policy"]["lane"] == "required"
 
+    async def test_a_failed_reopen_never_delivers_the_old_projects_recall(self, tmp_path, monkeypatch):
+        import asyncio as _asyncio
+
+        from miragen.daemon.sessions import plane as plane_mod
+
+        gate = _asyncio.Event()
+        h = await self._seeded(tmp_path, self.picking(gate))
+        await h.send("SessionStart", source="startup", session="s-2")
+        await h.send("UserPromptSubmit", session="s-2", prompt="ok", prompt_id="p-1")
+        gate.set()
+        await h.drain()                                    # repo's open recall: ready
+        monkeypatch.setattr(plane_mod, "RETRIEVAL_TIMEOUT_S", 0)   # the new project's open fails
+        moved = await h.send("UserPromptSubmit", session="s-2", cwd="/w/other", prompt="ok",
+                             prompt_id="p-2")
+        assert "vault mounted" not in (moved.context or "")
+
+    async def test_a_stop_claim_does_not_block_the_stop_for_open_memories(self, tmp_path):
+        async def selector(request, cards):
+            if "lunch" in request:                         # the prompt's recall: nothing
+                return SelectionResult(selections=[])
+            return SelectionResult(selections=[
+                Selection(record_id=c["record_id"], reason="x") for c in cards])
+
+        h = await self._seeded(tmp_path, selector)
+        caps = {"capabilities": ["async-recall"]}
+        await h.send("SessionStart", source="startup", session="s-2", client_extra=caps)
+        prompt = await h.send("UserPromptSubmit", session="s-2", prompt="what about lunch today",
+                              prompt_id="p-1", client_extra=caps)
+        await h.drain()
+        claim = await h.plane.claim_recall("claude-code", "s-2", prompt.recall_pending, wait=5)
+        assert claim["state"] != "ready"                   # waits for the next prompt instead
+        later = await h.send("UserPromptSubmit", session="s-2", prompt="ok", prompt_id="p-2")
+        assert "vault mounted" in later.context
+
+    async def test_the_sweep_drops_open_recalls_of_dead_sessions(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        h = await self._seeded(tmp_path, self.picking())
+        await h.send("SessionStart", source="startup", session="s-2")
+        await h.drain()
+        h.alive.clear()
+        await h.plane.sweep()
+        await h.plane.sweep(now=datetime.now(timezone.utc) + timedelta(days=3))
+        await h.drain()
+        assert "claude-code:s-2" not in h.plane._open_recalls
+
+    async def test_repeated_opens_reuse_the_selection(self, tmp_path):
+        calls = []
+        h = await self._seeded(tmp_path, self.picking(calls=calls))
+        for i in range(2, 6):
+            await h.send("SessionStart", source="startup", session=f"s-{i}")
+            await h.drain()
+        assert len(calls) == 1                             # same goal + revision: one model call
+        rows = [json.loads(line) for f in (h.state_dir / "judgments").glob("*.jsonl")
+                for line in f.read_text().splitlines()]
+        assert len([r for r in rows if "candidates" in r]) == 1   # cache hits log no judgment
+
 
 def plane_preamble() -> str:
     from miragen.daemon.sessions.plane import OPEN_RECALL_PREAMBLE

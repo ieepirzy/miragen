@@ -88,6 +88,9 @@ class RecallSelection:
     section: str | None = None
     items: list[dict[str, Any]] = field(default_factory=list)
     selected: list[tuple[str, str]] = field(default_factory=list)
+    # The picks came from the selection cache: no selector call was made
+    # (so there is no judgment to log).
+    cached: bool = False
 
 
 class MemoryLifecycle:
@@ -404,7 +407,8 @@ class MemoryLifecycle:
             "ok" if cards else "empty", effective_instance, query, cards, context,
         )
 
-    async def recall_select(self, candidates: RecallCandidates) -> RecallSelection:
+    async def recall_select(self, candidates: RecallCandidates, *,
+                            cached: bool = False) -> RecallSelection:
         """Phase 2, off the prompt path: the selector over the cards, then
         the canonical re-render. Selector failure never falls back to the
         nearest neighbours (§17.7): the status says degraded, nothing is
@@ -413,22 +417,33 @@ class MemoryLifecycle:
 
         if self.selector is None or not candidates.cards:
             return RecallSelection("none_selected")
-        try:
-            result = await self.selector(candidates.query, candidates.cards)
-        except Exception as exc:  # noqa: BLE001 — any selector failure degrades
-            return RecallSelection(f"degraded: selector: {self._degrade(f'relevance selection: {exc}')}")
-        kept = clamp_selections(result, candidates.cards, self.spec.recall.max_selected)
-        selected = [(sel.record_id, sel.reason) for sel in kept]
+        # `cached`: the open's goal-only recall reuses the inline lane's
+        # cache (same instance, state revision and query → same picks).
+        revision = (candidates.context or {}).get("state_revision")
+        digest = _stable_digest(candidates.query)
+        hit = self._selection_cache.get(candidates.instance) if cached else None
+        from_cache = bool(hit and revision is not None and hit[0] == revision and hit[1] == digest)
+        if from_cache:
+            selected = hit[2]
+        else:
+            try:
+                result = await self.selector(candidates.query, candidates.cards)
+            except Exception as exc:  # noqa: BLE001 — any selector failure degrades
+                return RecallSelection(f"degraded: selector: {self._degrade(f'relevance selection: {exc}')}")
+            kept = clamp_selections(result, candidates.cards, self.spec.recall.max_selected)
+            selected = [(sel.record_id, sel.reason) for sel in kept]
+            if cached and revision is not None:
+                self._selection_cache[candidates.instance] = (revision, digest, selected)
         if not selected:
-            return RecallSelection("none_selected")
+            return RecallSelection("none_selected", cached=from_cache)
         try:
             section, items = await self._render_selected(selected)
         except (MemoryUnavailable, MemoryAPIError) as exc:
             return RecallSelection(f"degraded: {self._degrade(f'optional recall: {exc}')}",
-                                   selected=selected)
+                                   selected=selected, cached=from_cache)
         if not section:
-            return RecallSelection("none_selected", selected=selected)
-        return RecallSelection("ok", section, items, selected)
+            return RecallSelection("none_selected", selected=selected, cached=from_cache)
+        return RecallSelection("ok", section, items, selected, cached=from_cache)
 
     async def record_recall_manifest(
         self, candidates: RecallCandidates, selection: RecallSelection, *,

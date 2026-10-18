@@ -599,6 +599,7 @@ class SessionPlane:
                 self._drop_open_recall(session.key)
                 self._recall_seq.pop(session.key, None)
                 self._recall_failure_announced.discard(session.key)
+                self._recall_failure_announced.discard(f"{session.key}#open")
                 session.end(str(event.attributes.get("reason") or "session_end"))
                 self.journal.append(envelope)
                 self._spawn(self._capture_then_finalize(session, envelope, occurrence="end"))
@@ -1070,6 +1071,9 @@ class SessionPlane:
     async def _open_context(
         self, session: ExternalSession, envelope: EventEnvelope,
     ) -> tuple[str | None, str | None]:
+        # Whatever this open finds, a previous open's recall (another
+        # project's, or a pre-switch one) must not be delivered after it.
+        self._drop_open_recall(session.key)
         lifecycle, scope_detail = await self._lifecycle_for(session)
         self.stats.retrievals += 1
         if lifecycle is None:
@@ -1157,8 +1161,9 @@ class SessionPlane:
                       if self.config.recall.on_prompt else
                       "automatic recall on, but only at session open (not per prompt)")
         elif status == "background":
-            recall = ("automatic recall on: memories that bear on this session's goal are "
-                      "searched in the background and arrive with your next prompt; " + (
+            recall = ("automatic recall on: memories that bear on this session's goal (if "
+                      "it has one) are searched in the background and arrive with your next "
+                      "prompt; " + (
                           f"it also runs on each prompt of {self.config.recall.min_prompt_chars}+ characters"
                           if self.config.recall.on_prompt else
                           "it runs only at session open (not per prompt)"))
@@ -1325,7 +1330,10 @@ class SessionPlane:
             return {"state": "delivered"}
         answer = self._claim_prompt_recall(key, job)
         session = self.registry.get(key)
-        opened = self._take_open_recall(session) if session is not None else None
+        # A Stop claim (wait > 0) that found nothing for the prompt must not
+        # block the Stop for the open's memories: they wait for the next prompt.
+        opened = (self._take_open_recall(session)
+                  if session is not None and (wait <= 0 or answer["state"] == "ready") else None)
         if opened:
             prompt_context = answer.get("context") if answer["state"] in ("ready", "failed") else None
             return {"state": "ready",
@@ -1382,7 +1390,7 @@ class SessionPlane:
                 timeout=self.config.recall.search_timeout_seconds,
             )
             if job.candidates.status == "ok":
-                job.selection = await job.lifecycle.recall_select(job.candidates)
+                job.selection = await job.lifecycle.recall_select(job.candidates, cached=True)
             elif job.candidates.status.startswith("degraded"):
                 job.selection = RecallSelection(job.candidates.status)
             else:
@@ -1392,12 +1400,12 @@ class SessionPlane:
             job.done.set()
             raise
         except Exception as exc:  # noqa: BLE001 — the search timed out or failed; degrade
-            job.selection = RecallSelection(f"degraded: {exc or type(exc).__name__}")
+            job.selection = RecallSelection(f"degraded: {str(exc) or type(exc).__name__}")
         job.done.set()
         if job.selection.status.startswith("degraded"):
             self.stats.retrieval_failures += 1
             self.stats.open_recall_failures += 1
-        elif job.candidates.cards:
+        elif job.candidates.cards and not job.selection.cached:
             self.judgments.record(
                 session=job.key, scope=job.scope, recall_id=f"{job.key}#open",
                 query=job.candidates.query, cards=job.candidates.cards,
@@ -1425,8 +1433,11 @@ class SessionPlane:
                                           state="context")
             return f"{OPEN_RECALL_PREAMBLE}\n{selection.section}"
         job.delivered = "empty"
-        if selection.status.startswith("degraded") and session.key not in self._recall_failure_announced:
-            self._recall_failure_announced.add(session.key)
+        # Its own once-per-session key: an open failure must not silence the
+        # first prompt-recall failure (or the other way round).
+        announced = f"{session.key}#open"
+        if selection.status.startswith("degraded") and announced not in self._recall_failure_announced:
+            self._recall_failure_announced.add(announced)
             return ("[memory] background recall from this session's start failed: memories "
                     "may exist that were not checked. Use memory_recall if you need one. "
                     "(Said once per session.)")
@@ -1770,13 +1781,16 @@ class SessionPlane:
             self.stats.finalized_by_sweep += 1
             logger.info(f"[{session.key}] finalizing: {session.end_reason}")
             self._drop_recall(session.key)
+            self._drop_open_recall(session.key)
             self._spawn(self._locked(session, self._finalize(session, occurrence="end")))
         for key in pruned:
             self.journal.clear(key)
             self._locks.pop(key, None)
             self._drop_recall(key)
+            self._drop_open_recall(key)
             self._recall_seq.pop(key, None)
             self._recall_failure_announced.discard(key)
+            self._recall_failure_announced.discard(f"{key}#open")
         if stale or pruned:
             self.registry.save()
         return len(stale)
