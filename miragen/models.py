@@ -901,9 +901,9 @@ class MemoryRecallSpec(_ProfileModel):
             "search + a zero-or-more relevance selection (one model call on "
             "cache misses). Requires a resolvable model; without one the "
             "lane reports itself unconfigured rather than degrading. Bridge "
-            "backend: false means no recalled memories with each prompt (the "
-            "session-start context and the memory tools remain; turns are "
-            "still captured)."
+            "backend: false means no recalled memories are injected, at session "
+            "start or with each prompt (the working state, the memory guide and "
+            "the memory tools remain; turns are still captured)."
         ),
     )
     model: Optional[str] = Field(

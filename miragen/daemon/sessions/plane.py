@@ -62,6 +62,11 @@ logger = logging.getLogger("miragend.sessions")
 
 # Daemon-side bounds UNDER the adapter's (client.py: 10 s for context).
 RETRIEVAL_TIMEOUT_S = 8.0
+# The open's recall lane (search + selector) gets part of that budget: a
+# slow selector must cost the recall, not the working state. A timed-out
+# open is never counted as an injection, so every later prompt would
+# retry it and wait the whole RETRIEVAL_TIMEOUT_S again (ieepirzy/Mira#86).
+OPEN_RECALL_TIMEOUT_S = 4.0
 WRITE_TIMEOUT_S = 15.0
 _PROVISION_VERBS = ["read", "propose", "resolve", "retract"]
 # The extraction worker reads events, proposes records and claims jobs.
@@ -1066,6 +1071,10 @@ class SessionPlane:
                     instance=session.project.slug if session.project else None,
                     run_id=session.key,
                     trigger=f"hook:{envelope.event.original_event.lower()}",
+                    # no-prompt-recall: the client takes no injected
+                    # memories, at the open either (it'd still pay for them).
+                    recall=NO_PROMPT_RECALL_CAPABILITY not in envelope.client.capabilities,
+                    recall_timeout_s=OPEN_RECALL_TIMEOUT_S,
                 ),
                 timeout=RETRIEVAL_TIMEOUT_S,
             )
@@ -1121,6 +1130,9 @@ class SessionPlane:
             recall = (f"automatic recall on; it runs on each prompt of {self.config.recall.min_prompt_chars}+ characters"
                       if self.config.recall.on_prompt else
                       "automatic recall on, but only at session open (not per prompt)")
+        elif status == "declined":
+            recall = "no recalled memories are injected into this session (its client opted out)" + (
+                "; memory_recall searches on demand" if self.config.mcp.enabled else "")
         elif status in ("unconfigured", "disabled"):
             recall = "automatic recall is OFF on this bridge — nothing is injected on its own" + (
                 "; memory_recall searches on demand" if self.config.mcp.enabled else "")

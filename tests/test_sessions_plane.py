@@ -797,6 +797,63 @@ class TestStatusLine:
         assert "2 memories in group:project.x injected above — cite the ids" in line
 
 
+class TestOpenRecallBudget:
+    """ieepirzy/Mira#86: a slow selector at the open timed the WHOLE open
+    out, so no injection was counted and every later prompt re-opened and
+    waited the full retrieval timeout again (8 s per turn)."""
+
+    async def _seeded(self, tmp_path, selector):
+        h = Harness(tmp_path, selector=selector)
+        await h.send("SessionStart", source="startup")
+        lifecycle = h.plane._lifecycles[PROJECT_SCOPE]
+        await lifecycle.checkpoint(instance=REPO.slug, patch={"goal": "fix the vault deploy"})
+        await lifecycle.remember(instance=REPO.slug, run_id="seed",
+                                 content="the hel1 deploy needs the vault mounted first")
+        return h
+
+    async def test_a_slow_selector_costs_the_recall_not_the_open(self, tmp_path, monkeypatch):
+        import asyncio as _asyncio
+
+        from miragen.daemon.sessions import plane as plane_mod
+
+        slow = {"on": False}
+
+        async def selector(request, cards):
+            if slow["on"]:
+                await _asyncio.sleep(1)
+            return SelectionResult(selections=[])
+
+        h = await self._seeded(tmp_path, selector)
+        monkeypatch.setattr(plane_mod, "OPEN_RECALL_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(plane_mod, "RETRIEVAL_TIMEOUT_S", 0.5)  # the selector outlasts the open
+        slow["on"] = True
+        opened = await h.send("SessionStart", source="startup", session="s-2")
+        assert "fix the vault deploy" in opened.context  # the working state still arrives
+        assert "recall timed out" in opened.context
+        assert "recall DEGRADED" in opened.context.splitlines()[-1]
+        assert h.plane.registry.get("claude-code:s-2").counters.injections == 1
+        late = h.plane.stats.late_opens
+        await h.send("UserPromptSubmit", session="s-2", prompt="ok", prompt_id="p-1")
+        assert h.plane.stats.late_opens == late  # no re-open, no second wait
+
+    async def test_a_client_that_declines_recall_gets_none_at_the_open(self, tmp_path):
+        calls = []
+
+        async def selector(request, cards):
+            calls.append(request)
+            return SelectionResult(selections=[])
+
+        h = await self._seeded(tmp_path, selector)
+        before = len(calls)
+        opened = await h.send("SessionStart", source="startup", session="s-2",
+                              client_extra={"capabilities": ["no-prompt-recall"]})
+        assert len(calls) == before  # the selector never ran for it
+        assert "fix the vault deploy" in opened.context
+        assert "its client opted out" in opened.context.splitlines()[-1]
+        manifest = h.service.manifests[-1]
+        assert manifest["policy"]["lane"] == "required"
+
+
 def test_only_rendered_recall_entries_are_tracked():
     """Entries past the optional budget are not in the text, so they must
     not be in the manifest or counted for citation either."""
