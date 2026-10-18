@@ -654,3 +654,35 @@ async def test_grok_end_usage_fills_model_calls_cache_reasoning_api_time_and_cos
     assert (u.cached_input_tokens, u.cache_write_tokens, u.reasoning_tokens) == (9856, 12, 20)
     assert (u.api_duration_ms, u.cost_usd_ticks, u.requests) == (15123, 777, 3)
     assert result.timings["summary"]["model_api_ms"] == 15123
+
+
+async def test_reasoning_effort_is_set_per_instance(env):
+    # Mira (2026-10-18): chat on medium, heartbeats on low; grok's default
+    # for grok-4.6 is high.
+    h = env.harness(effort="medium", instance_effort={"mira-heartbeat": "low"})
+    chat = await h.run(turn("one", instance="chat"))
+    await h.run(turn("one", instance="mira-heartbeat", run_id="r2"))
+    argvs = {e["cwd"].rsplit("/", 1)[-1]: e["argv"] for e in env.log() if "argv" in e}
+    assert argvs["chat"][argvs["chat"].index("--reasoning-effort") + 1] == "medium"
+    assert argvs["mira-heartbeat"][argvs["mira-heartbeat"].index("--reasoning-effort") + 1] == "low"
+    assert argvs["chat"][-2:] == ["--no-leader", "stdio"]
+    spawn = next(sp for sp in chat.timings["spans"] if sp["name"] == "spawn")
+    assert spawn["detail"]["effort"] == "medium"
+
+
+async def test_no_effort_leaves_grok_its_default(env):
+    h = env.harness()
+    await h.run(turn("one"))
+    start = next(e for e in env.log() if "argv" in e)
+    assert "--reasoning-effort" not in start["argv"]
+
+
+def test_effort_settings_from_env(monkeypatch):
+    monkeypatch.setenv("MIRAGEN_GROK_EFFORT", "Medium")
+    monkeypatch.setenv("MIRAGEN_GROK_INSTANCE_EFFORT", "mira-heartbeat=low, other=xhigh")
+    s = GrokSettings.from_env(gateway_url="http://x/")
+    assert s.effort == "medium" and s.effort_for("chat") == "medium"
+    assert s.effort_for("mira-heartbeat") == "low" and s.effort_for("other") == "xhigh"
+    monkeypatch.setenv("MIRAGEN_GROK_INSTANCE_EFFORT", "mira-heartbeat=lowest")
+    with pytest.raises(ValueError, match="unknown reasoning effort 'lowest'"):
+        GrokSettings.from_env(gateway_url="http://x/")

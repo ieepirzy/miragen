@@ -62,11 +62,15 @@ logger = logging.getLogger("miragend.sessions")
 
 # Daemon-side bounds UNDER the adapter's (client.py: 10 s for context).
 RETRIEVAL_TIMEOUT_S = 8.0
-# The open's recall lane (search + selector) gets part of that budget: a
-# slow selector must cost the recall, not the working state. A timed-out
-# open is never counted as an injection, so every later prompt would
-# retry it and wait the whole RETRIEVAL_TIMEOUT_S again (ieepirzy/Mira#86).
-OPEN_RECALL_TIMEOUT_S = 4.0
+# Recall at the open (search + the selector model) runs in the background:
+# an open that waited on another model timed out, was never counted, and
+# every later prompt re-opened and waited RETRIEVAL_TIMEOUT_S again
+# (ieepirzy/Mira#86, miragen#211). The open answers with working state and
+# the guide; what recall finds arrives with the session's next prompt (or an
+# async-recall adapter's next claim).
+OPEN_RECALL_PREAMBLE = (
+    "[memory] Recall from this session's start finished in the background; "
+    "these memories may bear on the work:")
 WRITE_TIMEOUT_S = 15.0
 _PROVISION_VERBS = ["read", "propose", "resolve", "retract"]
 # The extraction worker reads events, proposes records and claims jobs.
@@ -125,6 +129,9 @@ class PlaneStats:
     async_recalls_empty: int = 0
     async_recalls_dropped: int = 0
     async_recall_failures: int = 0
+    open_recalls_started: int = 0
+    open_recalls_delivered: int = 0
+    open_recall_failures: int = 0
     recall_wait_timeouts: int = 0
     nudges_fired: int = 0
     nudges_reasked: int = 0
@@ -282,6 +289,9 @@ class SessionPlane:
         self._worker_ungranted: set[str] = set()
         self._tasks: set[asyncio.Task] = set()
         self._recalls: dict[str, RecallJob] = {}
+        # The open's background recall: its own slot, so a prompt's recall
+        # (which supersedes the previous PROMPT's) never cancels it.
+        self._open_recalls: dict[str, RecallJob] = {}
         self._recall_seq: dict[str, int] = {}
         self._recall_failure_announced: set[str] = set()
         self.judgments = JudgmentLog(
@@ -546,8 +556,10 @@ class SessionPlane:
                     context, detail = await self._open_context(session, envelope)
                 recalled, recall_detail, recall_pending = await self._prompt_recall(
                     session, envelope)
-                if recalled:
-                    context = f"{context}\n{recalled}" if context else recalled
+                opened = self._take_open_recall(session)
+                for part in (opened, recalled):
+                    if part:
+                        context = f"{context}\n{part}" if context else part
                 detail = "; ".join(part for part in (detail, recall_detail) if part) or None
             elif event.name == "turn.finished":
                 session.note_turn(event.content)
@@ -561,6 +573,7 @@ class SessionPlane:
                 # A result prepared for the pre-compaction context must not
                 # land in the compacted one.
                 self._drop_recall(session.key)
+                self._drop_open_recall(session.key)
                 session.counters.compactions += 1
                 self.journal.append(envelope)
                 self._spawn(self._capture_then_finalize(
@@ -583,6 +596,7 @@ class SessionPlane:
                 self._journal_and_capture(session, envelope)
             elif event.name == "context.closed":
                 self._drop_recall(session.key)
+                self._drop_open_recall(session.key)
                 self._recall_seq.pop(session.key, None)
                 self._recall_failure_announced.discard(session.key)
                 session.end(str(event.attributes.get("reason") or "session_end"))
@@ -1064,6 +1078,17 @@ class SessionPlane:
         store_detail = await self._ensure_run(session)
         if store_detail:
             scope_detail = "; ".join(part for part in (scope_detail, store_detail) if part)
+        # no-prompt-recall: the client takes no injected memories, at the
+        # open either.
+        if NO_PROMPT_RECALL_CAPABILITY in envelope.client.capabilities:
+            skipped = "declined"
+        elif not lifecycle.spec.recall.enabled:
+            skipped = "disabled"
+        elif self.selector is None:
+            skipped = "unconfigured"
+        else:
+            skipped = "background"
+        wants_recall = skipped == "background"
         started = time.monotonic()
         try:
             packet = await asyncio.wait_for(
@@ -1071,10 +1096,9 @@ class SessionPlane:
                     instance=session.project.slug if session.project else None,
                     run_id=session.key,
                     trigger=f"hook:{envelope.event.original_event.lower()}",
-                    # no-prompt-recall: the client takes no injected
-                    # memories, at the open either (it'd still pay for them).
-                    recall=NO_PROMPT_RECALL_CAPABILITY not in envelope.client.capabilities,
-                    recall_timeout_s=OPEN_RECALL_TIMEOUT_S,
+                    # Never inline: recall at the open runs in the background.
+                    recall=False,
+                    skipped_status=skipped,
                 ),
                 timeout=RETRIEVAL_TIMEOUT_S,
             )
@@ -1099,6 +1123,8 @@ class SessionPlane:
             self.stats.note_loimi(True)
         self._outage_announced.discard(session.key)
         self._count_injection(session, envelope)
+        if wants_recall:
+            self._start_open_recall(session, lifecycle, envelope)
         detail = "; ".join(part for part in (scope_detail, packet.degraded) if part) or None
         status = self._status_line(packet, project_scope=lifecycle.spec.scopes.default_write)
         return f"{self._session_header(session)}\n{packet.text}\n{status}", detail
@@ -1130,6 +1156,12 @@ class SessionPlane:
             recall = (f"automatic recall on; it runs on each prompt of {self.config.recall.min_prompt_chars}+ characters"
                       if self.config.recall.on_prompt else
                       "automatic recall on, but only at session open (not per prompt)")
+        elif status == "background":
+            recall = ("automatic recall on: memories that bear on this session's goal are "
+                      "searched in the background and arrive with your next prompt; " + (
+                          f"it also runs on each prompt of {self.config.recall.min_prompt_chars}+ characters"
+                          if self.config.recall.on_prompt else
+                          "it runs only at session open (not per prompt)"))
         elif status == "declined":
             recall = "no recalled memories are injected into this session (its client opted out)" + (
                 "; memory_recall searches on demand" if self.config.mcp.enabled else "")
@@ -1291,6 +1323,16 @@ class SessionPlane:
             return {"state": "pending"}
         if job.delivered is not None:
             return {"state": "delivered"}
+        answer = self._claim_prompt_recall(key, job)
+        session = self.registry.get(key)
+        opened = self._take_open_recall(session) if session is not None else None
+        if opened:
+            prompt_context = answer.get("context") if answer["state"] in ("ready", "failed") else None
+            return {"state": "ready",
+                    "context": "\n".join(part for part in (opened, prompt_context) if part)}
+        return answer
+
+    def _claim_prompt_recall(self, key: str, job: RecallJob) -> dict[str, Any]:
         selection = job.selection or RecallSelection("none_selected")
         if selection.status == "ok" and selection.section:
             job.delivered = "context"
@@ -1315,6 +1357,85 @@ class SessionPlane:
                 "were not checked. Use memory_recall if you need one. (Said once per session.)"
             )}
         return {"state": "empty"}
+
+    # ── recall at the open, in the background ──────────────────────────────────
+
+    def _start_open_recall(self, session: ExternalSession, lifecycle: MemoryLifecycle,
+                           envelope: EventEnvelope) -> None:
+        self._drop_open_recall(session.key)
+        job = RecallJob(
+            seq=0, key=session.key, scope=lifecycle.spec.scopes.default_write,
+            trigger=f"hook:{envelope.event.original_event.lower()}:open-async",
+            candidates=RecallCandidates("pending"), lifecycle=lifecycle,
+        )
+        self._open_recalls[session.key] = job
+        instance = session.project.slug if session.project else None
+        job.task = self._spawn(self._open_recall_in_background(job, instance))
+        self.stats.open_recalls_started += 1
+
+    async def _open_recall_in_background(self, job: RecallJob, instance: str | None) -> None:
+        """The open's recall lane, off the open's path: the search (the
+        working state's goal is the query), then the selector."""
+        try:
+            job.candidates = await asyncio.wait_for(
+                job.lifecycle.recall_candidates(instance=instance, prompt_hint=""),
+                timeout=self.config.recall.search_timeout_seconds,
+            )
+            if job.candidates.status == "ok":
+                job.selection = await job.lifecycle.recall_select(job.candidates)
+            elif job.candidates.status.startswith("degraded"):
+                job.selection = RecallSelection(job.candidates.status)
+            else:
+                job.selection = RecallSelection("none_selected")
+        except asyncio.CancelledError:
+            job.selection = RecallSelection("cancelled")
+            job.done.set()
+            raise
+        except Exception as exc:  # noqa: BLE001 — the search timed out or failed; degrade
+            job.selection = RecallSelection(f"degraded: {exc or type(exc).__name__}")
+        job.done.set()
+        if job.selection.status.startswith("degraded"):
+            self.stats.retrieval_failures += 1
+            self.stats.open_recall_failures += 1
+        elif job.candidates.cards:
+            self.judgments.record(
+                session=job.key, scope=job.scope, recall_id=f"{job.key}#open",
+                query=job.candidates.query, cards=job.candidates.cards,
+                selected=job.selection.selected, status=job.selection.status,
+                model=self.config.recall.model,
+            )
+
+    def _take_open_recall(self, session: ExternalSession) -> str | None:
+        """A finished open recall, at most once: its section (counted and
+        manifested now, when it is really delivered), a one-time failure
+        notice, or None (nothing found, or still running)."""
+        job = self._open_recalls.get(session.key)
+        if job is None or not job.done.is_set():
+            return None
+        self._open_recalls.pop(session.key, None)
+        selection = job.selection or RecallSelection("none_selected")
+        if selection.status == "ok" and selection.section:
+            job.delivered = "context"
+            self._spawn(job.lifecycle.record_recall_manifest(
+                job.candidates, selection, run_id=session.key, trigger=job.trigger))
+            self.stats.injections += 1
+            session.counters.injections += 1
+            self.stats.open_recalls_delivered += 1
+            self.judgments.mark_delivered(recall_id=f"{session.key}#open", session=session.key,
+                                          state="context")
+            return f"{OPEN_RECALL_PREAMBLE}\n{selection.section}"
+        job.delivered = "empty"
+        if selection.status.startswith("degraded") and session.key not in self._recall_failure_announced:
+            self._recall_failure_announced.add(session.key)
+            return ("[memory] background recall from this session's start failed: memories "
+                    "may exist that were not checked. Use memory_recall if you need one. "
+                    "(Said once per session.)")
+        return None
+
+    def _drop_open_recall(self, key: str) -> None:
+        job = self._open_recalls.pop(key, None)
+        if job is not None and job.task is not None and not job.task.done():
+            job.task.cancel()  # the runner reaps its claude child on cancel
 
     def _count_injection(self, session: ExternalSession, envelope: EventEnvelope) -> None:
         self.stats.injections += 1

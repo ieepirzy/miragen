@@ -75,6 +75,8 @@ ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR"
 # Tool names that are dispatchers, not tools: allowed only when they carry a
 # gateway tool (checked via the call's content).
 DISPATCHERS = ("use_tool", "search_tool")
+# grok's reasoning-effort levels (grok 1.0.62: low, medium, high, xhigh).
+EFFORTS = ("low", "medium", "high", "xhigh")
 
 
 class GrokHarnessError(RuntimeError):
@@ -98,6 +100,14 @@ class GrokSettings:
     # grok's own auto-compaction, as a safety net above the policy (percent
     # of the model's window; grok-4.7: 500k). None leaves grok's default.
     native_compact_percent: int | None = 90
+    # Reasoning effort per process (`--reasoning-effort`): `effort` for every
+    # instance, `instance_effort` overriding it by instance name. None leaves
+    # grok's default for the model (grok-4.6: high).
+    effort: str | None = None
+    instance_effort: dict[str, str] = field(default_factory=dict)
+
+    def effort_for(self, instance: str) -> str | None:
+        return self.instance_effort.get(instance, self.effort)
 
     @classmethod
     def from_env(cls, *, gateway_url: str) -> "GrokSettings":
@@ -116,7 +126,31 @@ class GrokSettings:
             session_retention_days=float(env.get("MIRAGEN_GROK_SESSION_RETENTION_DAYS", "30")),
             native_compact_percent=(int(env["MIRAGEN_GROK_NATIVE_COMPACT_PERCENT"])
                                     if env.get("MIRAGEN_GROK_NATIVE_COMPACT_PERCENT") else 90),
+            effort=_effort(env.get("MIRAGEN_GROK_EFFORT") or None, "MIRAGEN_GROK_EFFORT"),
+            instance_effort=_instance_efforts(env.get("MIRAGEN_GROK_INSTANCE_EFFORT", "")),
         )
+
+
+def _effort(value: str | None, source: str) -> str | None:
+    """A known effort level or None; a typo fails at startup, not as an agent
+    that dies on every spawn."""
+    if value is None:
+        return None
+    value = value.strip().lower()
+    if value not in EFFORTS:
+        raise ValueError(f"{source}: unknown reasoning effort '{value}' (one of {', '.join(EFFORTS)})")
+    return value
+
+
+def _instance_efforts(raw: str) -> dict[str, str]:
+    """``MIRAGEN_GROK_INSTANCE_EFFORT=mira-heartbeat=low,other=medium``."""
+    efforts: dict[str, str] = {}
+    for item in filter(None, (part.strip() for part in raw.split(","))):
+        name, sep, level = item.partition("=")
+        if not sep or not name.strip():
+            raise ValueError(f"MIRAGEN_GROK_INSTANCE_EFFORT: expected instance=level, got '{item}'")
+        efforts[name.strip()] = _effort(level, f"MIRAGEN_GROK_INSTANCE_EFFORT ({name.strip()})")
+    return efforts
 
 
 @dataclass
@@ -333,6 +367,7 @@ class GrokHarness(MiraRunEnv):
     async def _spawn(self, instance: str, *, ephemeral: bool) -> _Agent:
         workdir = self.settings.workdirs / instance
         workdir.mkdir(parents=True, exist_ok=True)
+        effort = self.settings.effort_for(instance)
         acp = self._session_factory(
             grok_bin=self.settings.grok_bin,
             grok_home=str(self.settings.grok_home),
@@ -340,11 +375,12 @@ class GrokHarness(MiraRunEnv):
             model=self.model,
             env=self._env(instance),
             permission_handler=self._permission,
-            extra_args=["--agent-profile", str(self.settings.grok_home / PROFILE_FILE)],
+            extra_args=["--agent-profile", str(self.settings.grok_home / PROFILE_FILE),
+                        *(["--reasoning-effort", effort] if effort else [])],
             cwd=str(workdir),
             strict_auth=True,
         )
-        startup: dict = {"t_spawn": time.monotonic()}
+        startup: dict = {"t_spawn": time.monotonic(), "effort": effort}
         try:
             await acp.start()
             opened = time.monotonic()
@@ -540,7 +576,8 @@ class GrokHarness(MiraRunEnv):
                 ms = startup.get(f"{name}_ms")
                 if ms is not None:
                     timer.add(name, at, at + ms / 1000,
-                              mode=startup.get("session_mode") if name == "session_open" else None)
+                              mode=startup.get("session_mode") if name == "session_open" else None,
+                              effort=startup.get("effort") if name == "spawn" else None)
                     at += ms / 1000
         deliver_update = self._update_pending(instance, ephemeral)
         handoff = None if ephemeral else self._pending_handoff(instance)

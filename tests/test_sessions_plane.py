@@ -725,7 +725,7 @@ class TestStatusLine:
 
         h = Harness(tmp_path, selector=selector)
         result = await h.send("SessionStart", source="startup")
-        assert "automatic recall on; it runs on each prompt of 5+ characters" in result.context.splitlines()[-1]
+        assert "it also runs on each prompt of 5+ characters" in result.context.splitlines()[-1]
 
     async def test_recent_capture_failures_are_announced(self, tmp_path):
         h = Harness(tmp_path)
@@ -797,61 +797,104 @@ class TestStatusLine:
         assert "2 memories in group:project.x injected above — cite the ids" in line
 
 
-class TestOpenRecallBudget:
-    """ieepirzy/Mira#86: a slow selector at the open timed the WHOLE open
-    out, so no injection was counted and every later prompt re-opened and
-    waited the full retrieval timeout again (8 s per turn)."""
+class TestOpenRecallInBackground:
+    """Recall at the open runs in the background (miragen#211, after
+    ieepirzy/Mira#86): an open that waited on the selector model timed out,
+    was never counted, and every later prompt re-opened and waited 8 s
+    again. The open answers with working state; recall arrives with the
+    next prompt, or with an async-recall adapter's next claim."""
 
     async def _seeded(self, tmp_path, selector):
         h = Harness(tmp_path, selector=selector)
         await h.send("SessionStart", source="startup")
+        await h.drain()   # the seeding session's own open recall (no goal yet: nothing)
+        h.plane._open_recalls.clear()
         lifecycle = h.plane._lifecycles[PROJECT_SCOPE]
         await lifecycle.checkpoint(instance=REPO.slug, patch={"goal": "fix the vault deploy"})
         await lifecycle.remember(instance=REPO.slug, run_id="seed",
                                  content="the hel1 deploy needs the vault mounted first")
         return h
 
-    async def test_a_slow_selector_costs_the_recall_not_the_open(self, tmp_path, monkeypatch):
+    @staticmethod
+    def picking(gate=None, calls=None):
+        async def selector(request, cards):
+            if calls is not None:
+                calls.append(request)
+            if gate is not None:
+                await gate.wait()
+            return SelectionResult(selections=[
+                Selection(record_id=c["record_id"], reason="the vault") for c in cards])
+        return selector
+
+    async def test_the_open_never_waits_for_the_selector(self, tmp_path):
         import asyncio as _asyncio
 
-        from miragen.daemon.sessions import plane as plane_mod
-
-        slow = {"on": False}
-
-        async def selector(request, cards):
-            if slow["on"]:
-                await _asyncio.sleep(1)
-            return SelectionResult(selections=[])
-
-        h = await self._seeded(tmp_path, selector)
-        monkeypatch.setattr(plane_mod, "OPEN_RECALL_TIMEOUT_S", 0.05)
-        monkeypatch.setattr(plane_mod, "RETRIEVAL_TIMEOUT_S", 0.5)  # the selector outlasts the open
-        slow["on"] = True
-        opened = await h.send("SessionStart", source="startup", session="s-2")
-        assert "fix the vault deploy" in opened.context  # the working state still arrives
-        assert "recall timed out" in opened.context
-        assert "recall DEGRADED" in opened.context.splitlines()[-1]
+        gate = _asyncio.Event()
+        h = await self._seeded(tmp_path, self.picking(gate))
+        opened = await _asyncio.wait_for(
+            h.send("SessionStart", source="startup", session="s-2"), timeout=2)
+        assert "fix the vault deploy" in opened.context          # working state at once
+        assert "vault mounted" not in opened.context              # recall not yet
+        assert "searched in the background" in opened.context.splitlines()[-1]
         assert h.plane.registry.get("claude-code:s-2").counters.injections == 1
-        late = h.plane.stats.late_opens
-        await h.send("UserPromptSubmit", session="s-2", prompt="ok", prompt_id="p-1")
-        assert h.plane.stats.late_opens == late  # no re-open, no second wait
+        early = await h.send("UserPromptSubmit", session="s-2", prompt="ok", prompt_id="p-1")
+        assert early.context is None                              # still selecting: nothing yet
+        gate.set()
+        await h.drain()
+        late = await h.send("UserPromptSubmit", session="s-2", prompt="ok", prompt_id="p-2")
+        assert late.context.startswith(plane_preamble())
+        assert "vault mounted" in late.context
+        assert h.plane.stats.open_recalls_delivered == 1
+        assert h.plane.stats.late_opens == 0
+        await h.drain()
+        assert any(m["policy"]["trigger"] == "hook:sessionstart:open-async"
+                   for m in h.service.manifests)                  # manifested when delivered
+        again = await h.send("UserPromptSubmit", session="s-2", prompt="ok", prompt_id="p-3")
+        assert again.context is None                              # delivered once
+
+    async def test_an_async_adapter_gets_it_with_its_next_claim(self, tmp_path):
+        h = await self._seeded(tmp_path, self.picking())
+        caps = {"capabilities": ["async-recall"]}
+        await h.send("SessionStart", source="startup", session="s-2", client_extra=caps)
+        prompt = await h.send("UserPromptSubmit", session="s-2", prompt="what about lunch today",
+                              prompt_id="p-1", client_extra=caps)
+        await h.drain()
+        claim = await h.plane.claim_recall("claude-code", "s-2", prompt.recall_pending)
+        assert claim["state"] == "ready"
+        assert plane_preamble() in claim["context"] and "vault mounted" in claim["context"]
+        assert h.plane.stats.open_recalls_delivered == 1
+
+    async def test_compaction_drops_a_running_open_recall(self, tmp_path):
+        import asyncio as _asyncio
+
+        gate = _asyncio.Event()
+        h = await self._seeded(tmp_path, self.picking(gate))
+        await h.send("SessionStart", source="startup", session="s-2")
+        job = h.plane._open_recalls["claude-code:s-2"]
+        await h.send("PreCompact", session="s-2", trigger="auto")
+        await _asyncio.sleep(0)
+        assert job.task.cancelled() or job.task.done()
+        assert "claude-code:s-2" not in h.plane._open_recalls
+        gate.set()
+        await h.drain()
 
     async def test_a_client_that_declines_recall_gets_none_at_the_open(self, tmp_path):
         calls = []
-
-        async def selector(request, cards):
-            calls.append(request)
-            return SelectionResult(selections=[])
-
-        h = await self._seeded(tmp_path, selector)
+        h = await self._seeded(tmp_path, self.picking(calls=calls))
         before = len(calls)
         opened = await h.send("SessionStart", source="startup", session="s-2",
                               client_extra={"capabilities": ["no-prompt-recall"]})
+        await h.drain()
         assert len(calls) == before  # the selector never ran for it
         assert "fix the vault deploy" in opened.context
         assert "its client opted out" in opened.context.splitlines()[-1]
-        manifest = h.service.manifests[-1]
-        assert manifest["policy"]["lane"] == "required"
+        assert h.service.manifests[-1]["policy"]["lane"] == "required"
+
+
+def plane_preamble() -> str:
+    from miragen.daemon.sessions.plane import OPEN_RECALL_PREAMBLE
+
+    return OPEN_RECALL_PREAMBLE
 
 
 def test_only_rendered_recall_entries_are_tracked():

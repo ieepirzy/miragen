@@ -167,12 +167,12 @@ class MemoryLifecycle:
     async def prepare_context(
         self, *, instance: str | None, run_id: str | None, trigger: str,
         prompt_hint: str | None = None, recall: bool = True,
-        recall_timeout_s: float | None = None,
+        recall_timeout_s: float | None = None, skipped_status: str = "declined",
     ) -> MemoryPacket:
         """Working state (required) plus the optional recall lane. `recall`
-        False skips the lane (the caller opted out of injected memories);
-        `recall_timeout_s` bounds it, so a slow selector costs the lane, not
-        the working state."""
+        False skips the lane (the caller opted out, or runs recall itself in
+        the background: `skipped_status` says which); `recall_timeout_s`
+        bounds it, so a slow selector costs the lane, not the working state."""
         effective_instance = instance or DEFAULT_INSTANCE
         try:
             context = await self._ensure_context(effective_instance)
@@ -200,7 +200,7 @@ class MemoryLifecycle:
         )
 
         if not recall:
-            optional_status = "declined"
+            optional_status = skipped_status
         else:
             try:
                 optional_status = await asyncio.wait_for(
@@ -229,7 +229,7 @@ class MemoryLifecycle:
                 "policy": {
                     "guidance_version": GUIDANCE_VERSION,
                     "trigger": trigger,
-                    "lane": "required" if optional_status == "declined" else "required+optional",
+                    "lane": "required+optional" if recall else "required",
                     "state_revision": context["state_revision"],
                     "optional_status": optional_status,
                 },
