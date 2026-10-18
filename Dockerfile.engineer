@@ -18,7 +18,9 @@
 # publish.yml builds it FROM the miragen image it has just published (by
 # digest) → ghcr.io/<owner>/miragen-engineer. Never built on a host.
 
-ARG MIRAGEN_IMAGE=ghcr.io/ieepirzy/miragen:latest
+# No default tag: CI passes the miragen image by digest (publish.yml: the one
+# it has just built; engineer-image.yml: a pinned digest).
+ARG MIRAGEN_IMAGE
 FROM ${MIRAGEN_IMAGE}
 
 # The version the plugin setup was checked against (`claude plugin
@@ -42,6 +44,11 @@ COPY deploy/engineer/engineer_setup.py /opt/engineer/engineer_setup.py
 
 # /run/engineer: credential files and the CA bundle, container-local (never
 # on the /agent volume, so never exported or served by miragend's file API).
+# No setuid/setgid binaries: nothing in a lane container may gain privileges
+# (miragend also sets no-new-privileges and drops every capability).
+RUN find / -xdev -type f -perm /6000 -exec chmod a-s {} + \
+    && ! find / -xdev -type f -perm /6000 | grep -q .
+
 RUN chmod -R a+rX /opt/engineer \
     && chmod 0755 /opt/engineer/engineer_setup.py \
     && mkdir -p /run/engineer \
@@ -53,6 +60,7 @@ LABEL io.miragen.engineer-image="1" \
 
 ENV CLAUDE_BIN=/usr/local/bin/claude \
     DISABLE_AUTOUPDATER=1 \
+    ENGINEER_SETUP_STRICT=1 \
     MIRAGEN_CLAUDE_HOME=/agent/claude-home
 
 USER agentuser

@@ -18,20 +18,28 @@ Runs as the unprivileged agent user every time the container starts, before
    loads (setting_sources=["user"]):
    - miragen-memory from the directory marketplace baked into the image;
    - miradesign from the MiraDesign daemon's own bundle
-     (``GET $MIRADESIGN_URL/v1/harness/cloud/plugin.tar.gz``, bearer), so the
-     plugin never speaks a newer hook protocol than the daemon and the image
-     carries no unpublished code. The last good bundle is kept on the
-     agent's volume and used when the daemon cannot be reached.
+     (``GET $MIRADESIGN_URL/v1/harness/cloud/plugin.tar.gz``, bearer, https
+     only, no redirects), unpacked into the container-local ``/run/engineer``
+     (never the agent's volume), so the plugin never speaks a newer hook
+     protocol than the daemon and the image carries no unpublished code.
+   Before that, the user-level Claude Code configuration on the agent's
+   volume is rebuilt from scratch: a session could otherwise persist hooks,
+   ``env``, ``apiKeyHelper``, MCP servers or plugins across restarts.
+   Only ``projects/`` (session resume) and miragen's own harness files stay.
    Options (URL, token) go through ``claude plugin configure --values-stdin``,
    so no token is ever on a command line. MiraDesign's idle wake is turned
    off: MiraRun's lane supervisor is the only thing that starts turns.
-4. A status file, ``/run/engineer/status.json``, says what was set up (names
+4. Every remaining credential value in the environment (``*_TOKEN``,
+   ``*_API_KEY``, ``*_SECRET``) becomes a file and a ``NAME_FILE`` path, so
+   PID 1's environment (``/proc/1/environ``) holds no secret. miragen reads
+   ``*_FILE`` at startup.
+5. A status file, ``/run/engineer/status.json``, says what was set up (names
    and versions, never values), and the same summary goes to the log.
 
-Failures are logged and the container still starts (an engineer without a
-plugin is visible to the supervisor as no progress; one that never boots is
-a crash loop with less to go on). ``ENGINEER_SETUP_STRICT=1`` makes a plugin
-failure fatal instead.
+A configured plugin that cannot be set up stops the container (fail
+closed): a lane without coordination does nothing useful, and a cached copy
+from a writable volume is not trusted. ``ENGINEER_SETUP_STRICT=0`` logs it
+and starts anyway.
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ import base64
 import binascii
 import io
 import json
+import stat
 import os
 import re
 import shutil
@@ -54,6 +63,16 @@ from collections.abc import Callable, Mapping, MutableMapping
 from pathlib import Path
 
 RUN_DIR = Path(os.environ.get("ENGINEER_RUN_DIR", "/run/engineer"))
+# What survives the per-boot rebuild of the Claude Code user configuration:
+# session transcripts and miragen's harness files (claude_code.py,
+# engineer.py). Everything else under CLAUDE_CONFIG_DIR is removed.
+KEEP_IN_CONFIG_DIR = frozenset({
+    "projects", "repos", "workspaces", "home", "todos",
+    "miragen-claude", "miragen-instances.json", "miragen-gitconfig",
+    ".claude.json",
+})
+# Credential-looking variables turned into files before miragen starts.
+SECRET_SUFFIXES = ("_TOKEN", "_API_KEY", "_SECRET", "_PASSWORD")
 SYSTEM_ROOTS = Path("/etc/ssl/certs/ca-certificates.crt")
 MIRAGEN_MARKETPLACE = Path(os.environ.get(
     "ENGINEER_MIRAGEN_MARKETPLACE", "/opt/engineer/marketplaces/miragen"))
@@ -120,12 +139,13 @@ def materialize_secrets(environ: MutableMapping[str, str], run_dir: Path) -> dic
     return written
 
 
-def _write_private(target: Path, value: str) -> None:
+def _write_private(target: Path, value: str, mode: int = 0o400) -> None:
+    """Atomic replace: works over an existing read-only file (a restart)."""
     fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".tmp-")
     try:
         with os.fdopen(fd, "w") as f:
             f.write(value)
-        os.chmod(tmp, 0o400)
+        os.chmod(tmp, mode)
         os.replace(tmp, target)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
@@ -148,28 +168,38 @@ def write_ca_bundle(environ: Mapping[str, str], run_dir: Path,
         log("ENGINEER_EXTRA_CA_B64 holds no certificate; no CA bundle written")
         return None
     target = run_dir / "ca-bundle.pem"
-    target.write_text(system_roots.read_text().rstrip("\n") + "\n" + pem.strip() + "\n")
-    target.chmod(0o444)
+    _write_private(target, system_roots.read_text().rstrip("\n") + "\n" + pem.strip() + "\n",
+                   mode=0o444)
     return target
 
 
 # ── 3. plugins ──────────────────────────────────────────────────────────────
 
-def _https_or_loopback(url: str) -> bool:
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme == "https":
-        return True
-    return parsed.scheme == "http" and parsed.hostname in ("127.0.0.1", "localhost", "::1")
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Any 3xx is an error: the bearer must never follow a redirect to
+    another host or to plain http."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, f"redirect refused ({code})",
+                                     headers, fp)
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirects())
 
 
 def fetch_bundle(url: str, token: str | None, *,
-                 opener: Callable = urllib.request.urlopen) -> bytes:
-    if not _https_or_loopback(url):
+                 opener: Callable = _NO_REDIRECT_OPENER.open) -> bytes:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname:
         raise ValueError("MIRADESIGN_URL must be https (a token is sent)")
     request = urllib.request.Request(url.rstrip("/") + BUNDLE_PATH)
     if token:
-        request.add_header("Authorization", f"Bearer {token}")
+        # Not resent on a redirect even by an opener that follows them.
+        request.add_unredirected_header("Authorization", f"Bearer {token}")
     with opener(request, timeout=30) as response:
+        final = urllib.parse.urlparse(response.geturl())
+        if final.scheme != "https" or final.hostname != parsed.hostname:
+            raise ValueError("the plugin bundle was served from another origin")
         data = response.read(MAX_BUNDLE_BYTES + 1)
     if len(data) > MAX_BUNDLE_BYTES:
         raise ValueError("plugin bundle too large")
@@ -180,9 +210,10 @@ def unpack_marketplace(data: bytes, dest: Path, plugin: str) -> Path:
     """Unpack a directory-marketplace tarball into ``dest`` (replacing it
     only once the new copy is complete and valid). Refuses links, absolute
     paths and traversal (tarfile's data filter)."""
-    staging = dest.parent / f".{dest.name}.new"
-    shutil.rmtree(staging, ignore_errors=True)
-    staging.mkdir(parents=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # A fresh, unpredictable directory: a pre-planted `.x.new` symlink is
+    # never followed.
+    staging = Path(tempfile.mkdtemp(dir=dest.parent, prefix=f".{dest.name}.new-"))
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
             tar.extractall(staging, filter="data")
@@ -192,16 +223,77 @@ def unpack_marketplace(data: bytes, dest: Path, plugin: str) -> Path:
             raise ValueError(f"bundle is not a marketplace holding '{plugin}'")
         json.loads(manifest.read_text())
         json.loads(plugin_json.read_text())
-        old = dest.parent / f".{dest.name}.old"
-        shutil.rmtree(old, ignore_errors=True)
-        if dest.exists():
-            dest.rename(old)
+        _remove(dest)
         staging.rename(dest)
-        shutil.rmtree(old, ignore_errors=True)
         return dest
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
+
+
+def _remove(path: Path) -> None:
+    """Remove a file, symlink or directory without following links."""
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(mode):
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def reset_claude_config(config_dir: Path) -> list[str]:
+    """Rebuild the user-level Claude Code configuration on the agent's
+    volume: remove everything but KEEP_IN_CONFIG_DIR, and strip MCP servers
+    from `.claude.json`. Returns what was removed (names only)."""
+    removed = []
+    config_dir.mkdir(parents=True, exist_ok=True)
+    for entry in config_dir.iterdir():
+        if entry.name in KEEP_IN_CONFIG_DIR:
+            continue
+        _remove(entry)
+        removed.append(entry.name)
+    state = config_dir / ".claude.json"
+    if state.is_symlink():
+        state.unlink()
+        removed.append(".claude.json")
+    elif state.is_file():
+        try:
+            data = json.loads(state.read_text())
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            state.unlink()
+            removed.append(".claude.json")
+        else:
+            changed = data.pop("mcpServers", None) is not None
+            for project in (data.get("projects") or {}).values():
+                if isinstance(project, dict):
+                    for key in ("mcpServers", "enabledMcpjsonServers", "allowedTools"):
+                        changed |= project.pop(key, None) is not None
+            if changed:
+                _write_private(state, json.dumps(data), mode=0o600)
+                removed.append(".claude.json:mcpServers")
+    return removed
+
+
+def secrets_to_files(environ: MutableMapping[str, str], run_dir: Path) -> list[str]:
+    """Every credential-looking value left in the environment becomes
+    run_dir/secrets/<name> and NAME_FILE, so PID 1's environment holds none."""
+    moved = []
+    secrets_dir = run_dir / "secrets"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+    for key in sorted(environ):
+        value = environ[key]
+        if not value or not key.endswith(SECRET_SUFFIXES):
+            continue
+        target = secrets_dir / key.lower()
+        _write_private(target, value)
+        del environ[key]
+        environ[f"{key}_FILE"] = str(target)
+        moved.append(key)
+    return moved
 
 
 def plugin_version(marketplace: Path, plugin: str) -> str | None:
@@ -259,7 +351,10 @@ def install_plugin(cli: ClaudeCLI, marketplace: Path, plugin_id: str,
 
 
 def setup_plugins(environ: Mapping[str, str], secrets: Mapping[str, Path], cli: ClaudeCLI,
-                  *, opener: Callable = urllib.request.urlopen) -> dict:
+                  *, opener: Callable | None = None,
+                  marketplace_dir: Path | None = None) -> dict:
+    opener = opener or _NO_REDIRECT_OPENER.open
+    marketplace_dir = marketplace_dir or (RUN_DIR / "marketplaces")
     status: dict[str, dict] = {}
 
     memory_url = (environ.get("MIRAGEN_MEMORY_URL") or "").strip()
@@ -274,25 +369,19 @@ def setup_plugins(environ: Mapping[str, str], secrets: Mapping[str, Path], cli: 
                 "installed": True, "version": plugin_version(MIRAGEN_MARKETPLACE, "miragen-memory"),
                 "token": bool(bridge)}
         except Exception as exc:  # noqa: BLE001 - reported, setup continues
-            status["miragen-memory"] = {"installed": False, "error": str(exc)}
+            status["miragen-memory"] = {"installed": False, "configured": True, "error": str(exc)}
     else:
         status["miragen-memory"] = {"installed": False, "error": "MIRAGEN_MEMORY_URL unset"}
 
     design_url = (environ.get("MIRADESIGN_URL") or "").strip().rstrip("/")
     design_token = secrets.get("MIRADESIGN_API_KEY")
     if design_url:
-        marketplace = cli.config_dir / "engineer-marketplaces" / "miradesign"
-        source = "cached"
+        marketplace = marketplace_dir / "miradesign"
         try:
-            try:
-                data = fetch_bundle(design_url, design_token.read_text() if design_token else None,
-                                    opener=opener)
-                unpack_marketplace(data, marketplace, "miradesign")
-                source = "daemon"
-            except (OSError, ValueError, urllib.error.URLError, tarfile.TarError) as exc:
-                if not marketplace.is_dir():
-                    raise RuntimeError(f"bundle unavailable and none cached: {exc}") from exc
-                log(f"miradesign bundle fetch failed ({exc}); using the cached copy")
+            data = fetch_bundle(design_url, design_token.read_text() if design_token else None,
+                                opener=opener)
+            unpack_marketplace(data, marketplace, "miradesign")
+            source = "daemon"
             options: dict[str, object] = {"daemon_url": design_url, "wake_idle_sessions": "false"}
             if design_token:
                 options["token"] = design_token.read_text()
@@ -301,7 +390,7 @@ def setup_plugins(environ: Mapping[str, str], secrets: Mapping[str, Path], cli: 
                 "installed": True, "source": source,
                 "version": plugin_version(marketplace, "miradesign"), "token": bool(design_token)}
         except Exception as exc:  # noqa: BLE001
-            status["miradesign"] = {"installed": False, "error": str(exc)}
+            status["miradesign"] = {"installed": False, "configured": True, "error": str(exc)}
     else:
         status["miradesign"] = {"installed": False, "error": "MIRADESIGN_URL unset"}
     return status
@@ -318,22 +407,26 @@ def main(argv: list[str]) -> None:
     ca = write_ca_bundle(environ, RUN_DIR)
 
     config_dir = Path(environ.get("MIRAGEN_CLAUDE_HOME", "/agent/claude-home"))
-    config_dir.mkdir(parents=True, exist_ok=True)
+    reset = reset_claude_config(config_dir)
     cli = ClaudeCLI(
         environ.get("CLAUDE_BIN") or "claude", config_dir,
         secrets=tuple(p.read_text() for p in secrets.values()),
     )
     plugins = setup_plugins(environ, secrets, cli)
 
+    moved = secrets_to_files(environ, RUN_DIR)
     status = {
         "secrets": sorted(str(p) for p in secrets.values()),
+        "env_secrets_to_files": moved,
+        "config_reset": sorted(reset),
         "ca_bundle": str(ca) if ca else None,
         "plugins": plugins,
     }
     (RUN_DIR / "status.json").write_text(json.dumps(status, indent=1, sort_keys=True))
     log(json.dumps(status, sort_keys=True))
-    failed = [name for name, entry in plugins.items() if not entry.get("installed")]
-    if failed and environ.get("ENGINEER_SETUP_STRICT") == "1":
+    failed = [name for name, entry in plugins.items()
+              if entry.get("configured") and not entry.get("installed")]
+    if failed and environ.get("ENGINEER_SETUP_STRICT", "1") != "0":
         raise SystemExit(f"engineer-setup: plugins not set up: {', '.join(failed)}")
 
     os.execvpe(argv[0], argv, environ)

@@ -249,22 +249,37 @@ def test_the_stack_publishes_only_on_the_wireguard_address():
             assert port.startswith("${AGENTS_HOST_BIND_ADDRESS"), (name, port)
 
 
-def test_agents_never_join_miragen_net_or_the_stack_default():
+def test_agents_never_share_a_network_with_miragend_or_each_other():
     stack = _stack()
-    env = stack["services"]["miragend"]["environment"]
+    miragend = stack["services"]["miragend"]
+    env = miragend["environment"]
+    assert env["MIRAGEND_ISOLATED_AGENTS"] == "on"
+    assert env["MIRAGEND_AGENT_NETWORK_PEERS"] == "lanes-gateway=github-broker"
     networks = env["MIRAGEND_AGENT_NETWORKS"].split(",")
-    assert "miragen-net" not in networks and "default" not in networks
-    declared = stack["networks"]
-    for name in networks:
-        assert declared[name]["name"] == name  # fixed names: miragend attaches by name
-    assert declared["lanes-control"]["internal"] is True
-    assert declared["lanes-broker"]["internal"] is True
-    assert declared["lanes-egress"]["driver_opts"][
-        "com.docker.network.bridge.enable_icc"] == "false"
-    # The broker's name on the engineers' broker network is the gateway.
-    gateway = stack["services"]["lanes-gateway"]["networks"]
-    assert gateway["lanes-broker"]["aliases"] == ["github-broker"]
-    assert "lanes-egress" not in gateway
+    assert networks == ["lanes-egress"]
+    # miragend is only on the default network, which no agent joins.
+    assert set(miragend["networks"]) == {"default"}
+    egress = stack["networks"]["lanes-egress"]
+    assert egress["name"] == "lanes-egress"
+    assert egress["driver_opts"]["com.docker.network.bridge.enable_icc"] == "false"
+    assert egress["driver_opts"]["com.docker.network.bridge.name"].startswith("lna")
+    assert set(stack["networks"]) == {"lanes-egress"}
+    assert set(stack["services"]["lanes-gateway"]["networks"]) == {"default"}
+
+
+def test_no_image_defaults_to_a_floating_tag():
+    stack = _stack()
+    assert ":?" in stack["services"]["miragend"]["image"]
+    assert "@sha256:" in stack["services"]["lanes-gateway"]["image"]
+    assert ":?" in stack["services"]["miragend"]["environment"]["MIRAGEN_BASE_IMAGE"]
+
+
+def test_the_gateway_routes_on_the_raw_uri_and_lane_names_only():
+    content = _stack()["configs"]["lanes-gateway-nginx"]["content"]
+    assert "map $$request_uri $$lane_agent" in content
+    assert "lane-[a-z0-9_-]{1,58}" in content
+    assert "proxy_pass http://$$lane_agent:8000$$lane_rest;" in content
+    assert "$$uri" not in content.replace("$$request_uri", "")
 
 
 def test_the_stack_holds_no_secret_values():

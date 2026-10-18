@@ -15,22 +15,32 @@ name: agents-host
 # Every address and secret comes from stack.env and files under
 # AGENTS_HOST_SECRETS_DIR. Nothing here is specific to one deployment.
 #
-# Networks (all with fixed names; miragend attaches agents by name):
-#   lanes-control  internal  miragend, lanes-gateway, agents  (lifecycle + turns)
-#   lanes-egress   no ICC    agents only                      (internet; egress open in v1)
-#   lanes-broker   internal  lanes-gateway (as github-broker), agents
-#   default                  miragend, lanes-gateway          (port publishing only)
-# Engineers never join the default network or miragen-net. The host's
-# AGENTS-EGRESS guard (movingfirm-infra agents-host/cloud-init.yaml) still
-# refuses every container's NEW connections into the mesh, 10.0.0.0/16 and
-# the metadata service, except the broker entry in /etc/agents-egress-allow.
+# Isolation (MIRAGEND_ISOLATED_AGENTS=on, miragen daemon/core.py):
+#   - each agent gets its own internal network `miragen-agent-<name>`
+#     (host bridge `lna…`) shared ONLY with lanes-gateway, which is there as
+#     the agent's API front and as `github-broker`. No agent shares a network
+#     with miragend or with another agent.
+#   - lanes-egress (bridge `lna-egress`, no inter-container traffic) is the
+#     agents' route to the internet. Egress is open in v1.
+#   - miragend is on the stack's default network only, with lanes-gateway.
+#     No agent is on it.
+#   - each agent's MIRAGEN_INTERNAL_TOKEN is derived from the master token
+#     and its name; credentials reach agents as files, never env values.
+#   - the run-control contract and schedules are not served.
+# The host's AGENTS-EGRESS guard (movingfirm-infra agents-host/cloud-init.yaml)
+# must also refuse `lna+` bridges' new connections to the host (INPUT) and to
+# published ports on the WireGuard address (DNAT, --ctorigdst); README step 4.
 # ============================================================
 
 services:
   miragend:
-    image: ${MIRAGEND_IMAGE:-ghcr.io/ieepirzy/miragend:latest}
+    # Pin by digest or sha- tag: no default (review round 1).
+    image: ${MIRAGEND_IMAGE:?set MIRAGEND_IMAGE (ghcr.io/ieepirzy/miragend@sha256:...)}
     container_name: miragend
     restart: unless-stopped
+    depends_on:
+      # Agent networks get the gateway attached when miragend starts.
+      - lanes-gateway
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # Identical path inside and outside: agent compose files bind
@@ -55,10 +65,12 @@ services:
       MIRAGEND_PORT: "8000"
       MIRAGEN_WORKSPACE: ${MIRAGEN_WORKSPACE:-/opt/miragen-lanes}
       MIRAGEND_STATE_DIR: /var/lib/miragend
-      # Every agent runs the engineer image. Pin it (a digest or sha- tag).
+      # Every agent runs the engineer image. Pin it (a digest).
       MIRAGEN_BASE_IMAGE: ${ENGINEER_IMAGE:?set ENGINEER_IMAGE (ghcr.io/ieepirzy/miragen-engineer@sha256:...)}
       # Credentials, from files. The daemon resolves *_FILE at startup.
       MIRAGEND_TOKEN_FILE: /run/agents-host-secrets/miragend_token
+      # The lanes MASTER agent token (= MiraRun's MIRARUN_LANES_MIRAGEN_TOKEN).
+      # No agent ever holds it: each gets HMAC(master, its name).
       MIRAGEN_INTERNAL_TOKEN_FILE: /run/agents-host-secrets/miragen_internal_token
       # The subscription token reaches only agents that run Claude Code
       # (docs/credential-grants.md); nothing else receives it.
@@ -67,8 +79,11 @@ services:
       # under `credentials:` (per-profile grants).
       MIRADESIGN_API_KEY_FILE: /run/agents-host-secrets/miradesign_token
       MIRAGEN_BRIDGE_API_KEY_FILE: /run/agents-host-secrets/miragen_bridge_token
-      # Agents attach to these, never to miragen-net (miragen#216).
-      MIRAGEND_AGENT_NETWORKS: lanes-control,lanes-egress,lanes-broker
+      MIRAGEND_ISOLATED_AGENTS: "on"
+      # Who joins each agent's private network, and as what.
+      MIRAGEND_AGENT_NETWORK_PEERS: lanes-gateway=github-broker
+      # Shared network every agent also joins: internet only, no ICC.
+      MIRAGEND_AGENT_NETWORKS: lanes-egress
       # What MiraRun is told an agent's address is: lanes-gateway, on the
       # WireGuard address, by agent name.
       MIRAGEND_AGENT_ENDPOINT_TEMPLATE: http://${AGENTS_HOST_BIND_ADDRESS:?set AGENTS_HOST_BIND_ADDRESS (this host's WireGuard address)}:${GATEWAY_PUBLISH_PORT:-8001}/a/{name}
@@ -81,19 +96,21 @@ services:
       MIRAGEND_MAX_AGENTS: ${MIRAGEND_MAX_AGENTS:-4}
       MIRAGEND_AGENT_MEM_LIMIT: ${MIRAGEND_AGENT_MEM_LIMIT:-3g}
       MIRAGEND_AGENT_CPU_LIMIT: ${MIRAGEND_AGENT_CPU_LIMIT:-2}
+      MIRAGEND_AGENT_PIDS_LIMIT: ${MIRAGEND_AGENT_PIDS_LIMIT:-512}
       MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS: ""
     ports:
       # The lifecycle API on the WireGuard address only. Docker-published
-      # ports bypass ufw, so the bind address IS the guard.
+      # ports bypass ufw, so the bind address IS the guard (plus the host
+      # rules refusing lane bridges, README step 4).
       - ${AGENTS_HOST_BIND_ADDRESS}:${MIRAGEND_PUBLISH_PORT:-8000}:8000
     networks:
+      # Not lanes-egress, not any agent network: no agent can reach it.
       default: {}
-      lanes-control: {}
     security_opt:
       - no-new-privileges:true
 
   lanes-gateway:
-    image: ${GATEWAY_IMAGE:-nginx:1.27.5-alpine}
+    image: ${GATEWAY_IMAGE:-nginx:1.27.5-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10}
     container_name: lanes-gateway
     restart: unless-stopped
     read_only: true
@@ -111,20 +128,25 @@ services:
     ports:
       - ${AGENTS_HOST_BIND_ADDRESS}:${GATEWAY_PUBLISH_PORT:-8001}:8001
     networks:
+      # Its upstream route (to the broker over WireGuard) and the publish.
+      # miragend attaches it to each agent's private network at runtime.
       default: {}
-      lanes-control: {}
-      lanes-broker:
-        aliases:
-          # The broker's name everywhere (mirarun compose: github-broker on
-          # mirarun-broker-net), so profiles and the broker's TLS name are
-          # the same on both hosts.
-          - github-broker
     security_opt:
       - no-new-privileges:true
 
 volumes:
   miragend-state:
   gateway-logs:
+
+networks:
+  lanes-egress:
+    name: lanes-egress
+    driver: bridge
+    driver_opts:
+      # Agents reach the internet here, never each other.
+      com.docker.network.bridge.enable_icc: "false"
+      # Host rules match `lna+` (README step 4).
+      com.docker.network.bridge.name: lna-egress
 
 configs:
   # Inline so the stack is one file (a Portainer git stack on an agent
@@ -137,8 +159,8 @@ configs:
       error_log stderr warn;
       events { worker_connections 256; }
 
-      # Engineers dial github-broker:8080 (this container's alias on
-      # lanes-broker); the bytes go to MiraRun's broker over WireGuard
+      # Engineers dial github-broker:8080 (this container's alias on their
+      # private network); the bytes go to MiraRun's broker over WireGuard
       # untouched. TLS is end to end: the gateway sees no credential.
       stream {
         log_format broker escape=json '{"ts":"$$time_iso8601","client":"$$remote_addr","upstream":"$$upstream_addr","status":$$status,"sent":$$bytes_sent,"received":$$bytes_received,"duration_s":$$session_time}';
@@ -153,26 +175,41 @@ configs:
 
       http {
         server_tokens off;
-        # Docker's embedded DNS: agent names resolve on lanes-control.
+        # Docker's embedded DNS: an agent's name resolves on its network.
         resolver 127.0.0.11 valid=10s ipv6=off;
-        log_format turns escape=json '{"ts":"$$time_iso8601","client":"$$remote_addr","agent":"$$agent","method":"$$request_method","path":"$$rest","status":$$status,"bytes":$$body_bytes_sent,"duration_s":$$request_time}';
+        # Routed on the RAW request URI, never the decoded URI: the agent
+        # name is `lane-` + miragen's name charset (daemon/core.py
+        # AGENT_NAME_PATTERN) and MiraRun's fixed lane prefix, so a
+        # percent-encoded or dot segment never matches. The rest (path and
+        # query, still encoded) is passed through as sent.
+        map $$request_uri $$lane_agent {
+          "~^/a/(?<name>lane-[a-z0-9_-]{1,58})(?:/|$$)" $$name;
+          default "";
+        }
+        map $$request_uri $$lane_rest {
+          "~^/a/lane-[a-z0-9_-]{1,58}(?<rest>/.*)$$" $$rest;
+          default "";
+        }
+        log_format turns escape=json '{"ts":"$$time_iso8601","client":"$$remote_addr","agent":"$$lane_agent","method":"$$request_method","path":"$$lane_rest","status":$$status,"bytes":$$body_bytes_sent,"duration_s":$$request_time}';
         access_log /var/log/lanes-gateway/agents.jsonl turns;
         client_max_body_size 16m;
 
         server {
           listen 8001;
-          # MiraRun's address only (the WireGuard peer). The agent's own
-          # token (X-Miragen-Token) is still checked by the agent.
+          # MiraRun's address only (the WireGuard peer). Agents reach this
+          # listener on their private network and get 403 here. The
+          # agent's own token (X-Miragen-Token) is still checked by the agent.
           allow ${MIRARUN_SOURCE_ADDRESS:?set MIRARUN_SOURCE_ADDRESS (MiraRun host's WireGuard address)};
           deny all;
 
           location = /healthz { access_log off; return 200 "ok"; }
 
-          # /a/<agent>/<path> -> http://<agent>:8000/<path>, lane agents only.
-          location ~ ^/a/(?<agent>${LANE_AGENT_PREFIX:-lane-}[a-z0-9-]+)(?<rest>/.*)$$ {
-            proxy_pass http://$$agent:8000$$rest$$is_args$$args;
+          location /a/ {
+            if ($$lane_agent = "") { return 404; }
+            if ($$lane_rest = "") { return 404; }
+            proxy_pass http://$$lane_agent:8000$$lane_rest;
             proxy_http_version 1.1;
-            proxy_set_header Host $$agent:8000;
+            proxy_set_header Host $$lane_agent:8000;
             proxy_set_header Connection "";
             # Turns stream and can run long.
             proxy_buffering off;
@@ -183,17 +220,3 @@ configs:
           location / { return 404; }
         }
       }
-
-networks:
-  lanes-control:
-    name: lanes-control
-    internal: true
-  lanes-egress:
-    name: lanes-egress
-    driver: bridge
-    driver_opts:
-      # Agents reach the internet here, never each other.
-      com.docker.network.bridge.enable_icc: "false"
-  lanes-broker:
-    name: lanes-broker
-    internal: true
