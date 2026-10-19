@@ -29,7 +29,7 @@ COPY . /build/
 ARG INSTALL_CLAUDE_CODE=1
 ARG CLAUDE_CODE_VERSION=2.1.280
 
-RUN pip install --no-cache-dir "/build[daemon]" \
+RUN pip install --no-cache-dir "/build[daemon,sentry]" \
     && apt-get update && apt-get install -y --no-install-recommends gosu curl ca-certificates \
     && if [ "$INSTALL_CLAUDE_CODE" = "1" ]; then \
          curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_CODE_VERSION" \
@@ -44,6 +44,13 @@ RUN pip install --no-cache-dir "/build[daemon]" \
 # volume (writable by miragend) and never self-update inside the image.
 ENV DISABLE_AUTOUPDATER=1 \
     CLAUDE_CONFIG_DIR=/var/lib/miragend/claude
+
+# The commit this image was built from (publish.yml passes github.sha). Read by
+# miragen.observability as the Sentry release; empty when built without the
+# arg, which reports no release rather than a shared fake one. Last layer
+# before the entrypoint so a new sha does not invalidate the install layers.
+ARG BUILD_REVISION=
+RUN printf '%s' "$BUILD_REVISION" > /app/BUILD_REVISION
 
 COPY entrypoint.miragend.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh

@@ -379,6 +379,16 @@ under `service.name=miragend` with `mira.run.id` (the session key),
 mechanical facts only, never prompt or memory content
 (see [telemetry.md](telemetry.md)).
 
+Error reporting is optional and separate from that tracing: install the
+`sentry` extra (the published miragend image has it) and set `SENTRY_DSN`
+(or `SENTRY_DSN_FILE`) for miragend and `miragen memory-worker`. Unset, they
+send nothing. `release` is the image's build commit (`/app/BUILD_REVISION`,
+from the `BUILD_REVISION` build arg; `SENTRY_RELEASE` overrides),
+`environment` is `SENTRY_ENVIRONMENT` (default `production`), traces sample
+at `SENTRY_TRACES_SAMPLE_RATE` (default 0.01). No PII, no frame locals, no
+request bodies; every event is scrubbed of credential-named fields and
+token-shaped strings first (`miragen/observability.py`).
+
 ## Scope and permissions
 
 A session's memory is scoped by the daemon, never by the session:

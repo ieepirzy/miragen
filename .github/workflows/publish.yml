@@ -129,6 +129,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Written to /app/BUILD_REVISION: the Sentry release (miragen.observability).
+          build-args: |
+            BUILD_REVISION=${{ github.sha }}
 
       # Best-effort fleet build-telemetry push (image footprint, layer count,
       # build duration) to the vitals collector's OTLP /v1/metrics and /v1/logs — see
