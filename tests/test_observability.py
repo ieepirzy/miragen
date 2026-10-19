@@ -248,3 +248,34 @@ def test_malformed_dsn_never_stops_the_process() -> None:
     sentry_sdk.init()
     assert init_sentry("miragend", {"SENTRY_DSN": "not a dsn"}) is False
     assert sentry_sdk.get_client().dsn is None
+
+
+def test_raw_log_parameters_are_dropped() -> None:
+    # The formatted message keeps the argument in context and gets scrubbed
+    # there; the bare copy of an opaque token would have nothing to match.
+    opaque = "opaquevalue0123456789abcdef"
+    event = {
+        "logentry": {
+            "message": "auth failed with Bearer %s",
+            "formatted": f"auth failed with Bearer {opaque}",
+            "params": [opaque],
+        },
+        "attributes": {
+            "sentry.message.template": "auth failed with Bearer %s",
+            "sentry.message.parameter.0": opaque,
+        },
+    }
+    scrubbed = scrub_event(event)
+    assert scrubbed is not None
+    assert opaque not in json.dumps(scrubbed)
+    assert scrubbed["logentry"]["message"] == "auth failed with Bearer %s"
+    assert "auth failed with Bearer" in scrubbed["logentry"]["formatted"]
+
+
+def test_api_key_query_parameter_is_filtered() -> None:
+    # Google APIs take the API key as plain ``key=``.
+    url = "https://maps.example/geocode?key=plainvalue456&address=x"
+    scrubbed = scrub_event({"message": f"GET {url}", "request": {"query_string": "key=plainvalue456&page=1"}})
+    assert scrubbed is not None
+    assert "plainvalue456" not in json.dumps(scrubbed)
+    assert scrubbed["request"]["query_string"] == f"key={FILTERED}&page=1"

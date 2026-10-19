@@ -112,11 +112,33 @@ def _is_sensitive_key(key: object) -> bool:
     return isinstance(key, str) and bool(_SENSITIVE_KEY.search(key.replace("-", "_")))
 
 
+# Query parameters that carry a credential although the name alone would be
+# too broad as a dict key (Google APIs take the API key as ``key=``).
+_SENSITIVE_QUERY_ONLY = frozenset({"key"})
+
+
+def _is_sensitive_param(name: str) -> bool:
+    return name.lower() in _SENSITIVE_QUERY_ONLY or _is_sensitive_key(name)
+
+
+def _is_raw_log_parameter(key: object, mapping: Mapping[Any, Any]) -> bool:
+    """A log call's %-arguments, kept apart from the formatted message.
+
+    They travel twice: inside the formatted message, where context such as
+    ``Bearer <x>`` lets the scrubber recognise a secret, and alone (an
+    event's ``logentry.params``, a log's ``sentry.message.parameter.N``),
+    where an opaque token has no shape to catch. The alone copy is dropped.
+    """
+    return isinstance(key, str) and (
+        key.startswith("sentry.message.parameter.") or (key == "params" and "formatted" in mapping)
+    )
+
+
 def _redact_text_query_params(value: str) -> str:
     if "=" not in value:
         return value
     return _TEXT_QUERY_PARAM.sub(
-        lambda m: m["head"] + FILTERED if _is_sensitive_key(m["name"]) else m[0],
+        lambda m: m["head"] + FILTERED if _is_sensitive_param(m["name"]) else m[0],
         value,
     )
 
@@ -125,7 +147,7 @@ def _scrub_query_string(value: str) -> str:
     parts = []
     for pair in value.split("&"):
         name, sep, _ = pair.partition("=")
-        parts.append(f"{name}={FILTERED}" if sep and _is_sensitive_key(name) else pair)
+        parts.append(f"{name}={FILTERED}" if sep and _is_sensitive_param(name) else pair)
     return redact_text("&".join(parts))
 
 
@@ -138,6 +160,8 @@ def _scrub(value: Any, depth: int = 0) -> Any:
     if isinstance(value, Mapping):
         out: dict[Any, Any] = {}
         for key, item in value.items():
+            if _is_raw_log_parameter(key, value):
+                continue
             if _is_sensitive_key(key):
                 out[key] = FILTERED
             elif key in _QUERY_KEYS and isinstance(item, str):
