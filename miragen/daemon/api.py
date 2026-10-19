@@ -655,6 +655,12 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
 
     load_file_secrets()
 
+    # Optional error reporting (miragen[sentry] + SENTRY_DSN); inert otherwise.
+    # After the *_FILE resolution so SENTRY_DSN_FILE works either way.
+    from miragen.observability import init_sentry
+
+    init_sentry("miragend")
+
     token = os.getenv("MIRAGEND_TOKEN", "")
     if not token:
         logger.warning(
