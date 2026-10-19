@@ -105,10 +105,13 @@ def code_violations(root: Path) -> list[str]:
                 continue
             rel = full.relative_to(root).as_posix()
             if rel == "tools.py":
+                from miragen.daemon import safe_fs
+
                 try:
-                    if is_code_free_python(full.read_text()):
+                    # Never through a link the agent planted.
+                    if is_code_free_python(safe_fs.read_text(root, "tools.py")):
                         continue
-                except (OSError, UnicodeDecodeError):
+                except (OSError, UnicodeDecodeError, safe_fs.UnsafeAgentPath):
                     pass
             found.append(rel)
     return sorted(found)

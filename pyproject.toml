@@ -75,6 +75,9 @@ dev = [
     # The bridge MCP's OAuth guard is exercised by tests/test_hosted_bridge.py;
     # CI installs `.[dev]` only.
     "origo>=0.3.0",
+    # tests/test_observability.py sends a real event through the SDK; without
+    # it there the leak test would have nothing to exercise.
+    "sentry-sdk[fastapi]==2.66.1",
 ]
 # Executor backend tier (self-harnessed executors). `openai-codex` is OpenAI's
 # App Server JSON-RPC SDK (AsyncCodex → threads → turns → notifications), which
@@ -117,6 +120,12 @@ daemon = [
 # Docker. `daemon` is a superset.
 bridge = [
     "origo>=0.3.0",
+]
+# Optional error reporting for miragend and the memory worker
+# (miragen/observability.py). Inert without SENTRY_DSN. Pinned exactly: an SDK
+# upgrade changes what leaves the process, so it is a reviewed change.
+sentry = [
+    "sentry-sdk[fastapi]==2.66.1",
 ]
 
 [project.urls]

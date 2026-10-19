@@ -1310,6 +1310,33 @@ class TestInternalTokenGuard:
         resp = await client.get("/health")
         assert resp.status_code == 200
 
+    async def test_a_required_token_that_is_empty_refuses_instead_of_opening(
+        self, client, monkeypatch
+    ):
+        # miragend's isolated agents (MIRAGEN_INTERNAL_AUTH=required): an
+        # unset token is a misconfiguration, never "no auth".
+        monkeypatch.delenv("MIRAGEN_INTERNAL_TOKEN", raising=False)
+        monkeypatch.setenv("MIRAGEN_INTERNAL_AUTH", "required")
+        with patch("miragen.app.run_agent", AsyncMock(return_value="hello")):
+            resp = await client.post("/run", json={"prompt": "hi"})
+        assert resp.status_code == 503
+        assert (await client.get("/runs")).status_code == 503
+        assert (await client.get("/health")).status_code == 200
+
+    async def test_the_mounted_guard_refuses_too(self, monkeypatch):
+        monkeypatch.delenv("MIRAGEN_INTERNAL_TOKEN", raising=False)
+        monkeypatch.setenv("MIRAGEN_INTERNAL_AUTH", "required")
+        sent = []
+
+        async def inner(scope, receive, send):
+            raise AssertionError("reached the mounted app")
+
+        async def send(message):
+            sent.append(message)
+
+        await app_module._TokenGuardASGI(inner)({"type": "http", "headers": []}, None, send)
+        assert sent[0]["status"] == 503
+
 
 class TestHistoryCap:
     def test_no_cap_returns_all_messages(self):

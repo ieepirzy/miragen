@@ -1,0 +1,228 @@
+name: agents-host
+
+# ============================================================
+# The agents host's lifecycle stack (mirarun ADR-041 §8, mirarun#180).
+#
+# One miragend that runs engineer-lane containers on this host, reachable by
+# MiraRun (on another host) over WireGuard only, plus `lanes-gateway`, which
+#   - publishes each agent's API to MiraRun on the same WireGuard address
+#     (MiraRun sends turns to the agent directly, not through miragend), and
+#   - is the `github-broker` engineers dial: a TLS pass-through to MiraRun's
+#     GitHub broker over the WireGuard link, so engineers use the same
+#     broker URL as on the MiraRun host and hold no GitHub token.
+#
+# Deployed as a Portainer stack on the agents host; runbook in README.md.
+# Every address and secret comes from stack.env and files under
+# AGENTS_HOST_SECRETS_DIR. Nothing here is specific to one deployment.
+#
+# Isolation (MIRAGEND_ISOLATED_AGENTS=on, miragen daemon/core.py):
+#   - each agent gets its own internal network `miragen-agent-<name>`
+#     (host bridge `lna…`) shared ONLY with lanes-gateway, which is there as
+#     the agent's API front and as `github-broker`. No agent shares a network
+#     with miragend or with another agent.
+#   - lanes-egress (bridge `lna-egress`, no inter-container traffic) is the
+#     agents' route to the internet. Egress is open in v1.
+#   - miragend is on the stack's default network only, with lanes-gateway.
+#     No agent is on it.
+#   - each agent's MIRAGEN_INTERNAL_TOKEN is derived from the master token
+#     and its name; credentials reach agents as files, never env values.
+#   - the run-control contract and schedules are not served.
+# The host's AGENTS-EGRESS guard (movingfirm-infra agents-host/cloud-init.yaml)
+# must also refuse `lna+` bridges' new connections to the host (INPUT) and to
+# published ports on the WireGuard address (DNAT, --ctorigdst); README step 4.
+# ============================================================
+
+services:
+  miragend:
+    # Pin by digest or sha- tag: no default (review round 1).
+    image: ${MIRAGEND_IMAGE:?set MIRAGEND_IMAGE (ghcr.io/ieepirzy/miragend@sha256:...)}
+    container_name: miragend
+    restart: unless-stopped
+    depends_on:
+      # Agent networks get the gateway attached when miragend starts.
+      - lanes-gateway
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Identical path inside and outside: agent compose files bind
+      # ./agents/<name> relative to it on the HOST (see ../../compose.yaml).
+      - ${MIRAGEN_WORKSPACE:-/opt/miragen-lanes}:${MIRAGEN_WORKSPACE:-/opt/miragen-lanes}
+      - miragend-state:/var/lib/miragend
+      # Secret files on the host, owned by uid 1000 (miragend's unprivileged
+      # user), mode 0400. Never in git, never in stack.env.
+      - type: bind
+        source: ${AGENTS_HOST_SECRETS_DIR:?set AGENTS_HOST_SECRETS_DIR (host directory of secret files)}
+        target: /run/agents-host-secrets
+        read_only: true
+    env_file:
+      # Portainer writes the stack's variables here. It holds names, paths
+      # and addresses only: every credential is a *_FILE pointing into
+      # /run/agents-host-secrets. Per-lane broker credentials are added the
+      # same way (GH_BROKER_<LANE>_API_KEY_FILE=...), with no change here.
+      - path: stack.env
+        required: false
+    environment:
+      MIRAGEND_HOST: 0.0.0.0
+      MIRAGEND_PORT: "8000"
+      MIRAGEN_WORKSPACE: ${MIRAGEN_WORKSPACE:-/opt/miragen-lanes}
+      MIRAGEND_STATE_DIR: /var/lib/miragend
+      # Every agent runs the engineer image. Pin it (a digest).
+      MIRAGEN_BASE_IMAGE: ${ENGINEER_IMAGE:?set ENGINEER_IMAGE (ghcr.io/ieepirzy/miragen-engineer@sha256:...)}
+      # Credentials, from files. The daemon resolves *_FILE at startup.
+      MIRAGEND_TOKEN_FILE: /run/agents-host-secrets/miragend_token
+      # The lanes MASTER agent token (= MiraRun's MIRARUN_LANES_MIRAGEN_TOKEN).
+      # No agent ever holds it: each gets HMAC(master, its name).
+      MIRAGEN_INTERNAL_TOKEN_FILE: /run/agents-host-secrets/miragen_internal_token
+      # The subscription token reaches only agents that run Claude Code
+      # (docs/credential-grants.md); nothing else receives it.
+      CLAUDE_CODE_OAUTH_TOKEN_FILE: /run/agents-host-secrets/claude_code_oauth_token
+      # Plugin tokens. An agent receives one only when its profile lists it
+      # under `credentials:` (per-profile grants).
+      MIRADESIGN_API_KEY_FILE: /run/agents-host-secrets/miradesign_token
+      MIRAGEN_BRIDGE_API_KEY_FILE: /run/agents-host-secrets/miragen_bridge_token
+      MIRAGEND_ISOLATED_AGENTS: "on"
+      # Who joins each agent's private network, and as what.
+      MIRAGEND_AGENT_NETWORK_PEERS: lanes-gateway=github-broker
+      # Shared network every agent also joins: internet only, no ICC.
+      MIRAGEND_AGENT_NETWORKS: lanes-egress
+      # What MiraRun is told an agent's address is: lanes-gateway, on the
+      # WireGuard address, by agent name.
+      MIRAGEND_AGENT_ENDPOINT_TEMPLATE: http://${AGENTS_HOST_BIND_ADDRESS:?set AGENTS_HOST_BIND_ADDRESS (this host's WireGuard address)}:${GATEWAY_PUBLISH_PORT:-8001}/a/{name}
+      # Durable record of every lifecycle action and credential grant.
+      MIRAGEND_AUDIT_LOG: /var/lib/miragend/audit/miragend.jsonl
+      # Non-secret engineer config every agent receives (names, values come
+      # from stack.env): the MiraDesign and memory bridge URLs, and the
+      # broker's CA (base64 PEM) when it is not publicly trusted.
+      MIRAGEND_AGENT_ENV_PASSTHROUGH: MIRADESIGN_URL,MIRAGEN_MEMORY_URL,ENGINEER_EXTRA_CA_B64
+      MIRAGEND_MAX_AGENTS: ${MIRAGEND_MAX_AGENTS:-4}
+      MIRAGEND_AGENT_MEM_LIMIT: ${MIRAGEND_AGENT_MEM_LIMIT:-3g}
+      MIRAGEND_AGENT_CPU_LIMIT: ${MIRAGEND_AGENT_CPU_LIMIT:-2}
+      MIRAGEND_AGENT_PIDS_LIMIT: ${MIRAGEND_AGENT_PIDS_LIMIT:-512}
+      MIRAGEN_EXTERNAL_ALLOWED_PROVIDERS: ""
+    ports:
+      # The lifecycle API on the WireGuard address only. Docker-published
+      # ports bypass ufw, so the bind address IS the guard (plus the host
+      # rules refusing lane bridges, README step 4).
+      - ${AGENTS_HOST_BIND_ADDRESS}:${MIRAGEND_PUBLISH_PORT:-8000}:8000
+    networks:
+      # Not lanes-egress, not any agent network: no agent can reach it.
+      default: {}
+    security_opt:
+      - no-new-privileges:true
+
+  lanes-gateway:
+    # Unprivileged nginx (uid 101, no root master), pinned by digest.
+    image: ${GATEWAY_IMAGE:-nginxinc/nginx-unprivileged:1.27.5-alpine@sha256:65e3e85dbaed8ba248841d9d58a899b6197106c23cb0ff1a132b7bfe0547e4c0}
+    container_name: lanes-gateway
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    pids_limit: 128
+    tmpfs:
+      - /tmp
+    command: ["nginx", "-c", "/etc/lanes-gateway/nginx.conf", "-g", "daemon off;"]
+    configs:
+      - source: lanes-gateway-nginx
+        target: /etc/lanes-gateway/nginx.conf
+    volumes:
+      # nginx's cache dir (owned by its uid in the image, so the fresh
+      # volume is too) holds its temp files and the JSON access logs of
+      # every proxied agent call (turns included) and broker connection.
+      - gateway-logs:/var/cache/nginx
+    ports:
+      - ${AGENTS_HOST_BIND_ADDRESS}:${GATEWAY_PUBLISH_PORT:-8001}:8001
+    networks:
+      # Its upstream route (to the broker over WireGuard) and the publish.
+      # miragend attaches it to each agent's private network at runtime.
+      default: {}
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  miragend-state:
+  gateway-logs:
+
+networks:
+  lanes-egress:
+    name: lanes-egress
+    driver: bridge
+    driver_opts:
+      # Agents reach the internet here, never each other.
+      com.docker.network.bridge.enable_icc: "false"
+      # Host rules match `lna+` (README step 4).
+      com.docker.network.bridge.name: lna-egress
+
+configs:
+  # Inline so the stack is one file (a Portainer git stack on an agent
+  # environment cannot bind files from the repository). Compose fills the
+  # ${...} values from stack.env; nginx's own variables are written $$name.
+  lanes-gateway-nginx:
+    content: |
+      worker_processes 1;
+      pid /tmp/nginx.pid;
+      error_log stderr warn;
+      events { worker_connections 256; }
+
+      # Engineers dial github-broker:8080 (this container's alias on their
+      # private network); the bytes go to MiraRun's broker over WireGuard
+      # untouched. TLS is end to end: the gateway sees no credential.
+      stream {
+        log_format broker escape=json '{"ts":"$$time_iso8601","client":"$$remote_addr","listener":"$$server_addr:$$server_port","upstream":"$$upstream_addr","status":$$status,"sent":$$bytes_sent,"received":$$bytes_received,"duration_s":$$session_time}';
+        access_log /var/cache/nginx/broker.jsonl broker;
+        server {
+          listen 8080;
+          proxy_pass ${BROKER_UPSTREAM:?set BROKER_UPSTREAM (broker address:port on the MiraRun host)};
+          proxy_connect_timeout 10s;
+          proxy_timeout 15m;
+        }
+      }
+
+      http {
+        server_tokens off;
+        # Docker's embedded DNS: an agent's name resolves on its network.
+        resolver 127.0.0.11 valid=10s ipv6=off;
+        # Routed on the RAW request URI, never the decoded URI: the agent
+        # name is `lane-` + miragen's name charset (daemon/core.py
+        # AGENT_NAME_PATTERN) and MiraRun's fixed lane prefix, so a
+        # percent-encoded or dot segment never matches. The rest (path and
+        # query, still encoded) is passed through as sent.
+        map $$request_uri $$lane_agent {
+          "~^/a/(?<name>lane-[a-z0-9_-]{1,58})(?:/|$$)" $$name;
+          default "";
+        }
+        map $$request_uri $$lane_rest {
+          "~^/a/lane-[a-z0-9_-]{1,58}(?<rest>/.*)$$" $$rest;
+          default "";
+        }
+        log_format turns escape=json '{"ts":"$$time_iso8601","client":"$$remote_addr","agent":"$$lane_agent","method":"$$request_method","path":"$$lane_rest","status":$$status,"bytes":$$body_bytes_sent,"duration_s":$$request_time}';
+        access_log /var/cache/nginx/agents.jsonl turns;
+        client_max_body_size 16m;
+
+        server {
+          listen 8001;
+          # MiraRun's WireGuard address only. Note: that is the VPS host's
+          # address, so it admits ANY container on the VPS whose traffic is
+          # masqueraded through it; the VPS-side DOCKER-USER rule in the
+          # README (step 6) narrows that to MiraRun's services. Agents reach
+          # this listener on their private network and get 403 here. The
+          # agent's own token (X-Miragen-Token) is still checked by the agent.
+          allow ${MIRARUN_SOURCE_ADDRESS:?set MIRARUN_SOURCE_ADDRESS (MiraRun host's WireGuard address)};
+          deny all;
+
+          location = /healthz { access_log off; return 200 "ok"; }
+
+          location /a/ {
+            if ($$lane_agent = "") { return 404; }
+            if ($$lane_rest = "") { return 404; }
+            proxy_pass http://$$lane_agent:8000$$lane_rest;
+            proxy_http_version 1.1;
+            proxy_set_header Host $$lane_agent:8000;
+            proxy_set_header Connection "";
+            # Turns stream and can run long.
+            proxy_buffering off;
+            proxy_read_timeout 15m;
+            proxy_send_timeout 15m;
+          }
+
+          location / { return 404; }
+        }
+      }

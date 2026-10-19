@@ -1537,6 +1537,12 @@ access_log.install()
 # pointing an executor.mcp_servers entry at /mcp/ask-human on this app.
 
 
+def _internal_token_required() -> bool:
+    """miragend sets MIRAGEN_INTERNAL_AUTH=required on isolated agents (the
+    agents host): an empty token is then an error, never "no auth"."""
+    return os.environ.get("MIRAGEN_INTERNAL_AUTH", "").strip().lower() == "required"
+
+
 class _TokenGuardASGI:
     """Route-level `_internal_auth` doesn't reach a mounted sub-app, so the
     same MIRAGEN_INTERNAL_TOKEN contract is enforced here: unset means no
@@ -1549,6 +1555,15 @@ class _TokenGuardASGI:
 
     async def __call__(self, scope, receive, send):
         expected = os.environ.get("MIRAGEN_INTERNAL_TOKEN")
+        if scope["type"] == "http" and not expected and _internal_token_required():
+            await send({
+                "type": "http.response.start",
+                "status": 503,
+                "headers": [(b"content-type", b"application/json")],
+            })
+            await send({"type": "http.response.body",
+                        "body": b'{"error": "internal token required but not configured"}'})
+            return
         if scope["type"] == "http" and expected:
             headers = {
                 k.decode("latin-1").lower(): v.decode("latin-1")
@@ -1671,6 +1686,9 @@ def _require_internal_token(x_miragen_token: Optional[str] = Header(default=None
     a matching X-Miragen-Token header. Unset (the default) means no enforcement,
     keeping single-container deployments zero-config."""
     expected = os.environ.get("MIRAGEN_INTERNAL_TOKEN")
+    if not expected and _internal_token_required():
+        raise HTTPException(status_code=503,
+                            detail={"error": "internal token required but not configured"})
     if expected and not hmac.compare_digest(x_miragen_token or "", expected):
         raise HTTPException(status_code=401, detail={"error": "unauthorized"})
 

@@ -26,6 +26,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      # The engineer image builds FROM exactly this image (by digest).
+      digest: ${{ steps.build.outputs.digest }}
 
     steps:
       - uses: actions/checkout@v4
@@ -129,6 +132,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Written to /app/BUILD_REVISION: the Sentry release (miragen.observability).
+          build-args: |
+            BUILD_REVISION=${{ github.sha }}
 
       # Best-effort fleet build-telemetry push (image footprint, layer count,
       # build duration) to the vitals collector's OTLP /v1/metrics and /v1/logs — see
@@ -154,3 +160,50 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           JOB_NAME: publish-miragend
         run: python3 scripts/report_build_telemetry.py
+
+  # miragen-engineer — the engineer-lane image (Dockerfile.engineer, mirarun
+  # ADR-041): FROM the miragen image published above, by digest, so the
+  # profile-contract label and runtime are exactly that build's.
+  publish-engineer:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/miragen-engineer
+          tags: |
+            type=ref,event=branch,suffix=
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.engineer
+          push: true
+          build-args: |
+            MIRAGEN_IMAGE=ghcr.io/${{ github.repository }}@${{ needs.publish.outputs.digest }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Digest
+        run: echo "ghcr.io/${{ github.repository_owner }}/miragen-engineer@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"

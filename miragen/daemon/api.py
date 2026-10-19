@@ -151,6 +151,7 @@ def create_app(
     Grok Build / Codex on this machine joined (miragen/daemon/harness_setup.py);
     its status is on /health."""
     app = FastAPI(title="miragend", version=_miragen_version())
+    isolated = bool(getattr(core, "isolated", False))
 
     async def require_token(request: Request) -> None:
         if not token:
@@ -189,7 +190,11 @@ def create_app(
     @app.get("/health")
     def health() -> dict:
         capabilities = list(DAEMON_CAPABILITIES) if core is not None else []
-        if core is not None and internal_token:
+        if isolated:
+            # Neither schedules nor the run-control contract are served on an
+            # isolated daemon (core.py ISOLATED_AGENTS_ENV).
+            capabilities = [c for c in capabilities if c != "schedules/v1"]
+        if core is not None and internal_token and not isolated:
             # The run-control contract is served only when the shared agent
             # token exists to authenticate it (and to forward downstream), so
             # it is advertised only then — a capability string is a promise.
@@ -230,6 +235,23 @@ def create_app(
     if core is None:
         return app
 
+    def audited(action: str, agent: str, request: Request, fn, **fields):
+        """Run one lifecycle mutation and leave an audit record of it,
+        whatever its outcome (miragen/daemon/audit.py)."""
+        client = request.client.host if request.client else None
+        try:
+            result = fn()
+        except DaemonError as exc:
+            core.audit.record(action, outcome="refused", agent=agent, client=client,
+                              code=exc.code, **fields)
+            raise
+        except Exception as exc:
+            core.audit.record(action, outcome="failed", agent=agent, client=client,
+                              error=type(exc).__name__, **fields)
+            raise
+        core.audit.record(action, agent=agent, client=client, **fields)
+        return result
+
     # -- registry -----------------------------------------------------------
 
     @app.get("/agents", dependencies=guarded)
@@ -244,41 +266,47 @@ def create_app(
     # -- lifecycle ----------------------------------------------------------
 
     @app.post("/agents", status_code=201, dependencies=guarded)
-    def create_agent(body: CreateAgentBody) -> dict:
-        core.create_agent(
-            body.name, body.yaml_source, body.tools_source, labels=body.labels
+    def create_agent(body: CreateAgentBody, request: Request) -> dict:
+        audited(
+            "agent.create", body.name, request,
+            lambda: core.create_agent(
+                body.name, body.yaml_source, body.tools_source, labels=body.labels
+            ),
         )
         return {"name": body.name, "status": core.container_status(body.name)}
 
     @app.put("/agents/{name}/config", dependencies=guarded)
-    def update_agent_config(name: str, body: YamlBody) -> dict:
-        return core.update_agent_config(name, body.yaml_source)
+    def update_agent_config(name: str, body: YamlBody, request: Request) -> dict:
+        return audited("agent.config.update", name, request,
+                       lambda: core.update_agent_config(name, body.yaml_source))
 
     @app.post("/agents/{name}/start", dependencies=guarded)
-    def start_agent(name: str) -> dict:
-        core.start_agent(name)
+    def start_agent(name: str, request: Request) -> dict:
+        audited("agent.start", name, request, lambda: core.start_agent(name))
         return {"name": name, "status": core.container_status(name)}
 
     @app.post("/agents/{name}/stop", dependencies=guarded)
-    def stop_agent(name: str) -> dict:
-        core.stop_agent(name)
+    def stop_agent(name: str, request: Request) -> dict:
+        audited("agent.stop", name, request, lambda: core.stop_agent(name))
         return {"name": name, "status": core.container_status(name)}
 
     @app.post("/agents/{name}/restart", dependencies=guarded)
-    def restart_agent(name: str) -> dict:
-        core.restart_agent(name)
+    def restart_agent(name: str, request: Request) -> dict:
+        audited("agent.restart", name, request, lambda: core.restart_agent(name))
         return {"name": name, "status": core.container_status(name)}
 
     @app.delete("/agents/{name}", dependencies=guarded)
-    def delete_agent(name: str) -> dict:
-        core.delete_agent(name)
+    def delete_agent(name: str, request: Request) -> dict:
+        audited("agent.delete", name, request, lambda: core.delete_agent(name))
         return {"name": name, "deleted": True}
 
     @app.get("/agents/{name}/logs", dependencies=guarded)
     def agent_logs(
-        name: str, tail: int = Query(default=50, ge=1, le=1000)
+        request: Request, name: str, tail: int = Query(default=50, ge=1, le=1000)
     ) -> dict:
-        return {"name": name, "logs": core.agent_logs(name, tail=tail)}
+        logs = audited("agent.logs.read", name, request,
+                       lambda: core.agent_logs(name, tail=tail), tail=tail)
+        return {"name": name, "logs": logs}
 
     # -- tool management ----------------------------------------------------
 
@@ -292,45 +320,57 @@ def create_app(
         return {"tool_name": tool_name, "source": core.tool_source(name, tool_name)}
 
     @app.post("/agents/{name}/tools", status_code=201, dependencies=guarded)
-    def register_tool(name: str, body: RegisterToolBody) -> dict:
-        core.register_tool(name, body.tool_name, body.source)
+    def register_tool(name: str, body: RegisterToolBody, request: Request) -> dict:
+        audited("agent.tool.register", name, request,
+                lambda: core.register_tool(name, body.tool_name, body.source),
+                tool=body.tool_name)
         return {"tool_name": body.tool_name, "registered": True}
 
     @app.patch("/agents/{name}/tools/{tool_name}", dependencies=guarded)
-    def edit_tool(name: str, tool_name: str, body: EditBody) -> dict:
-        core.edit_tool(name, tool_name, body.old_str, body.new_str)
+    def edit_tool(name: str, tool_name: str, body: EditBody, request: Request) -> dict:
+        audited("agent.tool.edit", name, request,
+                lambda: core.edit_tool(name, tool_name, body.old_str, body.new_str),
+                tool=tool_name)
         return {"tool_name": tool_name, "edited": True}
 
     @app.delete("/agents/{name}/tools/{tool_name}", dependencies=guarded)
-    def delete_tool(name: str, tool_name: str) -> dict:
-        core.delete_tool(name, tool_name)
+    def delete_tool(name: str, tool_name: str, request: Request) -> dict:
+        audited("agent.tool.delete", name, request,
+                lambda: core.delete_tool(name, tool_name), tool=tool_name)
         return {"tool_name": tool_name, "deleted": True}
 
     # -- workspace files ----------------------------------------------------
 
     @app.get("/agents/{name}/files", dependencies=guarded)
-    def read_file(name: str, path: str = Query(min_length=1)) -> dict:
-        return {"path": path, "content": core.read_file(name, path)}
+    def read_file(request: Request, name: str, path: str = Query(min_length=1)) -> dict:
+        content = audited("agent.file.read", name, request,
+                          lambda: core.read_file(name, path), path=path)
+        return {"path": path, "content": content}
 
     @app.put("/agents/{name}/files", dependencies=guarded)
-    def write_file(name: str, body: WriteFileBody) -> dict:
-        core.write_file(name, body.path, body.content)
+    def write_file(name: str, body: WriteFileBody, request: Request) -> dict:
+        audited("agent.file.write", name, request,
+                lambda: core.write_file(name, body.path, body.content), path=body.path)
         return {"path": body.path, "written": True}
 
     @app.patch("/agents/{name}/files", dependencies=guarded)
-    def edit_file(name: str, body: EditFileBody) -> dict:
-        core.edit_file(name, body.path, body.old_str, body.new_str)
+    def edit_file(name: str, body: EditFileBody, request: Request) -> dict:
+        audited("agent.file.edit", name, request,
+                lambda: core.edit_file(name, body.path, body.old_str, body.new_str),
+                path=body.path)
         return {"path": body.path, "edited": True}
 
     # -- export / import ----------------------------------------------------
 
     @app.post("/agents/{name}/export", dependencies=guarded)
-    def export_agent(name: str) -> dict:
-        return core.export_agent(name)
+    def export_agent(name: str, request: Request) -> dict:
+        return audited("agent.export", name, request, lambda: core.export_agent(name))
 
     @app.post("/agents/import", status_code=201, dependencies=guarded)
-    def import_agent(body: ImportBody) -> dict:
-        core.import_agent(body.name, body.archive_path, start=body.start)
+    def import_agent(body: ImportBody, request: Request) -> dict:
+        audited("agent.import", body.name, request,
+                lambda: core.import_agent(body.name, body.archive_path, start=body.start),
+                start=body.start)
         return {"name": body.name, "imported": True, "started": body.start}
 
     # -- validation ---------------------------------------------------------
@@ -344,7 +384,7 @@ def create_app(
 
     # -- schedules ----------------------------------------------------------
 
-    if schedules is not None:
+    if schedules is not None and not isolated:
 
         @app.post("/schedules", status_code=201, dependencies=guarded)
         def set_schedule(body: ScheduleBody) -> dict:
@@ -373,9 +413,14 @@ def create_app(
     # "unconfigured" rather than 404 — a client can tell "daemon too old"
     # from "daemon missing its token". Capabilities advertise only when
     # configured (see health()).
-    register_contract_routes(
-        app, core, internal_token=internal_token, transport=contract_transport
-    )
+    # An isolated daemon (the agents host) serves none of it: its agents
+    # are driven directly by the control plane through the gateway, and the
+    # contract's shared-token routes are exactly what an agent could use to
+    # run another agent's profile.
+    if not isolated:
+        register_contract_routes(
+            app, core, internal_token=internal_token, transport=contract_transport
+        )
 
     return app
 
@@ -610,6 +655,12 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
 
     load_file_secrets()
 
+    # Optional error reporting (miragen[sentry] + SENTRY_DSN); inert otherwise.
+    # After the *_FILE resolution so SENTRY_DSN_FILE works either way.
+    from miragen.observability import init_sentry
+
+    init_sentry("miragend")
+
     token = os.getenv("MIRAGEND_TOKEN", "")
     if not token:
         logger.warning(
@@ -682,13 +733,23 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
         internal_token=os.getenv("MIRAGEN_INTERNAL_TOKEN", ""),
         spawn_driver=spawn_driver,
     )
+    if core.isolated:
+        from miragen.daemon.core import check_isolated_tokens
+
+        check_isolated_tokens(token, os.getenv("MIRAGEN_INTERNAL_TOKEN", ""))
+        core.start_peer_reconciler()
     core.ensure_network()
 
     import miragen.daemon.schedules as schedules_module
 
     schedules_module.set_endpoint_resolver(core.endpoint)
 
-    schedules = ScheduleStore(build_scheduler(workspace / "retriggers.sqlite"))
+    # An isolated daemon shares no network with its agents, so a re-trigger
+    # could never reach one: no schedules there.
+    schedules = (
+        None if core.isolated
+        else ScheduleStore(build_scheduler(workspace / "retriggers.sqlite"))
+    )
     app = create_app(
         core,
         schedules,
@@ -702,13 +763,14 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
         harness_setup=harness_setup,
     )
 
-    @app.router.on_event("startup")
-    async def _start_scheduler() -> None:
-        schedules.start()
+    if schedules is not None:
+        @app.router.on_event("startup")
+        async def _start_scheduler() -> None:
+            schedules.start()
 
-    @app.router.on_event("shutdown")
-    async def _stop_scheduler() -> None:
-        schedules.shutdown()
+        @app.router.on_event("shutdown")
+        async def _stop_scheduler() -> None:
+            schedules.shutdown()
 
     uvicorn.run(
         app,

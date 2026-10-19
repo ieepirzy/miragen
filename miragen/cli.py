@@ -431,6 +431,11 @@ def memory_worker(once: bool, interval: int, limit: int, embed_url: str | None,
     import asyncio
     import time as _time
 
+    from miragen.observability import init_sentry
+
+    # Optional error reporting (miragen[sentry] + SENTRY_DSN); inert otherwise.
+    init_sentry("memory-worker")
+
     from miragen.memory import MemoryClient
     from miragen.memory.extraction import (
         build_http_embedder,
