@@ -102,10 +102,23 @@ _MAX_DEPTH = 16
 # Where Sentry keeps a raw query string: the request interface, and the
 # httpx/stdlib HTTP breadcrumbs.
 _QUERY_KEYS = frozenset({"query_string", "http.query"})
+# A query parameter inside free text: an httpx error message or a log line
+# quoting a full URL ("...?access_token=...&page=2"). The parameter's name
+# decides, exactly as for a raw query string.
+_TEXT_QUERY_PARAM = re.compile(r"(?P<head>[?&](?P<name>[A-Za-z0-9_.-]+)=)[^&#\s'\"<>]+")
 
 
 def _is_sensitive_key(key: object) -> bool:
     return isinstance(key, str) and bool(_SENSITIVE_KEY.search(key.replace("-", "_")))
+
+
+def _redact_text_query_params(value: str) -> str:
+    if "=" not in value:
+        return value
+    return _TEXT_QUERY_PARAM.sub(
+        lambda m: m["head"] + FILTERED if _is_sensitive_key(m["name"]) else m[0],
+        value,
+    )
 
 
 def _scrub_query_string(value: str) -> str:
@@ -121,7 +134,7 @@ def _scrub(value: Any, depth: int = 0) -> Any:
         # Too deep to inspect: drop it rather than send it unread.
         return FILTERED
     if isinstance(value, str):
-        return redact_text(value)
+        return redact_text(_redact_text_query_params(value))
     if isinstance(value, Mapping):
         out: dict[Any, Any] = {}
         for key, item in value.items():

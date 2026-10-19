@@ -228,3 +228,23 @@ def test_release_and_rate_overrides(tmp_path: Path) -> None:
     assert bad is not None
     assert bad["traces_sample_rate"] == DEFAULT_TRACES_SAMPLE_RATE
     assert bad["release"] == "c" * 40
+
+
+def test_credential_query_params_in_free_text_are_filtered() -> None:
+    # httpx puts the full URL, query included, into its error message, and
+    # a log line can quote one too: the raw-query-string keys never see it.
+    message = (
+        "Client error '400 Bad Request' for url "
+        "'https://api.example.invalid/v1/me?access_token=plainvalue123&fields=id'"
+    )
+    scrubbed = scrub_event({"message": message, "logentry": {"formatted": message}})
+    assert scrubbed is not None
+    assert "plainvalue123" not in json.dumps(scrubbed)
+    assert f"?access_token={FILTERED}&fields=id'" in scrubbed["message"]
+
+
+def test_malformed_dsn_never_stops_the_process() -> None:
+    # sentry_sdk.init raises BadDsn on a typo; init_sentry must swallow it.
+    sentry_sdk.init()
+    assert init_sentry("miragend", {"SENTRY_DSN": "not a dsn"}) is False
+    assert sentry_sdk.get_client().dsn is None
