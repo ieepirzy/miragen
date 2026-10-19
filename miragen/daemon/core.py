@@ -16,6 +16,8 @@ maps codes back to its LLM-facing guidance.
 from __future__ import annotations
 
 import ast
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -39,7 +41,15 @@ from miragen.daemon.spawn.base import (
     SpawnOperationFailed,
     SpawnUnitNotFound,
 )
-from miragen.daemon.spawn.docker_compose import DockerComposeSpawnDriver
+from miragen.daemon import safe_fs
+from miragen.daemon.audit import AuditLog, NullAuditLog, audit_log_from_env, names
+from miragen.daemon.spawn.docker_compose import (
+    DEFAULT_AGENT_NETWORK,
+    DEFAULT_TMPFS,
+    SECRET_FILES_DIR,
+    AgentIsolation,
+    DockerComposeSpawnDriver,
+)
 from miragen.agent_type import (
     ALLOWED_HOSTS_ENV,
     ALLOWED_PROVIDERS_ENV,
@@ -93,14 +103,52 @@ RESERVED_LABEL_PREFIX = "io.miragen."
 
 # Names an agent may never take: they collide with the management containers
 # on miragen-net (container-name DNS), letting an agent shadow the daemon.
-RESERVED_AGENT_NAMES = frozenset({"miragend", "miragen-mcp"})
+RESERVED_AGENT_NAMES = frozenset({"miragend", "miragen-mcp", "lanes-gateway"})
+
+# Deployment knobs for a daemon whose control plane is on another host (the
+# agents host, mirarun ADR-041 §8). Both unset = the single-host behaviour.
+#
+# MIRAGEND_AGENT_NETWORKS: comma-separated Docker networks every agent joins,
+#   the first one shared with miragend. Unset = miragen-net. Networks other
+#   than miragen-net must already exist (their options are the isolation).
+# MIRAGEND_AGENT_ENDPOINT_TEMPLATE: the agent address miragend ADVERTISES to
+#   its clients (`endpoint` in GET /agents and /agents/{name}), with `{name}`
+#   for the agent name, e.g. http://10.8.0.15:8001/a/{name}. miragend's own
+#   calls (schedule re-triggers) keep the driver's internal address.
+AGENT_NETWORKS_ENV = "MIRAGEND_AGENT_NETWORKS"
+# MIRAGEND_ISOLATED_AGENTS=on: the agents host's mode (AgentIsolation in
+# spawn/docker_compose.py, plus): each agent's MIRAGEN_INTERNAL_TOKEN is its
+# own, derived from the daemon's (derive_agent_token), so no agent holds a
+# credential another agent or the daemon accepts; credentials reach agents
+# as files; the run-control contract and managed schedules are not served.
+ISOLATED_AGENTS_ENV = "MIRAGEND_ISOLATED_AGENTS"
+# container[=alias[+alias...]] entries, comma-separated: who joins each
+# agent's private network, e.g. lanes-gateway=github-broker.
+AGENT_NETWORK_PEERS_ENV = "MIRAGEND_AGENT_NETWORK_PEERS"
+AGENT_PIDS_LIMIT_ENV = "MIRAGEND_AGENT_PIDS_LIMIT"
+AGENT_TMPFS_ENV = "MIRAGEND_AGENT_TMPFS"
+AGENT_TOKEN_CONTEXT = b"miragen-agent-token/v1\0"
+# Values that become secret files under isolation.
+SECRET_ENV_NAMES = frozenset({"MIRAGEN_INTERNAL_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"})
+# Any variable named like a credential also becomes a file under isolation
+# (the model rates token, a passthrough token).
+SECRET_ENV_SUFFIXES = ("_TOKEN", "_API_KEY", "_SECRET", "_PASSWORD")
+# Tells an isolated agent's app that an empty MIRAGEN_INTERNAL_TOKEN is an
+# error, not "no auth" (miragen/app.py).
+INTERNAL_AUTH_ENV = "MIRAGEN_INTERNAL_AUTH"
+AGENT_ENDPOINT_TEMPLATE_ENV = "MIRAGEND_AGENT_ENDPOINT_TEMPLATE"
+
+# A Claude Code credentials store (an interactive login, or plugin secrets
+# a deployment wrote: pluginSecrets). Never served by the file API, never
+# exported.
+CREDENTIAL_STORE_FILES = frozenset({".credentials.json"})
 
 # Agent export/import. Exports are tarballs of an agent workspace, excluding
 # run history and caches; imports must come from the workspace exports/
 # directory and extract with tarfile's "data" filter (rejects absolute paths,
 # traversal, and links).
 EXPORT_EXCLUDE_DIRS = frozenset({"runs", "__pycache__"})
-EXPORT_EXCLUDE_FILES = frozenset({"history.json"})
+EXPORT_EXCLUDE_FILES = frozenset({"history.json", *CREDENTIAL_STORE_FILES})
 MAX_EXPORT_FILE_BYTES = 10 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 50 * 1024 * 1024
 
@@ -547,6 +595,7 @@ class LifecycleCore:
         not_found: type[Exception] | None = None,
         sleep: Callable = time.sleep,
         spawn_driver: object | None = None,
+        audit: AuditLog | NullAuditLog | None = None,
     ) -> None:
         self.workspace = Path(workspace)
         self.agents_dir = self.workspace / "agents"
@@ -569,7 +618,12 @@ class LifecycleCore:
             runner=runner,
             not_found=self._not_found,
             sleep=sleep,
+            networks=agent_networks(self._environ),
+            isolation=agent_isolation(self._environ),
         )
+        self._endpoint_template = endpoint_template(self._environ)
+        self.isolated = isolated_agents(self._environ)
+        self.audit = audit if audit is not None else audit_log_from_env(self._environ)
         # create_agent/import_agent both do a check-then-act against
         # _agent_count() before committing a new agent (mkdir / shutil.move).
         # The daemon's request handlers can run concurrently in separate
@@ -641,17 +695,22 @@ class LifecycleCore:
             raise AgentNotFound(f"agent '{name}' not found")
         return d
 
-    def _safe_path(self, agent: str, rel: str) -> Path:
-        if ".." in rel:
+    def _safe_rel(self, rel: str) -> str:
+        """A workspace-relative path for the file API: no traversal, no
+        absolute path, never a credential store. Symlinks and hard links are
+        refused where the file is opened (safe_fs), on the same fd, so
+        nothing changes between the check and the use."""
+        if ".." in rel or "\x00" in rel:
             raise InvalidPath("path traversal not allowed")
         p = Path(rel)
         if p.is_absolute():
             raise InvalidPath("path traversal not allowed")
-        base = self._agent_dir(agent).resolve()
-        full = (base / p).resolve()
-        if not str(full).startswith(str(base) + os.sep) and full != base:
+        parts = [part for part in p.parts if part not in ("", ".")]
+        if not parts:
             raise InvalidPath("path traversal not allowed")
-        return full
+        if parts[-1] in CREDENTIAL_STORE_FILES:
+            raise InvalidPath("credential stores are not served")
+        return "/".join(parts)
 
     def _safe_export_path(self, archive_path: str) -> Path:
         if ".." in archive_path:
@@ -691,11 +750,44 @@ class LifecycleCore:
             "oom_killed": getattr(lifecycle, "oom_killed", None),
         }
 
+    def reconcile_peers(self) -> None:
+        """Re-attach the gateway to every agent's private network (isolated
+        mode). Cheap and idempotent; run periodically so a recreated gateway
+        gets its attachments back without an agent restart."""
+        reconnect = getattr(self._spawn_driver, "reconnect_peers", None)
+        if reconnect is None:
+            return
+        try:
+            reconnect()
+        except Exception as exc:  # the next pass retries
+            logger.warning("peer reconcile failed: %s", exc)
+
+    def start_peer_reconciler(self, interval_s: float | None = None) -> threading.Thread:
+        interval = interval_s if interval_s is not None else float(
+            self._environ.get("MIRAGEND_PEER_RECONCILE_S") or 30)
+
+        def loop() -> None:
+            while True:
+                self._sleep(interval)
+                self.reconcile_peers()
+
+        thread = threading.Thread(target=loop, name="miragend-peer-reconcile", daemon=True)
+        thread.start()
+        return thread
+
     def ensure_network(self) -> None:
         self._spawn_driver.ensure_ready()
 
     def endpoint(self, name: str) -> str:
+        """The address miragend itself uses to reach the agent."""
         return self._spawn_driver.endpoint(name)
+
+    def advertised_endpoint(self, name: str) -> str:
+        """The address miragend tells its clients (MIRAGEND_AGENT_ENDPOINT_TEMPLATE),
+        else the internal one."""
+        if self._endpoint_template:
+            return self._endpoint_template.replace("{name}", name)
+        return self.endpoint(name)
 
     def _compose_up(self, name: str) -> None:
         try:
@@ -1004,6 +1096,49 @@ class LifecycleCore:
     # every mount and is written only after a create, import or update has
     # booted. A rollback restores it, and the update path reads the agent's
     # previous executor kind from it, never from the agent-writable file.
+    # -- agent-workspace file access (miragen/daemon/safe_fs.py) -------------
+    # The workspace is the agent's own, read-write: never follow a link in
+    # it, never write through one, never trust a file that is not regular.
+
+    def _agent_read(self, name: str, rel: str) -> str:
+        try:
+            return safe_fs.read_text(self._agent_dir(name), rel)
+        except safe_fs.UnsafeAgentPath as exc:
+            raise InvalidPath(str(exc)) from None
+
+    def _agent_read_or_none(self, name: str, rel: str) -> str | None:
+        try:
+            return safe_fs.read_text(self._agent_dir(name), rel)
+        except (FileNotFoundError, NotADirectoryError, safe_fs.UnsafeAgentPath,
+                UnicodeDecodeError):
+            return None
+
+    def _agent_write(self, name: str, rel: str, content: str) -> None:
+        try:
+            safe_fs.write_text(self._agent_dir(name), rel, content)
+        except safe_fs.UnsafeAgentPath as exc:
+            raise InvalidPath(str(exc)) from None
+
+    def _agent_exists(self, name: str, rel: str) -> bool:
+        return safe_fs.exists(self._agent_dir(name), rel)
+
+    def _agent_yaml_data(self, name: str) -> dict:
+        text = self._agent_read_or_none(name, "agent.yaml")
+        if text is None:
+            return {}
+        data = yaml.safe_load(text) or {}
+        return data if isinstance(data, dict) else {}
+
+    def _profile_text(self, name: str) -> str | None:
+        """The profile this daemon last applied (outside every mount), else
+        the workspace's agent.yaml read without following links. What
+        clients are shown is the daemon's copy, never a file the agent can
+        point anywhere."""
+        last_good = self._last_good(name)
+        if last_good is not None:
+            return last_good
+        return self._agent_read_or_none(name, "agent.yaml")
+
     def _last_good_path(self, name: str) -> Path:
         return self.workspace / ".miragend" / "profiles" / f"{name}.yaml"
 
@@ -1043,30 +1178,55 @@ class LifecycleCore:
             return None
 
     @staticmethod
-    def _delivered(spec: ServiceSpec | None) -> tuple[dict[str, str], frozenset[str]] | None:
-        """What a unit hands its process: environment and mounted secrets."""
+    def _delivered(spec: ServiceSpec | None) -> tuple | None:
+        """What a unit hands its process: environment, mounted secrets, and
+        secret files (by digest)."""
         if spec is None:
             return None
-        return dict(spec.environment), frozenset(spec.secret_names)
+        return (
+            dict(spec.environment),
+            frozenset(spec.secret_names),
+            frozenset((k, hashlib.sha256(v.encode()).hexdigest())
+                      for k, v in spec.secret_files.items()),
+        )
 
     def _labels_path(self, name: str) -> Path:
-        return self._agent_dir(name) / "labels.json"
+        # Daemon-owned, outside the agent's mount: labels carry access
+        # grants a control plane assigns, so the agent must not write them.
+        return self.workspace / ".miragend" / "labels" / f"{name}.json"
 
     def _read_agent_labels(self, name: str) -> dict[str, str]:
         path = self._labels_path(name)
-        if not path.exists():
+        try:
+            text = path.read_text()
+        except FileNotFoundError:
+            # An agent created before labels moved: its workspace copy, read
+            # without following links, migrated once to the daemon's place.
+            text = self._agent_read_or_none(name, "labels.json")
+            if text is None:
+                return {}
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+            except OSError:
+                pass
+        except OSError:
             return {}
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(text)
         except Exception:
             return {}
         return data if isinstance(data, dict) else {}
 
     def _write_agent_labels(self, name: str, labels: Mapping[str, str]) -> None:
+        path = self._labels_path(name)
         if labels:
-            self._labels_path(name).write_text(json.dumps(dict(labels)))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(dict(labels)))
+            os.replace(tmp, path)
         else:
-            self._labels_path(name).unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
 
     def _build_service_spec(
         self, name: str, image_ref: str | None = None, *, profile_text: str | None = None
@@ -1075,10 +1235,7 @@ class LifecycleCore:
         from — the text the caller is applying. None reads the agent's
         agent.yaml, which create and import have just written themselves."""
         if profile_text is None:
-            try:
-                profile_text = (self._agent_dir(name) / "agent.yaml").read_text()
-            except OSError:
-                profile_text = None
+            profile_text = self._agent_read_or_none(name, "agent.yaml")
         plan = self._credentials_for(name, profile_text)
         secret_names = self._secret_names(plan)
         env = {"AGENT_PROFILE": "agent.yaml"}
@@ -1086,8 +1243,12 @@ class LifecycleCore:
             # Enable the agent's own /run* guard with the same shared token
             # this daemon (and its clients) authenticate with. Without it a
             # managed agent boots unprotected while callers send
-            # X-Miragen-Token — the header is required by no one.
-            env["MIRAGEN_INTERNAL_TOKEN"] = self._internal_token
+            # X-Miragen-Token — the header is required by no one. Isolated:
+            # the agent's own derived token, never the daemon's.
+            env["MIRAGEN_INTERNAL_TOKEN"] = (
+                derive_agent_token(self._internal_token, name)
+                if self.isolated else self._internal_token
+            )
         # Per-profile credential grants: only the keys this profile implies
         # or declares (miragen/credentials.py), never the daemon's whole
         # *_API_KEY / *_API_KEY_FILE set. NAME_FILE rides with its secret
@@ -1121,6 +1282,10 @@ class LifecycleCore:
         # Every managed agent gets a default resource ceiling so a single
         # runaway container can't starve the host — overridable per-deployment
         # via MIRAGEND_AGENT_CPU_LIMIT / MIRAGEND_AGENT_MEM_LIMIT (see #57).
+        secret_files: dict[str, str] = {}
+        if self.isolated:
+            env[INTERNAL_AUTH_ENV] = "required"
+            env, secret_files = _as_secret_files(env)
         cpu_limit = self._environ.get("MIRAGEND_AGENT_CPU_LIMIT", DEFAULT_AGENT_CPU_LIMIT)
         mem_limit = self._environ.get("MIRAGEND_AGENT_MEM_LIMIT", DEFAULT_AGENT_MEM_LIMIT)
 
@@ -1146,6 +1311,7 @@ class LifecycleCore:
             mem_limit=mem_limit,
             workspace_dir=self._agent_dir(name),
             secret_names=tuple(secret_names),
+            secret_files=secret_files,
         )
 
     def _compose_add_service(
@@ -1157,6 +1323,26 @@ class LifecycleCore:
     def _define_service(self, name: str, spec: ServiceSpec) -> None:
         self.ensure_network()
         self._spawn_driver.define_service(name, spec)
+        # What this container is given, by name: the provider keys and
+        # tokens in its environment and the secrets mounted into it. Taken
+        # from the applied unit itself, so it is what runs, not what was
+        # planned.
+        self.audit.record(
+            "agent.credentials.granted",
+            agent=name,
+            keys=names(k for k in spec.environment if GRANTABLE_RE.fullmatch(k)),
+            key_files=names(
+                k for k in spec.environment
+                if k.endswith("_FILE") and GRANTABLE_RE.fullmatch(k[: -len("_FILE")])
+            ),
+            tokens=names(
+                k for k in spec.environment
+                if k in (CLAUDE_CODE_TOKEN_ENV, "MIRAGEN_INTERNAL_TOKEN")
+            ),
+            secrets=names(spec.secret_names),
+            secret_files=names(spec.secret_files),
+            image=spec.image,
+        )
 
     def _compose_remove_service(self, name: str) -> None:
         self._spawn_driver.remove_service(name)
@@ -1171,14 +1357,13 @@ class LifecycleCore:
                     continue
                 name = entry.name
                 mode = model = ""
-                yaml_path = entry / "agent.yaml"
-                if yaml_path.exists():
-                    try:
-                        data = self._read_yaml(yaml_path)
+                try:
+                    data = yaml.safe_load(self._profile_text(name) or "") or {}
+                    if isinstance(data, dict):
                         mode = data.get("mode", "")
                         model = (data.get("spec") or {}).get("model", "")
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
                 result.append(
                     {
                         "name": name,
@@ -1189,7 +1374,7 @@ class LifecycleCore:
                         # from the agent; addressing is the driver's call —
                         # container-name DNS on miragen-net for Compose, a
                         # different scheme for other substrates.
-                        "endpoint": self.endpoint(name),
+                        "endpoint": self.advertised_endpoint(name),
                         # started_at / finished_at / exit_code / oom_killed,
                         # each None when unknown.
                         **self.container_lifecycle(name),
@@ -1198,14 +1383,15 @@ class LifecycleCore:
         return result
 
     def get_agent(self, name: str) -> dict:
-        d = self._require_agent(name)
-        yaml_path = d / "agent.yaml"
+        self._require_agent(name)
         return {
             "name": name,
-            "yaml": yaml_path.read_text() if yaml_path.exists() else "",
+            # The daemon's own copy of the profile it applied, never the
+            # agent-writable workspace file (which may be a link to a secret).
+            "yaml": self._profile_text(name) or "",
             "status": self.container_status(name),
-            "has_tools": (d / "tools.py").exists(),
-            "endpoint": self.endpoint(name),
+            "has_tools": self._agent_exists(name, "tools.py"),
+            "endpoint": self.advertised_endpoint(name),
             **self.container_lifecycle(name),
         }
 
@@ -1277,12 +1463,17 @@ class LifecycleCore:
                 )
             try:
                 d.mkdir(parents=True)
+                if self.isolated:
+                    # The agent runs as its own uid with miragend's gid as a
+                    # supplementary group (AgentIsolation.shared_gid).
+                    d.chmod(0o770)
             except Exception as exc:
                 raise DaemonError(str(exc)) from exc
 
         try:
-            (d / "agent.yaml").write_text(yaml_source)
-            (d / "tools.py").write_text(
+            self._agent_write(name, "agent.yaml", yaml_source)
+            self._agent_write(
+                name, "tools.py",
                 tools_source
                 if tools_source is not None
                 else f"from miragen import register\n\n# Tools for {name}\n"
@@ -1311,8 +1502,7 @@ class LifecycleCore:
 
     def update_agent_config(self, name: str, yaml_source: str) -> dict:
         d = self._require_agent(name)
-        yaml_path = d / "agent.yaml"
-        if not yaml_path.exists():
+        if self._last_good(name) is None and not self._agent_exists(name, "agent.yaml"):
             raise AgentNotFound(f"agent '{name}' has no agent.yaml")
 
         summary = validate_profile_text(yaml_source, environ=self._environ)
@@ -1333,7 +1523,7 @@ class LifecycleCore:
         # daemon's own copy: agents/<name>/ is mounted rw into the agent, so
         # the on-disk agent.yaml may say anything by now. Agents applied
         # before that copy existed fall back to the file (see rollback).
-        original = yaml_path.read_text()
+        original = self._agent_read_or_none(name, "agent.yaml") or ""
         last_good = self._last_good(name)
         previous = last_good if last_good is not None else original
         old_kind = self._profile_kind(name, previous)
@@ -1387,7 +1577,7 @@ class LifecycleCore:
         new_spec = self._build_service_spec(name, apply_ref, profile_text=yaml_source)
         recreate = will_recreate or self._delivered(previous_spec) != self._delivered(new_spec)
 
-        yaml_path.write_text(yaml_source)
+        self._agent_write(name, "agent.yaml", yaml_source)
         try:
             if recreate:
                 self._define_service(name, new_spec)
@@ -1439,7 +1629,7 @@ class LifecycleCore:
         rw /agent mount. Only when the driver cannot report a previous
         definition is the unit recomposed from `previous_text` on the image
         the agent ran (`image_ref`)."""
-        (self._agent_dir(name) / "agent.yaml").write_text(previous_text)
+        self._agent_write(name, "agent.yaml", previous_text)
         try:
             if not recreate:
                 self.restart_agent(name)
@@ -1493,43 +1683,46 @@ class LifecycleCore:
     # -- tool management ----------------------------------------------------
 
     def list_tools(self, agent: str) -> list[dict]:
-        d = self._require_agent(agent)
-        p = d / "tools.py"
-        if not p.exists():
+        self._require_agent(agent)
+        source = self._agent_read_or_none(agent, "tools.py")
+        if source is None:
             return []
-        return parse_registered_tools(p.read_text())
+        return parse_registered_tools(source)
+
+    def _tools_source(self, agent: str) -> str:
+        source = self._agent_read_or_none(agent, "tools.py")
+        if source is None:
+            raise WorkspaceFileNotFound(f"tools.py not found for agent '{agent}'")
+        return source
 
     def tool_source(self, agent: str, tool_name: str) -> str:
-        d = self._require_agent(agent)
-        p = d / "tools.py"
-        if not p.exists():
-            raise WorkspaceFileNotFound(f"tools.py not found for agent '{agent}'")
-        source = p.read_text()
+        self._require_agent(agent)
+        source = self._tools_source(agent)
         span = find_function_span(source, tool_name)
         if span is None:
             raise ToolNotFound(f"tool '{tool_name}' not found in {agent}/tools.py")
         lines = source.splitlines(keepends=True)
         return "".join(lines[span[0] : span[1]])
 
-    def _public_agent_type(self, d: Path) -> str | None:
-        """'external'/'hybrid' when the stored profile is public-facing, else
-        None. Read as written: the loader refuses an interpolated
-        agent_type, so the raw value is the real one."""
+    def _public_agent_type(self, agent: str) -> str | None:
+        """'external'/'hybrid' when the profile this daemon applied is
+        public-facing, else None. The daemon's copy, not the workspace file
+        the agent could rewrite to unlock tools. Read as written: the loader
+        refuses an interpolated agent_type, so the raw value is the real one."""
         try:
-            agent_type = self._read_yaml(d / "agent.yaml").get("agent_type")
+            data = yaml.safe_load(self._profile_text(agent) or "") or {}
+            agent_type = data.get("agent_type") if isinstance(data, dict) else None
         except Exception:
             return None
         return agent_type if agent_type in PUBLIC_AGENT_TYPES else None
 
-    def _refuse_code_write_on_public_agent(self, agent: str, full: Path) -> None:
+    def _refuse_code_write_on_public_agent(self, agent: str, rel: str) -> None:
         """write_file/edit_file is a side door around both the tool refusal
         and profile validation: a public agent takes no code file, and its
         agent.yaml changes only through update_agent_config (validated)."""
-        d = self._agent_dir(agent)
-        agent_type = self._public_agent_type(d)
+        agent_type = self._public_agent_type(agent)
         if agent_type is None:
             return
-        rel = full.relative_to(d.resolve()).as_posix()
         if rel == "agent.yaml":
             why = "profile changes go through config update, which validates them"
         elif is_code_path(rel):
@@ -1540,10 +1733,10 @@ class LifecycleCore:
             f"agent '{agent}' is agent_type: {agent_type}; refusing to write '{rel}' ({why})"
         )
 
-    def _refuse_tools_on_public_agent(self, agent: str, d: Path) -> None:
+    def _refuse_tools_on_public_agent(self, agent: str) -> None:
         """Live tool injection is custom code; a public-facing agent takes
         none."""
-        agent_type = self._public_agent_type(d)
+        agent_type = self._public_agent_type(agent)
         if agent_type is not None:
             raise PublicAgentRefused(
                 f"agent '{agent}' is agent_type: {agent_type}; it takes no "
@@ -1551,13 +1744,29 @@ class LifecycleCore:
                 "container has)"
             )
 
+    def _update_agent_tools_list(self, agent: str, *, add: str | None = None,
+                                 remove: str | None = None) -> None:
+        text = self._agent_read_or_none(agent, "agent.yaml")
+        if text is None:
+            return
+        data = yaml.safe_load(text) or {}
+        if not isinstance(data, dict):
+            return
+        tools_list: list = data.get("tools", []) or []
+        if add is not None and add not in tools_list:
+            tools_list.append(add)
+        elif remove is not None and remove in tools_list:
+            tools_list.remove(remove)
+        else:
+            return
+        data["tools"] = tools_list
+        self._agent_write(agent, "agent.yaml", yaml.dump(
+            data, default_flow_style=False, allow_unicode=True, sort_keys=False))
+
     def register_tool(self, agent: str, tool_name: str, source: str) -> None:
-        d = self._require_agent(agent)
-        self._refuse_tools_on_public_agent(agent, d)
-        tools_path = d / "tools.py"
-        yaml_path = d / "agent.yaml"
-        if not tools_path.exists():
-            raise WorkspaceFileNotFound(f"tools.py not found for agent '{agent}'")
+        self._require_agent(agent)
+        self._refuse_tools_on_public_agent(agent)
+        original_tools = self._tools_source(agent)
 
         try:
             ast.parse(source)
@@ -1571,40 +1780,31 @@ class LifecycleCore:
                 f"registered as '{tool_name}' (found: {found})"
             )
 
-        original_tools = tools_path.read_text()
-        original_yaml = yaml_path.read_text() if yaml_path.exists() else None
+        original_yaml = self._agent_read_or_none(agent, "agent.yaml")
+
+        def restore() -> None:
+            self._agent_write(agent, "tools.py", original_tools)
+            if original_yaml is not None:
+                self._agent_write(agent, "agent.yaml", original_yaml)
+
         try:
-            tools_path.write_text(
-                original_tools.rstrip("\n") + "\n\n" + source.strip() + "\n"
-            )
-            if yaml_path.exists():
-                data = self._read_yaml(yaml_path)
-                tools_list: list = data.get("tools", [])
-                if tool_name not in tools_list:
-                    tools_list.append(tool_name)
-                    data["tools"] = tools_list
-                    self._write_yaml(yaml_path, data)
+            self._agent_write(
+                agent, "tools.py", original_tools.rstrip("\n") + "\n\n" + source.strip() + "\n")
+            self._update_agent_tools_list(agent, add=tool_name)
             self.restart_agent(agent)
         except DaemonError as exc:
-            tools_path.write_text(original_tools)
-            if original_yaml is not None:
-                yaml_path.write_text(original_yaml)
+            restore()
             raise RestartFailed(
                 f"tool written but restart failed (rolled back): {exc}"
             ) from exc
         except Exception as exc:
-            tools_path.write_text(original_tools)
-            if original_yaml is not None:
-                yaml_path.write_text(original_yaml)
+            restore()
             raise DaemonError(str(exc)) from exc
 
     def edit_tool(self, agent: str, tool_name: str, old_str: str, new_str: str) -> None:
-        d = self._require_agent(agent)
-        self._refuse_tools_on_public_agent(agent, d)
-        tools_path = d / "tools.py"
-        if not tools_path.exists():
-            raise WorkspaceFileNotFound(f"tools.py not found for agent '{agent}'")
-        source = tools_path.read_text()
+        self._require_agent(agent)
+        self._refuse_tools_on_public_agent(agent)
+        source = self._tools_source(agent)
         span = find_function_span(source, tool_name)
         if span is None:
             raise ToolNotFound(f"tool '{tool_name}' not found")
@@ -1624,56 +1824,44 @@ class LifecycleCore:
                 f"old_str appears {count} times within tool '{tool_name}' — must be unique",
                 occurrences=count,
             )
-        tools_path.write_text(before + target.replace(old_str, new_str, 1) + after)
+        self._agent_write(agent, "tools.py", before + target.replace(old_str, new_str, 1) + after)
         self.restart_agent(agent)
 
     def delete_tool(self, agent: str, tool_name: str) -> None:
-        d = self._require_agent(agent)
-        tools_path = d / "tools.py"
-        yaml_path = d / "agent.yaml"
-        if not tools_path.exists():
-            raise WorkspaceFileNotFound(f"tools.py not found for agent '{agent}'")
-        source = tools_path.read_text()
+        self._require_agent(agent)
+        source = self._tools_source(agent)
         span = find_function_span(source, tool_name)
         if span is None:
             raise ToolNotFound(f"tool '{tool_name}' not found")
 
         lines = source.splitlines(keepends=True)
-        tools_path.write_text("".join(lines[: span[0]] + lines[span[1] :]))
-
-        if yaml_path.exists():
-            data = self._read_yaml(yaml_path)
-            tools_list: list = data.get("tools", [])
-            if tool_name in tools_list:
-                tools_list.remove(tool_name)
-                data["tools"] = tools_list
-                self._write_yaml(yaml_path, data)
+        self._agent_write(agent, "tools.py", "".join(lines[: span[0]] + lines[span[1] :]))
+        self._update_agent_tools_list(agent, remove=tool_name)
         self.restart_agent(agent)
 
     # -- workspace files ----------------------------------------------------
 
     def read_file(self, agent: str, path: str) -> str:
         self._require_agent(agent)
-        full = self._safe_path(agent, path)
+        rel = self._safe_rel(path)
         try:
-            return full.read_text()
-        except FileNotFoundError:
+            return self._agent_read(agent, rel)
+        except (FileNotFoundError, NotADirectoryError):
             raise WorkspaceFileNotFound(f"file not found: {path}") from None
 
     def write_file(self, agent: str, path: str, content: str) -> None:
         self._require_agent(agent)
-        full = self._safe_path(agent, path)
-        self._refuse_code_write_on_public_agent(agent, full)
-        full.parent.mkdir(parents=True, exist_ok=True)
-        full.write_text(content)
+        rel = self._safe_rel(path)
+        self._refuse_code_write_on_public_agent(agent, rel)
+        self._agent_write(agent, rel, content)
 
     def edit_file(self, agent: str, path: str, old_str: str, new_str: str) -> None:
         self._require_agent(agent)
-        full = self._safe_path(agent, path)
-        self._refuse_code_write_on_public_agent(agent, full)
+        rel = self._safe_rel(path)
+        self._refuse_code_write_on_public_agent(agent, rel)
         try:
-            content = full.read_text()
-        except FileNotFoundError:
+            content = self._agent_read(agent, rel)
+        except (FileNotFoundError, NotADirectoryError):
             raise WorkspaceFileNotFound(f"file not found: {path}") from None
         count = content.count(old_str)
         if count == 0:
@@ -1682,7 +1870,7 @@ class LifecycleCore:
             raise EditConflict(
                 f"old_str appears {count} times — must be unique", occurrences=count
             )
-        full.write_text(content.replace(old_str, new_str, 1))
+        self._agent_write(agent, rel, content.replace(old_str, new_str, 1))
 
     # -- export / import ----------------------------------------------------
 
@@ -1706,7 +1894,13 @@ class LifecycleCore:
                 if fp.is_symlink():
                     skipped.append({"path": str(rel), "reason": "symlink not exported"})
                     continue
-                size = fp.stat().st_size
+                st = fp.stat()
+                if st.st_nlink > 1:
+                    # A hard link may name a file outside the workspace (the
+                    # agent can create one); its contents are not the agent's.
+                    skipped.append({"path": str(rel), "reason": "hard link not exported"})
+                    continue
+                size = st.st_size
                 if size > MAX_EXPORT_FILE_BYTES:
                     skipped.append(
                         {"path": str(rel), "reason": f"exceeds 10 MB cap ({size} bytes)"}
@@ -1716,8 +1910,26 @@ class LifecycleCore:
 
         with tarfile.open(archive_path, "w:gz") as tar:
             for fp, arcname in members:
-                tar.add(fp, arcname=arcname, recursive=False)
-                included.append(arcname[len(agent) + 1 :])
+                # Opened again through safe_fs, on the fd that is archived:
+                # a file swapped for a link (or hard-linked) after the walk
+                # above is skipped, never followed.
+                rel = arcname[len(agent) + 1 :]
+                try:
+                    fd = safe_fs.open_regular(d, rel)
+                except (OSError, safe_fs.UnsafeAgentPath):
+                    skipped.append({"path": rel, "reason": "changed or not a plain file"})
+                    continue
+                with os.fdopen(fd, "rb") as handle:
+                    st = os.fstat(handle.fileno())
+                    if st.st_size > MAX_EXPORT_FILE_BYTES:
+                        skipped.append({"path": rel, "reason": "grew past the 10 MB cap"})
+                        continue
+                    info = tarfile.TarInfo(arcname)
+                    info.size = st.st_size
+                    info.mtime = int(st.st_mtime)
+                    info.mode = st.st_mode & 0o644
+                    tar.addfile(info, handle)
+                included.append(rel)
 
         size_bytes = archive_path.stat().st_size
         if size_bytes > MAX_ARCHIVE_BYTES:
@@ -1841,7 +2053,7 @@ class LifecycleCore:
                 shutil.move(str(src_root), str(d))
                 created_dir = True
 
-            imported_text = (d / "agent.yaml").read_text()
+            imported_text = self._agent_read(name, "agent.yaml")
             self._compose_add_service(name, spawn_ref, profile_text=imported_text)
             added_service = True
 
@@ -1869,3 +2081,106 @@ class LifecycleCore:
         finally:
             if staging is not None:
                 shutil.rmtree(staging, ignore_errors=True)
+
+
+def agent_networks(environ: Mapping[str, str]) -> tuple[str, ...]:
+    """MIRAGEND_AGENT_NETWORKS, parsed: names in order, de-duplicated."""
+    raw = environ.get(AGENT_NETWORKS_ENV, "") or ""
+    seen: list[str] = []
+    for part in raw.split(","):
+        name = part.strip()
+        if name and name not in seen:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", name):
+                raise ValueError(f"{AGENT_NETWORKS_ENV}: invalid network name {name!r}")
+            seen.append(name)
+    return tuple(seen) or (DEFAULT_AGENT_NETWORK,)
+
+
+def endpoint_template(environ: Mapping[str, str]) -> str | None:
+    """MIRAGEND_AGENT_ENDPOINT_TEMPLATE, checked: an http(s) URL with one
+    `{name}` and nothing else to format."""
+    raw = (environ.get(AGENT_ENDPOINT_TEMPLATE_ENV) or "").strip()
+    if not raw:
+        return None
+    if not re.match(r"^https?://[^/\s{}]+", raw):
+        raise ValueError(f"{AGENT_ENDPOINT_TEMPLATE_ENV} must be an http(s) URL")
+    if raw.count("{name}") != 1 or raw.replace("{name}", "").count("{") or raw.replace(
+        "{name}", ""
+    ).count("}"):
+        raise ValueError(f"{AGENT_ENDPOINT_TEMPLATE_ENV} must contain exactly one {{name}}")
+    return raw.rstrip("/")
+
+
+def derive_agent_token(master: str, name: str) -> str:
+    """An isolated agent's own MIRAGEN_INTERNAL_TOKEN: HMAC-SHA256(master,
+    "miragen-agent-token/v1\\0" + name), hex. MiraRun derives the same value
+    from its lanes agent token (mirarun adapters/miragen/routing.py); a
+    golden vector in both test suites keeps the two in step."""
+    return hmac.new(master.encode("utf-8"), AGENT_TOKEN_CONTEXT + name.encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def isolated_agents(environ: Mapping[str, str]) -> bool:
+    raw = (environ.get(ISOLATED_AGENTS_ENV) or "").strip().lower()
+    if raw in ("", "off", "0", "false", "no"):
+        return False
+    if raw in ("on", "1", "true", "yes"):
+        return True
+    raise ValueError(f"{ISOLATED_AGENTS_ENV} must be on or off")
+
+
+def agent_isolation(environ: Mapping[str, str]) -> AgentIsolation | None:
+    if not isolated_agents(environ):
+        return None
+    peers = []
+    for entry in (environ.get(AGENT_NETWORK_PEERS_ENV) or "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        container, _, aliases = entry.partition("=")
+        alias_list = tuple(a for a in aliases.split("+") if a)
+        for value in (container, *alias_list):
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
+                raise ValueError(f"{AGENT_NETWORK_PEERS_ENV}: invalid entry {entry!r}")
+        peers.append((container, alias_list))
+    if not peers:
+        raise ValueError(
+            f"{ISOLATED_AGENTS_ENV}=on needs {AGENT_NETWORK_PEERS_ENV}: without a peer "
+            "nothing can reach an isolated agent")
+    tmpfs_raw = (environ.get(AGENT_TMPFS_ENV) or "").strip()
+    tmpfs = tuple(t.strip() for t in tmpfs_raw.split(";") if t.strip()) or DEFAULT_TMPFS
+    return AgentIsolation(
+        peers=tuple(peers),
+        pids_limit=int(environ.get(AGENT_PIDS_LIMIT_ENV) or 512),
+        tmpfs=tmpfs,
+        shared_gid=os.getgid(),
+    )
+
+
+def check_isolated_tokens(daemon_token: str, master: str) -> None:
+    """An isolated daemon (the agents host) must have both tokens, and they
+    must differ: an empty MIRAGEND_TOKEN leaves the lifecycle API open on
+    the WireGuard address, an empty master leaves every agent's API open,
+    and equal ones make the agents' master the daemon's credential."""
+    if not daemon_token:
+        raise SystemExit(f"{ISOLATED_AGENTS_ENV}=on needs MIRAGEND_TOKEN")
+    if not master:
+        raise SystemExit(f"{ISOLATED_AGENTS_ENV}=on needs MIRAGEN_INTERNAL_TOKEN")
+    if hmac.compare_digest(daemon_token, master):
+        raise SystemExit("MIRAGEND_TOKEN and MIRAGEN_INTERNAL_TOKEN must differ")
+
+
+def _as_secret_files(env: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+    """Move credential values out of the environment: NAME=value becomes
+    NAME_FILE=<SECRET_FILES_DIR>/<name> plus a file with the value."""
+    out: dict[str, str] = {}
+    files: dict[str, str] = {}
+    for key, value in env.items():
+        if key in SECRET_ENV_NAMES or GRANTABLE_RE.fullmatch(key) or (
+            key.endswith(SECRET_ENV_SUFFIXES) and not key.endswith("_FILE")
+        ):
+            files[key] = value
+            out[f"{key}_FILE"] = f"{SECRET_FILES_DIR}/{key.lower()}"
+        else:
+            out[key] = value
+    return out, files

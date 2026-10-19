@@ -199,6 +199,11 @@ class KubernetesSpawnDriver:
         pass
 
     def define_service(self, name: str, spec: ServiceSpec) -> None:
+        if spec.secret_files:
+            raise SpawnOperationFailed(
+                "secret files (MIRAGEND_ISOLATED_AGENTS) are not supported on the "
+                "kubernetes substrate"
+            )
         if not _DNS1123_LABEL.fullmatch(name):
             raise SpawnOperationFailed(
                 f"'{name}' is not a valid Kubernetes object name (must be "

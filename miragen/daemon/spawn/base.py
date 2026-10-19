@@ -36,6 +36,11 @@ class ServiceSpec:
     mem_limit: str
     workspace_dir: Path
     secret_names: tuple[str, ...] = field(default_factory=tuple)
+    # Credentials delivered as files rather than environment values
+    # (MIRAGEND_ISOLATED_AGENTS): env var name -> value. The environment then
+    # holds only NAME_FILE paths, so `docker inspect` and /proc/1/environ
+    # show no secret. Only the Docker Compose driver supports it.
+    secret_files: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

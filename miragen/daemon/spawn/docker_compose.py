@@ -11,10 +11,16 @@ dict inline.
 
 from __future__ import annotations
 
+import hashlib
+import os
+import shutil
 import subprocess
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
+
+import logging
 
 import yaml
 
@@ -26,6 +32,68 @@ from miragen.daemon.spawn.base import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+# The network every agent joins unless the deployment names others
+# (MIRAGEND_AGENT_NETWORKS). miragend creates it when it is missing.
+DEFAULT_AGENT_NETWORK = "miragen-net"
+
+
+# Where secret files sit inside an isolated agent container.
+SECRET_FILES_DIR = "/run/miragen-secrets"
+# Label on per-agent private networks; its value is the agent name.
+AGENT_NETWORK_LABEL = "io.miragen.agent-network"
+# Host bridge names of per-agent networks start with this, so one host rule
+# (`-i lna+`) covers every lane bridge, including ones created later.
+LANE_BRIDGE_PREFIX = "lna"
+# The engineer image's agent user (Dockerfile.engineer): a high uid, so an
+# agent's files on the host belong to no login user.
+AGENT_UID = 10000
+DEFAULT_TMPFS = (
+    "/tmp:size=512m,mode=1777",
+    f"/run/engineer:uid={AGENT_UID},gid={AGENT_UID},mode=0700,size=16m",
+)
+
+
+@dataclass(frozen=True)
+class AgentIsolation:
+    """MIRAGEND_ISOLATED_AGENTS (the agents host, mirarun ADR-041 §8).
+
+    - Each agent gets its own internal network, shared only with `peers`
+      (container name -> network aliases there): the gateway, as the
+      agent's API front and as `github-broker`. Agents never share a
+      network with miragend or with each other (the configured networks,
+      e.g. an egress network, must disable inter-container traffic).
+    - Credentials are files under SECRET_FILES_DIR, not environment values.
+    - Units are hardened: no-new-privileges, every capability dropped, a pid
+      limit, and a read-only root filesystem with `tmpfs` scratch mounts.
+    """
+
+    peers: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    pids_limit: int = 512
+    read_only: bool = True
+    tmpfs: tuple[str, ...] = DEFAULT_TMPFS
+    # miragend's own gid: the agent gets it as a supplementary group, so it
+    # can read the secret files miragend writes (0440) and write its own
+    # workspace (0770), while running as a uid of its own.
+    shared_gid: int | None = None
+
+
+def private_network(name: str) -> str:
+    return f"miragen-agent-{name}"
+
+
+def private_bridge(name: str) -> str:
+    # Linux interface names are at most 15 characters.
+    return LANE_BRIDGE_PREFIX + hashlib.sha256(name.encode()).hexdigest()[:10]
+
+
+class AgentNetworkMissing(SpawnOperationFailed):
+    """A network named in MIRAGEND_AGENT_NETWORKS does not exist. miragend
+    never creates those: their options (internal, inter-container traffic)
+    are the isolation, so the deployment that owns them declares them."""
+
+
 class DockerComposeSpawnDriver:
     def __init__(
         self,
@@ -35,6 +103,8 @@ class DockerComposeSpawnDriver:
         runner: Callable = subprocess.run,
         not_found: type[Exception],
         sleep: Callable = time.sleep,
+        networks: tuple[str, ...] = (DEFAULT_AGENT_NETWORK,),
+        isolation: AgentIsolation | None = None,
     ) -> None:
         self.workspace = Path(workspace)
         self.compose_file = self.workspace / "compose.yml"
@@ -42,6 +112,14 @@ class DockerComposeSpawnDriver:
         self._run = runner
         self._sleep = sleep
         self._not_found = not_found
+        # The networks each agent container joins, in order. The first is
+        # the one miragend shares with its agents (container-name DNS for
+        # endpoint()); the rest are the agent's own (e.g. an egress-only
+        # network on the agents host, mirarun ADR-041).
+        if not networks:
+            raise ValueError("an agent must join at least one network")
+        self.networks = tuple(networks)
+        self.isolation = isolation
 
     # -- compose.yml (this driver's persisted service definitions) ----------
 
@@ -59,38 +137,179 @@ class DockerComposeSpawnDriver:
         return {
             "secrets": {},
             "services": {},
-            "networks": {"miragen-net": {"external": True}},
+            "networks": self._networks_block(),
         }
+
+    def _networks_block(self, data: dict | None = None) -> dict:
+        block = {n: {"external": True} for n in self.networks}
+        if self.isolation is not None and data is not None:
+            for service in (data.get("services") or {}).values():
+                for net in service.get("networks") or ():
+                    block.setdefault(net, {"external": True})
+        return block
+
+    # -- isolation ------------------------------------------------------------
+
+    def _secrets_dir(self, name: str) -> Path:
+        # Outside agents/<name>: never under the agent's mount, the file API
+        # or export.
+        return self.workspace / "agent-secrets" / name
+
+    def _write_secret_files(self, name: str, files: dict[str, str]) -> None:
+        target = self._secrets_dir(name)
+        shutil.rmtree(target, ignore_errors=True)  # a revoked grant leaves nothing
+        target.mkdir(parents=True, mode=0o700)
+        target.chmod(0o700)
+        if self.isolation is not None and self.isolation.shared_gid is not None:
+            # Group-readable for the agent (supplementary gid), nobody else.
+            target.chmod(0o750)
+        for var, value in files.items():
+            path = target / var.lower()
+            mode = 0o440 if self.isolation is not None and self.isolation.shared_gid is not None else 0o400
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(value)
+
+    def _read_secret_files(self, name: str, environment: dict[str, str]) -> dict[str, str]:
+        files: dict[str, str] = {}
+        for key, value in environment.items():
+            if key.endswith("_FILE") and value.startswith(SECRET_FILES_DIR + "/"):
+                try:
+                    files[key[: -len("_FILE")]] = (
+                        self._secrets_dir(name) / Path(value).name).read_text()
+                except OSError:
+                    continue
+        return files
+
+    def _ensure_private_network(self, name: str) -> str:
+        network_name = private_network(name)
+        try:
+            network = self._docker.networks.get(network_name)
+            self._verify_private_network(network, name)
+        except self._not_found:
+            network = self._docker.networks.create(
+                network_name,
+                driver="bridge",
+                internal=True,
+                labels={AGENT_NETWORK_LABEL: name},
+                options={"com.docker.network.bridge.name": private_bridge(name)},
+            )
+        self._connect_peers(network)
+        return network_name
+
+    def _verify_private_network(self, network, name: str) -> None:
+        """A network with the agent's network name that miragend did not make
+        for this agent (not internal, or another label) is refused, never
+        reused: it could give the agent a route or a neighbour."""
+        attrs = getattr(network, "attrs", None)
+        if attrs is None:
+            kw = getattr(network, "kw", {})  # test fakes
+            internal, labels = kw.get("internal"), kw.get("labels") or {}
+        else:
+            internal = attrs.get("Internal")
+            labels = attrs.get("Labels") or {}
+        if internal is not True or labels.get(AGENT_NETWORK_LABEL) != name:
+            raise SpawnOperationFailed(
+                f"network '{network.name}' exists but is not this agent's private "
+                "network (internal, labelled by miragend); refusing to reuse it")
+
+    def _connect_peers(self, network) -> None:
+        for container, aliases in self.isolation.peers:
+            try:
+                network.connect(container, aliases=list(aliases))
+            except Exception as exc:  # already connected, or the peer is not up
+                if "already exists" not in str(exc) and "already attached" not in str(exc):
+                    raise SpawnOperationFailed(
+                        f"could not attach '{container}' to {network.name}: {exc}") from exc
+
+    def reconnect_peers(self) -> None:
+        """Re-attach the peers (the gateway) to every agent network. A
+        recreated gateway container loses runtime network attachments."""
+        if self.isolation is None:
+            return
+        for network in self._docker.networks.list(filters={"label": AGENT_NETWORK_LABEL}):
+            self._connect_peers(network)
+
+    def _remove_private_network(self, name: str) -> None:
+        try:
+            network = self._docker.networks.get(private_network(name))
+        except self._not_found:
+            return
+        except Exception:
+            return
+        for container, _ in self.isolation.peers:
+            try:
+                network.disconnect(container, force=True)
+            except Exception:
+                pass
+        try:
+            network.remove()
+        except Exception:
+            pass
 
     # -- SpawnDriver ----------------------------------------------------------
 
     def ensure_ready(self) -> None:
+        self._ensure_networks()
         try:
-            self._docker.networks.get("miragen-net")
-        except self._not_found:
-            self._docker.networks.create("miragen-net", driver="bridge", attachable=True)
+            self.reconnect_peers()
+        except SpawnOperationFailed as exc:
+            # The gateway may not be up yet at daemon start; every agent
+            # start re-attaches it (up()), and that one is strict.
+            logger.warning("could not re-attach agent network peers: %s", exc)
+
+    def _ensure_networks(self) -> None:
+        for network in self.networks:
+            try:
+                self._docker.networks.get(network)
+            except self._not_found:
+                if network != DEFAULT_AGENT_NETWORK:
+                    raise AgentNetworkMissing(
+                        f"agent network '{network}' (MIRAGEND_AGENT_NETWORKS) does not "
+                        "exist; the deployment that owns it must create it first"
+                    ) from None
+                self._docker.networks.create(network, driver="bridge", attachable=True)
 
     def define_service(self, name: str, spec: ServiceSpec) -> None:
+        if spec.secret_files and self.isolation is None:
+            raise SpawnOperationFailed("secret files need MIRAGEND_ISOLATED_AGENTS")
         data = self._compose_load()
-        data["networks"] = {"miragen-net": {"external": True}}
         data.setdefault("secrets", {}).update(
             {s: {"external": True} for s in spec.secret_names}
         )
-        data.setdefault("services", {})[name] = {
+        service = {
             "image": spec.image,
             "container_name": name,
             "restart": "unless-stopped",
             "secrets": list(spec.secret_names),
             "environment": dict(spec.environment),
             "volumes": [f"./agents/{name}:/agent"],
-            "networks": ["miragen-net"],
+            "networks": list(self.networks),
             "cpus": spec.cpu_limit,
             "mem_limit": spec.mem_limit,
             "labels": dict(spec.labels),
         }
+        if self.isolation is not None:
+            service["networks"] = [self._ensure_private_network(name), *self.networks]
+            self._write_secret_files(name, spec.secret_files)
+            service["volumes"].append(f"./agent-secrets/{name}:{SECRET_FILES_DIR}:ro")
+            service["security_opt"] = ["no-new-privileges:true"]
+            service["cap_drop"] = ["ALL"]
+            if self.isolation.shared_gid is not None:
+                service["group_add"] = [str(self.isolation.shared_gid)]
+            service["pids_limit"] = self.isolation.pids_limit
+            if self.isolation.read_only:
+                service["read_only"] = True
+                service["tmpfs"] = list(self.isolation.tmpfs)
+        data.setdefault("services", {})[name] = service
+        data["networks"] = self._networks_block(data)
         self._write_yaml(self.compose_file, data)
 
     def up(self, name: str) -> None:
+        if self.isolation is not None:
+            # The gateway may have been recreated since the agent's network
+            # was made; its attachment is what MiraRun and the broker use.
+            self._ensure_private_network(name)
         result = self._run(
             ["docker", "compose", "up", "-d", name],
             capture_output=True,
@@ -107,6 +326,10 @@ class DockerComposeSpawnDriver:
             return
         data = self._compose_load()
         data.get("services", {}).pop(name, None)
+        if self.isolation is not None:
+            data.get("networks", {}).pop(private_network(name), None)
+            shutil.rmtree(self._secrets_dir(name), ignore_errors=True)
+            self._remove_private_network(name)
         self._write_yaml(self.compose_file, data)
 
     def status(self, name: str) -> str:
@@ -147,6 +370,9 @@ class DockerComposeSpawnDriver:
         return logs.decode("utf-8", errors="replace")
 
     def restart(self, name: str) -> None:
+        if self.isolation is not None:
+            # Same as up(): a recreated gateway lost its attachment.
+            self._ensure_private_network(name)
         try:
             self._docker.containers.get(name).restart()
         except self._not_found:
@@ -192,10 +418,13 @@ class DockerComposeSpawnDriver:
             mem_limit=str(service.get("mem_limit", "")),
             workspace_dir=self.workspace / "agents" / name,
             secret_names=tuple(service.get("secrets") or ()),
+            secret_files=self._read_secret_files(
+                name, {str(k): str(v) for k, v in (service.get("environment") or {}).items()}),
         )
 
     def endpoint(self, name: str) -> str:
-        # Reachable by any container on miragen-net (container-name DNS).
+        # Reachable by any container on the first agent network
+        # (container-name DNS), miragend included.
         return f"http://{name}:8000"
 
 
