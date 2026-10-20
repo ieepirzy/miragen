@@ -1,0 +1,57 @@
+# pr-scope: deploy config and app code never in one PR.
+# Rollback reverts only the app image; a redeploy re-reads compose/env from
+# main, so a mixed PR cannot be rolled back. Split it, or a person adds the
+# `mixed-change-ok` label (the job re-runs on labeled/unlabeled).
+name: pr-scope
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-scope-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-scope:
+    name: pr-scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # The classifier as the base branch has it, so a PR cannot loosen the
+      # check it is judged by. Only on the PR that introduces it does the
+      # script come from the PR head (with a warning).
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+      - name: Use the PR's script only when the base has none (bootstrap)
+        if: ${{ hashFiles('scripts/ci/pr_scope.py') == '' }}
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          echo "::warning::scripts/ci/pr_scope.py is not on the base branch yet; using the PR's copy"
+          git fetch --no-tags --depth=1 origin "$HEAD_SHA"
+          git checkout "$HEAD_SHA" -- scripts/ci/pr_scope.py
+      - name: Deploy config and app code are not mixed
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_SCOPE_OVERRIDE: ${{ contains(github.event.pull_request.labels.*.name, 'mixed-change-ok') }}
+        run: |
+          python3 scripts/ci/pr_scope.py \
+            --config 'compose*.y*ml' \
+            --config '.env*' \
+            --config 'Dockerfile*' \
+            --config 'Containerfile*' \
+            --config 'deploy/' \
+            --config 'k8s/' \
+            --config 'infra/' \
+            --config '.github/workflows/' \
+            --source 'miragen/' \
+            --source 'miragen_hook/' \
+            --source 'packages/' \
+            --source 'plugins/'
