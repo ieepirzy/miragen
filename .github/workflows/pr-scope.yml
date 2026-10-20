@@ -24,10 +24,12 @@ jobs:
     steps:
       # The classifier as the base branch has it, so a PR cannot loosen the
       # check it is judged by. Only on the PR that introduces it does the
-      # script come from the PR head (with a warning).
+      # script come from the PR head (with a warning). The base branch's tip,
+      # not the event's base.sha: that can predate the script for a PR
+      # branched before it landed, which has no copy of its own either.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event.pull_request.base.ref }}
       - name: Use the PR's script only when the base has none (bootstrap)
         if: ${{ hashFiles('scripts/ci/pr_scope.py') == '' }}
         env:
