@@ -255,6 +255,9 @@ def test_the_token_directory_is_private_even_on_a_world_writable_volume(tmp_path
     volume = tmp_path / "volume"
     volume.mkdir()
     volume.chmod(0o777)
+    # Left behind wide open (an earlier process, a hand-made dir): tightened.
+    (volume / "private").mkdir()
+    (volume / "private").chmod(0o777)
     h = ModelTokenHolder(volume)
     h.set(ModelToken.parse(_credential()))
     assert stat.S_IMODE(os.stat(h.path.parent).st_mode) == 0o700
