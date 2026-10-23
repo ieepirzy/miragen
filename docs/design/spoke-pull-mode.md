@@ -1,0 +1,183 @@
+# Spoke pull mode: miragend as a cluster's provisioner
+
+**Status:** built and tested against fakes. It has not run on a cluster.
+It implements item 3 of the first slice in MiraRun ADR-045, "Agent workloads
+on Kubernetes clusters: MiraRun holds desired state, each cluster's spoke
+pulls it".
+
+## 1. What it is
+
+A control plane (the *hub*) holds desired state for agent workloads in many
+clusters. It never connects into a cluster. Each cluster instead runs one
+miragend in **pull mode**, the *spoke*. The spoke dials out to the hub,
+claims what is addressed to it, makes its cluster match, and reports back.
+
+`miragend-spoke` (`miragen/daemon/spoke/`) is that process. It is off unless
+`MIRAGEND_SPOKE_CONFIG` names its config file.
+
+The push-mode daemon (`miragend`, `POST /agents`) is unchanged, and so is
+its bare-Pod driver (`spawn/kubernetes.py`). That driver keeps the gaps
+listed in §6, which the spoke's own driver does not have.
+
+## 2. One tick
+
+1. **Intents.** `POST /api/spoke/v1/intents/claim` returns intents under a
+   lease. For each one:
+   - **Check it against the local allowlist.** That covers the namespace
+     served, the workload classes allowed there, the organizations it
+     serves, and the hub-requested network labels allowed. A refused
+     intent is reported `refused` and acknowledged, so it is not offered
+     again, and it is never applied.
+   - **Render it from the spoke's own class template and apply it.** The
+     hub sends no pod spec, image, or environment.
+   - **Acknowledge** the generation under the lease.
+   - **Report** what the cluster says.
+
+   Applying the same generation twice changes nothing, so a lease offered
+   again is safe.
+2. **Watch.** The spoke reports a tracked workload's phase when it changes.
+   - An ephemeral Job that has ended is deleted only after the hub took its
+     final report, with a 204 answer. Its runs' events are relayed first.
+     The Job's `ttlSecondsAfterFinished` is a backstop of days, for a spoke
+     that dies in between.
+   - An agent is a server, so its Job does not end on its own. It ends
+     when the hub sets the intent to `stopped` or `deleted`, or at its
+     deadline (`activeDeadlineSeconds`).
+3. **Deliveries.** `POST /api/spoke/v1/deliveries/claim`. Each delivery is
+   forwarded to its agent in-cluster (pod IP, `X-Miragen-Token`) and then
+   settled:
+
+   | Kind | Agent call | On an unknown outcome |
+   |---|---|---|
+   | `launch`, `turn`, `answer` | `POST /instances/{instance}/turns` with the delivery's `idempotency_key` | left unsettled. The hub offers it again; the agent deduplicates by key |
+   | `discard` | `DELETE /instances/{instance}` (idempotent) | left unsettled |
+   | `resume` | `POST /runs/{run_id}/resume` (no key) | settled `uncertain`, never sent again |
+   | `abandon` | `POST /runs/{run_id}/abandon` (no key) | settled `uncertain`, never sent again |
+
+   If the connection never opened, nothing was delivered. An at-most-once
+   delivery is then settled `rejected`. An agent's 4xx is settled
+   `rejected` with its reason.
+
+   The spoke keeps a bounded memory of the at-most-once deliveries it has
+   sent, so one is never sent twice even if it were offered again. It also
+   keeps settles it could not deliver to the hub, and retries only the
+   settle.
+4. **Events.** Each turn or resume with a `run_intent_id` is tracked. Its
+   event pages are read from the agent by cursor
+   (`GET /runs/{id}/events?after=N`) and pushed unchanged to the hub at
+   `RUN_EVENTS_ROUTE`. `(run_id, seq)` deduplicates them, so pushing a page
+   twice is harmless. Tracking ends when the run is no longer running and
+   nothing is left to read.
+
+A hub that is unreachable means exponential backoff with jitter, capped at
+`poll.max_backoff_seconds`. A claim that returns work means the spoke polls
+again at once.
+
+## 3. Configuration
+
+Annotated in the module docstring of `miragen/daemon/spoke/config.py`:
+
+- **`hub.url`** and **`hub.token_file`**: the token is read from a file,
+  never inline and never from the environment, and never logged.
+- **`images`**: the only images a template may use.
+- **`classes.ephemeral`** and **`classes.persistent`**, each with:
+  - `image`, `service_account_name`, `runtime_class_name`;
+  - `node_selector`, `tolerations`;
+  - `requests`, `limits`;
+  - `run_as_user`/`run_as_group`/`fs_group`;
+  - `backstop_ttl_seconds`;
+  - for persistent only, `storage_size` and `storage_class_name`.
+- **`namespaces.<name>`**: `classes` and `organizations`.
+- **`network_label_keys`**.
+- **`poll`**: `interval_seconds`, `max_backoff_seconds`, `claim_limit`.
+
+The file is mounted by the cluster's GitOps. Nothing in it comes from the
+hub.
+
+## 4. What the driver renders (`spawn/kubernetes_workloads.py`)
+
+- **`ephemeral` is a Job:**
+  - `backoffLimit: 0`, with `activeDeadlineSeconds` from the intent's
+    deadline;
+  - `ttlSecondsAfterFinished` as the backstop only;
+  - `restartPolicy: Never`.
+- **`persistent` is a StatefulSet:**
+  - `replicas` 0 or 1, so stopped is scale to zero and the volume stays;
+  - a `volumeClaimTemplate` mounted at `/agent`, with an init container
+    that recreates the image's state directories on an empty volume;
+  - a `Retain` PVC policy. Deleting an intent deletes the claim
+    explicitly.
+- **Both:**
+  - the profile is one ConfigMap key, mounted read-only by `subPath` at
+    `/etc/miragen/profile/agent.yaml`, with `AGENT_PROFILE` pointing at it;
+  - `automountServiceAccountToken: false`;
+  - non-root, RuntimeDefault seccomp, every capability dropped, no
+    privilege escalation;
+  - nodeSelector, tolerations, RuntimeClass and resources from the
+    template.
+- **Not created:** no Namespace, NetworkPolicy, Role or Service. The
+  namespace's admission and default-deny policies are the cluster's GitOps,
+  and they are the boundary. The spoke's RBAC needs:
+  - `jobs`, `statefulsets` and `configmaps`: create, get, list, update,
+    patch, delete;
+  - `pods`: get, list;
+  - `persistentvolumeclaims`: delete.
+
+  All of it is scoped to the namespaces it serves.
+
+## 5. Credentials
+
+- **The pod spec never holds a model or provider credential.** `Workload`
+  refuses any environment name that looks like one.
+- **One exception, `MIRAGEN_INTERNAL_TOKEN`.** It is a random value per
+  workload that guards only that agent's own API from its neighbours. The
+  spoke reads it back from the unit's spec after a restart.
+- **Model access** comes from a `ModelCredentialSource`. The default is
+  `NoModelCredentials`: an agent spawned by this slice has no model access
+  from the spoke.
+  - The intended source is the deployment's provider gateway: a base URL
+    plus a short-lived workload token.
+  - How that token reaches the agent without entering the pod spec is
+    open: a per-turn header on the delivery relay, or a projected volume
+    the spoke refreshes.
+  - The gateway's API is the gateway's to define, so nothing here guesses
+    it.
+
+## 6. Not done
+
+- **Event cursors live in memory.** After a spoke restart, relay for a run
+  resumes only when the hub delivers to that run again. Persisting cursors,
+  for example as an annotation on the unit, is a follow-up.
+- **Harness and runtime share one UID** (`agentuser`, Dockerfile). The
+  run record miragen writes is therefore only as strong as the agent's
+  inability to edit it (ADR-045 §7, tier 2). Separating them needs an image
+  change: a second user for the harness and a spool the harness cannot
+  write.
+- **Model credentials:** see §5.
+- **Liveness and readiness probes for the spoke itself.** Nothing serves
+  HTTP. An exec probe on a heartbeat file is the likely shape.
+- **The push-mode bare-Pod driver** (`spawn/kubernetes.py`) still has G1-G5:
+  - it mounts the profile over `/agent`;
+  - it writes credentials into its ConfigMap and the pod env;
+  - it sets no scheduling or RuntimeClass;
+  - it creates bare Pods;
+  - it uses toy limits.
+
+  The spoke does not use it.
+
+## 7. Notes on the hub contract
+
+- **There is no long-poll.** The claim routes return immediately, so the
+  spoke polls at `poll.interval_seconds`.
+- **The event route is newer than the rest.** It sits behind `EventSink`
+  and one constant (`RUN_EVENTS_ROUTE`).
+- **Delivery payloads are read as:**
+  - `instance`, `prompt`, `provenance` and `mirarun` for turn kinds;
+  - `instance` for `discard`;
+  - `run_id` plus `prompt`/`answer` for `resume`;
+  - `run_id` plus `discard_workspace` for `abandon`.
+
+  A turn without `instance` uses `r-<run_intent_id prefix>`. The hub has
+  to fill these consistently.
+- **Key length.** A turn's idempotency key is capped at 200 characters by
+  the agent, and the hub allows 255. A longer key is settled `rejected`.
