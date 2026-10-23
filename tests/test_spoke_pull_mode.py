@@ -118,6 +118,25 @@ def test_an_intent_is_applied_then_acked_then_reported():
     assert job["spec"]["activeDeadlineSeconds"] == 3600
 
 
+def test_kubernetes_timestamps_reach_the_hub_as_datetimes_or_not_at_all():
+    world = World()
+    intent = world.offer()
+    world.spoke.tick()
+    name = workload_name(UUID(intent["intent_id"]))
+    world.k8s.add_pod(name, phase="Running",
+                      state={"running": {"startedAt": "2026-10-23T10:00:00Z"}})
+    world.spoke.tick()
+    running = [b for _, b in world.hub.reports if b["phase"] == "running"]
+    assert running and running[0]["started_at"].startswith("2026-10-23T10:00:00")
+    other = world.offer()
+    world.spoke.tick()
+    world.k8s.add_pod(workload_name(UUID(other["intent_id"])), phase="Running",
+                      state={"running": {"startedAt": "not a time"}})
+    world.spoke.tick()
+    running = [b for _, b in world.hub.reports if b["phase"] == "running"]
+    assert len(running) == 2 and "started_at" not in running[1]
+
+
 def test_a_namespace_outside_the_allowlist_is_refused_and_never_applied():
     world = World()
     world.offer(namespace="kube-system")
