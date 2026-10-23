@@ -137,6 +137,8 @@ Documentation = "https://github.com/ieepirzy/miragen/blob/main/README.md"
 [project.scripts]
 miragen = "miragen.cli:cli"
 miragend = "miragen.daemon.api:main"
+# miragend's pull mode, the per-cluster spoke (docs/design/spoke-pull-mode.md).
+miragend-spoke = "miragen.daemon.spoke.main:main"
 # The stdlib-only harness adapter (miragen_hook/): what Claude Code / Codex
 # hook entries invoke. Imports nothing from `miragen` on purpose.
 miragen-hook = "miragen_hook.client:main"
