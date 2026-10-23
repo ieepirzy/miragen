@@ -54,6 +54,7 @@ class FakeHub:
         self.reports: list[tuple[str, dict]] = []
         self.settles: list[tuple[str, dict]] = []
         self.pages: list[tuple[str, dict]] = []
+        self.waits: list[tuple[str, int]] = []
         self.fail: dict[str, int] = {}  # route kind -> status to answer once
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -65,6 +66,8 @@ class FakeHub:
         self.timeline.append(("hub", kind))
         if kind in self.fail:
             return httpx.Response(self.fail.pop(kind), json={"detail": "injected"})
+        if path.endswith("/claim"):
+            self.waits.append((path, body.get("wait_seconds", -1)))
         if path == "intents/claim":
             out, self.intents = self.intents, []
             return httpx.Response(200, json={"intents": out})
@@ -81,6 +84,8 @@ class FakeHub:
             self.settles.append((path, body))
             return httpx.Response(200, json={"status": body["status"]})
         if kind == "events":
+            assert set(body) == {"run", "events"}, body
+            assert body["run"]["run_id"] == body["events"]["run_id"]
             self.pages.append((path, body))
             return httpx.Response(204)
         raise AssertionError(path)
@@ -279,11 +284,16 @@ def test_a_turn_is_forwarded_settled_and_its_events_relayed():
     assert world.agent.forwarded == [("turn", "k-1")]
     assert world.hub.settles[0][1]["status"] == "accepted"
     assert world.hub.pages[0][0] == f"runs/{delivery['run_intent_id']}/events"
-    assert [e["seq"] for e in world.hub.pages[0][1]["events"]] == [1, 2]
+    assert [e["seq"] for e in world.hub.pages[0][1]["events"]["events"]] == [1, 2]
+    assert world.hub.pages[0][1]["run"]["status"] == "running"
+    assert "result" not in world.hub.settles[0][1]  # only a launch carries one
     world.agent.status = "succeeded"
     world.spoke.tick()
     assert world.spoke.runs == {}
-    assert len(world.hub.pages) == 1  # nothing new, nothing pushed again
+    # One more push: the terminal record with an empty page, no event again.
+    assert len(world.hub.pages) == 2
+    assert world.hub.pages[1][1]["run"]["status"] == "succeeded"
+    assert world.hub.pages[1][1]["events"]["events"] == []
 
 
 def test_a_turn_whose_outcome_is_unknown_is_left_for_the_hub_to_offer_again():
@@ -393,6 +403,33 @@ def test_events_written_just_before_the_run_stops_are_still_relayed():
 
     world.spoke.agents = AgentClient(transport=httpx.MockTransport(late_events))
     world.spoke.tick()
-    assert [e["seq"] for page in world.hub.pages for e in page[1]["events"]] == [1]
+    assert [e["seq"] for page in world.hub.pages for e in page[1]["events"]["events"]] == [1]
     world.spoke.tick()
     assert world.spoke.runs == {}
+
+
+def test_an_accepted_launch_tells_the_hub_which_agent_run_it_started():
+    world = World()
+    intent = world.offer()
+    world.spoke.tick()
+    world.run_pod(intent)
+    world.deliver(intent, kind="launch", idempotency_key="launch-1",
+                  payload={"prompt": "go", "provenance": {}, "mirarun": {}})
+    world.spoke.tick()
+    settle = world.hub.settles[0][1]
+    assert settle["status"] == "accepted"
+    assert settle["result"] == {"run_id": "turn-1", "status": "running", "duplicate": False}
+
+
+def test_claims_long_poll_when_idle_and_return_at_once_while_relaying():
+    world = World()
+    intent = world.offer()
+    world.spoke.tick()
+    assert ("intents/claim", 5) in world.hub.waits
+    assert ("deliveries/claim", 25) in world.hub.waits
+    world.run_pod(intent)
+    world.deliver(intent)
+    world.spoke.tick()  # the turn is now tracked for relay
+    world.hub.waits.clear()
+    world.spoke.tick()
+    assert world.hub.waits == [("intents/claim", 0), ("deliveries/claim", 0)]

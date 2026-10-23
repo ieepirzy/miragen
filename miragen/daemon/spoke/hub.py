@@ -13,9 +13,13 @@ routes and bodies are MiraRun's `/api/spoke/v1/*` contract:
   (a claim, kept as it was said);
 - `POST deliveries/claim` → `{"deliveries": [...]}`;
 - `POST deliveries/{org}/{delivery}/settle` `{attempt, status, detail}`;
-- event pages for a run go up through `EventSink`. That route is the newest
-  part of the contract, so it sits behind its own small interface and one
-  constant.
+- `POST runs/{run_intent}/events` `{run, events}` → the hub's projection:
+  the agent's own run record and one of its event pages, both unchanged.
+  That route is the newest part of the contract, so it sits behind its own
+  small interface (`EventSink`) and one constant.
+
+Both claim routes long-poll: `wait_seconds` (at most 25) lets the hub hold
+the request until work appears.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ API_PREFIX = "/api/spoke/v1"
 # The hub route that takes a run's event page. Kept in one place: the hub
 # side lands separately and its name may still change.
 RUN_EVENTS_ROUTE = API_PREFIX + "/runs/{run_intent_id}/events"
+MAX_CLAIM_WAIT_SECONDS = 25
 
 
 class HubUnavailable(Exception):
@@ -147,10 +152,14 @@ class Observation:
 
 
 class EventSink(Protocol):
-    def push_page(self, run_intent_id: UUID, page: dict[str, Any]) -> None:
-        """Hand one event page of a run to the hub. The page is the agent's
-        own `GET /runs/{id}/events?after=` answer, unchanged: (run_id, seq)
-        is its deduplication key, so pushing a page twice is harmless."""
+    def push_events(
+        self, run_intent_id: UUID, run: dict[str, Any], page: dict[str, Any]
+    ) -> None:
+        """Hand one event page of a run to the hub, with the run's record.
+        Both are the agent's own answers, unchanged: `GET /runs/{id}` (the
+        projection needs its status, timings and usage) and
+        `GET /runs/{id}/events?after=`. (run_id, seq) deduplicates events, so
+        pushing a page twice is harmless."""
 
 
 class HubClient:
@@ -185,8 +194,10 @@ class HubClient:
             raise HubUnavailable(f"hub answered {response.status_code}")
         return response
 
-    def claim_intents(self, limit: int) -> list[ClaimedIntent]:
-        response = self._post(f"{API_PREFIX}/intents/claim", {"limit": limit})
+    def claim_intents(self, limit: int, *, wait_seconds: int = 0) -> list[ClaimedIntent]:
+        response = self._post(
+            f"{API_PREFIX}/intents/claim", _claim_body(limit, wait_seconds)
+        )
         return [ClaimedIntent.from_json(item) for item in response.json().get("intents") or []]
 
     def acknowledge(self, intent: ClaimedIntent) -> None:
@@ -202,24 +213,45 @@ class HubClient:
             observation.to_json(),
         )
 
-    def claim_deliveries(self, limit: int) -> list[ClaimedDelivery]:
-        response = self._post(f"{API_PREFIX}/deliveries/claim", {"limit": limit})
+    def claim_deliveries(self, limit: int, *, wait_seconds: int = 0) -> list[ClaimedDelivery]:
+        response = self._post(
+            f"{API_PREFIX}/deliveries/claim", _claim_body(limit, wait_seconds)
+        )
         return [
             ClaimedDelivery.from_json(item) for item in response.json().get("deliveries") or []
         ]
 
-    def settle(self, delivery: ClaimedDelivery, status: str, detail: str | None = None) -> None:
+    def settle(
+        self,
+        delivery: ClaimedDelivery,
+        status: str,
+        detail: str | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> None:
+        """`result` is the agent's answer to an accepted `launch`: the hub
+        maps the queued run to the agent's run through its `run_id`."""
         body: dict[str, Any] = {"attempt": delivery.attempt, "status": status}
         if detail:
             body["detail"] = detail[:1024]
+        if result is not None:
+            body["result"] = result
         self._post(
             f"{API_PREFIX}/deliveries/{delivery.organization_id}/{delivery.delivery_id}/settle",
             body,
             lease=True,
         )
 
-    def push_page(self, run_intent_id: UUID, page: dict[str, Any]) -> None:
-        self._post(RUN_EVENTS_ROUTE.format(run_intent_id=run_intent_id), page)
+    def push_events(
+        self, run_intent_id: UUID, run: dict[str, Any], page: dict[str, Any]
+    ) -> None:
+        self._post(
+            RUN_EVENTS_ROUTE.format(run_intent_id=run_intent_id),
+            {"run": run, "events": page},
+        )
+
+
+def _claim_body(limit: int, wait_seconds: int) -> dict[str, Any]:
+    return {"limit": limit, "wait_seconds": max(0, min(wait_seconds, MAX_CLAIM_WAIT_SECONDS))}
 
 
 def _detail(response: httpx.Response) -> str:

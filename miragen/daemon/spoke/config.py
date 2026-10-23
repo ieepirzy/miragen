@@ -9,6 +9,7 @@ and templates this file names. Nothing here ever comes from the hub.
       url: https://hub.example            # the MiraRun hub, reached outbound
       token_file: /var/run/spoke/token    # the spoke's credential, read once
     poll:
+      wait_seconds: 25                    # the hub's long-poll on each claim (<= 25)
       interval_seconds: 5
       max_backoff_seconds: 60
       claim_limit: 8
@@ -70,6 +71,7 @@ class SpokeConfig:
     interval_seconds: float = 5.0
     max_backoff_seconds: float = 60.0
     claim_limit: int = 8
+    wait_seconds: int = 25
     agent_timeout_seconds: float = 30.0
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -171,6 +173,7 @@ def parse_config(raw: dict[str, Any]) -> SpokeConfig:
         interval_seconds=float(poll.get("interval_seconds", 5)),
         max_backoff_seconds=float(poll.get("max_backoff_seconds", 60)),
         claim_limit=max(1, min(int(poll.get("claim_limit", 8)), 32)),
+        wait_seconds=max(0, min(int(poll.get("wait_seconds", 25)), 25)),
         agent_timeout_seconds=float(raw.get("agent_timeout_seconds", 30)),
     )
 

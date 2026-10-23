@@ -21,7 +21,15 @@ One tick:
      unknown, they are settled `uncertain` and never sent again. If nothing
      was sent (the connection never opened), they are settled `rejected`.
 4. **Events.** Relay each tracked run's event pages, read from the agent
-   by cursor, to the hub (`EventSink`).
+   by cursor, to the hub with the run's record (`EventSink`). Once a run
+   has stopped and nothing is left to read, its final record goes up once
+   more, so the hub sees the terminal status even with no new event.
+
+Claims long-poll. With nothing to relay, the delivery claim waits up to
+`poll.wait_seconds` for work, and the intent claim waits a fifth of that,
+so an idle spoke costs the hub one held request at a time. While runs are
+being relayed, both claims return at once and the loop paces itself at
+`poll.interval_seconds`.
 
 Nothing here is pushed by the hub. Every call is the spoke's.
 """
@@ -169,7 +177,8 @@ class Spoke:
         """One pass. True when anything was claimed, so the caller polls
         again at once instead of sleeping."""
         busy = False
-        for intent in self.hub.claim_intents(self.config.claim_limit):
+        wait = 0 if (self.runs or self.pending_settles) else self.config.wait_seconds
+        for intent in self.hub.claim_intents(self.config.claim_limit, wait_seconds=wait // 5):
             busy = True
             try:
                 self.handle_intent(intent)
@@ -178,7 +187,7 @@ class Spoke:
                 logger.error("intent %s: %s", intent.intent_id, exc)
         self.watch()
         self.retry_settles()
-        for delivery in self.hub.claim_deliveries(self.config.claim_limit):
+        for delivery in self.hub.claim_deliveries(self.config.claim_limit, wait_seconds=wait):
             busy = True
             try:
                 self.handle_delivery(delivery)
@@ -209,7 +218,8 @@ class Spoke:
                 # keep the loop alive at the normal pace.
                 logger.error("the hub refused the spoke: %s", exc)
                 busy = False
-            if not busy:
+            if not busy and (self.runs or self.config.wait_seconds == 0):
+                # A long-poll already waited; only pace a loop that did not.
                 sleep(self.config.interval_seconds)
 
     # -- intents ----------------------------------------------------------------
@@ -379,9 +389,15 @@ class Spoke:
 
     # -- deliveries -------------------------------------------------------------
 
-    def _settle(self, delivery: ClaimedDelivery, status: str, detail: str | None = None) -> None:
+    def _settle(
+        self,
+        delivery: ClaimedDelivery,
+        status: str,
+        detail: str | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> None:
         try:
-            self.hub.settle(delivery, status, detail)
+            self.hub.settle(delivery, status, detail, result)
             self.pending_settles.pop(delivery.delivery_id, None)
         except LeaseLost:
             self.pending_settles.pop(delivery.delivery_id, None)
@@ -417,7 +433,7 @@ class Spoke:
             # Otherwise leave it: the hub offers it again once the lease ends.
             return
         try:
-            detail = self._forward(delivery, tracked, endpoint, token)
+            detail, result = self._forward(delivery, tracked, endpoint, token)
         except AgentOutcomeUnknown as exc:
             if delivery.at_most_once:
                 self._remember(delivery, "uncertain", f"forwarded once, outcome unknown: {exc}")
@@ -437,7 +453,7 @@ class Spoke:
         if delivery.at_most_once:
             self._remember(delivery, "accepted", detail)
             return
-        self._settle(delivery, "accepted", detail)
+        self._settle(delivery, "accepted", detail, result)
 
     def _remember(self, delivery: ClaimedDelivery, status: str, detail: str | None) -> None:
         self.sent_once[delivery.delivery_id] = (status, detail)
@@ -445,8 +461,11 @@ class Spoke:
             self.sent_once.popitem(last=False)
         self._settle(delivery, status, detail)
 
-    def _forward(self, delivery: ClaimedDelivery, tracked: TrackedWorkload,
-                 endpoint: str, token: str) -> str | None:
+    def _forward(
+        self, delivery: ClaimedDelivery, tracked: TrackedWorkload, endpoint: str, token: str
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        """Forward one delivery. Returns the settle detail and, for a
+        `launch`, the agent's answer as the hub's `result`."""
         payload = delivery.payload
         if delivery.kind in _TURN_KINDS:
             if len(delivery.idempotency_key) > TURN_KEY_MAX:
@@ -468,14 +487,25 @@ class Spoke:
                 mirarun=_mapping(payload.get("mirarun")),
             )
             turn_id = str(accepted.get("turn_id") or "")
+            if not turn_id:
+                raise AgentOutcomeUnknown("the agent accepted the turn without an id")
             self._track_run(delivery, turn_id)
-            return f"turn {turn_id}" + (" (duplicate)" if accepted.get("duplicate") else "")
+            detail = f"turn {turn_id}" + (" (duplicate)" if accepted.get("duplicate") else "")
+            result = None
+            if delivery.kind == "launch":
+                # The hub's LaunchResult: the run whose events follow.
+                result = {
+                    "run_id": turn_id,
+                    "status": str(accepted.get("status") or "running"),
+                    "duplicate": bool(accepted.get("duplicate", False)),
+                }
+            return detail, result
         if delivery.kind == "discard":
             instance = payload.get("instance")
             if not isinstance(instance, str) or not _INSTANCE.fullmatch(instance):
                 raise _Invalid("payload.instance is missing or not an instance name")
             self.agents.discard_instance(endpoint, token, instance=instance)
-            return None
+            return None, None
         if delivery.kind in ("resume", "abandon"):
             run_id = payload.get("run_id")
             if not isinstance(run_id, str) or not run_id:
@@ -493,7 +523,7 @@ class Spoke:
                 discard = bool(payload.get("discard_workspace", False))
                 self.agents.control_run(endpoint, token, run_id, "abandon",
                                         params={"discard_workspace": str(discard).lower()})
-            return None
+            return None, None
         raise _Invalid(f"unknown delivery kind '{delivery.kind}'")
 
     def _track_run(self, delivery: ClaimedDelivery, agent_run_id: str) -> None:
@@ -520,25 +550,35 @@ class Spoke:
             return
         if not self._relay(endpoint, token, run):
             return
-        status = self.agents.run_status(endpoint, token, run.agent_run_id)
-        if status not in STOPPED_RUN_STATUSES:
+        record = self.agents.run_record(endpoint, token, run.agent_run_id)
+        if record is None or record.get("status") not in STOPPED_RUN_STATUSES:
             return
         # The run may have written its last events between the empty page
         # above and the status read: read once more, after seeing it stopped,
-        # and only let go when that read is empty too.
+        # and only let go when that read is empty too. Then the stopped record
+        # goes up once more with an empty page, so the hub sees the terminal
+        # status even when the run's last event came before it.
         if self._relay(endpoint, token, run):
+            self._sink().push_events(run.run_intent_id, record, _empty_page(record, run.after))
             self.runs.pop(key, None)
+
+    def _sink(self) -> EventSink:
+        if self.events is None:
+            raise RuntimeError("the spoke has no event sink")
+        return self.events
 
     def _relay(self, endpoint: str, token: str, run: TrackedRun) -> bool:
         """Relay what the agent has after the cursor (bounded). True when the
         last page read was empty and final: nothing is left right now."""
-        if self.events is None:
-            raise RuntimeError("the spoke has no event sink")
+        sink = self._sink()
         page: dict[str, Any] = {}
         for _ in range(_MAX_PAGES_PER_TICK):
             page = self.agents.events(endpoint, token, run.agent_run_id, after=run.after)
             if page.get("events"):
-                self.events.push_page(run.run_intent_id, page)
+                record = self.agents.run_record(endpoint, token, run.agent_run_id)
+                if record is None:
+                    raise AgentRejected(404, "the agent has no record of the run")
+                sink.push_events(run.run_intent_id, record, page)
             next_after = page.get("next_after")
             if isinstance(next_after, int):
                 run.after = next_after
@@ -565,6 +605,16 @@ class Spoke:
             except (AgentRejected, AgentUnreachable, AgentOutcomeUnknown) as exc:
                 logger.warning("draining events of %s failed: %s", run.agent_run_id, exc)
             self.runs.pop(key, None)
+
+
+def _empty_page(record: dict[str, Any], after: int) -> dict[str, Any]:
+    return {
+        "run_id": record.get("run_id"),
+        "count": 0,
+        "events": [],
+        "next_after": after,
+        "has_more": False,
+    }
 
 
 class _Invalid(Exception):

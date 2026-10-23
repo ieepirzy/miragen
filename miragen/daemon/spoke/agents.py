@@ -111,12 +111,15 @@ class AgentClient:
             raise AgentRejected(response.status_code, _detail(response))
         return response.json()
 
-    def run_status(self, endpoint: str, token: str, run_id: str) -> str | None:
+    def run_record(self, endpoint: str, token: str, run_id: str) -> dict[str, Any] | None:
+        """`GET /runs/{id}`, unchanged; None when the agent has no such run."""
         response = self._send("GET", endpoint, f"/runs/{run_id}", token)
-        if response.status_code != 200:
+        if response.status_code == 404:
             return None
-        status = response.json().get("status")
-        return status if isinstance(status, str) else None
+        if response.status_code != 200:
+            raise AgentRejected(response.status_code, _detail(response))
+        record = response.json()
+        return record if isinstance(record, dict) else None
 
 
 def _detail(response: httpx.Response) -> str:
