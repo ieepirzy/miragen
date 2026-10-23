@@ -842,12 +842,14 @@ class Spoke:
                     tracked.model_expires_at = None
                 elif exc.status_code not in _ITEM_REFUSALS:
                     raise
-                logger.warning("model token for %s: the hub answered %s",
+                # Only the workload's name and an HTTP status: no credential.
+                logger.warning("model access refresh for %s: the hub answered %s",
                                tracked.name, exc.status_code)
             except (AgentRejected, AgentUnreachable, AgentOutcomeUnknown,
                     SpawnOperationFailed) as exc:
                 tracked.model_retry_at = now + _MODEL_PUSH_RETRY
-                logger.warning("handing %s its model token failed: %s",
+                # Only the workload's name and an exception's type name.
+                logger.warning("model access hand-over to %s failed: %s",
                                tracked.name, type(exc).__name__)
 
     def pump_turn_results(self) -> None:

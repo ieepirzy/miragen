@@ -21,7 +21,6 @@ from miragen import model_token
 from miragen.app import app
 from miragen.harness.claude_code import ClaudeCodeHarnessError
 from miragen.model_token import ModelToken, ModelTokenHolder, ModelTokenInvalid
-from miragen.models import AgentProfile
 from miragen.runs import RunStore
 from tests.test_claude_code_harness import Env, FakeClient, profile, turn
 
@@ -127,17 +126,11 @@ async def test_the_harness_calls_the_gateway_with_the_helper_and_nothing_else(cc
     assert TOKEN not in json.dumps(child) and TOKEN not in options.settings
 
 
-async def test_a_profiles_connection_wins_over_the_spokes(cc, gateway):
-    gateway.set(ModelToken.parse(_credential()))
-    prof = AgentProfile.model_validate({
-        "name": "mira", "mode": "interactive", "triggers": [{"type": "http"}],
-        "inject_timestamp": False,
-        "spec": {"model": "claude-code:sonnet", "instructions": "You are Mira.",
-                 "harness": {"model_connection": "profile-conn"}}})
-    h = cc.harness(prof)
-    await h.run(turn("hi"))
-    base = FakeClient.instances[0].options.env["ANTHROPIC_BASE_URL"]
-    assert base == f"{GATEWAY}/anthropic/profile-conn"
+async def test_without_a_connection_there_are_no_model_calls(cc, gateway, monkeypatch):
+    monkeypatch.delenv("MIRAGEN_MODEL_CONNECTION")
+    h = cc.harness()
+    with pytest.raises(ClaudeCodeHarnessError, match="no model connection"):
+        h._env("chat")
 
 
 async def test_a_saved_login_refuses_the_gateway_harness(cc, gateway):

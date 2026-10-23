@@ -1208,15 +1208,6 @@ class HarnessSpec(_ProfileModel):
             "question and returns at once (the answer arrives as a later turn)."
         ),
     )
-    model_connection: Optional[str] = Field(
-        default=None,
-        pattern=r"^[a-z0-9][a-z0-9._-]{0,62}$",
-        description=(
-            "On a spoke (MIRAGEN_MODEL_GATEWAY_URL set): the provider-gateway connection "
-            "this agent's model calls use, as <gateway>/anthropic/<connection>. Unset falls "
-            "back to the spoke's MIRAGEN_MODEL_CONNECTION."
-        ),
-    )
 
     @field_validator("env_passthrough")
     @classmethod

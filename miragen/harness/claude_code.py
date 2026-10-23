@@ -29,7 +29,8 @@ swap between them (``spec.model``) when one is rate limited:
 
 * **On a spoke, the provider gateway only** (``MIRAGEN_MODEL_GATEWAY_URL``
   set; MiraRun ADR-045 §5). Model calls go to
-  ``<gateway>/anthropic/<connection>`` (``ANTHROPIC_BASE_URL``) with the
+  ``<gateway>/anthropic/<connection>`` (``ANTHROPIC_BASE_URL``, the
+  connection from the spoke's class config) with the
   workload's short-lived model token. Claude Code reads it through an
   ``apiKeyHelper`` (flag settings, so no settings file can replace it) that
   prints the current token from its 0600 file (``miragen.model_token``). The
@@ -349,13 +350,11 @@ class ClaudeCodeHarness(MiraRunEnv):
         root = os.environ.get(MODEL_GATEWAY_ENV, "").rstrip("/")
         if not root.startswith("https://") and not root.startswith("http://"):
             raise ClaudeCodeHarnessError(f"{MODEL_GATEWAY_ENV} is not a URL")
-        spec = harness_spec(self.profile)
-        connection = (spec.model_connection if spec is not None else None) \
-            or os.environ.get(MODEL_CONNECTION_ENV)
+        # The spoke's class config names the connection. A per-profile one is
+        # a profile-contract change (v7), left for its own PR.
+        connection = os.environ.get(MODEL_CONNECTION_ENV)
         if not connection:
-            raise ClaudeCodeHarnessError(
-                "no model connection: set spec.harness.model_connection or "
-                f"{MODEL_CONNECTION_ENV}")
+            raise ClaudeCodeHarnessError(f"no model connection: {MODEL_CONNECTION_ENV} is not set")
         command = holder().helper_command()
         if command is None:
             raise ClaudeCodeHarnessError(

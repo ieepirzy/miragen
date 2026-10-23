@@ -166,8 +166,9 @@ hub.
     any `settings.json`, so a session cannot point the token at another
     host. Its `ANTHROPIC_BASE_URL` is
     `<MIRAGEN_MODEL_GATEWAY_URL>/anthropic/<connection>`; the connection
-    comes from `spec.harness.model_connection` or the class's
-    `model_connection`. Both come from configuration, never from the hub.
+    comes from the class's `model_connection`. Both come from configuration,
+    never from the hub. A per-profile connection would be a profile-contract
+    change (v7, with the image label), so it is left for its own PR.
   - **No fallback.** No subscription token or API key reaches Claude Code,
     and a saved login refuses the harness. With no token, or an expired one,
     the helper fails and so does every model call. This follows

@@ -149,7 +149,9 @@ class ModelTokenHolder:
         if path.parent.is_symlink():
             raise OSError("the token directory is a symlink")
         # mkdir's mode is masked by the umask and ignored when it exists.
-        os.chmod(path.parent, 0o700)
+        # Owner-only: stricter than the rule's suggested 0o644, which would let
+        # every user list the directory. The token file inside is 0600.
+        os.chmod(path.parent, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
         tmp = path.with_name(f".{TOKEN_FILE}.{os.getpid()}")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
