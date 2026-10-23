@@ -651,11 +651,13 @@ def test_a_429_waits_a_minute_before_asking_again():
 
 def test_a_token_the_agent_did_not_take_is_pushed_again_without_minting_another():
     world = World()
-    _launch_with_model(world, minutes=4)
-    world.agent.raise_on["/credentials/model"] = httpx.ConnectError
+    intent = world.running()
+    world.agent.raise_on["/credentials/model"] = httpx.ConnectError  # the first hand-over fails
+    world.deliver(intent, kind="launch", credentials={"secret_env": {}, "model": _model(4)})
     world.spoke.tick()
+    assert world.agent.model_tokens == [] and sum(len(v) for v in world.hub.minted.values()) == 1
     world.agent.raise_on.clear()
-    world.hub.now = NOW + timedelta(seconds=16)
+    world.hub.now = NOW + timedelta(seconds=16)  # past the push retry, inside the mint minute
     world.spoke.tick()
     assert [t["token"] for t in world.agent.model_tokens] == ["minted-1"]
     assert sum(len(v) for v in world.hub.minted.values()) == 1
