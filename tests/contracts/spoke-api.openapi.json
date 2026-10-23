@@ -1,0 +1,1211 @@
+{
+  "components": {
+    "schemas": {
+      "ClaimedDeliveriesResponse": {
+        "properties": {
+          "deliveries": {
+            "items": {
+              "$ref": "#/components/schemas/ClaimedDeliveryResponse"
+            },
+            "title": "Deliveries",
+            "type": "array"
+          }
+        },
+        "required": [
+          "deliveries"
+        ],
+        "title": "ClaimedDeliveriesResponse",
+        "type": "object"
+      },
+      "ClaimedDeliveryResponse": {
+        "properties": {
+          "at_most_once": {
+            "title": "At Most Once",
+            "type": "boolean"
+          },
+          "attempt": {
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "credentials": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credentials"
+          },
+          "delivery_id": {
+            "format": "uuid",
+            "title": "Delivery Id",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "intent_id": {
+            "format": "uuid",
+            "title": "Intent Id",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "lease_expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Expires At"
+          },
+          "organization_id": {
+            "format": "uuid",
+            "title": "Organization Id",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "title": "Payload",
+            "type": "object"
+          },
+          "run_intent_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Intent Id"
+          },
+          "trace_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trace Id"
+          }
+        },
+        "required": [
+          "organization_id",
+          "delivery_id",
+          "intent_id",
+          "kind",
+          "idempotency_key",
+          "at_most_once",
+          "payload",
+          "run_intent_id",
+          "trace_id",
+          "attempt",
+          "lease_expires_at"
+        ],
+        "title": "ClaimedDeliveryResponse",
+        "type": "object"
+      },
+      "ClaimedIntentResponse": {
+        "properties": {
+          "attempt": {
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "deadline_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deadline At"
+          },
+          "desired_state": {
+            "title": "Desired State",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "integer"
+          },
+          "grant_set": {
+            "additionalProperties": true,
+            "title": "Grant Set",
+            "type": "object"
+          },
+          "instance_count": {
+            "title": "Instance Count",
+            "type": "integer"
+          },
+          "intent_id": {
+            "format": "uuid",
+            "title": "Intent Id",
+            "type": "string"
+          },
+          "lease_expires_at": {
+            "format": "date-time",
+            "title": "Lease Expires At",
+            "type": "string"
+          },
+          "namespace": {
+            "title": "Namespace",
+            "type": "string"
+          },
+          "network_labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Network Labels",
+            "type": "object"
+          },
+          "organization_id": {
+            "format": "uuid",
+            "title": "Organization Id",
+            "type": "string"
+          },
+          "principal": {
+            "title": "Principal",
+            "type": "string"
+          },
+          "product": {
+            "title": "Product",
+            "type": "string"
+          },
+          "profile_name": {
+            "title": "Profile Name",
+            "type": "string"
+          },
+          "profile_sha256": {
+            "title": "Profile Sha256",
+            "type": "string"
+          },
+          "profile_yaml": {
+            "title": "Profile Yaml",
+            "type": "string"
+          },
+          "trace_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trace Id"
+          },
+          "workload_class": {
+            "title": "Workload Class",
+            "type": "string"
+          }
+        },
+        "required": [
+          "organization_id",
+          "intent_id",
+          "product",
+          "namespace",
+          "workload_class",
+          "principal",
+          "generation",
+          "desired_state",
+          "instance_count",
+          "profile_name",
+          "profile_sha256",
+          "profile_yaml",
+          "grant_set",
+          "network_labels",
+          "deadline_at",
+          "trace_id",
+          "attempt",
+          "lease_expires_at"
+        ],
+        "title": "ClaimedIntentResponse",
+        "type": "object"
+      },
+      "ClaimedIntentsResponse": {
+        "properties": {
+          "intents": {
+            "items": {
+              "$ref": "#/components/schemas/ClaimedIntentResponse"
+            },
+            "title": "Intents",
+            "type": "array"
+          }
+        },
+        "required": [
+          "intents"
+        ],
+        "title": "ClaimedIntentsResponse",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "OpenRunResponse": {
+        "properties": {
+          "intent_id": {
+            "format": "uuid",
+            "title": "Intent Id",
+            "type": "string"
+          },
+          "last_event_sequence": {
+            "title": "Last Event Sequence",
+            "type": "integer"
+          },
+          "organization_id": {
+            "format": "uuid",
+            "title": "Organization Id",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "run_intent_id": {
+            "format": "uuid",
+            "title": "Run Intent Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "organization_id",
+          "intent_id",
+          "run_intent_id",
+          "run_id",
+          "last_event_sequence"
+        ],
+        "title": "OpenRunResponse",
+        "type": "object"
+      },
+      "OpenRunsResponse": {
+        "properties": {
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/OpenRunResponse"
+            },
+            "title": "Runs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "runs"
+        ],
+        "title": "OpenRunsResponse",
+        "type": "object"
+      },
+      "ProjectionResponse": {
+        "description": "Where the run's projection stands: the spoke resumes after\n`last_event_sequence`. A page that was already applied changes nothing\nand still answers 200 with the cursor.",
+        "properties": {
+          "last_event_sequence": {
+            "title": "Last Event Sequence",
+            "type": "integer"
+          },
+          "run_intent_id": {
+            "format": "uuid",
+            "title": "Run Intent Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_intent_id",
+          "status",
+          "last_event_sequence"
+        ],
+        "title": "ProjectionResponse",
+        "type": "object"
+      },
+      "SettledResponse": {
+        "properties": {
+          "delivery_id": {
+            "format": "uuid",
+            "title": "Delivery Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "delivery_id",
+          "status"
+        ],
+        "title": "SettledResponse",
+        "type": "object"
+      },
+      "TurnResultResponse": {
+        "properties": {
+          "delivery_id": {
+            "format": "uuid",
+            "title": "Delivery Id",
+            "type": "string"
+          },
+          "recorded": {
+            "title": "Recorded",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "delivery_id",
+          "recorded"
+        ],
+        "title": "TurnResultResponse",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "MiraRun spoke pull API",
+    "version": "1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/spoke/v1/deliveries/claim": {
+      "post": {
+        "operationId": "claim_deliveries_api_spoke_v1_deliveries_claim_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "limit": {
+                    "default": 32,
+                    "maximum": 32,
+                    "minimum": 1,
+                    "title": "Limit",
+                    "type": "integer"
+                  },
+                  "wait_seconds": {
+                    "default": 0,
+                    "maximum": 25,
+                    "minimum": 0,
+                    "title": "Wait Seconds",
+                    "type": "integer"
+                  }
+                },
+                "title": "ClaimRequest",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClaimedDeliveriesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Claim Deliveries",
+        "tags": [
+          "spoke"
+        ]
+      }
+    },
+    "/api/spoke/v1/deliveries/{delivery_id}/result": {
+      "post": {
+        "description": "A session turn's reply, after its delivery was settled. The same\nreply twice is 200; a different one is 409.",
+        "operationId": "record_result_api_spoke_v1_deliveries__delivery_id__result_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "delivery_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Delivery Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "A session turn's reply: the agent's finished turn record\n(`GET /instances/{i}/turns/{id}`), sent after the turn's delivery was\nsettled `accepted` (dispatched).",
+                "properties": {
+                  "result": {
+                    "additionalProperties": true,
+                    "title": "Result",
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "result"
+                ],
+                "title": "TurnResultRequest",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnResultResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Result",
+        "tags": [
+          "spoke"
+        ]
+      }
+    },
+    "/api/spoke/v1/deliveries/{organization_id}/{delivery_id}/settle": {
+      "post": {
+        "operationId": "settle_api_spoke_v1_deliveries__organization_id___delivery_id__settle_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Organization Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "delivery_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Delivery Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "attempt": {
+                    "maximum": 2147483647,
+                    "minimum": 1,
+                    "title": "Attempt",
+                    "type": "integer"
+                  },
+                  "detail": {
+                    "anyOf": [
+                      {
+                        "maxLength": 1024,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Detail"
+                  },
+                  "result": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Result"
+                  },
+                  "status": {
+                    "title": "Status",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "attempt",
+                  "status"
+                ],
+                "title": "SettleRequest",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettledResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Settle",
+        "tags": [
+          "spoke"
+        ]
+      }
+    },
+    "/api/spoke/v1/intents/claim": {
+      "post": {
+        "operationId": "claim_intents_api_spoke_v1_intents_claim_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "limit": {
+                    "default": 32,
+                    "maximum": 32,
+                    "minimum": 1,
+                    "title": "Limit",
+                    "type": "integer"
+                  },
+                  "wait_seconds": {
+                    "default": 0,
+                    "maximum": 25,
+                    "minimum": 0,
+                    "title": "Wait Seconds",
+                    "type": "integer"
+                  }
+                },
+                "title": "ClaimRequest",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClaimedIntentsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Claim Intents",
+        "tags": [
+          "spoke"
+        ]
+      }
+    },
+    "/api/spoke/v1/intents/{organization_id}/{intent_id}/ack": {
+      "post": {
+        "operationId": "acknowledge_api_spoke_v1_intents__organization_id___intent_id__ack_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Organization Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "intent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Intent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "attempt": {
+                    "maximum": 2147483647,
+                    "minimum": 1,
+                    "title": "Attempt",
+                    "type": "integer"
+                  },
+                  "generation": {
+                    "maximum": 9223372036854775807,
+                    "minimum": 1,
+                    "title": "Generation",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "generation",
+                  "attempt"
+                ],
+                "title": "AcknowledgeRequest",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Acknowledge",
+        "tags": [
+          "spoke"
+        ]
+      }
+    },
+    "/api/spoke/v1/intents/{organization_id}/{intent_id}/observations": {
+      "post": {
+        "operationId": "report_api_spoke_v1_intents__organization_id___intent_id__observations_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Organization Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "intent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Intent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "attempt": {
+                    "maximum": 2147483647,
+                    "minimum": 0,
+                    "title": "Attempt",
+                    "type": "integer"
+                  },
+                  "exit_code": {
+                    "anyOf": [
+                      {
+                        "maximum": 2147483647,
+                        "minimum": -2147483648,
+                        "type": "integer"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Exit Code"
+                  },
+                  "finished_at": {
+                    "anyOf": [
+                      {
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Finished At"
+                  },
+                  "generation": {
+                    "maximum": 9223372036854775807,
+                    "minimum": 1,
+                    "title": "Generation",
+                    "type": "integer"
+                  },
+                  "k8s_namespace": {
+                    "anyOf": [
+                      {
+                        "maxLength": 63,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "K8S Namespace"
+                  },
+                  "oom_killed": {
+                    "anyOf": [
+                      {
+                        "type": "boolean"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Oom Killed"
+                  },
+                  "phase": {
+                    "pattern": "^[a-z][a-z_]{0,31}$",
+                    "title": "Phase",
+                    "type": "string"
+                  },
+                  "pod_uid": {
+                    "anyOf": [
+                      {
+                        "maxLength": 64,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Pod Uid"
+                  },
+                  "reason": {
+                    "anyOf": [
+                      {
+                        "maxLength": 255,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Reason"
+                  },
+                  "started_at": {
+                    "anyOf": [
+                      {
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Started At"
+                  }
+                },
+                "required": [
+                  "generation",
+                  "attempt",
+                  "phase"
+                ],
+                "title": "ObservationRequest",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Report",
+        "tags": [
+          "spoke"
+        ]
+      }
+    },
+    "/api/spoke/v1/runs/open": {
+      "get": {
+        "description": "Runs this spoke launched that have not finished, with the cursor\neach one's events have reached: what a restarted spoke relays again.",
+        "operationId": "open_runs_api_spoke_v1_runs_open_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenRunsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Open Runs",
+        "tags": [
+          "spoke"
+        ]
+      }
+    },
+    "/api/spoke/v1/runs/{run_intent_id}/events": {
+      "post": {
+        "description": "A page of events for a run this spoke launched (ADR-045 \u00a72): the\nprojector applies it exactly as a page it pulled.",
+        "operationId": "push_events_api_spoke_v1_runs__run_intent_id__events_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_intent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Run Intent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "miragen's `GET /runs/{id}` and `GET /runs/{id}/events` bodies, relayed\nunchanged; read by the same parsers the hub uses when it pulls.",
+                "properties": {
+                  "events": {
+                    "additionalProperties": true,
+                    "title": "Events",
+                    "type": "object"
+                  },
+                  "run": {
+                    "additionalProperties": true,
+                    "title": "Run",
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "run",
+                  "events"
+                ],
+                "title": "PushedEventsRequest",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Push Events",
+        "tags": [
+          "spoke"
+        ]
+      }
+    }
+  }
+}

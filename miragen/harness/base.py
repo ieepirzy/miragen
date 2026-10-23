@@ -55,8 +55,9 @@ class HarnessTurn:
     # Continue the instance's conversation (instances/v1 use_history).
     use_history: bool = False
     run_id: str | None = None
-    # This launch's ephemeral MCP credential values (never persisted).
-    secret_env: dict[str, str] | None = None
+    # This launch's ephemeral MCP credential values (never persisted, never
+    # in repr, so never in a log line that prints a turn).
+    secret_env: dict[str, str] | None = field(default=None, repr=False)
     # Per-run system context (the memory packet): transient by contract.
     extra_instructions: str | None = None
     # MiraRun's ids for the run or session (execution-refs/v1). A harness

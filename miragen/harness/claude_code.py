@@ -644,10 +644,6 @@ class ClaudeCodeHarness(MiraRunEnv):
     async def _turn(self, turn: HarnessTurn, on_text: Callable[[str], None] | None) -> HarnessResult:
         from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
 
-        if turn.secret_env:
-            raise ClaudeCodeHarnessError(
-                "per-launch MCP credentials are not supported by the claude-code harness "
-                "(the gateway holds deployment-level upstream credentials)")
         instance, ephemeral = self._key(turn)
         await self._remember_mirarun(instance, ephemeral, turn.mirarun)
         # A `lost` the client could see before this turn is now consumed; one
@@ -667,7 +663,8 @@ class ClaudeCodeHarness(MiraRunEnv):
         try:
             async with agent.lock:
                 agent.last_used = time.monotonic()
-                with self.gateway.turn(instance, turn.run_id) as log:
+                with self.gateway.turn(instance, turn.run_id,
+                                       secret_env=turn.secret_env) as log:
                     try:
                         async with asyncio.timeout(self.settings.turn_timeout_s):
                             await agent.client.query(self._compose(turn))

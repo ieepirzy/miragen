@@ -14,7 +14,7 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 
@@ -24,7 +24,7 @@ from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger as APIntervalTrigger
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
@@ -2402,6 +2402,52 @@ async def resolve_profile(request: ResolveRequest):
     return body
 
 
+class TurnCredentials(BaseModel):
+    """A run's scoped credentials for one base-tier turn (MiraRun ADR-021,
+    ADR-045 §5), handed over by the control plane when the turn is launched.
+
+    `secret_env` is keyed by the environment variable a capability names in
+    `bearer_token_env`: a pydantic-ai profile resolves it in-process; a CLI
+    harness's tool gateway uses it for that upstream during this turn only.
+    Values are SecretStr so they never print. They are held in memory for
+    the one turn, never written to the run record, the workspace or the
+    conversation, and dropped when the turn ends.
+
+    `repositories` exists so a control plane's checkout bindings are refused
+    loudly rather than ignored: the base tier prepares no checkout (see
+    `run_agent`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Checked in `start_turn`, not by a validator here: a validation error
+    # echoes its input in the 422 body, and the input is the secret.
+    secret_env: dict[str, SecretStr] = Field(default_factory=dict)
+    repositories: dict[str, Any] = Field(default_factory=dict)
+
+
+_SECRET_ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,127}")
+
+
+def _turn_secret_env(credentials: TurnCredentials) -> dict[str, str] | None:
+    """A turn's credentials as plain values, checked without ever putting a
+    value into an error."""
+    if credentials.repositories:
+        raise HTTPException(status_code=422, detail="base-tier turns prepare no repository "
+                            "checkout; repository bindings are not accepted here")
+    if len(credentials.secret_env) > 32:
+        raise HTTPException(status_code=422, detail="secret_env: at most 32 entries")
+    out: dict[str, str] = {}
+    for name, value in credentials.secret_env.items():
+        if not _SECRET_ENV_NAME.fullmatch(name):
+            raise HTTPException(status_code=422, detail="secret_env: a name is not an "
+                                "environment variable name")
+        plain = value.get_secret_value()
+        if len(plain) > 8192:
+            raise HTTPException(status_code=422, detail=f"secret_env.{name}: value too long")
+        out[name] = plain
+    return out or None
+
+
 class TurnRequest(BaseModel):
     """One turn in a conversation instance (base tier)."""
 
@@ -2412,6 +2458,8 @@ class TurnRequest(BaseModel):
     # process keeps the refs it was started with; new ones apply from its
     # next process (rotate the instance to apply them at once).
     mirarun: MiraRunRefs | None = None
+    # This turn's run-scoped credentials (base tier only).
+    credentials: TurnCredentials | None = None
 
 
 @app.post("/instances/{name}/turns", status_code=202, dependencies=[_internal_auth])
@@ -2428,11 +2476,15 @@ async def start_turn(name: str, request: TurnRequest, response: Response):
     if _executor is not None:
         raise HTTPException(status_code=409, detail="an executor-tier agent has no "
                             "conversation instances; use /executor-runs")
-    result = await launch_executor_run(
+    turn_secret_env = (
+        _turn_secret_env(request.credentials) if request.credentials is not None else None
+    )
+    result = await _launch_run(
         ExecutorLaunchRequest(prompt=request.prompt, idempotency_key=request.idempotency_key,
                               provenance=request.provenance, instance=name, use_history=True,
                               mirarun=request.mirarun),
-        response)
+        response,
+        turn_secret_env=turn_secret_env)
     return {"turn_id": result["run_id"], "instance": name,
             **{k: v for k, v in result.items() if k in ("status", "duplicate")}}
 
@@ -2451,7 +2503,24 @@ async def get_turn(name: str, turn_id: str):
 
 @app.post("/executor-runs", status_code=202, dependencies=[_internal_auth])
 async def launch_executor_run(request: ExecutorLaunchRequest, response: Response):
+    """Idempotent, provenance-carrying executor launch (see `_launch_run`).
+    Run-scoped credentials reach this route only through the EDF's secret
+    bindings (`context.secrets`); the base tier's turn credentials do not."""
+    return await _launch_run(request, response)
+
+
+async def _launch_run(
+    request: ExecutorLaunchRequest,
+    response: Response,
+    *,
+    turn_secret_env: dict[str, str] | None = None,
+):
     """Idempotent, provenance-carrying executor launch.
+
+    `turn_secret_env` is a base-tier turn's run-scoped credentials
+    (`TurnCredentials`), already keyed by environment variable name. It joins
+    `mcp_secret_env` for this one run, is never persisted, and is cleared
+    when the run ends.
 
     Acceptance is DURABLE-FIRST: the run record (with provenance and, when an
     EDF is supplied, the resolved snapshot + hash) is persisted before this
@@ -2620,6 +2689,8 @@ async def launch_executor_run(request: ExecutorLaunchRequest, response: Response
             value = request.context.secrets.get(binding.name)
             if value:
                 mcp_secret_env[binding.environment_variable] = value
+    if turn_secret_env:
+        mcp_secret_env.update(turn_secret_env)
 
     async def _background_run() -> None:
         try:
@@ -2636,6 +2707,8 @@ async def launch_executor_run(request: ExecutorLaunchRequest, response: Response
             # so a launch exception never propagates into a bare task error.
             logger.error(f"[{_profile.name}] launched run failed: {e}", exc_info=True)
         finally:
+            # This run's credentials end with it.
+            mcp_secret_env.clear()
             release()
 
     _spawn_background(_background_run())

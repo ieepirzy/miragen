@@ -19,6 +19,15 @@ with no turn in progress is refused.
 Identity: one bearer credential per *instance* (a harness session binds its
 MCP servers once, so a per-run token could not rotate). The instance's active
 run is the one turn admission allows at a time.
+
+Per-run upstream credentials: a base-tier turn may carry its run's scoped
+credentials (MiraRun ADR-021, a run-scoped MCP bearer), keyed by the
+environment variable a capability names in `bearer_token_env`. They live on
+the turn's `TurnLog`, in memory only. While that turn is in progress the
+gateway authenticates to the matching upstream with the run's value instead
+of the deployment-level one, which is the same precedence `resolve_capabilities`
+uses in-process. They are cleared when the turn ends, and never logged,
+recorded or forwarded anywhere else.
 """
 
 from __future__ import annotations
@@ -86,6 +95,9 @@ class _Upstream:
     token: str | None
     allowed: set[str] | None
     auth: "OAuthUpstream | None" = None
+    # The capability's `bearer_token_env`: a turn's run-scoped value for this
+    # name, when it carries one, is used instead of `token`.
+    token_env: str | None = None
     # Send X-Harness-Session for the calling instance (miragen's memory
     # bridge binds its memory_*/store_* tools to a session this way).
     bridge_session: bool = False
@@ -109,6 +121,9 @@ class TurnLog:
     # and for an upstream call the session open (auth + initialize) apart from
     # the call itself.
     timings: list[dict] = field(default_factory=list)
+    # This turn's run-scoped upstream credentials, by environment variable
+    # name. In memory only, never in repr, cleared when the turn ends.
+    secret_env: dict[str, str] | None = field(default=None, repr=False)
 
 
 def _capability_entries(profile: AgentProfile) -> list[tuple[str, dict]]:
@@ -232,6 +247,7 @@ class ToolGateway:
             self._upstreams[name] = _Upstream(name=name, url=cfg["url"], token=token,
                                               allowed=set(allowed) if allowed else None,
                                               auth=auth,
+                                              token_env=cfg.get("bearer_token_env"),
                                               bridge_session=bool(cfg.get("bridge_session")))
         for fn in runtime_tools or ():
             self._add_local(fn.__name__, fn, runtime=True)
@@ -271,15 +287,20 @@ class ToolGateway:
         return self._credentials.get(token or "")
 
     @contextlib.contextmanager
-    def turn(self, instance: str, run_id: str | None) -> Iterator[TurnLog]:
+    def turn(
+        self, instance: str, run_id: str | None, *, secret_env: dict[str, str] | None = None
+    ) -> Iterator[TurnLog]:
         if instance in self._active:
             raise RuntimeError(f"instance '{instance}' already has a turn in progress")
-        log = TurnLog(run_id=run_id)
+        log = TurnLog(run_id=run_id, secret_env=dict(secret_env) if secret_env else None)
         self._active[instance] = log
         try:
             yield log
         finally:
             self._active.pop(instance, None)
+            if log.secret_env:
+                log.secret_env.clear()
+            log.secret_env = None
 
     # ── tool table ───────────────────────────────────────────────────────
     def _shim_for(self, tool_name: str) -> Callable[[], GatewayRunContext]:
@@ -318,12 +339,17 @@ class ToolGateway:
         token = up.token
         if up.auth is not None:
             token = await up.auth.token()
+        run_id, instance = _CURRENT.get()
+        # The calling turn's run-scoped credential for this upstream, if it
+        # carries one, wins over the deployment-level value.
+        active = self._active.get(instance) if instance else None
+        if active is not None and active.secret_env and up.token_env:
+            token = active.secret_env.get(up.token_env) or token
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         # Which agent/run/instance is calling, for upstream attribution (a
         # harness session binds its MCP credentials once, so identity can't
         # ride a per-run token). Informational: upstream authorization is
-        # still miragen's own credential above.
-        run_id, instance = _CURRENT.get()
+        # miragen's own credential above, or the turn's run-scoped one.
         headers["X-Miragen-Agent"] = self.profile.name
         if run_id:
             headers["X-Miragen-Run-Id"] = run_id
