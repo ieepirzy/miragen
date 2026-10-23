@@ -65,13 +65,24 @@ listed in §6, which the spoke's own driver does not have.
 4. **Events.** Each turn or resume with a `run_intent_id` is tracked. Its
    event pages are read from the agent by cursor
    (`GET /runs/{id}/events?after=N`) and pushed unchanged to the hub at
-   `RUN_EVENTS_ROUTE`. `(run_id, seq)` deduplicates them, so pushing a page
-   twice is harmless. Tracking ends when the run is no longer running and
-   nothing is left to read.
+   `RUN_EVENTS_ROUTE` as `{"run": <GET /runs/{id}>, "events": <page>}`.
+   `(run_id, seq)` deduplicates them, so pushing a page twice is harmless.
+   Tracking ends when the run is no longer running and a read made after
+   seeing it stopped is empty. Its stopped record then goes up once more
+   with an empty page, so the hub sees the terminal status.
+
+   An accepted `launch` is settled with `result: {run_id, status,
+   duplicate}`: the agent's turn id is the run the hub's queued launch maps
+   to.
 
 A hub that is unreachable means exponential backoff with jitter, capped at
-`poll.max_backoff_seconds`. A claim that returns work means the spoke polls
-again at once.
+`poll.max_backoff_seconds`. Claims long-poll (`wait_seconds`, at most 25):
+
+- the delivery claim waits `poll.wait_seconds`, and the intent claim a
+  fifth of that;
+- while runs are being relayed, both return at once and the loop paces
+  itself at `poll.interval_seconds`;
+- a claim that returns work means the spoke polls again at once.
 
 ## 3. Configuration
 
@@ -167,8 +178,11 @@ hub.
 
 ## 7. Notes on the hub contract
 
-- **There is no long-poll.** The claim routes return immediately, so the
-  spoke polls at `poll.interval_seconds`.
+- **Credentials minted at claim are not forwarded yet.** A claimed
+  `launch` may carry repository and MCP credentials (`credentials`), but the
+  agent's base-tier turns route takes no `context`, unlike `/executor-runs`.
+  The spoke does not put them into the pod spec, so today they are dropped.
+  It needs a base-tier way to hand a turn its run-scoped credentials.
 - **The event route is newer than the rest.** It sits behind `EventSink`
   and one constant (`RUN_EVENTS_ROUTE`).
 - **Delivery payloads are read as:**
