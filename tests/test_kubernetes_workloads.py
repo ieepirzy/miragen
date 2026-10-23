@@ -261,3 +261,20 @@ def test_list_managed_finds_both_classes():
                            deadline_seconds=None))
     found = {(w.name, w.workload_class) for w in driver.list_managed(NS)}
     assert found == {("mw-" + "1" * 32, "ephemeral"), ("mw-" + "2" * 32, "persistent")}
+
+
+def test_a_gateway_class_gets_an_in_memory_token_volume_and_no_token():
+    fake = FakeKubernetes()
+    template = WorkloadTemplate(image="i", service_account_name="sa",
+                                model_gateway_url="https://gateway.invalid",
+                                model_connection="anthropic-main")
+    _driver(fake).apply(_workload(template=template))
+    pod = fake.objects["jobs"]["mw-" + "1" * 32]["spec"]["template"]["spec"]
+    env = {e["name"]: e["value"] for e in pod["containers"][0]["env"]}
+    assert env["MIRAGEN_MODEL_GATEWAY_URL"] == "https://gateway.invalid"
+    assert env["MIRAGEN_MODEL_CONNECTION"] == "anthropic-main"
+    assert env["MIRAGEN_MODEL_TOKEN_DIR"] == "/run/miragen/model"
+    volume = next(v for v in pod["volumes"] if v["name"] == "model-token")
+    assert volume["emptyDir"]["medium"] == "Memory"
+    mounts = {m["name"]: m["mountPath"] for m in pod["containers"][0]["volumeMounts"]}
+    assert mounts["model-token"] == "/run/miragen/model"

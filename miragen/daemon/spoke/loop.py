@@ -58,7 +58,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -112,6 +112,12 @@ _ENVELOPE_KEYS = ("seq", "schema", "type", "ts", "target", "run_id")
 # Hub refusals that concern one item (a delivery, a run, an intent), not the
 # spoke as a whole: that item is dropped or skipped, the loop goes on.
 _ITEM_REFUSALS = frozenset({404, 409, 422})
+# Model tokens live 15 minutes; refresh this far ahead, never more often than
+# the hub mints (once a minute per workload), and retry a failed hand-over.
+_MODEL_REFRESH_MARGIN = timedelta(minutes=5)
+_MODEL_MINT_INTERVAL = timedelta(seconds=60)
+_MODEL_PUSH_RETRY = timedelta(seconds=15)
+_ENDED_PHASES = frozenset({"succeeded", "failed", "absent", "stopped", "deleted"})
 
 
 def workload_name(intent_id: UUID) -> str:
@@ -129,6 +135,12 @@ class TrackedWorkload:
     generation: int
     attempt: int
     last_phase: str | None = None
+    # The workload's model token (ADR-045 §5): when the one the agent holds
+    # expires, when a refresh may next be tried, and a minted token the agent
+    # has not taken yet (pushed again without minting another).
+    model_expires_at: datetime | None = None
+    model_retry_at: datetime | None = None
+    model_unpushed: dict[str, str] | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -276,6 +288,7 @@ class Spoke:
             self._contained("delivery", delivery.delivery_id, self.handle_delivery, delivery)
         self.pump_events()
         self.pump_turn_results()
+        self.refresh_model_tokens()
         return busy
 
     def _contained(self, what: str, item: object, handler: Callable[[Any], None],
@@ -601,6 +614,10 @@ class Spoke:
             if delivery.at_most_once:
                 self._settle(delivery, "rejected", f"not forwarded: {exc}")
             return
+        if delivery.credentials and isinstance(delivery.credentials.get("model"), dict):
+            # The agent now holds this token; refresh it before it expires.
+            tracked.model_expires_at = _model_expiry(delivery.credentials["model"])
+            tracked.model_retry_at = None
         if forwarded.turn is not None and delivery.kind in ("turn", "answer"):
             # Dispatched now; its record goes up when the turn has finished.
             instance, turn_id = forwarded.turn
@@ -778,6 +795,51 @@ class Spoke:
                     SpawnOperationFailed) as exc:
                 logger.warning("relaying events of %s failed: %s", run.agent_run_id, exc)
 
+    def refresh_model_tokens(self) -> None:
+        """Refresh each live workload's model token before it expires and
+        hand it to the agent. The hub mints at most once a minute per
+        workload: a 429 waits that minute. A workload the hub no longer knows
+        (404) stops being refreshed. Tokens are never logged."""
+        now = self.clock()
+        for tracked in list(self.workloads.values()):
+            if tracked.model_expires_at is None or tracked.last_phase in _ENDED_PHASES:
+                continue
+            if tracked.model_retry_at is not None and now < tracked.model_retry_at:
+                continue
+            if tracked.model_unpushed is None and \
+                    now < tracked.model_expires_at - _MODEL_REFRESH_MARGIN:
+                continue
+            try:
+                if tracked.model_unpushed is None:
+                    tracked.model_unpushed = self.hub.refresh_model_token(
+                        tracked.organization_id, tracked.intent_id)
+                endpoint = self.driver.endpoint(tracked.namespace, tracked.name)
+                token = self.driver.internal_token(tracked.namespace, tracked.name,
+                                                   tracked.workload_class)
+                if endpoint is None or token is None:
+                    tracked.model_retry_at = now + _MODEL_PUSH_RETRY
+                    continue
+                self.agents.put_model_credential(endpoint, token, tracked.model_unpushed)
+                tracked.model_expires_at = _model_expiry(tracked.model_unpushed)
+                tracked.model_unpushed = None
+                tracked.model_retry_at = None
+            except HubUnavailable:
+                raise
+            except HubRefused as exc:
+                if exc.status_code == 429:
+                    tracked.model_retry_at = now + _MODEL_MINT_INTERVAL
+                elif exc.status_code == 404:
+                    tracked.model_expires_at = None
+                elif exc.status_code not in _ITEM_REFUSALS:
+                    raise
+                logger.warning("model token for %s: the hub answered %s",
+                               tracked.name, exc.status_code)
+            except (AgentRejected, AgentUnreachable, AgentOutcomeUnknown,
+                    SpawnOperationFailed) as exc:
+                tracked.model_retry_at = now + _MODEL_PUSH_RETRY
+                logger.warning("handing %s its model token failed: %s",
+                               tracked.name, type(exc).__name__)
+
     def pump_turn_results(self) -> None:
         """Post each finished turn's record. A turn still running stays; one
         the agent or the hub no longer knows (404, 409) is dropped."""
@@ -879,7 +941,18 @@ def _turn_credentials(minted: dict[str, Any] | None) -> dict[str, Any] | None:
     if minted.get("repositories"):
         # Forwarded so the agent refuses them loudly (no base-tier checkout).
         out["repositories"] = dict(minted["repositories"])
+    if isinstance(minted.get("model"), dict):
+        # The workload's model token: never secret_env, which is a run's.
+        out["model"] = dict(minted["model"])
     return out or None
+
+
+def _model_expiry(credential: dict[str, str]) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(credential["expires_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def _empty_page(record: dict[str, Any], after: int) -> dict[str, Any]:

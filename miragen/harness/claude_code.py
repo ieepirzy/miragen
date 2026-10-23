@@ -27,6 +27,19 @@ swap between them (``spec.model``) when one is rate limited:
   system prompt byte-stable for the prompt cache. Prompts are delivered
   verbatim: no ``@path`` expansion, no slash commands.
 
+* **On a spoke, the provider gateway only** (``MIRAGEN_MODEL_GATEWAY_URL``
+  set; MiraRun ADR-045 §5). Model calls go to
+  ``<gateway>/anthropic/<connection>`` (``ANTHROPIC_BASE_URL``) with the
+  workload's short-lived model token. Claude Code reads it through an
+  ``apiKeyHelper`` (flag settings, so no settings file can replace it) that
+  prints the current token from its 0600 file (``miragen.model_token``). The
+  helper is re-read every minute, so a refreshed token takes over without a
+  restart. No subscription token reaches the child, and a saved login in
+  ``CLAUDE_CONFIG_DIR`` refuses the harness. With no token, or an expired
+  one, the helper fails and so does the model call: there is no fallback.
+  Docs: code.claude.com/docs/en/llm-gateway-connect ("Rotate credentials
+  with apiKeyHelper") and /authentication ("Authentication precedence").
+
 All of the above is the default, ``locked`` posture. ``spec.harness.posture:
 engineer`` (mirarun ADR-041 §4) opts a profile out of the tool lockdown:
 Claude Code's own tools with ``bypassPermissions`` (the container is the
@@ -105,6 +118,15 @@ SUBAGENT_MODEL_ENV = "CLAUDE_CODE_SUBAGENT_MODEL"
 SUBAGENT_MODEL_FORCE_ENV = "CLAUDE_CODE_SUBAGENT_MODEL_FORCE"
 # The only environment a claude process inherits from the container (plus
 # what _env sets). Same list as the Grok harness's.
+# A spoke's provider gateway (ADR-045 §5): its root, and the connection a
+# profile's model calls use when the profile names none.
+MODEL_GATEWAY_ENV = "MIRAGEN_MODEL_GATEWAY_URL"
+MODEL_CONNECTION_ENV = "MIRAGEN_MODEL_CONNECTION"
+# How long Claude Code caches the helper's token. Short, so a refreshed token
+# is picked up well before the old one (15 minutes) expires.
+HELPER_TTL_MS = 60_000
+# Scrubbed everywhere else; set on purpose in gateway mode, and only there.
+_GATEWAY_ALLOWED = frozenset({"ANTHROPIC_BASE_URL"})
 ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
                  "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy")
 _GATEWAY_PREFIX = f"mcp__{GATEWAY_SERVER}__"
@@ -301,13 +323,56 @@ class ClaudeCodeHarness(MiraRunEnv):
             settings_json = home / "settings.json"
             if settings_json.is_file():
                 settings_json.chmod(0o444)
-        if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") and not self._logged_in():
+        if self._gateway_mode():
+            try:
+                self._model_gateway()
+            except ClaudeCodeHarnessError as exc:
+                logger.error("claude-code harness: %s; model calls will fail", exc)
+        elif not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") and not self._logged_in():
             logger.warning("claude-code harness: no subscription credential (neither the "
                            "setup-token env var nor a login in CLAUDE_CONFIG_DIR); turns will "
                            "fail until one is provided (`claude setup-token`)")
 
     def _logged_in(self) -> bool:
         return (self.settings.claude_home / ".credentials.json").is_file()
+
+    # ── the provider gateway (a spoke) ───────────────────────────────────
+    @staticmethod
+    def _gateway_mode() -> bool:
+        return bool(os.environ.get(MODEL_GATEWAY_ENV))
+
+    def _model_gateway(self) -> tuple[str, str]:
+        """(base URL, credential helper command) on a spoke. Refuses, rather
+        than letting another credential stand in, when anything is missing."""
+        from miragen.model_token import holder
+
+        root = os.environ.get(MODEL_GATEWAY_ENV, "").rstrip("/")
+        if not root.startswith("https://") and not root.startswith("http://"):
+            raise ClaudeCodeHarnessError(f"{MODEL_GATEWAY_ENV} is not a URL")
+        spec = harness_spec(self.profile)
+        connection = (spec.model_connection if spec is not None else None) \
+            or os.environ.get(MODEL_CONNECTION_ENV)
+        if not connection:
+            raise ClaudeCodeHarnessError(
+                "no model connection: set spec.harness.model_connection or "
+                f"{MODEL_CONNECTION_ENV}")
+        command = holder().helper_command()
+        if command is None:
+            raise ClaudeCodeHarnessError(
+                "no model token directory (MIRAGEN_MODEL_TOKEN_DIR): the token has nowhere "
+                "to live, so nothing may call models")
+        if self._logged_in():
+            raise ClaudeCodeHarnessError(
+                "a saved login is present in CLAUDE_CONFIG_DIR; on a spoke the gateway "
+                "token is the only model credential")
+        return f"{root}/anthropic/{connection}", command
+
+    def _gateway_settings(self, base: dict[str, Any] | None = None) -> str | None:
+        """Flag settings for gateway mode (they outrank every settings file)."""
+        if not self._gateway_mode():
+            return json.dumps(base) if base is not None else None
+        _, command = self._model_gateway()
+        return json.dumps({**(base or {}), "apiKeyHelper": command})
 
     def _state_path(self) -> Path:
         return self.settings.claude_home / STATE_FILE
@@ -347,14 +412,26 @@ class ClaudeCodeHarness(MiraRunEnv):
             env["MCP_TOOL_TIMEOUT"] = str(self.tool_timeout_s * 1000)
         if self.settings.auto_compact_window:
             env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(self.settings.auto_compact_window)
-        if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        if self._gateway_mode():
+            # The gateway token, through the helper, is the only model
+            # credential: no subscription token, ever.
+            base_url, _ = self._model_gateway()
+            env["ANTHROPIC_BASE_URL"] = base_url
+            env["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"] = str(HELPER_TTL_MS)
+        elif os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
             env["CLAUDE_CODE_OAUTH_TOKEN"] = os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
         env.update(self._mirarun_env(instance))
         keep = [k for k in ENV_ALLOWLIST if k in os.environ]
         keep += [*env, "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SDK_READS_SESSION_STATE", "PWD"]
-        assert not set(keep) & set(SCRUBBED_ENV)
+        self._check_scrubbed(keep)
         env[KEEP_ENV] = " ".join(keep)
         return env
+
+    def _check_scrubbed(self, keep: list[str]) -> None:
+        allowed = _GATEWAY_ALLOWED if self._gateway_mode() else frozenset()
+        leaked = (set(keep) & set(SCRUBBED_ENV)) - allowed
+        if leaked or (self._gateway_mode() and "CLAUDE_CODE_OAUTH_TOKEN" in keep):
+            raise ClaudeCodeHarnessError(f"refusing a credential in the child env: {sorted(leaked)}")
 
     def current_session_id(self, instance: str) -> str | None:
         """The Claude Code session id serving ``instance`` now (its live
@@ -399,7 +476,7 @@ class ClaudeCodeHarness(MiraRunEnv):
         keep = [k for k in ENV_ALLOWLIST if k in os.environ]
         keep += [*env, "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SDK_READS_SESSION_STATE", "PWD"]
         keep = list(dict.fromkeys(keep))
-        assert not set(keep) & set(SCRUBBED_ENV)
+        self._check_scrubbed(keep)
         env[KEEP_ENV] = " ".join(keep)
         return env
 
@@ -461,6 +538,7 @@ class ClaudeCodeHarness(MiraRunEnv):
             verbatim_prompts=True,
             hooks={"PreCompact": [HookMatcher(hooks=[pre_compact])]},
             stderr=stderr.append,
+            settings=self._gateway_settings(),
         )
 
     def _engineer_options(self, instance: str, workdir: Path, *, resume: str | None,
@@ -494,7 +572,7 @@ class ClaudeCodeHarness(MiraRunEnv):
             setting_sources=["user"],
             # Flag settings outrank user settings: the depth hooks stay on even
             # if a session rewrites settings.json.
-            settings=json.dumps({"disableAllHooks": False}),
+            settings=self._gateway_settings({"disableAllHooks": False}),
             skills="all",
             plugins=[{"type": "local", "path": p} for p in spec.plugin_dirs],
             # The container is the boundary. can_use_tool would never be

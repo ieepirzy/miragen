@@ -92,6 +92,12 @@ class AgentClient:
             raise AgentRejected(response.status_code, _detail(response))
         return response.json()
 
+    def put_model_credential(self, endpoint: str, token: str, credential: dict[str, str]) -> None:
+        """Hand the agent its workload's refreshed model token."""
+        response = self._send("PUT", endpoint, "/credentials/model", token, json=credential)
+        if response.status_code not in (200, 204):
+            raise AgentRejected(response.status_code, _detail(response))
+
     def discard_instance(self, endpoint: str, token: str, *, instance: str) -> None:
         response = self._send("DELETE", endpoint, f"/instances/{instance}", token)
         if response.status_code not in (200, 404):
