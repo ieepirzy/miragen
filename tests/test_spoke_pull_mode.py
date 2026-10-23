@@ -688,7 +688,7 @@ def test_an_agents_error_detail_is_scrubbed_before_it_is_settled_or_logged(caplo
     world = World()
     intent = world.running()
     # Token-shaped (three dotted segments) but plainly a test value.
-    leaked = ".".join(["test-header-segment", "test-claims-segment", "test-signature"])
+    leaked = "test-header-segment.test-claims-segment.test-signature"
     original = world.agent.handler
 
     def echoing(request: httpx.Request) -> httpx.Response:
