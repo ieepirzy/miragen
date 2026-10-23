@@ -518,20 +518,33 @@ class Spoke:
                                            tracked.workload_class)
         if endpoint is None or token is None:
             return
+        if not self._relay(endpoint, token, run):
+            return
+        status = self.agents.run_status(endpoint, token, run.agent_run_id)
+        if status not in STOPPED_RUN_STATUSES:
+            return
+        # The run may have written its last events between the empty page
+        # above and the status read: read once more, after seeing it stopped,
+        # and only let go when that read is empty too.
+        if self._relay(endpoint, token, run):
+            self.runs.pop(key, None)
+
+    def _relay(self, endpoint: str, token: str, run: TrackedRun) -> bool:
+        """Relay what the agent has after the cursor (bounded). True when the
+        last page read was empty and final: nothing is left right now."""
+        if self.events is None:
+            raise RuntimeError("the spoke has no event sink")
+        page: dict[str, Any] = {}
         for _ in range(_MAX_PAGES_PER_TICK):
             page = self.agents.events(endpoint, token, run.agent_run_id, after=run.after)
             if page.get("events"):
-                assert self.events is not None
                 self.events.push_page(run.run_intent_id, page)
             next_after = page.get("next_after")
             if isinstance(next_after, int):
                 run.after = next_after
             if not page.get("has_more"):
                 break
-        if not page.get("events") and not page.get("has_more"):
-            status = self.agents.run_status(endpoint, token, run.agent_run_id)
-            if status in STOPPED_RUN_STATUSES:
-                self.runs.pop(key, None)
+        return not page.get("events") and not page.get("has_more")
 
     def pump_events(self) -> None:
         for key, run in list(self.runs.items()):

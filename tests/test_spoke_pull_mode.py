@@ -369,3 +369,30 @@ def test_an_abandon_the_agent_refused_is_not_sent_again():
     world.spoke.tick()
     sends = [w for w in _kinds(world.timeline, "agent") if w.endswith("/abandon")]
     assert len(sends) == 1
+
+
+def test_events_written_just_before_the_run_stops_are_still_relayed():
+    """The race: an empty final page, then the agent writes its last events
+    and stops, then the status read says stopped. Those events must go up."""
+    world = World()
+    intent = world.offer()
+    world.spoke.tick()
+    world.run_pod(intent)
+    world.deliver(intent)
+    world.spoke.tick()  # the turn is forwarded and tracked; no events yet
+    assert world.hub.pages == []
+    original = world.agent.handler
+
+    def late_events(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.startswith("/runs/") \
+                and not request.url.path.endswith("/events"):
+            # Between the empty page and this status read, the run finished.
+            world.agent.events = [{"seq": 1, "type": "turn.done"}]
+            world.agent.status = "succeeded"
+        return original(request)
+
+    world.spoke.agents = AgentClient(transport=httpx.MockTransport(late_events))
+    world.spoke.tick()
+    assert [e["seq"] for page in world.hub.pages for e in page[1]["events"]] == [1]
+    world.spoke.tick()
+    assert world.spoke.runs == {}
