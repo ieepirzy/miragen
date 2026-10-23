@@ -450,8 +450,9 @@ def test_relays_resume_from_the_hubs_open_runs_and_cursor():
     intent = world.running()
     run_intent = str(uuid4())
     world.hub.cursors[run_intent] = 2
-    world.hub.open = [{"run_intent_id": run_intent, "intent_id": intent["intent_id"],
-                       "agent_run_id": "run-7", "last_event_sequence": 2}]
+    world.hub.open = [{"organization_id": intent["organization_id"],
+                       "run_intent_id": run_intent, "intent_id": intent["intent_id"],
+                       "run_id": "run-7", "last_event_sequence": 2}]
     world.agent.events = [{"seq": n, "type": "e"} for n in (1, 2, 3, 4)]
     world.spoke.resync_open_runs()
     world.spoke.tick()
@@ -556,3 +557,28 @@ def test_config_refuses_an_inline_token_and_unlisted_images():
 
 def test_unused_imports_are_real():
     assert HubRefused and SpawnOperationFailed
+
+
+def test_with_the_published_hub_a_replay_is_skipped_and_the_cursor_followed():
+    world = World()
+    world.hub.replays = "skip"
+    intent = world.running()
+    delivery = world.deliver(intent, kind="launch")
+    world.spoke.tick()
+    world.hub.cursors[delivery["run_intent_id"]] = 3  # the hub already has 1..3
+    world.agent.events = [{"seq": n, "type": "e"} for n in range(1, 6)]
+    world.spoke.tick()
+    run = next(iter(world.spoke.runs.values()))
+    assert run.after == 5
+    assert world.hub.cursors[delivery["run_intent_id"]] == 5
+
+
+def test_a_turn_result_that_conflicts_is_dropped():
+    world = World()
+    intent = world.running()
+    world.deliver(intent)
+    world.spoke.tick()
+    world.agent.turn_status["turn-1"] = "succeeded"
+    world.hub.fail["result"] = 409
+    world.spoke.tick()
+    assert world.spoke.pending_results == {}

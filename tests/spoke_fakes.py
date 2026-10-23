@@ -1,73 +1,66 @@
 """Strict fakes for the spoke's tests: a hub that validates every request
-against mirror copies of MiraRun's request models (src/mirarun/api/spoke.py
-on feat/workload-deliveries-wiring, 6a49d67) and enforces leases and event
-cursors, plus a fake agent. tests/test_hub_contract.py checks the same
-client against the real router."""
+body and every response it sends against MiraRun's published spoke contract
+(tests/contracts/spoke-api.openapi.json, copied from mirarun
+docs/contracts/spoke-api/openapi.json at feat/workload-deliveries-wiring
+42d015d), and enforces the hub's leases, write-once turn results and event
+cursors; plus a fake agent. tests/test_hub_contract.py runs the same client
+against the real router."""
 
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+import jsonschema
 
-INT4_MAX = 2**31 - 1
-INT8_MAX = 2**63 - 1
-PHASE_PATTERN = r"^[a-z][a-z_]{0,31}$"
+SPEC = json.loads((Path(__file__).parent / "contracts" / "spoke-api.openapi.json").read_text())
 DELIVERY_SETTLED = ("accepted", "rejected", "uncertain")
 NOW = datetime(2026, 10, 23, 12, 0, tzinfo=UTC)
 
 
-# -- MiraRun's request models, mirrored exactly -------------------------------
-
-class ClaimRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    limit: int = Field(default=32, ge=1, le=32)
-    wait_seconds: int = Field(default=0, ge=0, le=25)
-
-
-class AcknowledgeRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    generation: int = Field(ge=1, le=INT8_MAX)
-    attempt: int = Field(ge=1, le=INT4_MAX)
+def _operation(method: str, path: str) -> dict:
+    for template, operations in SPEC["paths"].items():
+        pattern = "^" + re.sub(r"\{[^}]+\}", "[^/]+", template) + "$"
+        if re.match(pattern, path) and method.lower() in operations:
+            return operations[method.lower()]
+    raise AssertionError(f"{method} {path} is not in the published contract")
 
 
-class ObservationRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    generation: int = Field(ge=1, le=INT8_MAX)
-    attempt: int = Field(ge=0, le=INT4_MAX)
-    phase: str = Field(pattern=PHASE_PATTERN)
-    reason: str | None = Field(default=None, max_length=255)
-    started_at: datetime | None = None
-    finished_at: datetime | None = None
-    exit_code: int | None = Field(default=None, ge=-INT4_MAX - 1, le=INT4_MAX)
-    oom_killed: bool | None = None
-    k8s_namespace: str | None = Field(default=None, max_length=63)
-    pod_uid: str | None = Field(default=None, max_length=64)
+def _validate(schema: dict, instance: Any, what: str) -> None:
+    root = {**schema, "components": SPEC["components"]}
+    try:
+        jsonschema.Draft202012Validator(root).validate(instance)
+    except jsonschema.ValidationError as exc:
+        raise ContractViolation(f"{what}: {exc.message}") from exc
 
 
-class SettleRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    attempt: int = Field(ge=1, le=INT4_MAX)
-    status: str
-    detail: str | None = Field(default=None, max_length=1024)
-    result: dict[str, Any] | None = None
+class ContractViolation(Exception):
+    pass
 
 
-class PushedEventsRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    run: dict[str, Any]
-    events: dict[str, Any]
+def validate_request(method: str, path: str, body: Any) -> None:
+    operation = _operation(method, path)
+    request_body = operation.get("requestBody")
+    if request_body is None:
+        assert body in (None, {}), f"{method} {path} takes no body"
+        return
+    _validate(request_body["content"]["application/json"]["schema"], body, f"{path} request")
 
 
-class TurnResultRequest(BaseModel):
-    # The coordinator's decided shape for the new turn-result route.
-    model_config = ConfigDict(extra="forbid")
-    result: dict[str, Any]
+def validate_response(method: str, path: str, status: int, body: Any) -> None:
+    operation = _operation(method, path)
+    response = operation["responses"].get(str(status))
+    if response is None or status >= 400:
+        return  # errors carry `detail` only
+    content = (response.get("content") or {}).get("application/json")
+    if content and content.get("schema"):
+        _validate(content["schema"], body, f"{path} {status} response")
 
 
 class Timeline(list):
@@ -94,6 +87,9 @@ class StrictHub:
         self.cursors: dict[str, int] = {}        # run intent -> last event sequence
         self.open: list[dict] = []               # what GET runs/open returns
         self.fail: dict[str, int | list[int]] = {}
+        self.turn_results: dict[str, dict] = {}
+        # "reject": refuse a replayed page (stricter); "skip": the published hub.
+        self.replays = "reject"
 
     def _injected(self, kind: str) -> int | None:
         planned = self.fail.get(kind)
@@ -109,45 +105,43 @@ class StrictHub:
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         assert request.headers["authorization"].startswith("Bearer mrsp_")
-        path = urlsplit(str(request.url)).path.removeprefix("/api/spoke/v1/")
+        full = urlsplit(str(request.url)).path
+        path = full.removeprefix("/api/spoke/v1/")
         parts = path.split("/")
-        kind = parts[-1]
-        if parts[0] == "runs" and kind == "events":
-            kind = "events"
-        if path == "runs/open":
-            kind = "open"
+        kind = "open" if path == "runs/open" else (
+            "events" if parts[0] == "runs" else parts[-1])
         self.timeline.append(("hub", kind))
         injected = self._injected(kind)
         if injected is not None:
             return _refuse(injected, "injected")
-        body = json.loads(request.content) if request.content else {}
+        body = json.loads(request.content) if request.content else None
         try:
-            if path in ("intents/claim", "deliveries/claim"):
-                claim = ClaimRequest.model_validate(body)
-                self.waits.append((path, claim.wait_seconds))
-                return self._claim(path, claim.limit)
-            if kind == "ack":
-                AcknowledgeRequest.model_validate(body)
-                self.acks.append((path, body))
-                return httpx.Response(204)
-            if kind == "observations":
-                ObservationRequest.model_validate(body)
-                self.reports.append((path, body))
-                return httpx.Response(204)
-            if kind == "settle":
-                return self._settle(parts[2], SettleRequest.model_validate(body), path, body)
-            if kind == "events":
-                return self._events(parts[1], PushedEventsRequest.model_validate(body), path)
-            if kind == "result":
-                TurnResultRequest.model_validate(body)
-                if parts[1] not in self.settled:
-                    return _refuse(404, "not found")
-                self.results.append((path, body))
-                return httpx.Response(204)
-            if kind == "open":
-                return httpx.Response(200, json={"runs": self.open})
-        except ValidationError as exc:
-            return _refuse(422, str(exc)[:200])
+            validate_request(request.method, full, body)
+        except ContractViolation as exc:
+            return _refuse(422, str(exc)[:300])
+        response = self._route(path, parts, kind, body or {})
+        payload = json.loads(response.content) if response.content else None
+        validate_response(request.method, full, response.status_code, payload)
+        return response
+
+    def _route(self, path: str, parts: list[str], kind: str, body: dict) -> httpx.Response:
+        if path in ("intents/claim", "deliveries/claim"):
+            self.waits.append((path, body.get("wait_seconds", 0)))
+            return self._claim(path, body.get("limit", 32))
+        if kind == "ack":
+            self.acks.append((path, body))
+            return httpx.Response(204)
+        if kind == "observations":
+            self.reports.append((path, body))
+            return httpx.Response(204)
+        if kind == "settle":
+            return self._settle(parts[2], body, path)
+        if kind == "events":
+            return self._events(parts[1], body, path)
+        if kind == "result":
+            return self._result(parts[1], body, path)
+        if kind == "open":
+            return httpx.Response(200, json={"runs": self.open})
         raise AssertionError(f"unexpected hub route {path}")
 
     def _claim(self, path: str, limit: int) -> httpx.Response:
@@ -159,30 +153,42 @@ class StrictHub:
             self.claimed[item["delivery_id"]] = item
         return httpx.Response(200, json={"deliveries": out})
 
-    def _settle(self, delivery_id: str, body: SettleRequest, path: str, raw: dict):
-        if body.status not in DELIVERY_SETTLED:
+    def _settle(self, delivery_id: str, body: dict, path: str) -> httpx.Response:
+        status = body["status"]
+        if status not in DELIVERY_SETTLED:
             return _refuse(422, "bad status")
         claimed = self.claimed.get(delivery_id)
         if claimed is None:
             return _refuse(404, "not found")
-        if body.attempt != claimed["attempt"]:
+        if body["attempt"] != claimed["attempt"]:
             return _refuse(409, "the lease is no longer yours")
-        if claimed["kind"] in ("turn", "answer") and body.result is not None:
-            # Settled means dispatched: the reply comes on the result route.
-            return _refuse(422, "a turn settle carries no result")
-        if (claimed["kind"] == "launch" and body.status == "accepted"
-                and not (body.result and body.result.get("run_id"))):
+        result = body.get("result")
+        if claimed["kind"] != "launch" and result is not None:
+            # Settled means dispatched: only an accepted launch carries a result.
+            return _refuse(422, "only an accepted launch carries a result")
+        if claimed["kind"] == "launch" and status == "accepted" and not (
+                result and result.get("run_id")):
             return _refuse(422, "an accepted launch needs its result.run_id")
         previous = self.settled.get(delivery_id)
-        if previous is not None and previous["status"] != body.status:
+        if previous is not None and previous["status"] != status:
             return _refuse(409, f"already {previous['status']}")
-        self.settled[delivery_id] = raw
-        self.settles.append((path, raw))
-        return httpx.Response(200, json={"delivery_id": delivery_id, "status": body.status})
+        self.settled[delivery_id] = body
+        self.settles.append((path, body))
+        return httpx.Response(200, json={"delivery_id": delivery_id, "status": status})
 
-    def _events(self, run_intent_id: str, body: PushedEventsRequest, path: str):
-        page = body.events
-        run = body.run
+    def _result(self, delivery_id: str, body: dict, path: str) -> httpx.Response:
+        settled = self.settled.get(delivery_id)
+        if settled is None or settled["status"] != "accepted":
+            return _refuse(404, "not found")
+        previous = self.turn_results.get(delivery_id)
+        if previous is not None and previous != body["result"]:
+            return _refuse(409, "a different reply is already recorded")
+        self.turn_results[delivery_id] = body["result"]
+        self.results.append((path, body))
+        return httpx.Response(200, json={"delivery_id": delivery_id, "recorded": True})
+
+    def _events(self, run_intent_id: str, body: dict, path: str) -> httpx.Response:
+        page, run = body["events"], body["run"]
         if page.get("run_id") != run.get("run_id"):
             return _refuse(422, "page and record name different runs")
         events = page.get("events") or []
@@ -192,14 +198,16 @@ class StrictHub:
         seqs = [e["seq"] for e in events]
         if seqs != sorted(seqs) or len(set(seqs)) != len(seqs):
             return _refuse(422, "events out of order")
-        if seqs and seqs[0] <= cursor:
-            # The old hub's behaviour: a replayed page is refused.
+        if self.replays == "reject" and seqs and seqs[0] <= cursor:
+            # Stricter than the published hub, which skips them: a spoke that
+            # follows the cursor never replays, so it passes either way.
             return _refuse(422, f"replayed events (cursor {cursor})")
-        if seqs and seqs[0] != cursor + 1:
+        fresh = [s for s in seqs if s > cursor]
+        if fresh and fresh[0] != cursor + 1:
             return _refuse(422, f"gap after {cursor}")
-        if seqs:
-            self.cursors[run_intent_id] = seqs[-1]
-        self.pages.append((path, {"run": run, "events": page}))
+        if fresh:
+            self.cursors[run_intent_id] = fresh[-1]
+        self.pages.append((path, body))
         return httpx.Response(200, json={
             "run_intent_id": run_intent_id, "status": run.get("status", "running"),
             "last_event_sequence": self.cursors.get(run_intent_id, 0)})

@@ -178,6 +178,25 @@ hub.
 
 ## 7. Notes on the hub contract
 
+- **The contract is MiraRun's published spec.** That is
+  `docs/contracts/spoke-api/openapi.json`; this repository keeps a copy in
+  `tests/contracts/`.
+  - The unit tests' fake hub (`tests/spoke_fakes.py`) validates every
+    request and response against it, and enforces the hub's leases,
+    write-once turn results and event cursors.
+  - `tests/test_hub_contract.py` (marker `hub_contract`, skipped unless
+    mirarun is importable; `MIRARUN_SRC` adds a checkout) runs the spoke's
+    `HubClient` against MiraRun's real `spoke_router`.
+  - That test uses the hub's own run-record and event-page parsers, and its
+    turn-record checks, fed by miragen's own `RunStore` and event writer.
+  - Last run against feat/workload-deliveries-wiring `42d015d`: 5 passed.
+- **Settle means dispatched.** A `turn`'s or `answer`'s reply goes to
+  `POST deliveries/{id}/result` once the turn has finished. A settle that
+  carries one is refused.
+- **Resuming after a restart.** `GET runs/open` returns the spoke's
+  unfinished runs and the hub's cursor for each, and pushed pages are
+  idempotent. A restarted spoke resumes relaying from the hub's position.
+
 - **Credentials minted at claim are forwarded into the turn.** A claimed
   `launch` may carry the run's credentials. The spoke forwards them as the
   turn's `credentials` (`POST /instances/{i}/turns`, base tier only). The

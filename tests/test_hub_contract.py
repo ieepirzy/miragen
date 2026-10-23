@@ -30,17 +30,18 @@ if os.environ.get("MIRARUN_SRC"):
 
 spoke_api = pytest.importorskip("mirarun.api.spoke")
 wd = pytest.importorskip("mirarun.domain.workloads")
+aw = pytest.importorskip("mirarun.application.workloads")
 fastapi = pytest.importorskip("fastapi")
-from fastapi.testclient import TestClient  # noqa: E402
+from fastapi.testclient import TestClient
 
-from miragen import events as run_events  # noqa: E402
-from miragen.daemon.spoke.hub import (  # noqa: E402
+from miragen import events as run_events
+from miragen.daemon.spoke.hub import (
     ClaimedDelivery,
     HubClient,
     HubRefused,
     Observation,
 )
-from miragen.runs import RunStore  # noqa: E402
+from miragen.runs import RunStore
 
 pytestmark = pytest.mark.hub_contract
 
@@ -58,6 +59,7 @@ class StubService:
         self.intents: list = []
         self.deliveries: list = []
         self.calls: list[tuple[str, dict]] = []
+        self.open: list = []
 
     def authenticate(self, token: str):
         if token != TOKEN:
@@ -81,6 +83,17 @@ class StubService:
     def settle(self, spoke, **kwargs):
         self.calls.append(("settle", kwargs))
         return SimpleNamespace(id=kwargs["delivery_id"], status=kwargs["status"])
+
+    def record_result(self, spoke, *, delivery_id, result):
+        # The hub's own checks on a turn record (application/workloads.py).
+        validated = wd.validate_payload(result)
+        if validated.get("status") not in aw._TURN_STATUSES:
+            raise wd.WorkloadInvalid("not a finished turn's status")
+        self.calls.append(("result", {"delivery_id": delivery_id, "result": validated}))
+        return SimpleNamespace(id=delivery_id)
+
+    def open_runs(self, spoke):
+        return list(self.open)
 
     def ingest_events(self, spoke, *, run_intent_id, backend_run, page):
         self.calls.append(("events", {"run": backend_run, "page": page}))
@@ -171,12 +184,12 @@ def test_a_launch_claim_settle_and_event_push_round_trip(world, tmp_path):
 
     hub.settle(delivery, "accepted", f"turn {record.run_id}",
                {"run_id": record.run_id, "status": "running", "duplicate": False})
-    settled = [kw for kind, kw in service.calls if kind == "settle"][0]
+    settled = next(kw for kind, kw in service.calls if kind == "settle")
     assert settled["result"]["run_id"] == record.run_id
 
     cursor = hub.push_events(delivery.run_intent_id, record.model_dump(mode="json"), page_body)
     assert cursor == 2
-    pushed = [kw for kind, kw in service.calls if kind == "events"][0]
+    pushed = next(kw for kind, kw in service.calls if kind == "events")
     assert pushed["run"].run_id == record.run_id
     assert [e.sequence for e in pushed["page"].events] == [1, 2]
 
@@ -189,9 +202,26 @@ def test_a_wrong_token_is_refused(world):
     assert refused.value.status_code == 401
 
 
-@pytest.mark.xfail(reason="the hub's turn-result and open-runs routes are not published yet",
-                   strict=False)
-def test_the_newer_routes_exist(world):
+def test_a_finished_turn_record_is_accepted_by_the_hubs_checks(world, tmp_path):
     service, hub = world
-    hub.post_turn_result(uuid4(), {"run_id": "t", "status": "succeeded"})
-    hub.open_runs()
+    store = RunStore(root=tmp_path / "runs")
+    record = store.start(agent_name="analyst", trigger="launch", prompt="hi",
+                         instance="main", use_history=True)
+    finished = store.finish(record, status="succeeded", output="the reply")
+    delivery_id = uuid4()
+    hub.post_turn_result(delivery_id, finished.model_dump(mode="json"))
+    recorded = next(kw for kind, kw in service.calls if kind == "result")
+    assert recorded["delivery_id"] == delivery_id
+    assert recorded["result"]["output"] == "the reply"
+
+
+def test_open_runs_are_read_with_their_cursors(world):
+    service, hub = world
+    intent = service.offer_intent()
+    run_intent = uuid4()
+    service.open.append(wd.OpenRun(organization_id=intent.organization_id,
+                                   intent_id=intent.id, run_intent_id=run_intent,
+                                   run_id="run-7", last_event_sequence=4))
+    runs = hub.open_runs()
+    assert [(r.run_intent_id, r.agent_run_id, r.last_event_sequence) for r in runs] == [
+        (run_intent, "run-7", 4)]

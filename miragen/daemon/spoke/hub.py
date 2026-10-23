@@ -26,11 +26,13 @@ Settling a delivery means "dispatched", never "finished". A `turn` or
 finishes, its record goes up separately, to `deliveries/{id}/result`
 (idempotent, accepted after the lease has expired).
 
-Two routes are newer than the hub's published contract. They sit behind one
-constant each, so a rename touches one line:
-- `TURN_RESULT_ROUTE`: `POST`, body `{"result": <the agent's turn record>}`;
-- `OPEN_RUNS_ROUTE`: `GET`, the runs this spoke relays and the hub's cursor
-  for each.
+The contract is MiraRun's published `docs/contracts/spoke-api/openapi.json`
+(a copy the tests validate against is in `tests/contracts/`). Two routes:
+- `TURN_RESULT_ROUTE`: `POST`, body `{"result": <the agent's turn record>}`.
+  The same reply again is 200 and a different one is 409; it is accepted
+  after the settle, and after the lease has expired;
+- `OPEN_RUNS_ROUTE`: `GET`, the spoke's accepted, unfinished runs, with the
+  hub's cursor for each, so a restarted spoke resumes relaying.
 """
 
 from __future__ import annotations
@@ -297,7 +299,7 @@ class HubClient:
                 runs.append(OpenRun(
                     run_intent_id=UUID(item["run_intent_id"]),
                     intent_id=UUID(item["intent_id"]),
-                    agent_run_id=str(item["agent_run_id"]),
+                    agent_run_id=str(item["run_id"]),
                     last_event_sequence=int(item.get("last_event_sequence") or 0),
                 ))
             except (KeyError, TypeError, ValueError):
