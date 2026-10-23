@@ -22,9 +22,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger as APIntervalTrigger
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
@@ -42,6 +43,8 @@ from miragen.edf import (
 from miragen.executor import ExecutorBackend, ExecutorResult, RepositoryCheckout, build_executor
 from miragen.factory import build_agent, registered_handlers, registered_tools
 from miragen.file_secrets import load_file_secrets
+from miragen.model_token import ModelToken, ModelTokenInvalid
+from miragen.model_token import holder as model_token_holder
 from miragen.harness import (
     PYDANTIC_AI, Harness, HarnessTurn, InstanceBusyError, PydanticAIHarness, build_model_harness,
     forget_inactive_harnesses, profile_harness,
@@ -1497,6 +1500,8 @@ async def lifespan(app: FastAPI):
                     with suppress(Exception):
                         await asyncio.wait_for(inbox_task, timeout=10)
     finally:
+        # The workload's model token ends with the process (ADR-045 §5).
+        model_token_holder().clear()
         _ask_human_guard.inner = _mcp_not_ready
         _voice_mcp_guard.inner = _mcp_not_ready
         _memory_mcp_guard.inner = _mcp_not_ready
@@ -2423,6 +2428,34 @@ class TurnCredentials(BaseModel):
     # echoes its input in the 422 body, and the input is the secret.
     secret_env: dict[str, SecretStr] = Field(default_factory=dict)
     repositories: dict[str, Any] = Field(default_factory=dict)
+    # The workload's model token {env, token, expires_at} (ADR-045 §5). Not a
+    # run's: it is held for the whole workload (`miragen.model_token`), and
+    # replaced by newer ones from turns or `PUT /credentials/model`.
+    model: dict[str, SecretStr] | None = None
+
+
+def _validated(model: type[BaseModel], data: Any, *, where: str | None = None):
+    """Validate without echoing: an error keeps where and what, never the input."""
+    try:
+        return model.model_validate(data)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=_errors_without_input(exc.errors(), where)) \
+            from None
+
+
+def _errors_without_input(errors: Any, where: str | None = None) -> list[dict[str, Any]]:
+    prefix = [where] if where else []
+    return [{"loc": [*prefix, *(e.get("loc") or ())], "msg": e.get("msg"), "type": e.get("type")}
+            for e in errors]
+
+
+def _take_model_token(value: dict[str, SecretStr] | dict[str, Any]) -> None:
+    plain = {k: (v.get_secret_value() if isinstance(v, SecretStr) else v)
+             for k, v in value.items()}
+    try:
+        model_token_holder().set(ModelToken.parse(plain))
+    except ModelTokenInvalid as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
 
 
 _SECRET_ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,127}")
@@ -2463,7 +2496,7 @@ class TurnRequest(BaseModel):
 
 
 @app.post("/instances/{name}/turns", status_code=202, dependencies=[_internal_auth])
-async def start_turn(name: str, request: TurnRequest, response: Response):
+async def start_turn(name: str, raw: Request, response: Response):
     """Start a turn in a conversation instance, with its history.
 
     The base tier's name for what /executor-runs does for it: the same
@@ -2476,9 +2509,21 @@ async def start_turn(name: str, request: TurnRequest, response: Response):
     if _executor is not None:
         raise HTTPException(status_code=409, detail="an executor-tier agent has no "
                             "conversation instances; use /executor-runs")
-    turn_secret_env = (
-        _turn_secret_env(request.credentials) if request.credentials is not None else None
-    )
+    # Read raw: `credentials` is taken off before the rest is validated, and
+    # validated on its own, so no error about any field ever carries a secret.
+    try:
+        body = json.loads(await raw.body())
+    except ValueError:
+        raise HTTPException(status_code=422, detail="body is not JSON") from None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="body must be an object")
+    raw_credentials = body.pop("credentials", None)
+    request = _validated(TurnRequest, body)
+    credentials = (_validated(TurnCredentials, raw_credentials, where="credentials")
+                   if raw_credentials is not None else None)
+    turn_secret_env = _turn_secret_env(credentials) if credentials is not None else None
+    if credentials is not None and credentials.model is not None:
+        _take_model_token(credentials.model)
     result = await _launch_run(
         ExecutorLaunchRequest(prompt=request.prompt, idempotency_key=request.idempotency_key,
                               provenance=request.provenance, instance=name, use_history=True,
@@ -2487,6 +2532,28 @@ async def start_turn(name: str, request: TurnRequest, response: Response):
         turn_secret_env=turn_secret_env)
     return {"turn_id": result["run_id"], "instance": name,
             **{k: v for k, v in result.items() if k in ("status", "duplicate")}}
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Every 422 keeps each error's location, message and type, and drops
+    `input` and `ctx`: a body can carry a credential (a turn's, a model
+    token), and an error about a sibling field would otherwise echo it."""
+    return JSONResponse(status_code=422, content={"detail": _errors_without_input(exc.errors())})
+
+
+@app.put("/credentials/model", status_code=204, dependencies=[_internal_auth])
+async def put_model_credential(request: Request):
+    """The workload's refreshed model token, from its spoke (ADR-045 §5).
+    Read raw and checked here, so an error never echoes the token."""
+    try:
+        body = json.loads(await request.body())
+    except ValueError:
+        raise HTTPException(status_code=422, detail="body is not JSON") from None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="body must be an object")
+    _take_model_token(body)
+    return Response(status_code=204)
 
 
 @app.get("/instances/{name}/turns/{turn_id}", response_model=RunRecord, dependencies=[_internal_auth])

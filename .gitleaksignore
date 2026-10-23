@@ -15,3 +15,9 @@
 # master; shared with mirarun's tests), not a credential. Introduced in this
 # commit under a name the generic rule matches; renamed and annotated since.
 fa1f21034b7cbe9e7557bcd7eeac575ba8bab9af:tests/test_daemon_agents_host.py:generic-api-key:305
+# A made-up JWT-shaped fixture for the spoke's error-detail scrubber test
+# (miragen#223): header and claims decode to {"alg":"ES256"} and
+# {"sub":"workload"}, the signature to the text "signature-value-x"; nothing
+# ever signed it. Replaced in a later commit by a plainly fake value; the
+# entry stops the push-delta scan resurfacing this commit's own patch.
+a36dce5be8d55a3a0e338a99a756bfadb2938825:tests/test_spoke_pull_mode.py:jwt:690

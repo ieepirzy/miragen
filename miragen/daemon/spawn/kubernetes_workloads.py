@@ -97,6 +97,12 @@ class WorkloadTemplate:
     backstop_ttl_seconds: int = 3 * 24 * 3600
     storage_size: str | None = None
     storage_class_name: str | None = None
+    # The provider gateway this class's agents call models through (MiraRun
+    # ADR-045 §5): its root and the default connection. The workload's model
+    # token then lives on an in-memory volume at `model_token_dir`.
+    model_gateway_url: str | None = None
+    model_connection: str | None = None
+    model_token_dir: str = "/run/miragen/model"
 
 
 @dataclass(frozen=True)
@@ -275,6 +281,11 @@ class KubernetesWorkloadDriver:
             "AGENT_PROFILE": f"{PROFILE_DIR}/{PROFILE_KEY}",
             _INTERNAL_TOKEN_ENV: workload.internal_token,
         }
+        if template.model_gateway_url:
+            env["MIRAGEN_MODEL_GATEWAY_URL"] = template.model_gateway_url
+            env["MIRAGEN_MODEL_TOKEN_DIR"] = template.model_token_dir
+            if template.model_connection:
+                env["MIRAGEN_MODEL_CONNECTION"] = template.model_connection
         mounts = [
             {
                 "name": "profile",
@@ -285,6 +296,9 @@ class KubernetesWorkloadDriver:
         ]
         if workload.workload_class == "persistent":
             mounts.append({"name": "state", "mountPath": STATE_DIR})
+        if template.model_gateway_url:
+            # The model token's only home: memory, never the node's disk.
+            mounts.append({"name": "model-token", "mountPath": template.model_token_dir})
         container_security = {
             "allowPrivilegeEscalation": False,
             "capabilities": {"drop": ["ALL"]},
@@ -326,6 +340,9 @@ class KubernetesWorkloadDriver:
                 }
             ],
         }
+        if template.model_gateway_url:
+            spec["volumes"].append({"name": "model-token",
+                                    "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}})
         if template.runtime_class_name:
             spec["runtimeClassName"] = template.runtime_class_name
         if template.node_selector:

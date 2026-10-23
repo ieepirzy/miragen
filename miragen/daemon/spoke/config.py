@@ -140,6 +140,9 @@ def parse_config(raw: dict[str, Any]) -> SpokeConfig:
         unknown = set(body) - known
         if unknown:
             raise SpokeConfigInvalid(f"classes.{name}: unknown keys {sorted(unknown)}")
+        gateway = body.get("model_gateway_url")
+        if gateway is not None and not str(gateway).startswith("https://"):
+            raise SpokeConfigInvalid(f"classes.{name}.model_gateway_url must be https://")
         classes[name] = WorkloadTemplate(**body)
 
     namespaces: dict[str, NamespacePolicy] = {}

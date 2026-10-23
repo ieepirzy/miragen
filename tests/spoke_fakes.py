@@ -1,8 +1,8 @@
 """Strict fakes for the spoke's tests: a hub that validates every request
 body and every response it sends against MiraRun's published spoke contract
 (tests/contracts/spoke-api.openapi.json, copied from mirarun
-docs/contracts/spoke-api/openapi.json at feat/workload-deliveries-wiring
-42d015d), and enforces the hub's leases, write-once turn results and event
+docs/contracts/spoke-api/openapi.json at feat/workload-tokens
+de7d886), and enforces the hub's leases, write-once turn results and event
 cursors; plus a fake agent. tests/test_hub_contract.py runs the same client
 against the real router."""
 
@@ -88,6 +88,8 @@ class StrictHub:
         self.open: list[dict] = []               # what GET runs/open returns
         self.fail: dict[str, int | list[int]] = {}
         self.turn_results: dict[str, dict] = {}
+        self.minted: dict[str, list[datetime]] = {}  # intent -> mint times
+        self.now = NOW
         # "reject": refuse a replayed page (stricter); "skip": the published hub.
         self.replays = "reject"
 
@@ -110,6 +112,8 @@ class StrictHub:
         parts = path.split("/")
         kind = "open" if path == "runs/open" else (
             "events" if parts[0] == "runs" else parts[-1])
+        if parts[0] == "workloads" and kind == "token":
+            kind = "token"
         self.timeline.append(("hub", kind))
         injected = self._injected(kind)
         if injected is not None:
@@ -142,6 +146,8 @@ class StrictHub:
             return self._result(parts[1], body, path)
         if kind == "open":
             return httpx.Response(200, json={"runs": self.open})
+        if kind == "token":
+            return self._token(parts[2])
         raise AssertionError(f"unexpected hub route {path}")
 
     def _claim(self, path: str, limit: int) -> httpx.Response:
@@ -175,6 +181,16 @@ class StrictHub:
         self.settled[delivery_id] = body
         self.settles.append((path, body))
         return httpx.Response(200, json={"delivery_id": delivery_id, "status": status})
+
+    def _token(self, intent_id: str) -> httpx.Response:
+        """At most once a minute per workload, like the hub."""
+        times = self.minted.setdefault(intent_id, [])
+        if times and self.now - times[-1] < timedelta(seconds=60):
+            return _refuse(429, "at most one token a minute")
+        times.append(self.now)
+        return httpx.Response(200, json={
+            "env": "MODEL_TOKEN", "token": f"minted-{len(times)}",
+            "expires_at": (self.now + timedelta(minutes=15)).isoformat()})
 
     def _result(self, delivery_id: str, body: dict, path: str) -> httpx.Response:
         settled = self.settled.get(delivery_id)
@@ -223,6 +239,7 @@ class FakeAgent:
         self.status = "running"
         self.raise_on: dict[str, type[Exception]] = {}
         self.limits: list[int] = []
+        self.model_tokens: list[dict] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -248,6 +265,9 @@ class FakeAgent:
             return httpx.Response(200, json={"run_id": turn_id,
                                              "status": self.turn_status[turn_id],
                                              "output": "the reply"})
+        if request.method == "PUT" and path == "/credentials/model":
+            self.model_tokens.append(json.loads(request.content))
+            return httpx.Response(204)
         if request.method == "DELETE" and path.startswith("/instances/"):
             self.forwarded.append(("discard", path))
             return httpx.Response(200, json={})

@@ -20,6 +20,8 @@ from typing import Any
 
 import httpx
 
+from miragen.daemon.spoke.redact import scrub
+
 TURN_KEY_MAX = 200  # TurnRequest.idempotency_key max_length
 # RunStatus (miragen/models.py) values in which a run is not running: its
 # event stream is complete until something resumes it.
@@ -92,6 +94,12 @@ class AgentClient:
             raise AgentRejected(response.status_code, _detail(response))
         return response.json()
 
+    def put_model_credential(self, endpoint: str, token: str, credential: dict[str, str]) -> None:
+        """Hand the agent its workload's refreshed model token."""
+        response = self._send("PUT", endpoint, "/credentials/model", token, json=credential)
+        if response.status_code not in (200, 204):
+            raise AgentRejected(response.status_code, _detail(response))
+
     def discard_instance(self, endpoint: str, token: str, *, instance: str) -> None:
         response = self._send("DELETE", endpoint, f"/instances/{instance}", token)
         if response.status_code not in (200, 404):
@@ -142,12 +150,11 @@ class AgentClient:
 
 
 def _detail(response: httpx.Response) -> str:
+    """The peer's error detail, bounded and scrubbed of anything token-shaped."""
     try:
         body = response.json()
     except ValueError:
-        return response.text[:200]
-    if isinstance(body, dict):
-        detail = body.get("detail")
-        if isinstance(detail, str):
-            return detail[:200]
-    return str(body)[:200]
+        return scrub(response.text[:200])
+    if isinstance(body, dict) and isinstance(body.get("detail"), str):
+        return scrub(body["detail"][:200])
+    return scrub(str(body)[:200])

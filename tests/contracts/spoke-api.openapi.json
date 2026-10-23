@@ -427,6 +427,31 @@
         ],
         "title": "ValidationError",
         "type": "object"
+      },
+      "WorkloadTokenResponse": {
+        "description": "A fresh model token for one live workload (ADR-045 \u00a75): the harness\nreads `token` from the variable `env`; it expires at `expires_at`.",
+        "properties": {
+          "env": {
+            "title": "Env",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "token": {
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "env",
+          "token",
+          "expires_at"
+        ],
+        "title": "WorkloadTokenResponse",
+        "type": "object"
       }
     }
   },
@@ -1202,6 +1227,90 @@
           }
         },
         "summary": "Push Events",
+        "tags": [
+          "spoke"
+        ]
+      }
+    },
+    "/api/spoke/v1/workloads/{organization_id}/{intent_id}/token": {
+      "post": {
+        "description": "A fresh model token for a live workload of this spoke's, before\nthe one it holds expires. At most once a minute per workload (429).\nNot this spoke's, unknown and deleted all answer 404.",
+        "operationId": "refresh_workload_token_api_spoke_v1_workloads__organization_id___intent_id__token_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Organization Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "intent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Intent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "Nothing to say: the workload is in the path and the spoke in the\ntoken. Declared so the contract stays complete, and read capped.",
+                "properties": {},
+                "title": "WorkloadTokenRequest",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkloadTokenResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refresh Workload Token",
         "tags": [
           "spoke"
         ]

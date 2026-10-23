@@ -45,6 +45,8 @@ from uuid import UUID
 
 import httpx
 
+from miragen.daemon.spoke.redact import scrub
+
 logger = logging.getLogger(__name__)
 
 API_PREFIX = "/api/spoke/v1"
@@ -54,6 +56,7 @@ RUN_EVENTS_ROUTE = API_PREFIX + "/runs/{run_intent_id}/events"
 MAX_CLAIM_WAIT_SECONDS = 25
 TURN_RESULT_ROUTE = API_PREFIX + "/deliveries/{delivery_id}/result"
 OPEN_RUNS_ROUTE = API_PREFIX + "/runs/open"
+MODEL_TOKEN_ROUTE = API_PREFIX + "/workloads/{organization_id}/{intent_id}/token"
 
 
 class HubUnavailable(Exception):
@@ -291,6 +294,16 @@ class HubClient:
         """A finished turn's record, for a `turn` or `answer` already settled."""
         self._post(TURN_RESULT_ROUTE.format(delivery_id=delivery_id), {"result": record})
 
+    def refresh_model_token(self, organization_id: UUID, intent_id: UUID) -> dict[str, str]:
+        """A fresh model token {env, token, expires_at} for a live workload
+        of this spoke's. At most once a minute per workload: a 429 is a
+        HubRefused(429), and the caller waits."""
+        body = _json(self._post(
+            MODEL_TOKEN_ROUTE.format(organization_id=organization_id, intent_id=intent_id), {}))
+        if not all(isinstance(body.get(k), str) for k in ("env", "token", "expires_at")):
+            raise HubUnavailable("malformed token response")
+        return {"env": body["env"], "token": body["token"], "expires_at": body["expires_at"]}
+
     def open_runs(self) -> list[OpenRun]:
         body = _json(self._get(OPEN_RUNS_ROUTE))
         runs: list[OpenRun] = []
@@ -337,10 +350,11 @@ def _claim_body(limit: int, wait_seconds: int) -> dict[str, Any]:
 
 
 def _detail(response: httpx.Response) -> str:
+    """The peer's error detail, bounded and scrubbed of anything token-shaped."""
     try:
         body = response.json()
     except ValueError:
-        return response.text[:200]
+        return scrub(response.text[:200])
     if isinstance(body, dict) and isinstance(body.get("detail"), str):
-        return body["detail"][:200]
-    return str(body)[:200]
+        return scrub(body["detail"][:200])
+    return scrub(str(body)[:200])

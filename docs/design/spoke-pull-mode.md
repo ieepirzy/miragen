@@ -143,16 +143,54 @@ hub.
 - **One exception, `MIRAGEN_INTERNAL_TOKEN`.** It is a random value per
   workload that guards only that agent's own API from its neighbours. The
   spoke reads it back from the unit's spec after a restart.
-- **Model access** comes from a `ModelCredentialSource`. The default is
-  `NoModelCredentials`: an agent spawned by this slice has no model access
-  from the spoke.
-  - The intended source is the deployment's provider gateway: a base URL
-    plus a short-lived workload token.
-  - How that token reaches the agent without entering the pod spec is
-    open: a per-turn header on the delivery relay, or a projected volume
-    the spoke refreshes.
-  - The gateway's API is the gateway's to define, so nothing here guesses
-    it.
+- **Model access is the workload's model token, through the provider
+  gateway, and nothing else** (`miragen/model_token.py`).
+  - The hub mints a 15-minute token per workload and hands it over at claim
+    as `credentials.model` `{env, token, expires_at}`. The spoke forwards it
+    on the turn (`credentials.model`, never `secret_env`, which is a run's).
+  - About 5 minutes before it expires, the spoke refreshes it
+    (`POST /api/spoke/v1/workloads/{org}/{intent}/token`) and hands it to
+    the agent (`PUT /credentials/model`). Only live workloads are refreshed.
+    The hub's once-a-minute 429 is waited out. A token the agent did not
+    take is pushed again, never minted again.
+  - The agent keeps it in memory and in one 0600 file on an in-memory
+    volume (`emptyDir` `medium: Memory`, at `MIRAGEN_MODEL_TOKEN_DIR`). The
+    file sits in a `private/` directory the runtime creates and keeps at
+    0700, because the volume root is the kubelet's and 0777. It is cleared
+    at shutdown. It is never persisted, logged or put in a repr,
+    and never appears in the pod spec, the workspace or a run record.
+  - Claude Code reads it through an `apiKeyHelper` set in flag settings,
+    which outrank every settings file, with
+    `CLAUDE_CODE_API_KEY_HELPER_TTL_MS=60000`. `ANTHROPIC_BASE_URL` and the
+    TTL also sit in the flag settings' `env`, which beats the process env and
+    any `settings.json`, so a session cannot point the token at another
+    host. Its `ANTHROPIC_BASE_URL` is
+    `<MIRAGEN_MODEL_GATEWAY_URL>/anthropic/<connection>`; the connection
+    comes from the class's `model_connection`. Both come from configuration,
+    never from the hub. A per-profile connection would be a profile-contract
+    change (v7, with the image label), so it is left for its own PR.
+  - **No fallback.** No subscription token or API key reaches Claude Code,
+    and a saved login refuses the harness. With no token, or an expired one,
+    the helper fails and so does every model call. This follows
+    code.claude.com/docs/en/llm-gateway-connect ("Rotate credentials with
+    apiKeyHelper") and /authentication ("Authentication precedence").
+  - **Nothing echoes it.** Every 422 drops `input` and `ctx` (an app-wide
+    handler). The turns route takes `credentials` off the body before
+    validating the rest. The spoke scrubs anything token-shaped from a
+    peer's error detail before logging it or settling with it.
+  - **Egress is the cluster's.** The spoke creates no NetworkPolicy, and
+    its RBAC has none. The boundary is the sandbox namespaces'
+    default-deny `CiliumNetworkPolicy` from the deployment's infra
+    (ADR-0025). It allows DNS and an FQDN allowlist, and denies the
+    metadata service and cluster internals. The provider gateway's and the
+    broker's hostnames must be on that allowlist before any agent can
+    reach a model.
+  - **After a spoke restart**, the expiry of the token each agent holds is
+    unknown, so gateway workloads are refreshed on the first tick. A minted
+    token that expired before the agent took it is replaced, never handed
+    over.
+  - Spoke class config: `model_gateway_url` (https only),
+    `model_connection`, and `model_token_dir`.
 
 ## 6. Not done
 
@@ -164,7 +202,13 @@ hub.
   inability to edit it (ADR-045 §7, tier 2). Separating them needs an image
   change: a second user for the harness and a spool the harness cannot
   write.
-- **Model credentials:** see §5.
+- **The token file is readable by the harness's UID**, which is also the
+  runtime's (see the UID item above). A separate harness user would make it
+  readable by the harness only.
+- **A managed-settings lock.** An image-level `managed-settings.json` with
+  `allowedProviders: ["customEndpoint"]` and the gateway in its `env` would
+  make Claude Code itself refuse any other provider. That is an image (deploy)
+  change, so it belongs in its own PR.
 - **Liveness and readiness probes for the spoke itself.** Nothing serves
   HTTP. An exec probe on a heartbeat file is the likely shape.
 - **The push-mode bare-Pod driver** (`spawn/kubernetes.py`) still has G1-G5:

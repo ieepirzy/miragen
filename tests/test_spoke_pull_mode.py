@@ -5,6 +5,7 @@ a fake agent. No cluster, no hub, no agent."""
 from __future__ import annotations
 
 import json
+import logging
 from datetime import timedelta
 from uuid import UUID, uuid4
 
@@ -74,7 +75,7 @@ class World:
             driver=KubernetesWorkloadDriver(base_url="https://k8s.invalid", token="t",
                                             transport=httpx.MockTransport(k8s_handler)),
             agents=AgentClient(transport=httpx.MockTransport(self.agent.handler)),
-            clock=lambda: NOW,
+            clock=lambda: self.hub.now,
             new_token=lambda: "internal-1",
             monotonic=lambda: 0.0,
         )
@@ -582,3 +583,151 @@ def test_a_turn_result_that_conflicts_is_dropped():
     world.hub.fail["result"] = 409
     world.spoke.tick()
     assert world.spoke.pending_results == {}
+
+
+
+# -- model tokens (ADR-045 §5) ------------------------------------------------
+
+def _model(minutes: float, token: str = "claim-token") -> dict:
+    return {"env": "MODEL_TOKEN", "token": token,
+            "expires_at": (NOW + timedelta(minutes=minutes)).isoformat()}
+
+
+def _launch_with_model(world, minutes: float) -> dict:
+    intent = world.running()
+    world.deliver(intent, kind="launch", credentials={"secret_env": {}, "model": _model(minutes)})
+    world.spoke.tick()
+    return intent
+
+
+def test_a_launchs_model_token_goes_into_the_turn_never_into_secret_env():
+    world = World()
+    intent = world.running()
+    bodies = []
+    original = world.agent.handler
+
+    def capture(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/turns"):
+            bodies.append(json.loads(request.content))
+        return original(request)
+
+    world.spoke.agents = AgentClient(transport=httpx.MockTransport(capture))
+    world.deliver(intent, kind="launch", credentials={"secret_env": {}, "model": _model(15)})
+    world.spoke.tick()
+    assert bodies[0]["credentials"] == {"model": _model(15)}
+    tracked = world.spoke.workloads[UUID(intent["intent_id"])]
+    assert tracked.model_expires_at == NOW + timedelta(minutes=15)
+
+
+def test_a_token_far_from_expiry_is_left_alone():
+    world = World()
+    _launch_with_model(world, minutes=14)
+    world.spoke.tick()
+    assert world.hub.minted == {} and world.agent.model_tokens == []
+
+
+def test_a_token_near_expiry_is_refreshed_and_handed_to_the_agent():
+    world = World()
+    intent = _launch_with_model(world, minutes=4)
+    world.spoke.tick()
+    assert [t["token"] for t in world.agent.model_tokens] == ["minted-1"]
+    tracked = world.spoke.workloads[UUID(intent["intent_id"])]
+    assert tracked.model_expires_at == NOW + timedelta(minutes=15)
+
+
+def test_a_429_waits_a_minute_before_asking_again():
+    world = World()
+    intent = world.running()
+    world.hub.minted[intent["intent_id"]] = [NOW]  # minted just now: the next one is a 429
+    world.deliver(intent, kind="launch", credentials={"secret_env": {}, "model": _model(4)})
+    world.spoke.tick()
+    world.spoke.tick()
+    assert len([k for who, k in world.timeline if who == "hub" and k == "token"]) == 1
+    assert world.agent.model_tokens == []
+    world.hub.now = NOW + timedelta(seconds=61)
+    world.spoke.tick()
+    assert [t["token"] for t in world.agent.model_tokens] == ["minted-2"]
+
+
+def test_a_token_the_agent_did_not_take_is_pushed_again_without_minting_another():
+    world = World()
+    intent = world.running()
+    world.agent.raise_on["/credentials/model"] = httpx.ConnectError  # the first hand-over fails
+    world.deliver(intent, kind="launch", credentials={"secret_env": {}, "model": _model(4)})
+    world.spoke.tick()
+    assert world.agent.model_tokens == [] and sum(len(v) for v in world.hub.minted.values()) == 1
+    world.agent.raise_on.clear()
+    world.hub.now = NOW + timedelta(seconds=16)  # past the push retry, inside the mint minute
+    world.spoke.tick()
+    assert [t["token"] for t in world.agent.model_tokens] == ["minted-1"]
+    assert sum(len(v) for v in world.hub.minted.values()) == 1
+
+
+def test_an_ended_workload_gets_no_new_token():
+    world = World()
+    intent = _launch_with_model(world, minutes=14)
+    tracked = world.spoke.workloads[UUID(intent["intent_id"])]
+    tracked.last_phase = "succeeded"
+    tracked.model_expires_at = NOW + timedelta(minutes=1)
+    world.spoke.refresh_model_tokens()
+    assert world.hub.minted == {}
+
+
+def test_model_tokens_are_never_logged_by_the_spoke(caplog):
+    caplog.set_level(logging.DEBUG)
+    world = World()
+    _launch_with_model(world, minutes=4)
+    world.agent.raise_on["/credentials/model"] = httpx.ConnectError
+    world.spoke.tick()
+    assert "minted-1" not in caplog.text and "claim-token" not in caplog.text
+    assert "minted-1" not in repr(world.spoke.workloads)
+
+
+def test_an_agents_error_detail_is_scrubbed_before_it_is_settled_or_logged(caplog):
+    caplog.set_level(logging.DEBUG)
+    world = World()
+    intent = world.running()
+    # Token-shaped (three dotted segments) but plainly a test value.
+    leaked = "test-header-segment.test-claims-segment.test-signature"
+    original = world.agent.handler
+
+    def echoing(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/turns"):
+            return httpx.Response(422, json={"detail": f"bad: {{'token': '{leaked}'}}"})
+        return original(request)
+
+    world.spoke.agents = AgentClient(transport=httpx.MockTransport(echoing))
+    world.deliver(intent, kind="launch", credentials={"secret_env": {}, "model": _model(15)})
+    world.spoke.tick()
+    settle = world.hub.settles[0][1]
+    assert settle["status"] == "rejected" and leaked not in settle["detail"]
+    assert "[redacted]" in settle["detail"] and leaked not in caplog.text
+
+
+def test_a_stale_unpushed_token_is_replaced_not_handed_over():
+    world = World()
+    intent = _launch_with_model(world, minutes=14)
+    tracked = world.spoke.workloads[UUID(intent["intent_id"])]
+    tracked.model_unpushed = _model(-1, token="stale")
+    tracked.model_expires_at = NOW + timedelta(minutes=1)
+    world.spoke.refresh_model_tokens()
+    assert [t["token"] for t in world.agent.model_tokens] == ["minted-1"]
+
+
+def test_after_a_restart_gateway_workloads_are_refreshed_at_once():
+    world = World(classes={
+        "ephemeral": {"image": IMAGE, "service_account_name": "agent-sandbox",
+                      "model_gateway_url": "https://gateway.invalid"},
+        "persistent": {"image": IMAGE, "service_account_name": "agent-sandbox",
+                       "storage_size": "10Gi"}})
+    intent = world.running()
+    restarted = Spoke(config=world.spoke.config, hub=world.spoke.hub, driver=world.spoke.driver,
+                      agents=world.spoke.agents, clock=lambda: world.hub.now,
+                      new_token=lambda: "internal-1", monotonic=lambda: 0.0)
+    restarted._next_resync = float("inf")
+    restarted._open_runs_supported = False
+    restarted.recover()
+    tracked = restarted.workloads[UUID(intent["intent_id"])]
+    assert tracked.model_expires_at == NOW
+    restarted.refresh_model_tokens()
+    assert [t["token"] for t in world.agent.model_tokens] == ["minted-1"]
