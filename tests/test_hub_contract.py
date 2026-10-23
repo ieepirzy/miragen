@@ -17,7 +17,9 @@ domain types.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import sys
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -132,7 +134,7 @@ class StubService:
                                              lease_expires_at=NOW + timedelta(minutes=1)))
         return intent
 
-    def offer_launch(self, intent):
+    def offer_launch(self, intent, model=None):
         delivery = wd.Delivery(
             organization_id=self.tenant, id=uuid4(), intent_id=intent.id,
             spoke_organization_id=self.platform, spoke_id=self.spoke.id, kind="launch",
@@ -142,8 +144,8 @@ class StubService:
             run_intent_id=uuid4())
         self.deliveries.append((delivery, {
             "secret_env": {"MIRARUN_MCP_TOKEN": "minted"},
-            "model": {"env": "MODEL_TOKEN", "token": "claim-model-token",
-                      "expires_at": (NOW + timedelta(minutes=15)).isoformat()}}))
+            "model": model or {"env": "MODEL_TOKEN", "token": "claim-model-token",
+                               "expires_at": (NOW + timedelta(minutes=15)).isoformat()}}))
         return delivery
 
 
@@ -249,3 +251,42 @@ def test_a_model_token_is_refreshed_and_a_second_mint_is_a_429(world):
     with pytest.raises(HubRefused) as refused:
         hub.refresh_model_token(intent.organization_id, intent.id)
     assert refused.value.status_code == 429
+
+
+WORKLOAD_PRINCIPAL = re.compile(r"^agent\.[a-z0-9][a-z0-9-]*\.[a-z]+\.[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)?$")
+
+
+def test_the_claimed_model_token_is_minted_by_the_hub_and_verified_by_luotsi(world, tmp_path):
+    """Three repositories: MiraRun's real key store, minter and issuer mint
+    the token; the spoke's HubClient claims it through MiraRun's real router;
+    Luotsi's real verifier and policy accept it. Needs luotsi importable too."""
+    luotsi_tokens = pytest.importorskip("luotsi.workload_tokens")
+    luotsi_policy = pytest.importorskip("luotsi.policy")
+    from mirarun.adapters.credentials.workload_tokens import (
+        JwtWorkloadTokenMinter,
+        WorkloadKeyStore,
+    )
+    from mirarun.application.workload_tokens import WorkloadTokenIssuer
+
+    service, hub = world
+    store = WorkloadKeyStore(tmp_path / "keys", tmp_path / "published.json")
+    store.maintain()
+    jwks_path = tmp_path / "jwks.json"
+    jwks_path.write_text(json.dumps(store.jwks()))
+    issuer = WorkloadTokenIssuer(
+        JwtWorkloadTokenMinter(store, issuer="https://hub.test"),
+        {service.tenant: "acme"}, token_env="ANTHROPIC_AUTH_TOKEN")
+    intent = service.offer_intent()
+    service.offer_launch(intent, model=issuer.credential(issuer.mint(intent)))
+
+    delivery = hub.claim_deliveries(8, wait_seconds=0)[0]
+    token = delivery.credentials["model"]["token"]
+    claims = luotsi_tokens.JwksFileVerifier(jwks_path, issuer="https://hub.test").verify(token)
+    assert claims.principal == "agent.acme.profile.analyst"
+    assert WORKLOAD_PRINCIPAL.fullmatch(claims.principal)
+    assert claims.tenant == "acme" and claims.workload == str(intent.id)
+    policy = luotsi_policy.load_policy(
+        "version: 1\n"
+        "tenants: [{id: acme}]\n"
+        "principals: [{id: agent.acme.profile.analyst, kind: workload, tenants: [acme]}]\n")
+    assert policy.workload_principal(claims.principal) is not None
