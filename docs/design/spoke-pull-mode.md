@@ -178,11 +178,20 @@ hub.
 
 ## 7. Notes on the hub contract
 
-- **Credentials minted at claim are not forwarded yet.** A claimed
-  `launch` may carry repository and MCP credentials (`credentials`), but the
-  agent's base-tier turns route takes no `context`, unlike `/executor-runs`.
-  The spoke does not put them into the pod spec, so today they are dropped.
-  It needs a base-tier way to hand a turn its run-scoped credentials.
+- **Credentials minted at claim are forwarded into the turn.** A claimed
+  `launch` may carry the run's credentials. The spoke forwards them as the
+  turn's `credentials` (`POST /instances/{i}/turns`, base tier only). The
+  agent holds them for that turn in memory and drops them at its end:
+  - a pydantic-ai profile resolves them in-process;
+  - a CLI harness's tool gateway uses them for the matching upstream.
+
+  Two contract points:
+  - the base tier finds them by the environment variable a capability names
+    (`bearer_token_env`), so the hub must send `secret_env` keyed by that
+    name. Values keyed by EDF binding name (`secrets`) are refused, never
+    dropped silently;
+  - repository bindings are refused, because the base tier prepares no
+    checkout.
 - **The event route is newer than the rest.** It sits behind `EventSink`
   and one constant (`RUN_EVENTS_ROUTE`).
 - **Delivery payloads are read as:**
