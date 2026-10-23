@@ -108,6 +108,7 @@ class AgentClient:
     def events(
         self, endpoint: str, token: str, run_id: str, *, after: int, limit: int = 200
     ) -> dict[str, Any]:
+        limit = max(1, min(limit, 1000))
         response = self._send(
             "GET", endpoint, f"/runs/{run_id}/events", token,
             params={"after": after, "limit": limit},
@@ -115,6 +116,19 @@ class AgentClient:
         if response.status_code != 200:
             raise AgentRejected(response.status_code, _detail(response))
         return response.json()
+
+    def get_turn(
+        self, endpoint: str, token: str, *, instance: str, turn_id: str
+    ) -> dict[str, Any] | None:
+        """`GET /instances/{instance}/turns/{id}`: the turn's record, unchanged;
+        None when the agent has no such turn."""
+        response = self._send("GET", endpoint, f"/instances/{instance}/turns/{turn_id}", token)
+        if response.status_code == 404:
+            return None
+        if response.status_code != 200:
+            raise AgentRejected(response.status_code, _detail(response))
+        record = response.json()
+        return record if isinstance(record, dict) else None
 
     def run_record(self, endpoint: str, token: str, run_id: str) -> dict[str, Any] | None:
         """`GET /runs/{id}`, unchanged; None when the agent has no such run."""

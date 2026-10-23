@@ -20,13 +20,24 @@ routes and bodies are MiraRun's `/api/spoke/v1/*` contract:
 
 Both claim routes long-poll: `wait_seconds` (at most 25) lets the hub hold
 the request until work appears.
+
+Settling a delivery means "dispatched", never "finished". A `turn` or
+`answer` is settled `accepted` once the agent has taken it. When the turn
+finishes, its record goes up separately, to `deliveries/{id}/result`
+(idempotent, accepted after the lease has expired).
+
+Two routes are newer than the hub's published contract. They sit behind one
+constant each, so a rename touches one line:
+- `TURN_RESULT_ROUTE`: `POST`, body `{"result": <the agent's turn record>}`;
+- `OPEN_RUNS_ROUTE`: `GET`, the runs this spoke relays and the hub's cursor
+  for each.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -39,6 +50,8 @@ API_PREFIX = "/api/spoke/v1"
 # side lands separately and its name may still change.
 RUN_EVENTS_ROUTE = API_PREFIX + "/runs/{run_intent_id}/events"
 MAX_CLAIM_WAIT_SECONDS = 25
+TURN_RESULT_ROUTE = API_PREFIX + "/deliveries/{delivery_id}/result"
+OPEN_RUNS_ROUTE = API_PREFIX + "/runs/open"
 
 
 class HubUnavailable(Exception):
@@ -95,7 +108,7 @@ class ClaimedIntent:
             profile_yaml=item["profile_yaml"],
             grant_set=dict(item.get("grant_set") or {}),
             network_labels={str(k): str(v) for k, v in (item.get("network_labels") or {}).items()},
-            deadline_at=datetime.fromisoformat(deadline) if deadline else None,
+            deadline_at=_timestamp(deadline) if deadline else None,
             trace_id=item.get("trace_id"),
             attempt=int(item["attempt"]),
         )
@@ -113,6 +126,7 @@ class ClaimedDelivery:
     run_intent_id: UUID | None
     trace_id: str | None
     attempt: int
+    lease_expires_at: datetime | None = None
     # A launch's run-scoped credentials, minted by the hub for this claim
     # only. Forwarded to the agent's turn, never stored, never in repr.
     credentials: dict[str, Any] | None = field(default=None, repr=False)
@@ -121,6 +135,7 @@ class ClaimedDelivery:
     def from_json(cls, item: dict[str, Any]) -> ClaimedDelivery:
         run_intent = item.get("run_intent_id")
         credentials = item.get("credentials")
+        lease = item.get("lease_expires_at")
         return cls(
             organization_id=UUID(item["organization_id"]),
             delivery_id=UUID(item["delivery_id"]),
@@ -132,6 +147,7 @@ class ClaimedDelivery:
             run_intent_id=UUID(run_intent) if run_intent else None,
             trace_id=item.get("trace_id"),
             attempt=int(item["attempt"]),
+            lease_expires_at=_timestamp(lease) if lease else None,
             credentials=dict(credentials) if isinstance(credentials, dict) else None,
         )
 
@@ -156,15 +172,26 @@ class Observation:
         return body
 
 
+@dataclass(frozen=True)
+class OpenRun:
+    """A run the hub expects this spoke to relay, and how far it has it."""
+
+    run_intent_id: UUID
+    intent_id: UUID
+    agent_run_id: str
+    last_event_sequence: int
+
+
 class EventSink(Protocol):
     def push_events(
         self, run_intent_id: UUID, run: dict[str, Any], page: dict[str, Any]
-    ) -> None:
+    ) -> int | None:
         """Hand one event page of a run to the hub, with the run's record.
         Both are the agent's own answers, unchanged: `GET /runs/{id}` (the
         projection needs its status, timings and usage) and
-        `GET /runs/{id}/events?after=`. (run_id, seq) deduplicates events, so
-        pushing a page twice is harmless."""
+        `GET /runs/{id}/events?after=`. The hub skips events it already has
+        and answers with its own cursor (`last_event_sequence`), which the
+        spoke resumes from."""
 
 
 class HubClient:
@@ -191,13 +218,14 @@ class HubClient:
             response = self._client.post(path, json=body)
         except httpx.HTTPError as exc:
             raise HubUnavailable(type(exc).__name__) from exc
-        if response.status_code == 409 and lease:
-            raise LeaseLost(409, _detail(response))
-        if 400 <= response.status_code < 500:
-            raise HubRefused(response.status_code, _detail(response))
-        if response.status_code >= 300:
-            raise HubUnavailable(f"hub answered {response.status_code}")
-        return response
+        return _checked(response, lease=lease)
+
+    def _get(self, path: str) -> httpx.Response:
+        try:
+            response = self._client.get(path)
+        except httpx.HTTPError as exc:
+            raise HubUnavailable(type(exc).__name__) from exc
+        return _checked(response, lease=False)
 
     def claim_intents(self, limit: int, *, wait_seconds: int = 0) -> list[ClaimedIntent]:
         response = self._post(
@@ -233,8 +261,9 @@ class HubClient:
         detail: str | None = None,
         result: dict[str, Any] | None = None,
     ) -> None:
-        """`result` is the agent's answer to an accepted `launch`: the hub
-        maps the queued run to the agent's run through its `run_id`."""
+        """Dispatched, never finished. `result` is the agent's answer to an
+        accepted `launch`: the hub maps the queued run to the agent's run
+        through its `run_id`."""
         body: dict[str, Any] = {"attempt": delivery.attempt, "status": status}
         if detail:
             body["detail"] = detail[:1024]
@@ -248,11 +277,57 @@ class HubClient:
 
     def push_events(
         self, run_intent_id: UUID, run: dict[str, Any], page: dict[str, Any]
-    ) -> None:
-        self._post(
+    ) -> int | None:
+        response = self._post(
             RUN_EVENTS_ROUTE.format(run_intent_id=run_intent_id),
             {"run": run, "events": page},
         )
+        cursor = _json(response).get("last_event_sequence")
+        return cursor if isinstance(cursor, int) and cursor >= 0 else None
+
+    def post_turn_result(self, delivery_id: UUID, record: dict[str, Any]) -> None:
+        """A finished turn's record, for a `turn` or `answer` already settled."""
+        self._post(TURN_RESULT_ROUTE.format(delivery_id=delivery_id), {"result": record})
+
+    def open_runs(self) -> list[OpenRun]:
+        body = _json(self._get(OPEN_RUNS_ROUTE))
+        runs: list[OpenRun] = []
+        for item in body.get("runs") or []:
+            try:
+                runs.append(OpenRun(
+                    run_intent_id=UUID(item["run_intent_id"]),
+                    intent_id=UUID(item["intent_id"]),
+                    agent_run_id=str(item["agent_run_id"]),
+                    last_event_sequence=int(item.get("last_event_sequence") or 0),
+                ))
+            except (KeyError, TypeError, ValueError):
+                logger.warning("skipping a malformed open run from the hub")
+        return runs
+
+
+def _checked(response: httpx.Response, *, lease: bool) -> httpx.Response:
+    if response.status_code == 409 and lease:
+        raise LeaseLost(409, _detail(response))
+    if 400 <= response.status_code < 500:
+        raise HubRefused(response.status_code, _detail(response))
+    if response.status_code >= 300:
+        raise HubUnavailable(f"hub answered {response.status_code}")
+    return response
+
+
+def _json(response: httpx.Response) -> dict[str, Any]:
+    if response.status_code == 204 or not response.content:
+        return {}
+    try:
+        body = response.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _timestamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def _claim_body(limit: int, wait_seconds: int) -> dict[str, Any]:

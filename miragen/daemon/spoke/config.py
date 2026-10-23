@@ -72,6 +72,8 @@ class SpokeConfig:
     max_backoff_seconds: float = 60.0
     claim_limit: int = 8
     wait_seconds: int = 25
+    # How often the spoke re-reads the hub's open runs and their cursors.
+    resync_seconds: float = 300.0
     agent_timeout_seconds: float = 30.0
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -174,6 +176,7 @@ def parse_config(raw: dict[str, Any]) -> SpokeConfig:
         max_backoff_seconds=float(poll.get("max_backoff_seconds", 60)),
         claim_limit=max(1, min(int(poll.get("claim_limit", 8)), 32)),
         wait_seconds=max(0, min(int(poll.get("wait_seconds", 25)), 25)),
+        resync_seconds=float(poll.get("resync_seconds", 300)),
         agent_timeout_seconds=float(raw.get("agent_timeout_seconds", 30)),
     )
 
