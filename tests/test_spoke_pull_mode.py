@@ -491,11 +491,13 @@ def test_an_oversized_event_goes_up_as_its_envelope():
     intent = world.running()
     world.deliver(intent, kind="launch")
     world.spoke.tick()
-    world.agent.events = [{"seq": 1, "type": "tool.output", "ts": "t",
+    world.agent.events = [{"seq": 1, "schema": "run-event/1", "type": "tool.output", "ts": "t",
                            "output": "x" * (300 * 1024)}]
     world.spoke.tick()
     event = world.hub.pages[0][1]["events"]["events"][0]
-    assert event == {"seq": 1, "type": "tool.output", "ts": "t", "truncated": True}
+    # The hub's envelope needs seq, schema, type and ts; all survive.
+    assert event == {"seq": 1, "schema": "run-event/1", "type": "tool.output", "ts": "t",
+                     "truncated": True}
 
 
 def test_a_resumed_run_is_relayed_again():

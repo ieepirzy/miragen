@@ -108,7 +108,7 @@ _DEFAULT_PAGE_LIMIT = 200
 # One event bigger than this is relayed as its envelope only, marked
 # `truncated`: the hub caps an event push at 1 MiB.
 _MAX_EVENT_BYTES = 256 * 1024
-_ENVELOPE_KEYS = ("seq", "schema_version", "type", "ts", "target", "run_id")
+_ENVELOPE_KEYS = ("seq", "schema", "type", "ts", "target", "run_id")
 # Hub refusals that concern one item (a delivery, a run, an intent), not the
 # spoke as a whole: that item is dropped or skipped, the loop goes on.
 _ITEM_REFUSALS = frozenset({404, 409, 422})
