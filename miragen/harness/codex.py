@@ -765,9 +765,6 @@ class CodexHarness(MiraRunEnv):
         return params
 
     async def _turn(self, turn: HarnessTurn, on_text: Callable[[str], None] | None) -> HarnessResult:
-        if turn.secret_env:
-            raise CodexHarnessError("per-launch MCP credentials are not supported by the codex "
-                                    "harness (the gateway holds deployment-level credentials)")
         instance, ephemeral = self._key(turn)
         # A compaction or rotation still running for this instance finishes
         # first: the turn must land in the thread it leaves behind.
@@ -787,7 +784,8 @@ class CodexHarness(MiraRunEnv):
         try:
             async with agent.lock:
                 agent.last_used = time.monotonic()
-                with self.gateway.turn(instance, turn.run_id) as log:
+                with self.gateway.turn(instance, turn.run_id,
+                                       secret_env=turn.secret_env) as log:
                     out = await self._drive(agent, instance, "turn/start", self._turn_params(
                         agent, self._compose(turn, handoff=handoff)), on_text)
                     calls = list(log.calls)

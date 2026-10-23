@@ -628,10 +628,6 @@ class GrokHarness(MiraRunEnv):
 
     async def _timed_turn(self, turn: HarnessTurn, on_text: Callable[[str], None] | None,
                           timer: TurnTimer) -> HarnessResult:
-        if turn.secret_env:
-            raise GrokHarnessError(
-                "per-launch MCP credentials are not supported by the grok-build harness "
-                "yet (the gateway holds deployment-level upstream credentials)")
         instance, ephemeral = self._key(turn)
         timer.instance = instance
         # A compaction or rotation still running for this instance finishes
@@ -674,7 +670,8 @@ class GrokHarness(MiraRunEnv):
             async with agent.lock:
                 timer.add("lock_wait", waited, time.monotonic())
                 agent.last_used = time.monotonic()
-                with self.gateway.turn(instance, turn.run_id) as log:
+                with self.gateway.turn(instance, turn.run_id,
+                                       secret_env=turn.secret_env) as log:
                     try:
                         async with asyncio.timeout(self.settings.turn_timeout_s):
                             after_tool = False

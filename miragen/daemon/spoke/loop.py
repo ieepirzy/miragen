@@ -485,6 +485,7 @@ class Spoke:
                 idempotency_key=delivery.idempotency_key,
                 provenance=_mapping(payload.get("provenance")),
                 mirarun=_mapping(payload.get("mirarun")),
+                credentials=_turn_credentials(delivery.credentials),
             )
             turn_id = str(accepted.get("turn_id") or "")
             if not turn_id:
@@ -605,6 +606,30 @@ class Spoke:
             except (AgentRejected, AgentUnreachable, AgentOutcomeUnknown) as exc:
                 logger.warning("draining events of %s failed: %s", run.agent_run_id, exc)
             self.runs.pop(key, None)
+
+
+def _turn_credentials(minted: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The hub's minted credentials as the agent's `TurnCredentials`.
+
+    The base tier finds a run-scoped MCP credential by the environment
+    variable its capability names (`bearer_token_env`), so `secret_env` must
+    be keyed by that name. Values keyed by EDF binding name (`secrets`) cannot
+    be placed by the agent: refused, never dropped silently."""
+    if not minted:
+        return None
+    secret_env = minted.get("secret_env") or {}
+    if minted.get("secrets") and not secret_env:
+        raise _Invalid(
+            "the run's credentials are keyed by binding name; a base-tier turn "
+            "needs them keyed by environment variable (secret_env)"
+        )
+    out: dict[str, Any] = {}
+    if secret_env:
+        out["secret_env"] = dict(secret_env)
+    if minted.get("repositories"):
+        # Forwarded so the agent refuses them loudly (no base-tier checkout).
+        out["repositories"] = dict(minted["repositories"])
+    return out or None
 
 
 def _empty_page(record: dict[str, Any], after: int) -> dict[str, Any]:

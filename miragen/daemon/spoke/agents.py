@@ -76,8 +76,13 @@ class AgentClient:
         idempotency_key: str,
         provenance: dict[str, Any] | None = None,
         mirarun: dict[str, Any] | None = None,
+        credentials: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """`credentials` is the turn's run-scoped `TurnCredentials`
+        (`secret_env`, `repositories`): held by the agent for this turn only."""
         body: dict[str, Any] = {"prompt": prompt, "idempotency_key": idempotency_key}
+        if credentials:
+            body["credentials"] = credentials
         if provenance:
             body["provenance"] = provenance
         if mirarun:

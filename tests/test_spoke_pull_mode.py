@@ -433,3 +433,40 @@ def test_claims_long_poll_when_idle_and_return_at_once_while_relaying():
     world.hub.waits.clear()
     world.spoke.tick()
     assert world.hub.waits == [("intents/claim", 0), ("deliveries/claim", 0)]
+
+
+def test_a_launchs_minted_credentials_are_forwarded_into_the_turn():
+    world = World()
+    intent = world.offer()
+    world.spoke.tick()
+    world.run_pod(intent)
+    bodies = []
+    original = world.agent.handler
+
+    def capture(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/turns"):
+            bodies.append(json.loads(request.content))
+        return original(request)
+
+    world.spoke.agents = AgentClient(transport=httpx.MockTransport(capture))
+    world.deliver(intent, kind="launch", idempotency_key="launch-2",
+                  payload={"prompt": "go", "provenance": {}, "mirarun": {}},
+                  credentials={"secret_env": {"MIRARUN_MCP_TOKEN": "minted"},
+                               "repositories": {}})
+    world.spoke.tick()
+    assert bodies[0]["credentials"] == {"secret_env": {"MIRARUN_MCP_TOKEN": "minted"}}
+    assert "minted" not in repr(world.spoke.workloads)
+
+
+def test_credentials_keyed_by_binding_name_are_refused_not_dropped():
+    world = World()
+    intent = world.offer()
+    world.spoke.tick()
+    world.run_pod(intent)
+    world.deliver(intent, kind="launch", idempotency_key="launch-3",
+                  payload={"prompt": "go", "provenance": {}, "mirarun": {}},
+                  credentials={"secrets": {"mirarun-mcp": "minted"}, "repositories": {}})
+    world.spoke.tick()
+    assert world.hub.settles[0][1]["status"] == "rejected"
+    assert "secret_env" in world.hub.settles[0][1]["detail"]
+    assert world.agent.forwarded == []

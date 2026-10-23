@@ -25,7 +25,7 @@ the request until work appears.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Protocol
 from uuid import UUID
@@ -113,10 +113,14 @@ class ClaimedDelivery:
     run_intent_id: UUID | None
     trace_id: str | None
     attempt: int
+    # A launch's run-scoped credentials, minted by the hub for this claim
+    # only. Forwarded to the agent's turn, never stored, never in repr.
+    credentials: dict[str, Any] | None = field(default=None, repr=False)
 
     @classmethod
     def from_json(cls, item: dict[str, Any]) -> ClaimedDelivery:
         run_intent = item.get("run_intent_id")
+        credentials = item.get("credentials")
         return cls(
             organization_id=UUID(item["organization_id"]),
             delivery_id=UUID(item["delivery_id"]),
@@ -128,6 +132,7 @@ class ClaimedDelivery:
             run_intent_id=UUID(run_intent) if run_intent else None,
             trace_id=item.get("trace_id"),
             attempt=int(item["attempt"]),
+            credentials=dict(credentials) if isinstance(credentials, dict) else None,
         )
 
 

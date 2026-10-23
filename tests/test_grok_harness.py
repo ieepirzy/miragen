@@ -4,6 +4,8 @@ real tool gateway over HTTP, real session files on disk."""
 
 from __future__ import annotations
 
+import contextlib
+
 import asyncio
 import json
 import os
@@ -266,10 +268,21 @@ async def test_stream_yields_deltas_then_result(env):
     assert deltas == ["echo: ", "stream me\n"] and stream.result.output == "echo: stream me\n"
 
 
-async def test_per_launch_credentials_are_refused_not_dropped(env):
+async def test_per_launch_credentials_reach_the_gateway_for_that_turn_only(env):
     h = env.harness()
-    with pytest.raises(GrokHarnessError, match="per-launch MCP credentials"):
-        await h.run(turn("hi", secret_env={"TOKEN": "x"}))
+    seen = []
+    original = h.gateway.turn
+
+    @contextlib.contextmanager
+    def spy(instance, run_id, *, secret_env=None):
+        with original(instance, run_id, secret_env=secret_env) as log:
+            seen.append(dict(log.secret_env or {}))
+            yield log
+        seen.append(log.secret_env)
+
+    h.gateway.turn = spy
+    await h.run(turn("hi", secret_env={"TOKEN": "x"}))
+    assert seen == [{"TOKEN": "x"}, None]
 
 
 # ── through the app tier ─────────────────────────────────────────────────────
