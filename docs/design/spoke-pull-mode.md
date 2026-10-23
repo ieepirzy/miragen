@@ -154,12 +154,17 @@ hub.
     The hub's once-a-minute 429 is waited out. A token the agent did not
     take is pushed again, never minted again.
   - The agent keeps it in memory and in one 0600 file on an in-memory
-    volume (`emptyDir` `medium: Memory`, at `MIRAGEN_MODEL_TOKEN_DIR`). It
-    is cleared at shutdown. It is never persisted, logged or put in a repr,
+    volume (`emptyDir` `medium: Memory`, at `MIRAGEN_MODEL_TOKEN_DIR`). The
+    file sits in a `private/` directory the runtime creates and keeps at
+    0700, because the volume root is the kubelet's and 0777. It is cleared
+    at shutdown. It is never persisted, logged or put in a repr,
     and never appears in the pod spec, the workspace or a run record.
   - Claude Code reads it through an `apiKeyHelper` set in flag settings,
     which outrank every settings file, with
-    `CLAUDE_CODE_API_KEY_HELPER_TTL_MS=60000`. Its `ANTHROPIC_BASE_URL` is
+    `CLAUDE_CODE_API_KEY_HELPER_TTL_MS=60000`. `ANTHROPIC_BASE_URL` and the
+    TTL also sit in the flag settings' `env`, which beats the process env and
+    any `settings.json`, so a session cannot point the token at another
+    host. Its `ANTHROPIC_BASE_URL` is
     `<MIRAGEN_MODEL_GATEWAY_URL>/anthropic/<connection>`; the connection
     comes from `spec.harness.model_connection` or the class's
     `model_connection`. Both come from configuration, never from the hub.
@@ -168,6 +173,21 @@ hub.
     the helper fails and so does every model call. This follows
     code.claude.com/docs/en/llm-gateway-connect ("Rotate credentials with
     apiKeyHelper") and /authentication ("Authentication precedence").
+  - **Nothing echoes it.** Every 422 drops `input` and `ctx` (an app-wide
+    handler). The turns route takes `credentials` off the body before
+    validating the rest. The spoke scrubs anything token-shaped from a
+    peer's error detail before logging it or settling with it.
+  - **Egress is the cluster's.** The spoke creates no NetworkPolicy, and
+    its RBAC has none. The boundary is the sandbox namespaces'
+    default-deny `CiliumNetworkPolicy` from the deployment's infra
+    (ADR-0025). It allows DNS and an FQDN allowlist, and denies the
+    metadata service and cluster internals. The provider gateway's and the
+    broker's hostnames must be on that allowlist before any agent can
+    reach a model.
+  - **After a spoke restart**, the expiry of the token each agent holds is
+    unknown, so gateway workloads are refreshed on the first tick. A minted
+    token that expired before the agent took it is replaced, never handed
+    over.
   - Spoke class config: `model_gateway_url` (https only),
     `model_connection`, and `model_token_dir`.
 

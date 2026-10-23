@@ -222,6 +222,7 @@ class Spoke:
                 except (KeyError, ValueError):
                     logger.warning("skipping %s/%s: not a spoke workload", namespace, item.name)
                     continue
+                template = self.config.classes.get(item.workload_class)
                 self.workloads[intent_id] = TrackedWorkload(
                     organization_id=organization_id,
                     intent_id=intent_id,
@@ -230,6 +231,10 @@ class Spoke:
                     workload_class=item.workload_class,
                     generation=generation,
                     attempt=attempt,
+                    # The token the agent holds is unknown after a restart:
+                    # refresh it on the first tick (the hub's 429 paces it).
+                    model_expires_at=(self.clock() if template is not None
+                                      and template.model_gateway_url else None),
                 )
         self.resync_open_runs()
 
@@ -806,6 +811,11 @@ class Spoke:
                 continue
             if tracked.model_retry_at is not None and now < tracked.model_retry_at:
                 continue
+            unpushed_expiry = _model_expiry(tracked.model_unpushed) \
+                if tracked.model_unpushed is not None else None
+            if unpushed_expiry is not None and unpushed_expiry <= now:
+                # Never hand over a stale token: mint a fresh one instead.
+                tracked.model_unpushed = None
             if tracked.model_unpushed is None and \
                     now < tracked.model_expires_at - _MODEL_REFRESH_MARGIN:
                 continue

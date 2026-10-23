@@ -45,6 +45,8 @@ from uuid import UUID
 
 import httpx
 
+from miragen.daemon.spoke.redact import scrub
+
 logger = logging.getLogger(__name__)
 
 API_PREFIX = "/api/spoke/v1"
@@ -348,10 +350,11 @@ def _claim_body(limit: int, wait_seconds: int) -> dict[str, Any]:
 
 
 def _detail(response: httpx.Response) -> str:
+    """The peer's error detail, bounded and scrubbed of anything token-shaped."""
     try:
         body = response.json()
     except ValueError:
-        return response.text[:200]
+        return scrub(response.text[:200])
     if isinstance(body, dict) and isinstance(body.get("detail"), str):
-        return body["detail"][:200]
-    return str(body)[:200]
+        return scrub(body["detail"][:200])
+    return scrub(str(body)[:200])

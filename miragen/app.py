@@ -23,8 +23,9 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger as APIntervalTrigger
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
@@ -2433,6 +2434,21 @@ class TurnCredentials(BaseModel):
     model: dict[str, SecretStr] | None = None
 
 
+def _validated(model: type[BaseModel], data: Any, *, where: str | None = None):
+    """Validate without echoing: an error keeps where and what, never the input."""
+    try:
+        return model.model_validate(data)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=_errors_without_input(exc.errors(), where)) \
+            from None
+
+
+def _errors_without_input(errors: Any, where: str | None = None) -> list[dict[str, Any]]:
+    prefix = [where] if where else []
+    return [{"loc": [*prefix, *(e.get("loc") or ())], "msg": e.get("msg"), "type": e.get("type")}
+            for e in errors]
+
+
 def _take_model_token(value: dict[str, SecretStr] | dict[str, Any]) -> None:
     plain = {k: (v.get_secret_value() if isinstance(v, SecretStr) else v)
              for k, v in value.items()}
@@ -2480,7 +2496,7 @@ class TurnRequest(BaseModel):
 
 
 @app.post("/instances/{name}/turns", status_code=202, dependencies=[_internal_auth])
-async def start_turn(name: str, request: TurnRequest, response: Response):
+async def start_turn(name: str, raw: Request, response: Response):
     """Start a turn in a conversation instance, with its history.
 
     The base tier's name for what /executor-runs does for it: the same
@@ -2493,11 +2509,21 @@ async def start_turn(name: str, request: TurnRequest, response: Response):
     if _executor is not None:
         raise HTTPException(status_code=409, detail="an executor-tier agent has no "
                             "conversation instances; use /executor-runs")
-    turn_secret_env = (
-        _turn_secret_env(request.credentials) if request.credentials is not None else None
-    )
-    if request.credentials is not None and request.credentials.model is not None:
-        _take_model_token(request.credentials.model)
+    # Read raw: `credentials` is taken off before the rest is validated, and
+    # validated on its own, so no error about any field ever carries a secret.
+    try:
+        body = json.loads(await raw.body())
+    except ValueError:
+        raise HTTPException(status_code=422, detail="body is not JSON") from None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="body must be an object")
+    raw_credentials = body.pop("credentials", None)
+    request = _validated(TurnRequest, body)
+    credentials = (_validated(TurnCredentials, raw_credentials, where="credentials")
+                   if raw_credentials is not None else None)
+    turn_secret_env = _turn_secret_env(credentials) if credentials is not None else None
+    if credentials is not None and credentials.model is not None:
+        _take_model_token(credentials.model)
     result = await _launch_run(
         ExecutorLaunchRequest(prompt=request.prompt, idempotency_key=request.idempotency_key,
                               provenance=request.provenance, instance=name, use_history=True,
@@ -2506,6 +2532,14 @@ async def start_turn(name: str, request: TurnRequest, response: Response):
         turn_secret_env=turn_secret_env)
     return {"turn_id": result["run_id"], "instance": name,
             **{k: v for k, v in result.items() if k in ("status", "duplicate")}}
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Every 422 keeps each error's location, message and type, and drops
+    `input` and `ctx`: a body can carry a credential (a turn's, a model
+    token), and an error about a sibling field would otherwise echo it."""
+    return JSONResponse(status_code=422, content={"detail": _errors_without_input(exc.errors())})
 
 
 @app.put("/credentials/model", status_code=204, dependencies=[_internal_auth])

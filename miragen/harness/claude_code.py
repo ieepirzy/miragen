@@ -371,8 +371,13 @@ class ClaudeCodeHarness(MiraRunEnv):
         """Flag settings for gateway mode (they outrank every settings file)."""
         if not self._gateway_mode():
             return json.dumps(base) if base is not None else None
-        _, command = self._model_gateway()
-        return json.dumps({**(base or {}), "apiKeyHelper": command})
+        base_url, command = self._model_gateway()
+        # Flag settings outrank every settings file and the process env, so a
+        # session that rewrites its settings.json cannot point the token at
+        # another host or swap the helper.
+        return json.dumps({**(base or {}), "apiKeyHelper": command, "env": {
+            "ANTHROPIC_BASE_URL": base_url,
+            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(HELPER_TTL_MS)}})
 
     def _state_path(self) -> Path:
         return self.settings.claude_home / STATE_FILE

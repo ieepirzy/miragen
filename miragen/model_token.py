@@ -9,7 +9,9 @@ token, or an expired one, model calls fail.
 
 Where it lives:
 - **In memory**, in this process's `ModelTokenHolder`.
-- **In one file**, `<MIRAGEN_MODEL_TOKEN_DIR>/model-token`, mode 0600. The
+- **In one file**, `<MIRAGEN_MODEL_TOKEN_DIR>/private/model-token`, mode
+  0600, in a directory this process creates and keeps at 0700 (the volume's
+  own root is the kubelet's, 0777, and not ours to chmod). The
   directory is an in-memory volume the spoke mounts, so the token never
   reaches the image, the workspace or a disk. The file exists only so a
   harness's credential helper can read the current token: Claude Code's
@@ -35,6 +37,7 @@ from pathlib import Path
 
 TOKEN_DIR_ENV = "MIRAGEN_MODEL_TOKEN_DIR"
 TOKEN_FILE = "model-token"
+PRIVATE_DIR = "private"
 _MAX_TOKEN = 8192
 
 # Run by the harness's credential helper: no imports beyond the standard
@@ -108,7 +111,7 @@ class ModelTokenHolder:
 
     @property
     def path(self) -> Path | None:
-        return self._directory / TOKEN_FILE if self._directory is not None else None
+        return self._directory / PRIVATE_DIR / TOKEN_FILE if self._directory is not None else None
 
     def set(self, token: ModelToken) -> None:
         """Take a newer token. An older one than held is ignored: a refresh
@@ -143,6 +146,10 @@ class ModelTokenHolder:
         if path is None:
             return
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if path.parent.is_symlink():
+            raise OSError("the token directory is a symlink")
+        # mkdir's mode is masked by the umask and ignored when it exists.
+        os.chmod(path.parent, 0o700)
         tmp = path.with_name(f".{TOKEN_FILE}.{os.getpid()}")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:

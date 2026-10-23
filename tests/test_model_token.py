@@ -218,3 +218,55 @@ async def test_a_malformed_token_is_refused_without_echoing_it(client, holder):
     r = await c.put("/credentials/model", json={**_credential(), "expires_at": "never"})
     assert r.status_code == 422 and TOKEN not in r.text
     assert holder.current() is None
+
+
+# -- review round 1: nothing echoes a token, and the agent cannot redirect it --
+
+@pytest.mark.parametrize("body", [
+    # The reviewer's probe: an error about a sibling field must not carry the body.
+    {"prompt": "", "idempotency_key": "k"},
+    {"prompt": "p"},
+    {"prompt": 123, "idempotency_key": "k"},
+])
+async def test_a_turn_422_never_echoes_the_token(client, holder, body):
+    c, _ = client
+    r = await c.post("/instances/main/turns", json={**body, "credentials": {
+        "model": _credential(), "secret_env": {"MCP_TOKEN": TOKEN}}})
+    assert r.status_code == 422
+    assert TOKEN not in r.text and "input" not in r.text
+    assert holder.current() is None
+
+
+async def test_malformed_credentials_are_refused_without_echo(client, holder):
+    c, _ = client
+    r = await c.post("/instances/main/turns", json={
+        "prompt": "p", "idempotency_key": "k",
+        "credentials": {"model": {**_credential(), "expires_at": 5}, "nope": TOKEN}})
+    assert r.status_code == 422 and TOKEN not in r.text
+
+
+async def test_every_validation_error_drops_its_input(client):
+    c, _ = client
+    r = await c.post("/executor-runs", json={"prompt": "p", "context": {"secrets": TOKEN}})
+    assert r.status_code == 422 and TOKEN not in r.text and "input" not in r.text
+
+
+def test_the_token_directory_is_private_even_on_a_world_writable_volume(tmp_path):
+    volume = tmp_path / "volume"
+    volume.mkdir()
+    volume.chmod(0o777)
+    h = ModelTokenHolder(volume)
+    h.set(ModelToken.parse(_credential()))
+    assert stat.S_IMODE(os.stat(h.path.parent).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(h.path).st_mode) == 0o600
+    h.clear()
+
+
+async def test_the_gateway_and_helper_ride_flag_settings(cc, gateway):
+    gateway.set(ModelToken.parse(_credential()))
+    h = cc.harness()
+    await h.run(turn("hi"))
+    settings = json.loads(FakeClient.instances[0].options.settings)
+    assert settings["env"]["ANTHROPIC_BASE_URL"] == f"{GATEWAY}/anthropic/anthropic-main"
+    assert settings["env"]["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"] == "60000"
+    assert TOKEN not in json.dumps(settings)

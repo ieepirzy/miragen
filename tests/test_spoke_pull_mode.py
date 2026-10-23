@@ -681,3 +681,52 @@ def test_model_tokens_are_never_logged_by_the_spoke(caplog):
     world.spoke.tick()
     assert "minted-1" not in caplog.text and "claim-token" not in caplog.text
     assert "minted-1" not in repr(world.spoke.workloads)
+
+
+def test_an_agents_error_detail_is_scrubbed_before_it_is_settled_or_logged(caplog):
+    caplog.set_level(logging.DEBUG)
+    world = World()
+    intent = world.running()
+    leaked = "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ3b3JrbG9hZCJ9.c2lnbmF0dXJlLXZhbHVlLXg"
+    original = world.agent.handler
+
+    def echoing(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/turns"):
+            return httpx.Response(422, json={"detail": f"bad: {{'token': '{leaked}'}}"})
+        return original(request)
+
+    world.spoke.agents = AgentClient(transport=httpx.MockTransport(echoing))
+    world.deliver(intent, kind="launch", credentials={"secret_env": {}, "model": _model(15)})
+    world.spoke.tick()
+    settle = world.hub.settles[0][1]
+    assert settle["status"] == "rejected" and leaked not in settle["detail"]
+    assert "[redacted]" in settle["detail"] and leaked not in caplog.text
+
+
+def test_a_stale_unpushed_token_is_replaced_not_handed_over():
+    world = World()
+    intent = _launch_with_model(world, minutes=14)
+    tracked = world.spoke.workloads[UUID(intent["intent_id"])]
+    tracked.model_unpushed = _model(-1, token="stale")
+    tracked.model_expires_at = NOW + timedelta(minutes=1)
+    world.spoke.refresh_model_tokens()
+    assert [t["token"] for t in world.agent.model_tokens] == ["minted-1"]
+
+
+def test_after_a_restart_gateway_workloads_are_refreshed_at_once():
+    world = World(classes={
+        "ephemeral": {"image": IMAGE, "service_account_name": "agent-sandbox",
+                      "model_gateway_url": "https://gateway.invalid"},
+        "persistent": {"image": IMAGE, "service_account_name": "agent-sandbox",
+                       "storage_size": "10Gi"}})
+    intent = world.running()
+    restarted = Spoke(config=world.spoke.config, hub=world.spoke.hub, driver=world.spoke.driver,
+                      agents=world.spoke.agents, clock=lambda: world.hub.now,
+                      new_token=lambda: "internal-1", monotonic=lambda: 0.0)
+    restarted._next_resync = float("inf")
+    restarted._open_runs_supported = False
+    restarted.recover()
+    tracked = restarted.workloads[UUID(intent["intent_id"])]
+    assert tracked.model_expires_at == NOW
+    restarted.refresh_model_tokens()
+    assert [t["token"] for t in world.agent.model_tokens] == ["minted-1"]
