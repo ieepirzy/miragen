@@ -201,6 +201,46 @@ async def test_gated_tools_raise_the_mcp_tool_timeout_and_turn_timeout(env):
     assert FakeClient.instances[0].options.env["MCP_TOOL_TIMEOUT"] == "1020000"
 
 
+def with_turn_timeout(prof: AgentProfile, seconds: int) -> AgentProfile:
+    doc = prof.model_dump(by_alias=True)
+    doc["spec"]["harness"] = {"turn_timeout_s": seconds}
+    return AgentProfile.model_validate(doc)
+
+
+async def test_profile_turn_timeout_overrides_the_deployment_default(env):
+    assert env.harness(profile(), turn_timeout_s=600).settings.turn_timeout_s == 600
+    h = env.harness(with_turn_timeout(profile(), 1800), turn_timeout_s=600)
+    assert h.settings.turn_timeout_s == 1800
+
+
+async def test_profile_turn_timeout_still_outlasts_gated_tools(env):
+    doc = profile(approval_required=["speak"], approval_timeout_s=900).model_dump(by_alias=True)
+    doc["spec"]["harness"] = {"turn_timeout_s": 300}
+    h = env.harness(AgentProfile.model_validate(doc), turn_timeout_s=600)
+    assert h.settings.turn_timeout_s == 1080
+
+
+def test_turn_timeout_implies_contract_7_and_unset_dumps_without_it():
+    from miragen.profile_contract import SUPPORTED_PROFILE_CONTRACTS
+
+    doc = profile().model_dump(by_alias=True)
+    doc["spec"]["harness"] = {"turn_timeout_s": 1800}
+    prof = AgentProfile.model_validate(doc)
+    assert prof.required_contract() == 7 and 7 in SUPPORTED_PROFILE_CONTRACTS
+    dumped = prof.model_dump(mode="json", by_alias=True)
+    assert dumped["spec"]["harness"]["turn_timeout_s"] == 1800
+    assert AgentProfile.model_validate(dumped).required_contract() == 7
+    with pytest.raises(ValueError, match="v7"):
+        AgentProfile.model_validate({**doc, "apiVersion": "miragen/v6"})
+    doc["spec"]["harness"] = {}
+    plain = AgentProfile.model_validate(doc).model_dump(mode="json", by_alias=True)
+    assert "turn_timeout_s" not in plain["spec"]["harness"]
+    assert AgentProfile.model_validate(plain).required_contract() == 4
+    doc["spec"]["harness"] = {"turn_timeout_s": 10}
+    with pytest.raises(ValueError):
+        AgentProfile.model_validate(doc)
+
+
 async def test_restart_resumes_the_session(env):
     h = env.harness()
     await h.run(turn("one"))
