@@ -40,6 +40,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 import yaml
@@ -47,6 +48,19 @@ import yaml
 from miragen.daemon.spawn.kubernetes_workloads import WORKLOAD_CLASSES, WorkloadTemplate
 
 _DNS1123 = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
+# Plain http is allowed only to an in-cluster Service: the workload token
+# never leaves the cluster network. Everything else must be https.
+_CLUSTER_LOCAL_SUFFIXES = (".svc", ".svc.cluster.local")
+
+
+def _gateway_url_allowed(url: str) -> bool:
+    parts = urlsplit(url)
+    if parts.scheme == "https":
+        return bool(parts.hostname)
+    return (parts.scheme == "http" and parts.hostname is not None
+            and parts.hostname.endswith(_CLUSTER_LOCAL_SUFFIXES))
+
+
 _LABEL_KEY = re.compile(r"^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$")
 
 
@@ -141,8 +155,10 @@ def parse_config(raw: dict[str, Any]) -> SpokeConfig:
         if unknown:
             raise SpokeConfigInvalid(f"classes.{name}: unknown keys {sorted(unknown)}")
         gateway = body.get("model_gateway_url")
-        if gateway is not None and not str(gateway).startswith("https://"):
-            raise SpokeConfigInvalid(f"classes.{name}.model_gateway_url must be https://")
+        if gateway is not None and not _gateway_url_allowed(str(gateway)):
+            raise SpokeConfigInvalid(
+                f"classes.{name}.model_gateway_url must be https://, or http:// to a"
+                " cluster-local Service (*.svc or *.svc.cluster.local)")
         classes[name] = WorkloadTemplate(**body)
 
     namespaces: dict[str, NamespacePolicy] = {}

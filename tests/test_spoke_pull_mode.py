@@ -556,6 +556,35 @@ def test_config_refuses_an_inline_token_and_unlisted_images():
                                        "service_account_name": "sa"}})
 
 
+def _gateway_class(url):
+    return {"ephemeral": {"image": IMAGE, "service_account_name": "agent-sandbox",
+                          "model_gateway_url": url}}
+
+
+@pytest.mark.parametrize("url", [
+    "https://gateway.invalid",
+    "http://luotsi.luotsi.svc.cluster.local:8080",
+    "http://luotsi.luotsi.svc:8080",
+])
+def test_config_accepts_https_or_a_cluster_local_http_gateway(url):
+    config = _config(classes=_gateway_class(url))
+    assert config.classes["ephemeral"].model_gateway_url == url
+
+
+@pytest.mark.parametrize("url", [
+    "http://gateway.invalid",
+    "http://luotsi.example.com",
+    "http://evil.svc.cluster.local.example.com",
+    "http://svc.cluster.local.attacker.invalid",
+    "ftp://luotsi.luotsi.svc.cluster.local",
+    "https://",
+    "luotsi.luotsi.svc.cluster.local",
+])
+def test_config_refuses_plain_http_outside_the_cluster(url):
+    with pytest.raises(SpokeConfigInvalid, match="model_gateway_url"):
+        _config(classes=_gateway_class(url))
+
+
 def test_unused_imports_are_real():
     assert HubRefused and SpawnOperationFailed
 

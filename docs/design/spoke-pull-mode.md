@@ -189,7 +189,7 @@ hub.
     unknown, so gateway workloads are refreshed on the first tick. A minted
     token that expired before the agent took it is replaced, never handed
     over.
-  - Spoke class config: `model_gateway_url` (https only),
+  - Spoke class config: `model_gateway_url` (https, or http only to a cluster-local Service such as `*.svc.cluster.local`),
     `model_connection`, and `model_token_dir`.
 
 ## 6. Not done
