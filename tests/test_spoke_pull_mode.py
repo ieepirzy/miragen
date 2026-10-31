@@ -556,6 +556,62 @@ def test_config_refuses_an_inline_token_and_unlisted_images():
                                        "service_account_name": "sa"}})
 
 
+def _gateway_class(url):
+    return {"ephemeral": {"image": IMAGE, "service_account_name": "agent-sandbox",
+                          "model_gateway_url": url}}
+
+
+@pytest.mark.parametrize("url", [
+    "https://gateway.invalid",
+    "http://luotsi.luotsi.svc.cluster.local:8080",
+    "http://luotsi.luotsi.svc:8080",
+    "http://luotsi.luotsi.svc.cluster.local.:8000",
+    "http://luotsi.luotsi.svc.cluster.local:8000/",
+])
+def test_config_accepts_https_or_a_cluster_local_http_gateway(url):
+    config = _config(classes=_gateway_class(url))
+    assert config.classes["ephemeral"].model_gateway_url == url
+
+
+@pytest.mark.parametrize("url", [
+    "http://gateway.invalid",
+    "http://luotsi.example.com",
+    "http://evil.svc.cluster.local.example.com",
+    "http://svc.cluster.local.attacker.invalid",
+    "ftp://luotsi.luotsi.svc.cluster.local",
+    "https://",
+    "luotsi.luotsi.svc.cluster.local",
+    # Node (WHATWG) reads `\\` as `/` and honours userinfo; Python's urlsplit
+    # doesn't, so these looked cluster-local to the old check while Claude
+    # Code would send the token to evil.com.
+    "http://evil.com\\@luotsi.luotsi.svc",
+    "http://evil.com\\luotsi.svc.cluster.local",
+    "http://u@evil.com@luotsi.luotsi.svc",
+    "http://evil.com@luotsi.luotsi.svc",
+    "http://luotsi%2eluotsi.svc",
+    "http://luotsi.luotsi.svc/%2e%2e",
+    "http://luotsi.luotsi.svc\t",
+    "http://luotsi.luotsi.svc\n",
+    "http://luotsi\tevil.com.svc",
+    "http://ｌｕｏｔｓｉ.luotsi.svc",
+    "http://luo\u00adtsi.luotsi.svc",
+    "http://luo\u200btsi.luotsi.svc",
+    "http://[::1]:8000",
+    "https://[fe80::1]",
+    "http://.svc",
+    "http://svc",
+    "http://LUOTSI.luotsi.svc",
+    "http://luotsi.luotsi.svc:0",
+    "http://luotsi.luotsi.svc:99999",
+    "http://luotsi.luotsi.svc?x=1",
+    "http://luotsi.luotsi.svc#frag",
+    "https://evil.com\\@gateway.invalid",
+])
+def test_config_refuses_plain_http_outside_the_cluster(url):
+    with pytest.raises(SpokeConfigInvalid, match="model_gateway_url"):
+        _config(classes=_gateway_class(url))
+
+
 def test_unused_imports_are_real():
     assert HubRefused and SpawnOperationFailed
 

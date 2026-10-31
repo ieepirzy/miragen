@@ -141,6 +141,28 @@ async def test_a_saved_login_refuses_the_gateway_harness(cc, gateway):
         h._env("chat")
 
 
+@pytest.mark.parametrize("url", [
+    "http://evil.com\\@luotsi.luotsi.svc",
+    "http://u@evil.com@luotsi.luotsi.svc",
+    "http://gateway.invalid",
+    "ftp://luotsi.luotsi.svc",
+])
+async def test_the_pod_rechecks_the_gateway_url(cc, gateway, monkeypatch, url):
+    monkeypatch.setenv("MIRAGEN_MODEL_GATEWAY_URL", url)
+    h = cc.harness()
+    with pytest.raises(ClaudeCodeHarnessError, match="MIRAGEN_MODEL_GATEWAY_URL"):
+        h._env("chat")
+
+
+async def test_a_cluster_local_http_gateway_is_used_as_given(cc, gateway, monkeypatch):
+    url = "http://luotsi.luotsi.svc.cluster.local:8000"
+    monkeypatch.setenv("MIRAGEN_MODEL_GATEWAY_URL", url + "/")
+    gateway.set(ModelToken.parse(_credential()))
+    h = cc.harness()
+    await h.run(turn("hi"))
+    assert FakeClient.instances[0].options.env["ANTHROPIC_BASE_URL"] == f"{url}/anthropic/anthropic-main"
+
+
 async def test_no_token_directory_means_no_model_calls(cc, monkeypatch):
     monkeypatch.setenv("MIRAGEN_MODEL_GATEWAY_URL", GATEWAY)
     monkeypatch.setenv("MIRAGEN_MODEL_CONNECTION", "c")

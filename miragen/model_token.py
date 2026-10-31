@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import sys
 import threading
@@ -39,6 +40,23 @@ TOKEN_DIR_ENV = "MIRAGEN_MODEL_TOKEN_DIR"
 TOKEN_FILE = "model-token"
 PRIVATE_DIR = "private"
 _MAX_TOKEN = 8192
+
+# The gateway URL is checked as a whole string, not through urlsplit: Claude
+# Code (Node, WHATWG URL) makes the call, and it parses `\`, userinfo and
+# percent-escapes differently from Python, so a URL urlsplit reads as
+# `*.svc` could reach another host in Node. Lowercase DNS-1123 labels, an
+# optional trailing dot, an optional port and a plain path are all it may hold.
+_LABEL = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+_GATEWAY_URL = re.compile(
+    rf"(?P<scheme>https?)://(?P<host>{_LABEL}(?:\.{_LABEL})*\.?)(?::(?P<port>[0-9]{{1,5}}))?"
+    r"(?:/[A-Za-z0-9._~-]*)*"
+)
+# Plain http only to a cluster-local Service name: the workload token is then
+# meant to stay on the cluster network. A `.svc` name alone doesn't guarantee
+# that (an ExternalName Service or hand-written Endpoints can point outside);
+# the exact URL pinned in the cluster config and the egress policy are the
+# real control.
+_CLUSTER_LOCAL_SUFFIXES = (".svc", ".svc.cluster.local")
 
 # Run by the harness's credential helper: no imports beyond the standard
 # library, no output but the token, exit 1 when there is none to give.
@@ -169,3 +187,18 @@ class ModelTokenHolder:
                 path.unlink()
             except FileNotFoundError:
                 pass
+
+
+def gateway_url_allowed(url: str) -> bool:
+    """Whether `url` may be a provider-gateway root: https to any strict DNS
+    name, or http only to a cluster-local Service name."""
+    m = _GATEWAY_URL.fullmatch(url)
+    if m is None:
+        return False
+    port = m["port"]
+    if port is not None and not 0 < int(port) <= 65535:
+        return False
+    if m["scheme"] == "https":
+        return True
+    host = m["host"].removesuffix(".")
+    return any(host.endswith(s) and len(host) > len(s) for s in _CLUSTER_LOCAL_SUFFIXES)

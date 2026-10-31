@@ -45,6 +45,7 @@ from uuid import UUID
 import yaml
 
 from miragen.daemon.spawn.kubernetes_workloads import WORKLOAD_CLASSES, WorkloadTemplate
+from miragen.model_token import gateway_url_allowed
 
 _DNS1123 = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 _LABEL_KEY = re.compile(r"^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$")
@@ -141,8 +142,10 @@ def parse_config(raw: dict[str, Any]) -> SpokeConfig:
         if unknown:
             raise SpokeConfigInvalid(f"classes.{name}: unknown keys {sorted(unknown)}")
         gateway = body.get("model_gateway_url")
-        if gateway is not None and not str(gateway).startswith("https://"):
-            raise SpokeConfigInvalid(f"classes.{name}.model_gateway_url must be https://")
+        if gateway is not None and not gateway_url_allowed(str(gateway)):
+            raise SpokeConfigInvalid(
+                f"classes.{name}.model_gateway_url must be https://, or http:// to a"
+                " cluster-local Service (*.svc or *.svc.cluster.local)")
         classes[name] = WorkloadTemplate(**body)
 
     namespaces: dict[str, NamespacePolicy] = {}
