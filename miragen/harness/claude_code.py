@@ -345,11 +345,16 @@ class ClaudeCodeHarness(MiraRunEnv):
     def _model_gateway(self) -> tuple[str, str]:
         """(base URL, credential helper command) on a spoke. Refuses, rather
         than letting another credential stand in, when anything is missing."""
-        from miragen.model_token import holder
+        from miragen.model_token import gateway_url_allowed, holder
 
-        root = os.environ.get(MODEL_GATEWAY_ENV, "").rstrip("/")
-        if not root.startswith("https://") and not root.startswith("http://"):
-            raise ClaudeCodeHarnessError(f"{MODEL_GATEWAY_ENV} is not a URL")
+        # Re-checked here, not trusted from the spoke: this URL is where the
+        # model token goes.
+        raw = os.environ.get(MODEL_GATEWAY_ENV, "")
+        if not gateway_url_allowed(raw):
+            raise ClaudeCodeHarnessError(
+                f"{MODEL_GATEWAY_ENV} must be https://, or http:// to a cluster-local "
+                "Service, with a plain lowercase DNS host")
+        root = raw.rstrip("/")
         # The spoke's class config names the connection. A per-profile one is
         # a profile-contract change (v7), left for its own PR.
         connection = os.environ.get(MODEL_CONNECTION_ENV)

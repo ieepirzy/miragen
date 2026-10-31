@@ -191,6 +191,14 @@ hub.
     over.
   - Spoke class config: `model_gateway_url` (https, or http only to a cluster-local Service such as `*.svc.cluster.local`),
     `model_connection`, and `model_token_dir`.
+  - The gateway URL is checked as a whole string, on the spoke and again in
+    the pod: lowercase DNS labels, an optional trailing dot, an optional port
+    and a plain path. No userinfo, backslash, percent-escapes, whitespace, non-ASCII
+    or IP literals, because Claude Code (Node) parses those differently from
+    Python. A `.svc` name doesn't guarantee the traffic stays in the cluster:
+    an ExternalName Service or hand-written Endpoints can point a `.svc` name
+    outside. The real control is the exact URL pinned in the cluster's spoke
+    config plus the sandbox egress policy.
 
 ## 6. Not done
 
