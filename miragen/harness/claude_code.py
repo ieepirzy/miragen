@@ -275,6 +275,9 @@ class ClaudeCodeHarness(MiraRunEnv):
         self.served = served
         self.engineer = is_engineer(profile)
         self._repo_locks: dict[str, asyncio.Lock] = {}
+        harness = profile.spec.harness
+        if harness is not None and harness.turn_timeout_s is not None:
+            settings.turn_timeout_s = float(harness.turn_timeout_s)
         # Clock order, as in the Grok harness: approval wait < Claude Code's
         # MCP tool timeout < this harness's turn timeout.
         self.tool_timeout_s: int | None = (
