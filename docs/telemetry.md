@@ -72,9 +72,24 @@ prompts, responses and tool arguments); on the executor tier, agent
 messages and intervention question text are excluded from the span
 translation. Large content stays in the run record, the event stream, and
 the artifact sink; a span references it, it doesn't embed it.
-And deliberately no LLM-in-the-loop analytics (no judge scores, no
-model-authored classifications) — spans state what happened, not what a
-model thinks about it.
+Spans themselves never carry model judgements (no grader output, no
+model-authored classifications): they state what happened, not what a
+model thinks about it. Model grading lives in the eval store, separately
+and asynchronously from the run, and only in a typed form:
+
+- every grade answers one criterion of a versioned rubric, with a typed
+  answer (enum, boolean, count, evidence list, or a 1–5 scale whose levels
+  are each described in the rubric), short reasoning, and evidence refs
+  (span ids, run-record events);
+- the grade records which grader produced it (`check`, `model@version`,
+  `human`), so its provenance is explicit;
+- an arbitrary model-authored number (a free 0–1 or 0–100 "quality score")
+  is never allowed, in spans or in the eval store; the overall verdict
+  comes from a deterministic, versioned score function over the grades.
+
+Future classifiers in the hot path follow the same rule: a typed decision
+tagged `classifier@version`, never a free score. (Ilari, 2026-11-01; Loimi
+`332c59d2`; design in infra `docs/research/agent-evals.md`.)
 
 ## Langfuse wiring (reference deployment)
 
