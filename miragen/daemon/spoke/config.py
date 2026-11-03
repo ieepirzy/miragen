@@ -8,6 +8,7 @@ and templates this file names. Nothing here ever comes from the hub.
     hub:
       url: https://hub.example            # the MiraRun hub, reached outbound
       token_file: /var/run/spoke/token    # the spoke's credential, read once
+      proxy: http://gateway.ns.svc:1055   # optional: an HTTP proxy for the hub only
     poll:
       wait_seconds: 25                    # the hub's long-poll on each claim (<= 25)
       interval_seconds: 5
@@ -69,6 +70,11 @@ class SpokeConfig:
     namespaces: dict[str, NamespacePolicy]
     images: frozenset[str]
     network_label_keys: frozenset[str] = frozenset()
+    # An HTTP proxy for the hub connection only, e.g. a tailnet node's
+    # outbound proxy when the hub is reached over a mesh. Never taken from
+    # HTTP_PROXY: the spoke's agent calls are plain http to pod IPs, and an
+    # environment proxy would route those through it too.
+    hub_proxy: str | None = None
     interval_seconds: float = 5.0
     max_backoff_seconds: float = 60.0
     claim_limit: int = 8
@@ -119,6 +125,9 @@ def parse_config(raw: dict[str, Any]) -> SpokeConfig:
     token_file = hub.get("token_file")
     if not token_file:
         raise SpokeConfigInvalid("hub.token_file is required; the token is never inline")
+    proxy = hub.get("proxy")
+    if proxy is not None and not str(proxy).startswith("http://"):
+        raise SpokeConfigInvalid("hub.proxy must be an http:// URL")
 
     images = frozenset(str(i) for i in raw.get("images") or ())
     if not images:
@@ -174,6 +183,7 @@ def parse_config(raw: dict[str, Any]) -> SpokeConfig:
     return SpokeConfig(
         hub_url=url.rstrip("/"),
         token_file=Path(token_file),
+        hub_proxy=str(proxy) if proxy is not None else None,
         classes=classes,
         namespaces=namespaces,
         images=images,

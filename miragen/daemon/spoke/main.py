@@ -39,7 +39,7 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
-    hub = HubClient(config.hub_url, token)
+    hub = HubClient(config.hub_url, token, proxy=config.hub_proxy)
     spoke = Spoke(
         config=config,
         hub=hub,

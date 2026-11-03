@@ -787,3 +787,50 @@ def test_after_a_restart_gateway_workloads_are_refreshed_at_once():
     assert tracked.model_expires_at == NOW
     restarted.refresh_model_tokens()
     assert [t["token"] for t in world.agent.model_tokens] == ["minted-1"]
+
+
+def test_config_takes_an_http_proxy_for_the_hub_only():
+    assert _config().hub_proxy is None
+    cfg = _config(hub={"url": "http://hub.mesh.invalid:8080", "token_file": "/nonexistent",
+                       "proxy": "http://gateway.ns.svc:1055"})
+    assert cfg.hub_proxy == "http://gateway.ns.svc:1055"
+    with pytest.raises(SpokeConfigInvalid):
+        _config(hub={"url": "https://hub.invalid", "token_file": "/nonexistent",
+                     "proxy": "socks5://gateway.ns.svc:1055"})
+
+
+def test_the_hub_client_goes_through_its_proxy(monkeypatch):
+    """The hub request reaches the proxy in absolute form; an environment
+    proxy is not used instead."""
+    import http.server
+    import threading
+
+    seen = []
+
+    class Proxy(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            seen.append(self.path)
+            body = b"{}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Proxy)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    try:
+        hub = HubClient("http://hub.mesh.invalid:8080", "t",
+                        proxy=f"http://127.0.0.1:{server.server_port}", timeout=5)
+        try:
+            hub._client.get("/api/spoke/v1/ping")
+        finally:
+            hub.close()
+    finally:
+        server.shutdown()
+    assert seen == ["http://hub.mesh.invalid:8080/api/spoke/v1/ping"]

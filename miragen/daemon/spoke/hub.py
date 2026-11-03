@@ -207,12 +207,15 @@ class HubClient:
         *,
         timeout: float = 70.0,
         transport: httpx.BaseTransport | None = None,
+        proxy: str | None = None,
     ) -> None:
         self._client = httpx.Client(
             base_url=base_url.rstrip("/"),
             headers={"Authorization": f"Bearer {token}"},
             timeout=timeout,
             transport=transport,
+            # An explicit proxy wins over HTTP(S)_PROXY (httpx).
+            proxy=proxy,
         )
 
     def close(self) -> None:
