@@ -61,6 +61,7 @@ from miragen.daemon.spawn.base import (
     SpawnUnitNotFound,
     UnitLifecycle,
 )
+from miragen.daemon.spawn.serviceaccount import INCLUSTER_DIR, ServiceAccountTokenAuth
 
 _DNS1123_LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 _CONTAINER_NAME = "agent"
@@ -72,7 +73,7 @@ _CONTAINER_PORT = 8000
 # a unit conversion.
 _MEM_SUFFIX = {"b": "", "k": "Ki", "m": "Mi", "g": "Gi"}
 
-_INCLUSTER_DIR = Path("/var/run/secrets/kubernetes.io/serviceaccount")
+_INCLUSTER_DIR = INCLUSTER_DIR
 
 
 class InClusterConfigUnavailable(Exception):
@@ -97,15 +98,19 @@ class KubernetesSpawnDriver:
         *,
         base_url: str,
         namespace: str,
-        token: str,
+        token: str | None = None,
+        auth: httpx.Auth | None = None,
         transport: httpx.BaseTransport | None = None,
         verify: str | bool = True,
         timeout: float = 30.0,
     ) -> None:
+        if (token is None) == (auth is None):
+            raise ValueError("pass exactly one of token and auth")
         self._namespace = namespace
         self._client = httpx.Client(
             base_url=base_url.rstrip("/"),
-            headers={"Authorization": f"Bearer {token}"},
+            headers={} if token is None else {"Authorization": f"Bearer {token}"},
+            auth=auth,
             transport=transport,
             verify=verify if transport is None else True,
             timeout=timeout,
@@ -118,7 +123,7 @@ class KubernetesSpawnDriver:
         substrate using whatever identity the daemon itself is already
         running under, nothing separately provisioned."""
         try:
-            token = (_INCLUSTER_DIR / "token").read_text().strip()
+            auth = ServiceAccountTokenAuth(_INCLUSTER_DIR / "token")
             namespace = (_INCLUSTER_DIR / "namespace").read_text().strip()
             ca_path = _INCLUSTER_DIR / "ca.crt"
             if not ca_path.exists():
@@ -139,7 +144,7 @@ class KubernetesSpawnDriver:
         return cls(
             base_url=f"https://{host}:{port}",
             namespace=namespace,
-            token=token,
+            auth=auth,
             verify=str(ca_path),
             timeout=timeout,
         )

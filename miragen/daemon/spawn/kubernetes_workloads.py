@@ -39,14 +39,15 @@ Built and tested against a fake API server (httpx.MockTransport), like
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import httpx
 
 from miragen.daemon.spawn.base import SpawnOperationFailed
+from miragen.daemon.spawn.serviceaccount import INCLUSTER_DIR, ServiceAccountTokenAuth
 
 WORKLOAD_CLASSES = ("persistent", "ephemeral")
 AGENT_PORT = 8000
@@ -71,7 +72,7 @@ _STATE_SUBDIRS = (
     "runs", "workspaces", "histories", "schedules", "memory",
     "grok-home", "claude-home", "codex-home", "kimi-home",
 )
-_INCLUSTER_DIR = Path("/var/run/secrets/kubernetes.io/serviceaccount")
+_INCLUSTER_DIR = INCLUSTER_DIR
 
 
 class InClusterConfigUnavailable(Exception):
@@ -176,25 +177,32 @@ class KubernetesWorkloadDriver:
         self,
         *,
         base_url: str,
-        token: str,
+        token: str | None = None,
+        auth: httpx.Auth | None = None,
         transport: httpx.BaseTransport | None = None,
         verify: str | bool = True,
         timeout: float = 30.0,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
+        if (token is None) == (auth is None):
+            raise ValueError("pass exactly one of token and auth")
         self._client = httpx.Client(
             base_url=base_url.rstrip("/"),
-            headers={"Authorization": f"Bearer {token}"},
+            headers={} if token is None else {"Authorization": f"Bearer {token}"},
+            auth=auth,
             transport=transport,
             verify=verify if transport is None else True,
             timeout=timeout,
         )
+        self._monotonic = monotonic
+        self._failing_since: float | None = None
 
     @classmethod
     def from_incluster_config(cls, *, timeout: float = 30.0) -> KubernetesWorkloadDriver:
         import os
 
         try:
-            token = (_INCLUSTER_DIR / "token").read_text().strip()
+            auth = ServiceAccountTokenAuth(_INCLUSTER_DIR / "token")
             ca_path = _INCLUSTER_DIR / "ca.crt"
             if not ca_path.exists():
                 raise FileNotFoundError(str(ca_path))
@@ -206,16 +214,36 @@ class KubernetesWorkloadDriver:
         port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
         if not host:
             raise InClusterConfigUnavailable("KUBERNETES_SERVICE_HOST is not set")
-        return cls(base_url=f"https://{host}:{port}", token=token, verify=str(ca_path),
+        return cls(base_url=f"https://{host}:{port}", auth=auth, verify=str(ca_path),
                    timeout=timeout)
 
     # -- the API server ---------------------------------------------------------
 
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         try:
-            return self._client.request(method, path, **kwargs)
+            response = self._client.request(method, path, **kwargs)
         except httpx.HTTPError as exc:
+            self._failed()
             raise SpawnOperationFailed(str(exc)) from exc
+        # Unreachable, unauthenticated or erroring: the API itself is down
+        # for this spoke. Any other answer, a 404 or 409 included, is not.
+        if response.status_code == 401 or response.status_code >= 500:
+            self._failed()
+        else:
+            self._failing_since = None
+        return response
+
+    def _failed(self) -> None:
+        if self._failing_since is None:
+            self._failing_since = self._monotonic()
+
+    def failing_for(self) -> float:
+        """Seconds the API server has failed every call, 0 while it answers.
+        Per-item errors are contained, so the spoke reads this to notice an
+        outage that never reaches its loop (miragen#224)."""
+        if self._failing_since is None:
+            return 0.0
+        return self._monotonic() - self._failing_since
 
     def _expect(self, response: httpx.Response, ok: tuple[int, ...], what: str) -> httpx.Response:
         if response.status_code not in ok:
