@@ -91,7 +91,11 @@ codex = [
 # Claude Code executor backend (claude-agent-sdk is the official Anthropic
 # package; the spawn backend needs no extra at all).
 claude-code = [
-    "claude-agent-sdk>=0.1.0",
+    # Pinned: the locked posture's options are snapshotted byte for byte
+    # (tests/test_claude_code_engineer.py), and the SDK also pins the bundled
+    # CLI (2.1.316). Bump deliberately: diff the release, then regenerate the
+    # golden only if the change leaves the posture's meaning intact.
+    "claude-agent-sdk==0.2.176",
 ]
 # Kimi Code executor backend (kimi-agent-sdk wraps the Kimi Code / kimi-cli
 # runtime; subscription OAuth lives under KIMI_CODE_HOME — see
