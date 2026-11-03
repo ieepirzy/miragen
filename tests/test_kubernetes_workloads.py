@@ -49,6 +49,8 @@ class FakeKubernetes:
         raise AssertionError(f"unexpected path {path}")
 
     def handler(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/version":  # the spoke's liveness probe
+            return httpx.Response(200, json={"gitVersion": "v1.36.4"})
         kind, name = self._parse(request.url.path)
         self.calls.append((request.method, f"{kind}/{name}"))
         store = self.objects[kind]

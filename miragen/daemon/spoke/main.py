@@ -15,7 +15,7 @@ from miragen.daemon.spawn.kubernetes_workloads import KubernetesWorkloadDriver
 from miragen.daemon.spoke.agents import AgentClient
 from miragen.daemon.spoke.config import SpokeConfigInvalid, load_config
 from miragen.daemon.spoke.hub import HubClient
-from miragen.daemon.spoke.loop import Spoke
+from miragen.daemon.spoke.loop import HubUnauthorized, KubeOutage, Spoke
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,9 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
     logger.info("spoke pulling from the hub; %d namespace(s) served", len(config.namespaces))
     try:
         spoke.run_forever(should_stop=lambda: stopping["now"])
+    except (KubeOutage, HubUnauthorized) as exc:
+        logger.error("%s; exiting so the pod restarts", exc)
+        raise SystemExit(1) from exc
     finally:
         hub.close()
 
