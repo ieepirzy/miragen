@@ -1209,6 +1209,19 @@ class HarnessSpec(_ProfileModel):
         ),
     )
 
+    turn_timeout_s: Optional[int] = Field(
+        default=None, ge=60, le=86400,
+        # Left out of serialized profiles when unset, like subagent_model's
+        # default: a v6 runtime (extra=forbid) rejects the key. Set, it
+        # implies contract 7 (inferred_contract).
+        exclude_if=lambda v: v is None,
+        description=(
+            "Any posture: this agent's turn timeout in seconds. Unset uses the "
+            "deployment-wide MIRAGEN_CLAUDE_TURN_TIMEOUT_S (default 600). Still "
+            "raised to outlast gated tool calls when approvals are required."
+        ),
+    )
+
     @field_validator("env_passthrough")
     @classmethod
     def _passthrough_allowed(cls, names: list[str]) -> list[str]:
@@ -2010,11 +2023,14 @@ class AgentProfile(_ProfileModel):
         rejects even `agent_type: internal` as an unknown key. Serialization
         drops the default (exclude_if on the field), so a profile that
         never declared it, or declared `internal`, dumps back to contract 1."""
+        harness = self.spec.harness if self.spec is not None else None
+        if harness is not None and harness.turn_timeout_s is not None:
+            # By value: an unset timeout never reaches a dump (exclude_if).
+            return 7
         if "credentials" in self.model_fields_set:
             # By presence, like agent_type: miragend spawns the text as
             # written, and an older runtime rejects even `credentials: []`.
             return 6
-        harness = self.spec.harness if self.spec is not None else None
         if harness is not None and harness.subagent_model == "pin":
             # By value: "inherit" never reaches a dump (exclude_if), so only
             # a pin needs a runtime that knows the key.
@@ -2053,7 +2069,7 @@ class AgentProfile(_ProfileModel):
                 f"features requiring {format_api_version(inferred)} "
                 "(the executor tier is a v2 surface, agent_type a v3 one, "
                 "spec.harness a v4 one, spec.harness.subagent_model: pin a v5 one, "
-                "credentials a v6 one) — "
+                "credentials a v6 one, spec.harness.turn_timeout_s a v7 one) — "
                 "a profile must not understate its runtime requirement"
             )
         return self
