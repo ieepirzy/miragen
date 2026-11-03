@@ -13,6 +13,7 @@ and templates this file names. Nothing here ever comes from the hub.
       interval_seconds: 5
       max_backoff_seconds: 60
       kube_outage_exit_seconds: 300       # exit, so the kubelet restarts us
+      hub_unauthorized_exit_seconds: 300  # likewise, re-reading token_file
       claim_limit: 8
     images:                               # every image a template may use
       - registry.example/miragen@sha256:<digest>
@@ -79,6 +80,9 @@ class SpokeConfig:
     # How long every Kubernetes API call may fail before the spoke exits
     # non-zero so the kubelet restarts it, instead of backing off forever.
     kube_outage_exit_seconds: float = 300.0
+    # How long the hub may answer every call with 401 before the spoke exits
+    # so a restart re-reads a rotated token file.
+    hub_unauthorized_exit_seconds: float = 300.0
     agent_timeout_seconds: float = 30.0
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -188,6 +192,7 @@ def parse_config(raw: dict[str, Any]) -> SpokeConfig:
         wait_seconds=max(0, min(int(poll.get("wait_seconds", 25)), 25)),
         resync_seconds=float(poll.get("resync_seconds", 300)),
         kube_outage_exit_seconds=float(poll.get("kube_outage_exit_seconds", 300)),
+        hub_unauthorized_exit_seconds=float(poll.get("hub_unauthorized_exit_seconds", 300)),
         agent_timeout_seconds=float(raw.get("agent_timeout_seconds", 30)),
     )
 

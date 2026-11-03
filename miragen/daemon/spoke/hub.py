@@ -38,6 +38,8 @@ The contract is MiraRun's published `docs/contracts/spoke-api/openapi.json`
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -207,6 +209,7 @@ class HubClient:
         *,
         timeout: float = 70.0,
         transport: httpx.BaseTransport | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._client = httpx.Client(
             base_url=base_url.rstrip("/"),
@@ -214,6 +217,25 @@ class HubClient:
             timeout=timeout,
             transport=transport,
         )
+        self._monotonic = monotonic
+        self._unauthorized_since: float | None = None
+
+    def _seen(self, response: httpx.Response) -> None:
+        # Only a 401 says the spoke's own token is bad; any other answer
+        # proves it still works. An unreachable hub says nothing either way.
+        if response.status_code == 401:
+            if self._unauthorized_since is None:
+                self._unauthorized_since = self._monotonic()
+        else:
+            self._unauthorized_since = None
+
+    def unauthorized_for(self) -> float:
+        """Seconds the hub has answered every call with 401, 0 otherwise. The
+        token is read once at start-up, so a revoked or rotated one only
+        recovers through a restart, which re-reads the Secret's file."""
+        if self._unauthorized_since is None:
+            return 0.0
+        return self._monotonic() - self._unauthorized_since
 
     def close(self) -> None:
         self._client.close()
@@ -223,6 +245,7 @@ class HubClient:
             response = self._client.post(path, json=body)
         except httpx.HTTPError as exc:
             raise HubUnavailable(type(exc).__name__) from exc
+        self._seen(response)
         return _checked(response, lease=lease)
 
     def _get(self, path: str) -> httpx.Response:
@@ -230,6 +253,7 @@ class HubClient:
             response = self._client.get(path)
         except httpx.HTTPError as exc:
             raise HubUnavailable(type(exc).__name__) from exc
+        self._seen(response)
         return _checked(response, lease=False)
 
     def claim_intents(self, limit: int, *, wait_seconds: int = 0) -> list[ClaimedIntent]:

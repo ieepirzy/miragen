@@ -1,5 +1,6 @@
 """miragen#224: the spoke keeps its rotating ServiceAccount token current,
-and exits when the Kubernetes API has failed every call for too long."""
+and exits when the Kubernetes API has failed every call, or the hub has
+refused its token on every call, for too long."""
 
 from __future__ import annotations
 
@@ -14,7 +15,8 @@ from miragen.daemon.spawn import kubernetes_workloads
 from miragen.daemon.spawn.base import SpawnOperationFailed
 from miragen.daemon.spawn.kubernetes_workloads import KubernetesWorkloadDriver
 from miragen.daemon.spawn.serviceaccount import ServiceAccountTokenAuth
-from miragen.daemon.spoke.loop import KubeOutage
+from miragen.daemon.spoke.hub import HubClient, HubUnavailable
+from miragen.daemon.spoke.loop import HubUnauthorized, KubeOutage
 from tests.test_spoke_pull_mode import World
 
 
@@ -163,3 +165,57 @@ def test_a_spoke_whose_api_recovers_does_not_exit():
 
     world.spoke.run_forever(should_stop=_paced(clock, 12, heal), sleep=lambda _: None)
     assert world.spoke.driver.failing_for() == 0.0
+
+
+def _revocable_hub(world, clock: Clock) -> dict[str, bool]:
+    """The world's hub behind a switch that answers every call with 401, as
+    a hub does once the spoke's token is revoked or rotated."""
+    state = {"revoked": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if state["revoked"]:
+            return httpx.Response(401, json={"detail": "invalid spoke token"})
+        return world.hub.handler(request)
+
+    world.spoke.hub = HubClient("https://hub.invalid", "mrsp_" + "x" * 43,
+                                transport=httpx.MockTransport(handler), monotonic=clock)
+    world.spoke.events = world.spoke.hub
+    return state
+
+
+def test_the_spoke_exits_once_the_hub_has_refused_its_token_past_the_bound():
+    world = World(poll={"hub_unauthorized_exit_seconds": 300})
+    clock = Clock()
+    hub = _revocable_hub(world, clock)
+    hub["revoked"] = True
+    with pytest.raises(HubUnauthorized):
+        world.spoke.run_forever(should_stop=_paced(clock, 50), sleep=lambda _: None)
+    assert 300 <= clock.now <= 420
+
+
+def test_a_hub_that_accepts_the_token_again_does_not_end_the_spoke():
+    world = World(poll={"hub_unauthorized_exit_seconds": 300})
+    clock = Clock()
+    hub = _revocable_hub(world, clock)
+    hub["revoked"] = True
+
+    def restore() -> None:
+        if clock.now >= 240:
+            hub["revoked"] = False
+
+    world.spoke.run_forever(should_stop=_paced(clock, 12, restore), sleep=lambda _: None)
+    assert world.spoke.hub.unauthorized_for() == 0.0
+
+
+def test_an_unreachable_hub_does_not_count_as_a_refused_token():
+    clock = Clock()
+
+    def down(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    hub = HubClient("https://hub.invalid", "t", transport=httpx.MockTransport(down),
+                    monotonic=clock)
+    with pytest.raises(HubUnavailable):
+        hub.claim_intents(1)
+    clock.now = 1000
+    assert hub.unauthorized_for() == 0.0

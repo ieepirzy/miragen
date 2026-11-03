@@ -44,8 +44,11 @@ Failures are contained:
   makes the whole loop back off, with capped exponential backoff, rather
   than spin or die;
 - a Kubernetes API that has failed every call for
-  `poll.kube_outage_exit_seconds` ends the loop with `KubeOutage`, so the
-  process exits non-zero and the kubelet restarts it (miragen#224).
+  `poll.kube_outage_exit_seconds` ends the loop with `KubeOutage`, and a hub
+  that has answered every call with 401 for
+  `poll.hub_unauthorized_exit_seconds` ends it with `HubUnauthorized`. Either
+  way the process exits non-zero and the kubelet restarts it, re-reading
+  both tokens (miragen#224).
 
 Nothing here is pushed by the hub. Every call is the spoke's.
 """
@@ -189,6 +192,10 @@ class KubeOutage(Exception):
     """The Kubernetes API has failed every call for too long to wait out."""
 
 
+class HubUnauthorized(Exception):
+    """The hub has refused the spoke's token on every call for too long."""
+
+
 @dataclass
 class Spoke:
     config: SpokeConfig
@@ -329,21 +336,24 @@ class Spoke:
                 busy = self.tick()
                 failures = 0
             except (HubUnavailable, HubRefused, SpawnOperationFailed) as exc:
-                self._check_kube()
+                self._check_health()
                 failures += 1
                 delay = self.backoff(failures)
                 logger.warning("%s (%s); retrying in %.0fs", type(exc).__name__, exc, delay)
                 sleep(delay)
                 continue
-            self._check_kube()
+            self._check_health()
             if not busy and (self.runs or self.config.wait_seconds == 0):
                 # A long-poll already waited; only pace a loop that did not.
                 sleep(self.config.interval_seconds)
 
-    def _check_kube(self) -> None:
+    def _check_health(self) -> None:
         down = self.driver.failing_for()
         if down >= self.config.kube_outage_exit_seconds:
             raise KubeOutage(f"the Kubernetes API has failed every call for {down:.0f}s")
+        refused = self.hub.unauthorized_for()
+        if refused >= self.config.hub_unauthorized_exit_seconds:
+            raise HubUnauthorized(f"the hub has answered every call with 401 for {refused:.0f}s")
 
     def backoff(self, failures: int) -> float:
         delay = min(self.config.max_backoff_seconds,
