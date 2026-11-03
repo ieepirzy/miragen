@@ -152,6 +152,33 @@ def test_the_spoke_exits_once_the_api_has_failed_past_the_bound():
     assert 300 <= clock.now <= 420
 
 
+def test_an_idle_spoke_after_one_failure_does_not_exit_against_a_healthy_api():
+    # One failed call, then no workloads to call about: the clock is stale,
+    # and the probe before exiting shows the API answering again.
+    world = World(poll={"kube_outage_exit_seconds": 300})
+    clock = Clock()
+    world.spoke.driver._monotonic = clock
+    probes: list[float] = []
+    probe = world.spoke.driver.probe
+
+    def recorded() -> None:
+        probes.append(clock.now)
+        probe()
+
+    world.spoke.driver.probe = recorded
+
+    def script() -> None:
+        if clock.now == 120:  # after recover(): one intent, one 500
+            world.offer()
+            world.k8s_fail.add("/configmaps")
+        elif clock.now == 180:  # healthy again; nothing left to call about
+            world.k8s_fail.clear()
+            world.hub.intents.clear()
+
+    world.spoke.run_forever(should_stop=_paced(clock, 12, script), sleep=lambda _: None)
+    assert probes and world.spoke.driver.failing_for() == 0.0
+
+
 def test_a_spoke_whose_api_recovers_does_not_exit():
     world = World(poll={"kube_outage_exit_seconds": 300})
     world.running()

@@ -245,6 +245,16 @@ class KubernetesWorkloadDriver:
             return 0.0
         return self._monotonic() - self._failing_since
 
+    def probe(self) -> None:
+        """One cheap call (`GET /version`) to learn whether the API answers
+        now. The outage clock only moves when calls are made, so an idle
+        spoke's last failure could be long stale: an answer clears it, a
+        failure keeps it running."""
+        try:
+            self._request("GET", "/version")
+        except SpawnOperationFailed:
+            pass
+
     def _expect(self, response: httpx.Response, ok: tuple[int, ...], what: str) -> httpx.Response:
         if response.status_code not in ok:
             raise SpawnOperationFailed(f"{what} failed: {response.status_code} {response.text}")

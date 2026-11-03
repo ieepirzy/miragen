@@ -348,6 +348,9 @@ class Spoke:
                 sleep(self.config.interval_seconds)
 
     def _check_health(self) -> None:
+        if self.driver.failing_for() >= self.config.kube_outage_exit_seconds:
+            # The clock may be stale (an idle spoke makes no calls): ask once.
+            self.driver.probe()
         down = self.driver.failing_for()
         if down >= self.config.kube_outage_exit_seconds:
             raise KubeOutage(f"the Kubernetes API has failed every call for {down:.0f}s")
