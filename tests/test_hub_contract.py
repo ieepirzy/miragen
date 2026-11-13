@@ -327,3 +327,31 @@ def test_the_spokes_heartbeat_is_what_the_hub_parses(world):
     assert sent["address"] == "spoke-pod-1:8080"
     assert sent["capabilities"] == ("resolve",)
     assert [n.namespace for n in sent["namespaces"]] == ["agents-sandbox"]
+
+
+def test_the_spokes_resolve_outcome_is_what_the_hub_reads():
+    # MiraRun ADR-050 Decision 4: the hub's own reading of a resolve's
+    # settle result, fed miragen's resolver output as the spoke sends it.
+    reader = getattr(aw, "_resolution", None)
+    if reader is None:
+        pytest.skip("this hub predates spoke-resolved EDFs")
+    from miragen.daemon.spoke.config import EdfPolicy
+    from miragen.daemon.spoke.resolve import resolve_allowed
+
+    edf = {"apiVersion": "mirarun.io/v1alpha1", "kind": "Environment",
+           "metadata": {"name": "analyst"},
+           "spec": {"executor": {"kind": "codex"}, "workspace": {"repositories": []}}}
+    resolved = resolve_allowed(edf, EdfPolicy())
+    body = resolved.model_dump(mode="json")
+    body["source_sha256"] = "f" * 64
+    revision_id = uuid4()
+    delivery = wd.Delivery(
+        organization_id=uuid4(), id=uuid4(), intent_id=uuid4(), spoke_organization_id=uuid4(),
+        spoke_id=uuid4(), kind="resolve", idempotency_key="resolve:x", created_at=NOW,
+        payload={"revision_id": str(revision_id), "source_sha256": "f" * 64})
+    update = reader(delivery, "accepted", {"resolution": "resolved", "resolved": body}, None)
+    assert update.status == "resolved" and update.revision_id == revision_id
+    assert update.resolved_sha256 == resolved.sha256
+    invalid = reader(delivery, "accepted",
+                     {"resolution": "invalid", "errors": [{"loc": "", "message": "no"}]}, None)
+    assert invalid.status == "invalid"

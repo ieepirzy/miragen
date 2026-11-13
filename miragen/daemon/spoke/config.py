@@ -32,6 +32,11 @@ and templates this file names. Nothing here ever comes from the hub.
       agents-tenant-a:
         classes: [ephemeral]
         organizations: [<tenant uuid>]
+        edf:                              # what an EDF resolved here may name;
+          presets: [mirarun-default]      # without this section, none resolves
+          tool_servers:                   # MCP server URLs: exact, or a prefix
+            - https://tools.example/mcp/  #   when the entry ends with "/"
+          targets: [staging]
     network_label_keys:                   # hub labels the spoke will set on a pod
       - access.mirarun.io/loimi
     heartbeat:                            # optional
@@ -62,9 +67,29 @@ class SpokeConfigInvalid(Exception):
 
 
 @dataclass(frozen=True)
+class EdfPolicy:
+    """What an EDF resolved for a namespace may name (MiraRun ADR-050
+    Decision 4). The hub cannot widen it: it comes from this file only. An
+    EDF v1alpha1 names no image (the class template's image is the one
+    that runs, and `images` already bounds that)."""
+
+    presets: frozenset[str] = frozenset()
+    tool_servers: tuple[str, ...] = ()
+    targets: frozenset[str] = frozenset()
+
+    def allows_tool_server(self, url: str) -> bool:
+        return any(
+            url == entry or (entry.endswith("/") and url.startswith(entry))
+            for entry in self.tool_servers
+        )
+
+
+@dataclass(frozen=True)
 class NamespacePolicy:
     classes: frozenset[str]
     organizations: frozenset[UUID]
+    # None: this namespace resolves no EDF at all (fails closed).
+    edf: EdfPolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -184,7 +209,9 @@ def parse_config(raw: dict[str, Any]) -> SpokeConfig:
             raise SpokeConfigInvalid(f"namespaces.{name}.organizations: {exc}") from exc
         if not organizations:
             raise SpokeConfigInvalid(f"namespaces.{name}.organizations must not be empty")
-        namespaces[name] = NamespacePolicy(classes=allowed, organizations=organizations)
+        namespaces[name] = NamespacePolicy(
+            classes=allowed, organizations=organizations, edf=_edf_policy(name, body.get("edf"))
+        )
     if not namespaces:
         raise SpokeConfigInvalid("namespaces: at least one is required")
 
@@ -218,6 +245,28 @@ def parse_config(raw: dict[str, Any]) -> SpokeConfig:
         agent_timeout_seconds=float(raw.get("agent_timeout_seconds", 30)),
         heartbeat_seconds=max(5.0, min(float(heartbeat.get("interval_seconds", 30)), 300.0)),
         heartbeat_address=address,
+    )
+
+
+def _edf_policy(namespace: str, raw: Any) -> EdfPolicy | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise SpokeConfigInvalid(f"namespaces.{namespace}.edf must be a mapping")
+    lists: dict[str, list[str]] = {}
+    for key in ("presets", "tool_servers", "targets"):
+        value = raw.get(key) or []
+        if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+            raise SpokeConfigInvalid(f"namespaces.{namespace}.edf.{key} must be a list of strings")
+        lists[key] = value
+    for url in lists["tool_servers"]:
+        if not url.startswith(("https://", "http://")):
+            raise SpokeConfigInvalid(
+                f"namespaces.{namespace}.edf.tool_servers: '{url}' is not an http(s) URL")
+    return EdfPolicy(
+        presets=frozenset(lists["presets"]),
+        tool_servers=tuple(lists["tool_servers"]),
+        targets=frozenset(lists["targets"]),
     )
 
 

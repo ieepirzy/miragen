@@ -177,9 +177,13 @@ class StrictHub:
         if body["attempt"] != claimed["attempt"]:
             return _refuse(409, "the lease is no longer yours")
         result = body.get("result")
-        if claimed["kind"] != "launch" and result is not None:
-            # Settled means dispatched: only an accepted launch carries a result.
-            return _refuse(422, "only an accepted launch carries a result")
+        if claimed["kind"] not in ("launch", "resolve") and result is not None:
+            # Settled means dispatched: only an accepted launch carries a
+            # result, and a resolve its outcome (MiraRun ADR-050 D4).
+            return _refuse(422, "only an accepted launch or resolve carries a result")
+        if claimed["kind"] == "resolve" and status == "accepted" and not (
+                result and result.get("resolution") in ("resolved", "invalid")):
+            return _refuse(422, "an accepted resolve needs its result.resolution")
         if claimed["kind"] == "launch" and status == "accepted" and not (
                 result and result.get("run_id")):
             return _refuse(422, "an accepted launch needs its result.run_id")

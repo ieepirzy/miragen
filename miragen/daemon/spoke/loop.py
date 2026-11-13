@@ -17,6 +17,11 @@ One tick:
      key. A failure where nothing or anything may have arrived is left
      unsettled, so the hub offers it again and the agent deduplicates.
      `discard` is idempotent by nature;
+   - `resolve` needs no agent: the EDF is checked against the namespace's
+     `edf` allowlist and resolved here (`spoke/resolve.py`), and the
+     outcome (`resolved` with the canonical result and hash, or `invalid`
+     with the errors) goes up with the settle. A `launch` that carries the
+     EDF and its hash is re-resolved first and refused if either changed;
    - `resume`, `abandon` are forwarded at most once. If the outcome is
      unknown, they are settled `uncertain` and never sent again. If nothing
      was sent (the connection never opened), they are settled `rejected`.
@@ -80,6 +85,7 @@ from miragen.daemon.spoke.agents import (
     AgentUnreachable,
 )
 from miragen.daemon.spoke.config import SpokeConfig
+from miragen.daemon.spoke.resolve import EdfRefused, resolve_allowed
 from miragen.daemon.spoke.credentials import ModelCredentialSource, NoModelCredentials
 from miragen.daemon.spoke.hub import (
     ClaimedDelivery,
@@ -234,7 +240,7 @@ class Spoke:
     _next_heartbeat: float = 0.0
     _heartbeat_supported: bool = True
     # What the heartbeat reports beyond the base contract.
-    capabilities: tuple[str, ...] = ()
+    capabilities: tuple[str, ...] = ("resolve",)
     version: str = field(default_factory=lambda: spoke_version())
     host_name: Callable[[], str] = socket.gethostname
     started_at: datetime | None = None
@@ -669,6 +675,10 @@ class Spoke:
             # Its lease is gone: the hub may already count it uncertain.
             self._settle(delivery, "rejected", "lease_expired")
             return
+        if delivery.kind == "resolve":
+            # Needs no agent: resolved here, against this spoke's allowlist.
+            self._resolve(delivery)
+            return
         if delivery.kind == "launch" and delivery.credentials is None:
             self._settle(delivery, "rejected",
                          "refused: a launch is never forwarded without its credentials")
@@ -718,6 +728,63 @@ class Spoke:
             return
         self._settle(delivery, "accepted", forwarded.detail, forwarded.result)
 
+    def _resolve(self, delivery: ClaimedDelivery) -> None:
+        """A `resolve` (MiraRun ADR-050 Decision 4): check the EDF against the
+        namespace's `edf` allowlist, then resolve it with miragen's own
+        resolver. Settled `accepted` with the outcome either way; `rejected`
+        only when the delivery itself is unusable."""
+        payload = delivery.payload
+        tracked = self.workloads.get(delivery.intent_id)
+        # The tracked workload's namespace when there is one; otherwise the
+        # one the hub names, only if this spoke serves it for that tenant.
+        namespace = tracked.namespace if tracked is not None else payload.get("namespace")
+        policy = self.config.namespaces.get(namespace) if isinstance(namespace, str) else None
+        if policy is None or delivery.organization_id not in policy.organizations:
+            self._settle(delivery, "rejected",
+                         "the namespace is not served by this spoke for this tenant")
+            return
+        document = payload.get("edf")
+        source_sha256 = payload.get("source_sha256")
+        instructions = payload.get("instructions")
+        if not isinstance(document, dict) or not isinstance(source_sha256, str):
+            self._settle(delivery, "rejected", "payload.edf or payload.source_sha256 is missing")
+            return
+        try:
+            resolved = resolve_allowed(
+                document, policy.edf,
+                instructions=instructions if isinstance(instructions, str) else None)
+        except EdfRefused as exc:
+            self._settle(delivery, "accepted", f"invalid: {exc}"[:1024],
+                         {"resolution": "invalid", "errors": exc.errors})
+            return
+        body = resolved.model_dump(mode="json")
+        body["source_sha256"] = source_sha256
+        self._settle(delivery, "accepted", f"resolved {resolved.sha256[:12]}",
+                     {"resolution": "resolved", "resolved": body})
+
+    def _check_environment(self, delivery: ClaimedDelivery, tracked: TrackedWorkload) -> str | None:
+        """A launch's `environment` (ADR-050 D4): re-resolve its EDF under the
+        workload's namespace allowlist as it is now, and refuse the launch if
+        it is no longer allowed or resolves to another hash. The resolved hash
+        goes back as the launch's snapshot. A hub from before this sends
+        none, and nothing is checked."""
+        environment = delivery.payload.get("environment")
+        if environment is None:
+            return None
+        if not isinstance(environment, dict):
+            raise _Invalid("payload.environment is not an object")
+        document, expected = environment.get("edf"), environment.get("resolved_sha256")
+        if not isinstance(document, dict) or not isinstance(expected, str):
+            raise _Invalid("payload.environment needs edf and resolved_sha256")
+        policy = self.config.namespaces.get(tracked.namespace)
+        try:
+            resolved = resolve_allowed(document, policy.edf if policy is not None else None)
+        except EdfRefused as exc:
+            raise _Invalid(f"refused: the EDF is no longer allowed here: {exc}") from exc
+        if resolved.sha256 != expected:
+            raise _Invalid("refused: the EDF resolves to a different hash than the hub expects")
+        return resolved.sha256
+
     def _remember(self, delivery: ClaimedDelivery, status: str, detail: str | None) -> None:
         self.sent_once[delivery.delivery_id] = (status, detail)
         while len(self.sent_once) > _SENT_ONCE_MEMORY:
@@ -741,6 +808,8 @@ class Spoke:
                 raise _Invalid("payload.instance is missing or not an instance name")
             if not isinstance(prompt, str) or not prompt:
                 raise _Invalid("payload.prompt is missing")
+            snapshot = (self._check_environment(delivery, tracked)
+                        if delivery.kind == "launch" else None)
             accepted = self.agents.start_turn(
                 endpoint, token,
                 instance=instance,
@@ -763,6 +832,9 @@ class Spoke:
                     "status": str(accepted.get("status") or "running"),
                     "duplicate": bool(accepted.get("duplicate", False)),
                 }
+                if snapshot is not None:
+                    # The hub compares it with the hash it resolved.
+                    result["snapshot_sha256"] = snapshot
             return _Forwarded(detail, result, (instance, turn_id))
         if delivery.kind == "discard":
             instance = payload.get("instance")

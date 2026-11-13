@@ -111,6 +111,27 @@ Annotated in the module docstring of `miragen/daemon/spoke/config.py`:
 - **`poll`**: `interval_seconds`, `max_backoff_seconds`, `claim_limit`.
 - **`heartbeat`** (optional): `interval_seconds` (5 to 300, default 30) and
   `address` (default: the host name).
+- **`namespaces.<name>.edf`** (optional): what an EDF resolved for that
+  namespace may name: `presets`, `tool_servers` (an MCP server URL, exact,
+  or a prefix when the entry ends with `/`) and `targets`. A namespace
+  without it resolves no EDF. An EDF names no image; the class template's
+  image is what runs.
+
+### EDF resolution in the cluster
+
+A `resolve` delivery carries a source EDF. The spoke validates it, checks
+it against the namespace's `edf` allowlist, and only then resolves it with
+miragen's own resolver, so the canonical document and its SHA-256 are the
+same as anywhere else. It settles the delivery `accepted` with
+`{resolution: resolved, resolved: <the resolver's output>}` or
+`{resolution: invalid, errors: [...]}`; `rejected` only when the delivery
+itself is unusable (a namespace it does not serve for that tenant). No
+agent needs to run. A `launch` whose payload carries `environment: {edf,
+resolved_sha256}` is re-resolved under the allowlist as it is now and
+refused if the EDF is no longer allowed or the hash differs; the resolved
+hash goes back as the launch's `snapshot_sha256`. The heartbeat advertises
+the `resolve` capability, and the hub offers `resolve` only to a spoke that
+does.
 
 The file is mounted by the cluster's GitOps. Nothing in it comes from the
 hub.

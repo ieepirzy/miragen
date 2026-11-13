@@ -21,7 +21,7 @@ def test_the_first_tick_sends_a_heartbeat_the_contract_accepts():
         "version": "miragen 0.2.0 (abc123def456)",
         "address": "spoke-pod-1",
         "namespaces": [{"namespace": NS, "classes": ["ephemeral", "persistent"]}],
-        "capabilities": [],
+        "capabilities": ["resolve"],
         "started_at": world.spoke.started_at.isoformat(),
     }]
     # Before the claims: a restarted spoke says what it is first.
