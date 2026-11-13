@@ -34,6 +34,10 @@ and templates this file names. Nothing here ever comes from the hub.
         organizations: [<tenant uuid>]
     network_label_keys:                   # hub labels the spoke will set on a pod
       - access.mirarun.io/loimi
+    heartbeat:                            # optional
+      interval_seconds: 30
+      address: spoke.example:8080         # shown by the hub, never dialled;
+                                          # default: this pod's host name
 """
 
 from __future__ import annotations
@@ -84,6 +88,10 @@ class SpokeConfig:
     # so a restart re-reads a rotated token file.
     hub_unauthorized_exit_seconds: float = 300.0
     agent_timeout_seconds: float = 30.0
+    # The heartbeat (MiraRun ADR-050 Decision 3): how often, and the address
+    # it reports. None: the host name, as the spoke sees itself.
+    heartbeat_seconds: float = 30.0
+    heartbeat_address: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def token(self) -> str:
@@ -94,6 +102,13 @@ class SpokeConfig:
         if not value:
             raise SpokeConfigInvalid("the spoke token file is empty")
         return value
+
+    def served_namespaces(self) -> list[dict[str, Any]]:
+        """What the heartbeat reports: each namespace and its classes."""
+        return [
+            {"namespace": name, "classes": sorted(policy.classes)}
+            for name, policy in sorted(self.namespaces.items())
+        ]
 
     def allows(self, namespace: str, workload_class: str, organization_id: UUID) -> str | None:
         """None when allowed; otherwise why not, for the `refused` report."""
@@ -178,6 +193,13 @@ def parse_config(raw: dict[str, Any]) -> SpokeConfig:
         if not _LABEL_KEY.fullmatch(key):
             raise SpokeConfigInvalid(f"network_label_keys: '{key}' is not a label key")
 
+    heartbeat = raw.get("heartbeat") or {}
+    if not isinstance(heartbeat, dict):
+        raise SpokeConfigInvalid("heartbeat must be a mapping")
+    address = heartbeat.get("address")
+    if address is not None and (not isinstance(address, str) or not 0 < len(address) <= 255):
+        raise SpokeConfigInvalid("heartbeat.address must be a string of at most 255 characters")
+
     poll = raw.get("poll") or {}
     return SpokeConfig(
         hub_url=url.rstrip("/"),
@@ -194,6 +216,8 @@ def parse_config(raw: dict[str, Any]) -> SpokeConfig:
         kube_outage_exit_seconds=float(poll.get("kube_outage_exit_seconds", 300)),
         hub_unauthorized_exit_seconds=float(poll.get("hub_unauthorized_exit_seconds", 300)),
         agent_timeout_seconds=float(raw.get("agent_timeout_seconds", 30)),
+        heartbeat_seconds=max(5.0, min(float(heartbeat.get("interval_seconds", 30)), 300.0)),
+        heartbeat_address=address,
     )
 
 

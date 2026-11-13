@@ -106,6 +106,9 @@ class StubService:
     def open_runs(self, spoke):
         return list(self.open)
 
+    def heartbeat(self, spoke, **kwargs):
+        self.calls.append(("heartbeat", kwargs))
+
     def ingest_events(self, spoke, *, run_intent_id, backend_run, page):
         self.calls.append(("events", {"run": backend_run, "page": page}))
         last = max((e.sequence for e in page.events), default=page.next_after)
@@ -290,3 +293,37 @@ def test_the_claimed_model_token_is_minted_by_the_hub_and_verified_by_luotsi(wor
         "tenants: [{id: acme}]\n"
         "principals: [{id: agent.acme.profile.analyst, kind: workload, tenants: [acme]}]\n")
     assert policy.workload_principal(claims.principal) is not None
+
+
+def test_the_spokes_heartbeat_is_what_the_hub_parses(world):
+    # MiraRun ADR-050 Decision 3; skipped (by the route's 404) against a hub
+    # from before it.
+    from miragen.daemon.spoke.config import parse_config
+
+    service, hub = world
+    config = parse_config({
+        "hub": {"url": "https://hub.invalid", "token_file": "/nonexistent"},
+        "images": ["registry.invalid/miragen@sha256:" + "a" * 64],
+        "classes": {"ephemeral": {"image": "registry.invalid/miragen@sha256:" + "a" * 64,
+                                  "service_account_name": "agent"}},
+        "namespaces": {"agents-sandbox": {"classes": ["ephemeral"],
+                                          "organizations": [str(service.tenant)]}},
+    })
+    try:
+        answer = hub.heartbeat({
+            "version": "miragen 0.2.0 (abc123def456)",
+            "address": "spoke-pod-1:8080",
+            "namespaces": config.served_namespaces(),
+            "capabilities": ["resolve"],
+            "started_at": NOW.isoformat(),
+            "something_newer": {"ignored": True},
+        })
+    except HubRefused as refused:
+        if refused.status_code == 404:
+            pytest.skip("this hub predates the heartbeat route")
+        raise
+    assert answer["heartbeat_seconds"] == 30
+    (kind, sent), = [c for c in service.calls if c[0] == "heartbeat"]
+    assert sent["address"] == "spoke-pod-1:8080"
+    assert sent["capabilities"] == ("resolve",)
+    assert [n.namespace for n in sent["namespaces"]] == ["agents-sandbox"]

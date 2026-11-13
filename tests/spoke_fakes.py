@@ -1,8 +1,8 @@
 """Strict fakes for the spoke's tests: a hub that validates every request
 body and every response it sends against MiraRun's published spoke contract
 (tests/contracts/spoke-api.openapi.json, copied from mirarun
-docs/contracts/spoke-api/openapi.json at feat/workload-tokens
-de7d886), and enforces the hub's leases, write-once turn results and event
+docs/contracts/spoke-api/openapi.json at feat/spoke-heartbeat
+bbd7ee6, mirarun#308), and enforces the hub's leases, write-once turn results and event
 cursors; plus a fake agent. tests/test_hub_contract.py runs the same client
 against the real router."""
 
@@ -92,6 +92,9 @@ class StrictHub:
         self.now = NOW
         # "reject": refuse a replayed page (stricter); "skip": the published hub.
         self.replays = "reject"
+        # False: a hub from before the heartbeat route (MiraRun ADR-050), 404.
+        self.heartbeat_route = True
+        self.heartbeats: list[dict] = []
 
     def _injected(self, kind: str) -> int | None:
         planned = self.fail.get(kind)
@@ -119,6 +122,8 @@ class StrictHub:
         if injected is not None:
             return _refuse(injected, "injected")
         body = json.loads(request.content) if request.content else None
+        if kind == "heartbeat" and not self.heartbeat_route:
+            return _refuse(404, "Not Found")
         try:
             validate_request(request.method, full, body)
         except ContractViolation as exc:
@@ -148,6 +153,9 @@ class StrictHub:
             return httpx.Response(200, json={"runs": self.open})
         if kind == "token":
             return self._token(parts[2])
+        if kind == "heartbeat":
+            self.heartbeats.append(body)
+            return httpx.Response(200, json={"heartbeat_seconds": 30, "stale_after_seconds": 120})
         raise AssertionError(f"unexpected hub route {path}")
 
     def _claim(self, path: str, limit: int) -> httpx.Response:

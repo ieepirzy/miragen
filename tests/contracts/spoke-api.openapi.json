@@ -273,6 +273,24 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "HeartbeatResponse": {
+        "properties": {
+          "heartbeat_seconds": {
+            "title": "Heartbeat Seconds",
+            "type": "integer"
+          },
+          "stale_after_seconds": {
+            "title": "Stale After Seconds",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "heartbeat_seconds",
+          "stale_after_seconds"
+        ],
+        "title": "HeartbeatResponse",
+        "type": "object"
+      },
       "OpenRunResponse": {
         "properties": {
           "intent_id": {
@@ -486,7 +504,6 @@
           "content": {
             "application/json": {
               "schema": {
-                "additionalProperties": false,
                 "properties": {
                   "limit": {
                     "default": 32,
@@ -574,7 +591,6 @@
           "content": {
             "application/json": {
               "schema": {
-                "additionalProperties": false,
                 "description": "A session turn's reply: the agent's finished turn record\n(`GET /instances/{i}/turns/{id}`), sent after the turn's delivery was\nsettled `accepted` (dispatched).",
                 "properties": {
                   "result": {
@@ -666,7 +682,6 @@
           "content": {
             "application/json": {
               "schema": {
-                "additionalProperties": false,
                 "properties": {
                   "attempt": {
                     "maximum": 2147483647,
@@ -742,6 +757,142 @@
         ]
       }
     },
+    "/api/spoke/v1/heartbeat": {
+      "post": {
+        "description": "The spoke's version, address, served namespaces, capabilities and\nstart time. Stored on its row, overwriting the last one.",
+        "operationId": "heartbeat_api_spoke_v1_heartbeat_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "What the spoke says about itself, at start and every\nHEARTBEAT_SECONDS (ADR-050 Decision 3). Every field is optional: a spoke\nthat knows less still counts as seen. The address is shown, never\ndialled.",
+                "properties": {
+                  "address": {
+                    "anyOf": [
+                      {
+                        "maxLength": 255,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Address"
+                  },
+                  "capabilities": {
+                    "items": {
+                      "pattern": "^[a-z][a-z0-9_.-]{0,63}$",
+                      "type": "string"
+                    },
+                    "maxItems": 32,
+                    "title": "Capabilities",
+                    "type": "array"
+                  },
+                  "namespaces": {
+                    "items": {
+                      "properties": {
+                        "classes": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "maxItems": 8,
+                          "title": "Classes",
+                          "type": "array"
+                        },
+                        "namespace": {
+                          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+                          "title": "Namespace",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "namespace"
+                      ],
+                      "title": "ReportedNamespaceBody",
+                      "type": "object"
+                    },
+                    "maxItems": 64,
+                    "title": "Namespaces",
+                    "type": "array"
+                  },
+                  "started_at": {
+                    "anyOf": [
+                      {
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Started At"
+                  },
+                  "version": {
+                    "anyOf": [
+                      {
+                        "maxLength": 255,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Version"
+                  }
+                },
+                "title": "HeartbeatRequest",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeartbeatResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Heartbeat",
+        "tags": [
+          "spoke"
+        ]
+      }
+    },
     "/api/spoke/v1/intents/claim": {
       "post": {
         "operationId": "claim_intents_api_spoke_v1_intents_claim_post",
@@ -767,7 +918,6 @@
           "content": {
             "application/json": {
               "schema": {
-                "additionalProperties": false,
                 "properties": {
                   "limit": {
                     "default": 32,
@@ -864,7 +1014,6 @@
           "content": {
             "application/json": {
               "schema": {
-                "additionalProperties": false,
                 "properties": {
                   "attempt": {
                     "maximum": 2147483647,
@@ -956,7 +1105,6 @@
           "content": {
             "application/json": {
               "schema": {
-                "additionalProperties": false,
                 "properties": {
                   "attempt": {
                     "maximum": 2147483647,
@@ -1179,7 +1327,6 @@
           "content": {
             "application/json": {
               "schema": {
-                "additionalProperties": false,
                 "description": "miragen's `GET /runs/{id}` and `GET /runs/{id}/events` bodies, relayed\nunchanged; read by the same parsers the hub uses when it pulls.",
                 "properties": {
                   "events": {
@@ -1278,7 +1425,6 @@
           "content": {
             "application/json": {
               "schema": {
-                "additionalProperties": false,
                 "description": "Nothing to say: the workload is in the path and the spoke in the\ntoken. Declared so the contract stays complete, and read capped.",
                 "properties": {},
                 "title": "WorkloadTokenRequest",

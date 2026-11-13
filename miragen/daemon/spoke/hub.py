@@ -32,7 +32,10 @@ The contract is MiraRun's published `docs/contracts/spoke-api/openapi.json`
   The same reply again is 200 and a different one is 409; it is accepted
   after the settle, and after the lease has expired;
 - `OPEN_RUNS_ROUTE`: `GET`, the spoke's accepted, unfinished runs, with the
-  hub's cursor for each, so a restarted spoke resumes relaying.
+  hub's cursor for each, so a restarted spoke resumes relaying;
+- `HEARTBEAT_ROUTE`: `POST`, what the spoke says about itself (version,
+  address, served namespaces, capabilities, start time), at start and every
+  `heartbeat.interval_seconds`. A hub that answers 404 has no such route.
 """
 
 from __future__ import annotations
@@ -59,6 +62,9 @@ MAX_CLAIM_WAIT_SECONDS = 25
 TURN_RESULT_ROUTE = API_PREFIX + "/deliveries/{delivery_id}/result"
 OPEN_RUNS_ROUTE = API_PREFIX + "/runs/open"
 MODEL_TOKEN_ROUTE = API_PREFIX + "/workloads/{organization_id}/{intent_id}/token"
+# What the spoke says about itself (MiraRun ADR-050 Decision 3). A hub from
+# before that route answers 404, and the spoke stops sending it.
+HEARTBEAT_ROUTE = API_PREFIX + "/heartbeat"
 
 
 class HubUnavailable(Exception):
@@ -327,6 +333,12 @@ class HubClient:
         if not all(isinstance(body.get(k), str) for k in ("env", "token", "expires_at")):
             raise HubUnavailable("malformed token response")
         return {"env": body["env"], "token": body["token"], "expires_at": body["expires_at"]}
+
+    def heartbeat(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Version, address, served namespaces, capabilities and start time.
+        The answer is read tolerantly: whatever it says beyond what the
+        spoke understands is ignored."""
+        return _json(self._post(HEARTBEAT_ROUTE, body))
 
     def open_runs(self) -> list[OpenRun]:
         body = _json(self._get(OPEN_RUNS_ROUTE))

@@ -60,6 +60,7 @@ import logging
 import random
 import re
 import secrets
+import socket
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -124,6 +125,20 @@ _MODEL_REFRESH_MARGIN = timedelta(minutes=5)
 _MODEL_MINT_INTERVAL = timedelta(seconds=60)
 _MODEL_PUSH_RETRY = timedelta(seconds=15)
 _ENDED_PHASES = frozenset({"succeeded", "failed", "absent", "stopped", "deleted"})
+
+
+def spoke_version() -> str:
+    """`miragen <version>`, and the image's build commit when it has one."""
+    try:
+        from importlib.metadata import version
+
+        installed = version("miragen")
+    except Exception:  # noqa: BLE001 - a version is a nicety, never a failure
+        installed = "unknown"
+    from miragen.observability import read_build_revision
+
+    revision = read_build_revision()
+    return f"miragen {installed}" + (f" ({revision[:12]})" if revision else "")
 
 
 def workload_name(intent_id: UUID) -> str:
@@ -214,11 +229,22 @@ class Spoke:
     monotonic: Callable[[], float] = time.monotonic
     _next_resync: float = 0.0
     _open_runs_supported: bool = True
+    # The heartbeat (MiraRun ADR-050 Decision 3): at start, then every
+    # `heartbeat.interval_seconds`. Off for good once the hub answers 404.
+    _next_heartbeat: float = 0.0
+    _heartbeat_supported: bool = True
+    # What the heartbeat reports beyond the base contract.
+    capabilities: tuple[str, ...] = ()
+    version: str = field(default_factory=lambda: spoke_version())
+    host_name: Callable[[], str] = socket.gethostname
+    started_at: datetime | None = None
     sent_once: OrderedDict[UUID, tuple[str, str | None]] = field(default_factory=OrderedDict)
 
     def __post_init__(self) -> None:
         if self.events is None:
             self.events = self.hub
+        if self.started_at is None:
+            self.started_at = self.clock()
 
     # -- start-up ---------------------------------------------------------------
 
@@ -270,6 +296,35 @@ class Spoke:
         for open_run in open_runs:
             self._adopt_run(open_run)
 
+    def send_heartbeat(self) -> None:
+        """Say what this spoke is. Never stops the loop: a hub without the
+        route (404) is not asked again, and any other failure is retried at
+        the next interval. Claims stamp the hub's last-seen clock anyway."""
+        self._next_heartbeat = self.monotonic() + self.config.heartbeat_seconds
+        if not self._heartbeat_supported:
+            return
+        assert self.started_at is not None
+        body = {
+            "version": self.version[:255],
+            "address": (self.config.heartbeat_address or self.host_name())[:255],
+            "namespaces": self.config.served_namespaces(),
+            "capabilities": list(self.capabilities),
+            "started_at": self.started_at.isoformat(),
+        }
+        try:
+            self.hub.heartbeat(body)
+        except HubRefused as exc:
+            if exc.status_code == 404:
+                self._heartbeat_supported = False
+                logger.warning("the hub has no heartbeat route; not sending heartbeats")
+            elif exc.status_code == 401:
+                raise
+            else:
+                logger.warning("the hub refused the heartbeat: %s", exc)
+        except HubUnavailable as exc:
+            logger.warning("heartbeat not delivered (%s); retrying in %.0fs",
+                           exc, self.config.heartbeat_seconds)
+
     def _adopt_run(self, open_run: OpenRun) -> None:
         key = f"{open_run.intent_id}/{open_run.agent_run_id}"
         run = self.runs.get(key)
@@ -288,6 +343,8 @@ class Spoke:
     def tick(self) -> bool:
         """One pass. True when anything was claimed, so the caller polls
         again at once instead of sleeping."""
+        if self.monotonic() >= self._next_heartbeat:
+            self.send_heartbeat()
         if self.monotonic() >= self._next_resync:
             self.resync_open_runs()
         busy = False

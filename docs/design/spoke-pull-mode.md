@@ -21,6 +21,14 @@ listed in §6, which the spoke's own driver does not have.
 
 ## 2. One tick
 
+0. **Heartbeat.** At start and then every `heartbeat.interval_seconds`
+   (default 30), `POST /api/spoke/v1/heartbeat` says what this spoke is:
+   its version and build commit, the address it reports (configured, or
+   its host name), the namespaces it serves with their classes, the
+   capabilities it has beyond the base contract, and when it started. The
+   hub shows the address and never connects to it. A hub without the route
+   answers 404 and is not asked again; any other failure is retried at the
+   next interval and never stops the tick.
 1. **Intents.** `POST /api/spoke/v1/intents/claim` returns intents under a
    lease. For each one:
    - **Check it against the local allowlist.** That covers the namespace
@@ -101,6 +109,8 @@ Annotated in the module docstring of `miragen/daemon/spoke/config.py`:
 - **`namespaces.<name>`**: `classes` and `organizations`.
 - **`network_label_keys`**.
 - **`poll`**: `interval_seconds`, `max_backoff_seconds`, `claim_limit`.
+- **`heartbeat`** (optional): `interval_seconds` (5 to 300, default 30) and
+  `address` (default: the host name).
 
 The file is mounted by the cluster's GitOps. Nothing in it comes from the
 hub.
