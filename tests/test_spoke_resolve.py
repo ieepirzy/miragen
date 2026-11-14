@@ -184,3 +184,30 @@ def test_the_edf_section_is_checked():
     assert not policy.allows_tool_server("https://tools.example/mcpx")
     assert _config(namespaces={NS: base}).namespaces[NS].edf is None
     assert isinstance(TENANT, UUID)
+
+
+# -- the namespace's required RuntimeClass -----------------------------------
+
+def test_a_namespace_pins_the_runtime_class_its_pods_run_under():
+    base = {"classes": ["ephemeral"], "organizations": [str(TENANT)]}
+    config = _config(namespaces={NS: {**base, "runtime_class": "gvisor"}})
+    assert config.namespaces[NS].runtime_class == "gvisor"
+    assert config.allows(NS, "ephemeral", TENANT) is None
+    assert config.served_namespaces() == [
+        {"namespace": NS, "classes": ["ephemeral"], "runtime_class": "gvisor"}]
+    # The persistent template in _config sets no RuntimeClass: a namespace
+    # pinning one and allowing that class is refused at start.
+    with pytest.raises(SpokeConfigInvalid, match="runtime_class"):
+        _config(namespaces={NS: {**base, "classes": ["persistent"], "runtime_class": "gvisor"}})
+    with pytest.raises(SpokeConfigInvalid, match="RuntimeClass name"):
+        _config(namespaces={NS: {**base, "runtime_class": "Not_A_Name"}})
+
+
+def test_an_intent_is_refused_when_its_template_does_not_run_under_the_pinned_class():
+    from dataclasses import replace
+
+    config = _config(namespaces={NS: {"classes": ["ephemeral"], "organizations": [str(TENANT)],
+                                      "runtime_class": "gvisor"}})
+    template = replace(config.classes["ephemeral"], runtime_class_name="runc")
+    loose = replace(config, classes={**config.classes, "ephemeral": template})
+    assert "RuntimeClass 'gvisor'" in loose.allows(NS, "ephemeral", TENANT)

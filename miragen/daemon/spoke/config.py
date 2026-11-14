@@ -32,6 +32,7 @@ and templates this file names. Nothing here ever comes from the hub.
       agents-tenant-a:
         classes: [ephemeral]
         organizations: [<tenant uuid>]
+        runtime_class: gvisor             # every pod here must use this RuntimeClass
         edf:                              # what an EDF resolved here may name;
           presets: [mirarun-default]      # without this section, none resolves
           tool_servers:                   # MCP server URLs: exact, or a prefix
@@ -90,6 +91,9 @@ class NamespacePolicy:
     organizations: frozenset[UUID]
     # None: this namespace resolves no EDF at all (fails closed).
     edf: EdfPolicy | None = None
+    # The RuntimeClass every pod rendered into this namespace must use (a
+    # sandbox such as gVisor). None: not pinned here.
+    runtime_class: str | None = None
 
 
 @dataclass(frozen=True)
@@ -131,7 +135,8 @@ class SpokeConfig:
     def served_namespaces(self) -> list[dict[str, Any]]:
         """What the heartbeat reports: each namespace and its classes."""
         return [
-            {"namespace": name, "classes": sorted(policy.classes)}
+            {"namespace": name, "classes": sorted(policy.classes),
+             **({"runtime_class": policy.runtime_class} if policy.runtime_class else {})}
             for name, policy in sorted(self.namespaces.items())
         ]
 
@@ -146,6 +151,9 @@ class SpokeConfig:
             return "this namespace does not serve the intent's organization"
         if workload_class not in self.classes:
             return f"no template for class '{workload_class}'"
+        required = policy.runtime_class
+        if required is not None and self.classes[workload_class].runtime_class_name != required:
+            return f"class '{workload_class}' does not run under RuntimeClass '{required}'"
         return None
 
 
@@ -209,11 +217,24 @@ def parse_config(raw: dict[str, Any]) -> SpokeConfig:
             raise SpokeConfigInvalid(f"namespaces.{name}.organizations: {exc}") from exc
         if not organizations:
             raise SpokeConfigInvalid(f"namespaces.{name}.organizations must not be empty")
+        runtime_class = body.get("runtime_class")
+        if runtime_class is not None and (
+                not isinstance(runtime_class, str) or not _DNS1123.fullmatch(runtime_class)):
+            raise SpokeConfigInvalid(f"namespaces.{name}.runtime_class: not a RuntimeClass name")
         namespaces[name] = NamespacePolicy(
-            classes=allowed, organizations=organizations, edf=_edf_policy(name, body.get("edf"))
+            classes=allowed, organizations=organizations, edf=_edf_policy(name, body.get("edf")),
+            runtime_class=runtime_class,
         )
     if not namespaces:
         raise SpokeConfigInvalid("namespaces: at least one is required")
+    for name, policy in namespaces.items():
+        for workload_class in policy.classes & set(classes):
+            if (policy.runtime_class is not None
+                    and classes[workload_class].runtime_class_name != policy.runtime_class):
+                raise SpokeConfigInvalid(
+                    f"namespaces.{name}.runtime_class is '{policy.runtime_class}' but"
+                    f" classes.{workload_class} runs under"
+                    f" '{classes[workload_class].runtime_class_name}'")
 
     label_keys = frozenset(str(k) for k in raw.get("network_label_keys") or ())
     for key in label_keys:
