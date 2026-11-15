@@ -94,7 +94,7 @@ def _read_only(path: Path) -> None:
 
 def _remove(path: Path) -> None:
     for current, dirs, files in os.walk(path, topdown=False):
-        os.chmod(current, 0o755)
+        os.chmod(current, 0o700)
         for name in files:
             (Path(current) / name).unlink()
         for name in dirs:
