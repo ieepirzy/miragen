@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -61,9 +62,8 @@ def write_plugin(skills: Sequence["PinnedSkill"], root: Path) -> Path:
     directory = root / f"{PLUGIN_NAME}-{bundle_digest(skills)[:16]}"
     if (directory / ".complete").is_file():
         return directory
-    staging = root / f".{directory.name}.{os.getpid()}"
-    if staging.exists():
-        _remove(staging)
+    # A fresh name every time: a staging directory never needs removing.
+    staging = root / f".{directory.name}.{uuid.uuid4().hex}"
     (staging / ".claude-plugin").mkdir(parents=True)
     (staging / ".claude-plugin" / "plugin.json").write_text(
         json.dumps({"name": PLUGIN_NAME, "version": "1.0.0",
@@ -78,8 +78,9 @@ def write_plugin(skills: Sequence["PinnedSkill"], root: Path) -> Path:
     try:
         staging.rename(directory)
     except OSError:
-        # Another process won the rename: its copy has the same content.
-        _remove(staging)
+        # Another process won the rename: its copy has the same content, and
+        # this read-only staging copy (a few KiB) is left as it is.
+        pass
     return directory
 
 
@@ -90,16 +91,6 @@ def _read_only(path: Path) -> None:
         for name in dirs:
             os.chmod(Path(current) / name, 0o555)
     os.chmod(path, 0o555)
-
-
-def _remove(path: Path) -> None:
-    for current, dirs, files in os.walk(path, topdown=False):
-        os.chmod(current, 0o700)
-        for name in files:
-            (Path(current) / name).unlink()
-        for name in dirs:
-            (Path(current) / name).rmdir()
-    path.rmdir()
 
 
 def skills_instructions(skills: Sequence["PinnedSkill"]) -> str:
