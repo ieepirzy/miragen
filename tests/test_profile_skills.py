@@ -239,3 +239,12 @@ def test_a_lost_rename_still_returns_an_intact_directory(tmp_path, monkeypatch):
     got = write_plugin(prof.spec.skills, tmp_path)
     assert got.is_dir()
     assert (got / "skills" / "brand-voice-fi" / "SKILL.md").read_text() == VOICE
+
+
+def test_frontmatter_is_read_line_by_line_like_skill_md_is_written():
+    from miragen.skills import skill_text_problem
+
+    text = "---\nname: x\ndescription: Rules for posts: when and how\n---\nbody\n"
+    assert skill_text_problem("x", "Rules for posts: when and how", text) is None
+    nested = "---\nname: x\ndescription: d\nallowed-tools:\n  - Bash\n---\nb\n"
+    assert "frontmatter" in skill_text_problem("x", "d", nested)

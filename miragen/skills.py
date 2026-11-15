@@ -48,21 +48,32 @@ _MANIFEST = json.dumps({"name": PLUGIN_NAME, "version": "1.0.0",
                         "description": "Skills pinned by MiraRun for this agent"})
 
 
-def _frontmatter(content: str) -> dict | None:
-    import yaml
-
-    if not content.startswith("---\n"):
-        return None
-    end = content.find("\n---\n", 4)
-    if end == -1 and content.endswith("\n---"):
-        end = len(content) - 4
-    if end == -1:
+def _frontmatter(content: str) -> dict[str, str] | None:
+    """The SKILL.md frontmatter, read line by line (SKILL.md frontmatter is
+    often not strict YAML: an unquoted colon in a description). Strict: every
+    line is a single-line `key: value` at column 0, no key twice; anything
+    else (an indented or continuation line) makes it unreadable (None)."""
+    lines = content.split("\n")
+    if not lines or lines[0] != "---":
         return None
     try:
-        parsed = yaml.safe_load(content[4:end])
-    except yaml.YAMLError:
+        end = lines.index("---", 1)
+    except ValueError:
         return None
-    return parsed if isinstance(parsed, dict) else None
+    out: dict[str, str] = {}
+    for line in lines[1:end]:
+        if not line.strip():
+            continue
+        if line[0] in " \t" or ":" not in line:
+            return None
+        key, _, value = line.partition(":")
+        key, value = key.strip(), value.strip()
+        if not key or key in out:
+            return None
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        out[key] = value
+    return out
 
 
 def skill_text_problem(name: str, description: str, content: str) -> str | None:
