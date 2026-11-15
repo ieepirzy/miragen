@@ -17,7 +17,10 @@ swap between them (``spec.model``) when one is rate limited:
   them), no settings, plugins, skills or CLAUDE.md are loaded, the gateway
   is the only MCP server (``--strict-mcp-config``), and ``can_use_tool``
   refuses anything but a gateway tool or an enabled web tool. The gateway
-  enforces approvals and fails closed on its own.
+  enforces approvals and fails closed on its own. The one exception is a
+  profile's pinned ``spec.skills`` (miragen/skills.py): they load from one
+  read-only local plugin, with only the ``Skill`` tool added and admitted
+  for those skills alone; still no settings source.
 * **Subscription only.** The child's environment is an allowlist enforced by
   an exec wrapper (the SDK merges the parent's environment otherwise): the
   subscription token (``CLAUDE_CODE_OAUTH_TOKEN``) or a login in
@@ -79,6 +82,8 @@ from miragen.harness.gateway import ToolGateway, _capability_entries
 from miragen.harness.served import ServedLedger
 from miragen.memory.claude_code import SCRUBBED_ENV, WORKER_ENV
 from miragen.models import AgentProfile, CallUsage, RunUsage, anthropic_usage_fields
+from miragen.skills import qualified as qualified_skill
+from miragen.skills import write_plugin as write_skill_plugin
 
 logger = logging.getLogger("miragen.harness.claude_code")
 
@@ -104,6 +109,8 @@ def check_miradesign_actor_name(profile: AgentProfile, instance: str) -> None:
 
 
 NAME = "claude-code"
+# Claude Code's built-in that reads a skill; added only for a profile with skills.
+SKILL_TOOL = "Skill"
 # Short on purpose: Claude Code names MCP tools mcp__<server>__<tool>, and
 # tool names are capped at 64 characters.
 GATEWAY_SERVER = "gw"
@@ -268,6 +275,11 @@ class ClaudeCodeHarness(MiraRunEnv):
         self.model = parse_harness_model(profile.spec.model)[1] or None
         caps = {name for name, _ in _capability_entries(profile)}
         self.builtins = frozenset(NATIVE_CAPABILITIES[c] for c in caps if c in NATIVE_CAPABILITIES)
+        # Catalog skills pinned into the profile (miragen/skills.py): one
+        # read-only local plugin, written by prepare().
+        self.skills = list(profile.spec.skills or [])
+        self.skill_names = [qualified_skill(s.name) for s in self.skills]
+        self.skill_plugin: Path | None = None
         from miragen.voice import with_voice_guidance
 
         self.instructions = with_voice_guidance(profile.spec.instructions or "", system_guidance)
@@ -297,6 +309,10 @@ class ClaudeCodeHarness(MiraRunEnv):
         home = self.settings.claude_home
         home.mkdir(parents=True, exist_ok=True)
         (home / "home").mkdir(exist_ok=True)
+        if self.skills:
+            root = home / "skill-plugins"
+            root.mkdir(exist_ok=True)
+            self.skill_plugin = write_skill_plugin(self.skills, root)
         self.settings.workdirs.mkdir(parents=True, exist_ok=True)
         real = self.settings.cli_path or bundled_cli() or shutil.which("claude")
         if not real:
@@ -496,6 +512,10 @@ class ClaudeCodeHarness(MiraRunEnv):
         if (tool_name.startswith(_GATEWAY_PREFIX) and len(tool_name) > len(_GATEWAY_PREFIX)) \
                 or tool_name in self.builtins:
             return PermissionResultAllow()
+        if tool_name == SKILL_TOOL and _input.get("skill") in self.skill_names:
+            # Only the profile's pinned skills: reading one is instructions,
+            # never a tool or a setting.
+            return PermissionResultAllow()
         logger.warning("claude-code harness: refused a non-gateway tool (%s)", tool_name)
         return PermissionResultDeny(message="Only miragen gateway tools are available.")
 
@@ -524,8 +544,9 @@ class ClaudeCodeHarness(MiraRunEnv):
             return self._engineer_options(instance, workdir, resume=resume, new_id=new_id,
                                           stderr=stderr, pre_compact=pre_compact,
                                           ephemeral=ephemeral)
+        skill_tools = {SKILL_TOOL} if self.skills else set()
         return ClaudeAgentOptions(
-            tools=sorted(self.builtins),
+            tools=sorted(self.builtins | skill_tools),
             system_prompt=self.instructions,
             mcp_servers={GATEWAY_SERVER: {
                 "type": "http", "url": self.settings.gateway_url,
@@ -534,7 +555,11 @@ class ClaudeCodeHarness(MiraRunEnv):
                 "headers": {"Authorization": f"Bearer ${{{GATEWAY_TOKEN_ENV}}}"}}},
             strict_mcp_config=True,
             setting_sources=[],
-            skills=[],
+            # The profile's pinned skills only (a context filter: every other
+            # skill stays hidden and the Skill tool refuses it), from the one
+            # local plugin prepare() wrote. No settings source is opened.
+            skills=list(self.skill_names),
+            plugins=self._skill_plugins(),
             permission_mode="default",
             can_use_tool=self._permission,
             model=self.model,
@@ -549,6 +574,11 @@ class ClaudeCodeHarness(MiraRunEnv):
             stderr=stderr.append,
             settings=self._gateway_settings(),
         )
+
+    def _skill_plugins(self) -> list[dict[str, str]]:
+        if self.skill_plugin is None:
+            return []
+        return [{"type": "local", "path": str(self.skill_plugin)}]
 
     def _engineer_options(self, instance: str, workdir: Path, *, resume: str | None,
                           new_id: str | None, stderr: deque, pre_compact,
@@ -583,7 +613,8 @@ class ClaudeCodeHarness(MiraRunEnv):
             # if a session rewrites settings.json.
             settings=self._gateway_settings({"disableAllHooks": False}),
             skills="all",
-            plugins=[{"type": "local", "path": p} for p in spec.plugin_dirs],
+            plugins=[{"type": "local", "path": p} for p in spec.plugin_dirs]
+            + self._skill_plugins(),
             # The container is the boundary. can_use_tool would never be
             # consulted under bypassPermissions; the depth limit is a hook.
             permission_mode="bypassPermissions",

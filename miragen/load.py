@@ -289,7 +289,15 @@ def load_profile(
 
     # Kept as written: an interpolated model is only visible before expansion.
     uninterpolated = copy.deepcopy(raw)
+    # Pinned skill text is never interpolated: ${VAR} in a skill must not pull
+    # this process's environment (credentials) into a prompt.
+    spec_raw = raw.get("spec")
+    pinned_skills = (
+        spec_raw.pop("skills") if isinstance(spec_raw, dict) and "skills" in spec_raw else None
+    )
     raw = interpolate_env(raw, environ=environ)
+    if pinned_skills is not None:
+        raw["spec"]["skills"] = pinned_skills
     _resolve_instructions_file(raw, path)
 
     # Validate + coerce via Pydantic
@@ -305,6 +313,12 @@ def load_profile(
     if profile.spec is not None and profile.spec.capabilities \
             and profile_harness(profile) == PYDANTIC_AI:
         resolve_capabilities(profile.spec.capabilities)
+
+    if profile.spec is not None and profile.spec.skills \
+            and profile_harness(profile) not in (PYDANTIC_AI, "claude-code"):
+        raise ValueError(
+            "spec.skills is delivered on the pydantic-ai and claude-code harnesses only; "
+            f"{profile_harness(profile)} would run without them")
 
     if profile.approval_delivery == "async" and (
             profile.spec is None or profile_harness(profile) == PYDANTIC_AI):
