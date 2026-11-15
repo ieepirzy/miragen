@@ -572,12 +572,18 @@ class ClaudeCodeHarness(MiraRunEnv):
             verbatim_prompts=True,
             hooks={"PreCompact": [HookMatcher(hooks=[pre_compact])]},
             stderr=stderr.append,
-            settings=self._gateway_settings(),
+            # Defence in depth: the pinned skills are already refused if they
+            # hold shell syntax; the CLI also never runs any (bundled CLI
+            # 2.1.316, claude-agent-sdk==0.2.176 pinned in pyproject).
+            settings=self._gateway_settings({"disableSkillShellExecution": True}),
         )
 
     def _skill_plugins(self) -> list[dict[str, str]]:
-        if self.skill_plugin is None:
+        if not self.skills:
             return []
+        # Re-checked at every launch: an edited copy is replaced, never served.
+        self.skill_plugin = write_skill_plugin(
+            self.skills, self.settings.claude_home / "skill-plugins")
         return [{"type": "local", "path": str(self.skill_plugin)}]
 
     def _engineer_options(self, instance: str, workdir: Path, *, resume: str | None,

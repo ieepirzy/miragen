@@ -1259,14 +1259,13 @@ class PinnedSkill(_ProfileModel):
 
     @model_validator(mode="after")
     def content_matches(self) -> "PinnedSkill":
-        from miragen.skills import DYNAMIC_CONTEXT, content_sha256
+        from miragen.skills import content_sha256, skill_text_problem
 
         if content_sha256(self.content) != self.sha256:
             raise ValueError(f"spec.skills: '{self.name}' does not match its sha256")
-        if DYNAMIC_CONTEXT in self.content:
-            raise ValueError(
-                f"spec.skills: '{self.name}' uses dynamic context (!`...`), "
-                "which runs a command when the skill loads")
+        problem = skill_text_problem(self.name, self.description, self.content)
+        if problem is not None:
+            raise ValueError(f"spec.skills: {problem}")
         return self
 
 

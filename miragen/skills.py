@@ -37,8 +37,54 @@ if TYPE_CHECKING:
 PLUGIN_NAME = "mirarun-skills"
 SKILL_NAME_PATTERN = r"^[a-z0-9][a-z0-9-]{0,63}$"
 # Claude Code runs !`command` when a skill loads (dynamic context injection).
-DYNAMIC_CONTEXT = "!`"
+# Both forms Claude Code runs when a skill loads: !`command` inline and a
+# ```! fenced block (the CLI matches /```!\s*\n?[\s\S]*?\n?```/).
+DYNAMIC_CONTEXT = ("!`", "```!")
 MAX_SKILL_CHARS = 256 * 1024
+# The only frontmatter keys a pinned skill may carry: everything else
+# (allowed-tools, hooks, context, agent, model, ...) changes what a run may do.
+FRONTMATTER_KEYS = frozenset({"name", "description"})
+_MANIFEST = json.dumps({"name": PLUGIN_NAME, "version": "1.0.0",
+                        "description": "Skills pinned by MiraRun for this agent"})
+
+
+def _frontmatter(content: str) -> dict | None:
+    import yaml
+
+    if not content.startswith("---\n"):
+        return None
+    end = content.find("\n---\n", 4)
+    if end == -1 and content.endswith("\n---"):
+        end = len(content) - 4
+    if end == -1:
+        return None
+    try:
+        parsed = yaml.safe_load(content[4:end])
+    except yaml.YAMLError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def skill_text_problem(name: str, description: str, content: str) -> str | None:
+    """Why this text may not run as a pinned skill, or None: no shell syntax,
+    and a frontmatter of exactly `name` (this skill's) and `description`
+    (the pinned one). Mirrors mirarun's pinner, so a profile edited after
+    pinning is refused here too."""
+    if any(marker in content for marker in DYNAMIC_CONTEXT):
+        return (f"'{name}' uses dynamic context (!`...` or ```!), "
+                "which runs a command when the skill loads")
+    front = _frontmatter(content)
+    if front is None:
+        return f"'{name}' has no SKILL.md frontmatter (---, name, description, ---)"
+    extra = sorted(set(front) - FRONTMATTER_KEYS)
+    if extra:
+        return f"'{name}' frontmatter may hold only name and description, not {', '.join(extra)}"
+    if front.get("name") != name:
+        return f"'{name}' frontmatter names '{front.get('name')}'"
+    if not isinstance(front.get("description"), str) \
+            or " ".join(front["description"].split()) != " ".join(description.split()):
+        return f"'{name}' frontmatter description differs from the pinned description"
+    return None
 
 
 def content_sha256(content: str) -> str:
@@ -55,32 +101,57 @@ def bundle_digest(skills: Sequence["PinnedSkill"]) -> str:
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
+def _expected_files(skills: Sequence["PinnedSkill"]) -> dict[str, bytes]:
+    files = {".claude-plugin/plugin.json": _MANIFEST.encode(), ".complete": b""}
+    for skill in skills:
+        files[f"skills/{skill.name}/SKILL.md"] = skill.content.encode("utf-8")
+    return files
+
+
+def _intact(directory: Path, expected: dict[str, bytes]) -> bool:
+    """Exactly the expected files with exactly the pinned bytes: no extra
+    file, no symlink. Checked on every reuse, so a copy someone edited (an
+    engineer-posture session can chmod and write) is never served."""
+    if directory.is_symlink() or not directory.is_dir():
+        return False
+    found: dict[str, bytes] = {}
+    try:
+        for current, dirs, files in os.walk(directory):
+            for name in dirs + files:
+                if (Path(current) / name).is_symlink():
+                    return False
+            for name in files:
+                path = Path(current) / name
+                found[path.relative_to(directory).as_posix()] = path.read_bytes()
+    except OSError:
+        return False
+    return found == expected
+
+
 def write_plugin(skills: Sequence["PinnedSkill"], root: Path) -> Path:
-    """Write the skills as one read-only local plugin under ``root`` and
-    return its directory. The directory is named by the skills' digests, so
-    the same set reuses it and a different set never overwrites it."""
+    """The skills as one read-only local plugin under ``root``. The canonical
+    directory is named by the skills' digests and reused only while intact;
+    otherwise a fresh copy is written and returned. The returned directory
+    always exists and always holds exactly the pinned text."""
+    expected = _expected_files(skills)
     directory = root / f"{PLUGIN_NAME}-{bundle_digest(skills)[:16]}"
-    if (directory / ".complete").is_file():
+    if _intact(directory, expected):
         return directory
     # A fresh name every time: a staging directory never needs removing.
     staging = root / f".{directory.name}.{uuid.uuid4().hex}"
-    (staging / ".claude-plugin").mkdir(parents=True)
-    (staging / ".claude-plugin" / "plugin.json").write_text(
-        json.dumps({"name": PLUGIN_NAME, "version": "1.0.0",
-                    "description": "Skills pinned by MiraRun for this agent"}),
-        encoding="utf-8")
-    for skill in skills:
-        skill_dir = staging / "skills" / skill.name
-        skill_dir.mkdir(parents=True)
-        (skill_dir / "SKILL.md").write_text(skill.content, encoding="utf-8")
-    (staging / ".complete").write_text("", encoding="utf-8")
+    for relative, data in expected.items():
+        path = staging / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
     _read_only(staging)
+    if directory.exists() or directory.is_symlink():
+        # A tampered or partial copy holds the canonical name: never use it.
+        return staging
     try:
         staging.rename(directory)
     except OSError:
-        # Another process won the rename: its copy has the same content, and
-        # this read-only staging copy (a few KiB) is left as it is.
-        pass
+        # Another process won the rename: use its copy only if it is intact.
+        return directory if _intact(directory, expected) else staging
     return directory
 
 
