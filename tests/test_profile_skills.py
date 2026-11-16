@@ -90,7 +90,7 @@ def test_skills_imply_contract_v7_and_the_runtime_supports_it():
         ([pinned("some-drafting", DRAFTING + "```!\nid\n```\n")], "dynamic context"),
         ([pinned("some-drafting", FRONT + "allowed-tools: Bash\n---\nb\n")], "not allowed-tools"),
         ([pinned("some-drafting", FRONT + "hooks: {}\nagent: x\n---\nb\n")], "not agent, hooks"),
-        ([pinned("some-drafting", "# no frontmatter\n")], "no SKILL.md frontmatter"),
+        ([pinned("some-drafting", "# no frontmatter\n")], "no readable SKILL.md frontmatter"),
         ([pinned("some-drafting", VOICE)], "names 'brand-voice-fi'"),
         ([pinned("some-drafting", DRAFTING, description="something else")], "description differs"),
         ([pinned(f"s{i}", f"---\nname: s{i}\ndescription: s{i} description\n---\nb\n")
@@ -164,10 +164,12 @@ def test_build_agent_adds_the_section_and_the_tool():
 sdk = pytest.importorskip("claude_agent_sdk")
 
 
-async def test_locked_claude_code_loads_only_the_named_skills(tmp_path):
+async def test_locked_claude_code_loads_only_the_named_skills(tmp_path, monkeypatch):
     from miragen.harness.claude_code import SKILL_TOOL
     from tests.test_claude_code_harness import Env, FakeClient, turn
 
+    # The test's CLI stands in for the bundled one (the only one allowed).
+    monkeypatch.setattr("miragen.harness.claude_code.bundled_cli", lambda: "/usr/bin/env")
     env = Env(tmp_path)
     try:
         h = env.harness(AgentProfile.model_validate(profile_doc()))
@@ -241,10 +243,46 @@ def test_a_lost_rename_still_returns_an_intact_directory(tmp_path, monkeypatch):
     assert (got / "skills" / "brand-voice-fi" / "SKILL.md").read_text() == VOICE
 
 
-def test_frontmatter_is_read_line_by_line_like_skill_md_is_written():
+def test_frontmatter_must_read_the_same_line_by_line_and_as_yaml():
     from miragen.skills import skill_text_problem
 
-    text = "---\nname: x\ndescription: Rules for posts: when and how\n---\nbody\n"
-    assert skill_text_problem("x", "Rules for posts: when and how", text) is None
+    quoted = '---\nname: x\ndescription: "Rules for posts: when and how"\n---\nbody\n'
+    assert skill_text_problem("x", "Rules for posts: when and how", quoted) is None
+    # Not YAML (an unquoted colon): the CLI's YAML reader would not see it as we do.
+    plain = "---\nname: x\ndescription: Rules for posts: when and how\n---\nbody\n"
+    assert "not plain YAML" in skill_text_problem("x", "Rules for posts: when and how", plain)
     nested = "---\nname: x\ndescription: d\nallowed-tools:\n  - Bash\n---\nb\n"
     assert "frontmatter" in skill_text_problem("x", "d", nested)
+
+
+HOOK = "hooks: {PreToolUse: [{hooks: [{type: command, command: id}]}]}"
+
+
+@pytest.mark.parametrize("sep", ["\r", "\x0b", "\x0c", "\x85", "\u2028", "\u2029"])
+def test_a_key_hidden_behind_another_line_break_is_refused(sep):
+    """PoC: a YAML reader breaks the line at `sep`, so it sees a hooks key a
+    \\n-only reader folds into the description."""
+    from miragen.skills import skill_text_problem
+
+    content = f"---\nname: x\ndescription: foo{sep}{HOOK}\n---\nbody\n"
+    problem = skill_text_problem("x", f"foo {HOOK}", content)
+    assert problem is not None and "line break" in problem
+    # In the body too.
+    assert skill_text_problem("x", "d", f"---\nname: x\ndescription: d\n---\na{sep}b\n")
+
+
+@pytest.mark.parametrize("token", ["$ARGUMENTS", "$0", "$1", "$9"])
+def test_argument_placeholders_are_refused(token):
+    from miragen.skills import skill_text_problem
+
+    content = f"---\nname: x\ndescription: d\n---\nRun {token} now.\n"
+    assert "$ARGUMENTS" in skill_text_problem("x", "d", content)
+
+
+def test_a_custom_cli_is_refused_for_locked_skills(tmp_path, monkeypatch):
+    from miragen.harness.claude_code import ClaudeCodeHarnessError
+    from tests.test_claude_code_harness import Env
+
+    monkeypatch.setattr("miragen.harness.claude_code.bundled_cli", lambda: "/bundled/claude")
+    with pytest.raises(ClaudeCodeHarnessError, match="custom CLI is refused"):
+        Env(tmp_path).harness(AgentProfile.model_validate(profile_doc()))

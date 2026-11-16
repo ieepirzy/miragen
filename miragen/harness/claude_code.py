@@ -315,6 +315,13 @@ class ClaudeCodeHarness(MiraRunEnv):
             self.skill_plugin = write_skill_plugin(self.skills, root)
         self.settings.workdirs.mkdir(parents=True, exist_ok=True)
         real = self.settings.cli_path or bundled_cli() or shutil.which("claude")
+        if self.skills and not self.engineer and (bundled_cli() is None or real != bundled_cli()):
+            # The locked posture's skill safety leans on the bundled CLI
+            # honouring disableSkillShellExecution (2.1.316 with the pinned
+            # claude-agent-sdk); a custom CLI (CLAUDE_BIN, PATH) is unverified.
+            raise ClaudeCodeHarnessError(
+                "spec.skills on the locked posture runs only on the CLI bundled with "
+                "claude-agent-sdk; unset CLAUDE_BIN (a custom CLI is refused)")
         if not real:
             logger.warning("claude-code harness: no claude CLI (bundled with claude-agent-sdk, "
                            "CLAUDE_BIN or PATH); turns will fail")

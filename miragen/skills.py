@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -46,6 +47,32 @@ MAX_SKILL_CHARS = 256 * 1024
 FRONTMATTER_KEYS = frozenset({"name", "description"})
 _MANIFEST = json.dumps({"name": PLUGIN_NAME, "version": "1.0.0",
                         "description": "Skills pinned by MiraRun for this agent"})
+
+
+# Line breaks other than \n: YAML (and the CLI's frontmatter parser) breaks
+# lines on these as well, so they are refused anywhere in a skill.
+LINE_BREAKS_REFUSED = ("\r", "\x0b", "\x0c", "\x85", "\u2028", "\u2029")
+# The CLI substitutes these into skill text before any shell processing.
+_ARGUMENT_PLACEHOLDER = re.compile(r"\$(ARGUMENTS|[0-9])")
+
+
+def _yaml_frontmatter(content: str) -> dict[str, str] | None:
+    import yaml
+
+    lines = content.split("\n")
+    try:
+        end = lines.index("---", 1)
+    except ValueError:
+        return None
+    try:
+        parsed = yaml.safe_load("\n".join(lines[1:end]))
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in parsed.items()
+    ):
+        return None
+    return parsed
 
 
 def _frontmatter(content: str) -> dict[str, str] | None:
@@ -81,19 +108,33 @@ def skill_text_problem(name: str, description: str, content: str) -> str | None:
     and a frontmatter of exactly `name` (this skill's) and `description`
     (the pinned one). Mirrors mirarun's pinner, so a profile edited after
     pinning is refused here too."""
+    if any(ch in content or ch in description for ch in LINE_BREAKS_REFUSED):
+        # The CLI parses frontmatter with a YAML parser that breaks lines on
+        # these too: a key hidden after one is invisible to a \n-only reader.
+        return f"'{name}' contains a line break other than \\n (CR, VT, FF, NEL, LS or PS)"
     if any(marker in content for marker in DYNAMIC_CONTEXT):
-        return (f"'{name}' uses dynamic context (!`...` or ```!), "
-                "which runs a command when the skill loads")
+        return (
+            f"'{name}' uses dynamic context (!`...` or ```!), "
+            "which runs a command when the skill loads"
+        )
+    if _ARGUMENT_PLACEHOLDER.search(content):
+        return f"'{name}' uses $ARGUMENTS or $0-$9, which the CLI substitutes before running it"
     front = _frontmatter(content)
     if front is None:
-        return f"'{name}' has no SKILL.md frontmatter (---, name, description, ---)"
+        return f"'{name}' has no readable SKILL.md frontmatter (---, name:, description:, ---)"
     extra = sorted(set(front) - FRONTMATTER_KEYS)
     if extra:
         return f"'{name}' frontmatter may hold only name and description, not {', '.join(extra)}"
-    if front.get("name") != name:
-        return f"'{name}' frontmatter names '{front.get('name')}'"
-    if not isinstance(front.get("description"), str) \
-            or " ".join(front["description"].split()) != " ".join(description.split()):
+    if set(front) != FRONTMATTER_KEYS:
+        return f"'{name}' frontmatter needs both name and description"
+    # The CLI reads frontmatter as YAML: it must parse to exactly the same two
+    # string values the line reader saw, or the two readers could disagree.
+    parsed = _yaml_frontmatter(content)
+    if parsed != front:
+        return f"'{name}' frontmatter is not plain YAML with just name and description"
+    if front["name"] != name:
+        return f"'{name}' frontmatter names '{front['name']}'"
+    if front["description"] != description:
         return f"'{name}' frontmatter description differs from the pinned description"
     return None
 
