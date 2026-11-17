@@ -41,6 +41,10 @@ Contract levels:
        spawn, docs/credential-grants.md). Implied by declaring the field at
        all, like `agent_type`: an older runtime rejects even an empty list.
        Serialization drops an empty list.
+    7  `spec.skills` (catalog skills MiraRun pinned into the profile,
+       miragen/skills.py, #233). Implied by declaring the field: an older
+       runtime rejects the key, and must not run a profile without the
+       skills it names.
 
 A new level is added when a profile feature requires runtime support that
 older runtimes would reject or — worse — silently ignore.
@@ -52,14 +56,14 @@ import re
 
 # Every contract level this build of the runtime can execute. Extend when a
 # new level is introduced; drop old levels only with a major version.
-SUPPORTED_PROFILE_CONTRACTS: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
+SUPPORTED_PROFILE_CONTRACTS: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7)
 
 # The newest contract this build serves — what freshly authored profiles
 # may declare.
 CURRENT_PROFILE_CONTRACT: int = max(SUPPORTED_PROFILE_CONTRACTS)
 
 # OCI image label carrying the supported levels, space-separated (e.g.
-# "1 2 3 4 5 6"). The Dockerfile bakes it in; a drift test pins the Dockerfile to
+# "1 2 3 4 5 6 7"). The Dockerfile bakes it in; a drift test pins the Dockerfile to
 # these constants. An image WITHOUT this label predates contract labeling
 # and is treated as supporting contract 1 only — the conservative reading,
 # and the correct one for every pre-executor-tier image in the wild.

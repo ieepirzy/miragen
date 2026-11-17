@@ -1134,7 +1134,8 @@ class HarnessSpec(_ProfileModel):
         default="locked",
         description=(
             "'locked' (default): the gateway-only Claude Code session — no built-in "
-            "tools, settings, plugins or skills. 'engineer': an unattended software "
+            "tools, settings, plugins or skills (except the profile's pinned spec.skills, "
+            "read through the Skill tool). 'engineer': an unattended software "
             "engineer (mirarun ADR-041 §4) — built-in tools with bypassPermissions "
             "(the container is the boundary), user settings (not the repository's) and plugins, a "
             "git worktree per instance, broker-wired git/gh, subagent depth limit, "
@@ -1243,6 +1244,31 @@ class HarnessSpec(_ProfileModel):
         return self
 
 
+class PinnedSkill(_ProfileModel):
+    """One catalog skill MiraRun pinned into this profile (`spec.skills`,
+    contract v7, miragen/skills.py). The content is the skill's SKILL.md;
+    the digest is checked here, so a profile cannot carry text other than
+    what was pinned."""
+
+    source: str = Field(min_length=1, max_length=128, description="Catalog source key.")
+    name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$", description="The skill's name.")
+    revision: Optional[str] = Field(default=None, description="The source's revision.")
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$", description="sha256 of `content`.")
+    description: str = Field(min_length=1, description="When the skill applies.")
+    content: str = Field(min_length=1, max_length=256 * 1024, description="SKILL.md text.")
+
+    @model_validator(mode="after")
+    def content_matches(self) -> "PinnedSkill":
+        from miragen.skills import content_sha256, skill_text_problem
+
+        if content_sha256(self.content) != self.sha256:
+            raise ValueError(f"spec.skills: '{self.name}' does not match its sha256")
+        problem = skill_text_problem(self.name, self.description, self.content)
+        if problem is not None:
+            raise ValueError(f"spec.skills: {problem}")
+        return self
+
+
 class AgentSpec(_ProfileModel):
     model: str = Field(
         description="Any pydantic-ai model string, e.g. 'anthropic:claude-sonnet-4-6'.",
@@ -1275,6 +1301,18 @@ class AgentSpec(_ProfileModel):
         ge=1,
         description="Maps to UsageLimits(request_limit=N) — caps model round-trips per run.",
     )
+    skills: Optional[list[PinnedSkill]] = Field(
+        default=None,
+        # Declaring the field implies profile contract v7 (older runtimes
+        # reject the key); an absent field never reaches a dump.
+        exclude_if=lambda v: v is None,
+        max_length=32,
+        description=(
+            "Catalog skills MiraRun pinned into this profile (miragen/skills.py): "
+            "claude-code loads them as Claude Code skills, pydantic-ai gets their "
+            "descriptions and a read_skill tool. Implies profile contract v7."
+        ),
+    )
     harness: Optional[HarnessSpec] = Field(
         default=None,
         # Declaring the block implies profile contract v4 (older runtimes
@@ -1286,6 +1324,13 @@ class AgentSpec(_ProfileModel):
             "Declaring the block implies profile contract v4."
         ),
     )
+
+    @model_validator(mode="after")
+    def unique_skill_names(self) -> "AgentSpec":
+        names = [skill.name for skill in self.skills or []]
+        if len(names) != len(set(names)):
+            raise ValueError("spec.skills names a skill twice")
+        return self
 
     @model_validator(mode="after")
     def one_instructions_source(self) -> "AgentSpec":
@@ -2010,6 +2055,10 @@ class AgentProfile(_ProfileModel):
         rejects even `agent_type: internal` as an unknown key. Serialization
         drops the default (exclude_if on the field), so a profile that
         never declared it, or declared `internal`, dumps back to contract 1."""
+        if self.spec is not None and "skills" in self.spec.model_fields_set:
+            # By presence: miragend spawns the text as written, and an older
+            # runtime rejects `spec.skills` as an unknown key.
+            return 7
         if "credentials" in self.model_fields_set:
             # By presence, like agent_type: miragend spawns the text as
             # written, and an older runtime rejects even `credentials: []`.
@@ -2053,7 +2102,7 @@ class AgentProfile(_ProfileModel):
                 f"features requiring {format_api_version(inferred)} "
                 "(the executor tier is a v2 surface, agent_type a v3 one, "
                 "spec.harness a v4 one, spec.harness.subagent_model: pin a v5 one, "
-                "credentials a v6 one) — "
+                "credentials a v6 one, spec.skills a v7 one) — "
                 "a profile must not understate its runtime requirement"
             )
         return self

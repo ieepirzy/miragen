@@ -200,6 +200,12 @@ def build_agent(
         from miragen.voice import with_voice_guidance
 
         instructions = with_voice_guidance(instructions, system_guidance)
+    if profile.spec.skills:
+        # Catalog skills pinned into the profile (miragen/skills.py): their
+        # descriptions always, each SKILL.md on demand through read_skill.
+        from miragen.skills import skills_instructions
+
+        instructions = f"{instructions}\n\n{skills_instructions(profile.spec.skills)}"
     if extra_instructions:
         instructions = f"{instructions}\n\n{extra_instructions}"
 
@@ -211,6 +217,11 @@ def build_agent(
     )
 
     _inject_tools(agent, profile)
+
+    if profile.spec.skills:
+        from miragen.skills import read_skill_tool
+
+        agent.tool_plain(read_skill_tool(profile.spec.skills))
 
     # Runtime-provided tools that are not part of the profile's whitelist —
     # e.g. the `speak` tool the app injects when the profile has a `voice:`
