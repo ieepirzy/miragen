@@ -6,6 +6,12 @@ on:
   pull_request:
   workflow_call:
 
+# Cancel a PR's superseded runs when a new commit lands; push, schedule,
+# dispatch and workflow_call runs each get their own group and always finish.
+concurrency:
+  group: tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
