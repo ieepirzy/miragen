@@ -7,6 +7,12 @@ on:
   schedule:
     - cron: "0 6 * * 1"  # weekly Monday scan
 
+# Cancel a PR's superseded runs when a new commit lands; push, schedule,
+# dispatch and workflow_call runs each get their own group and always finish.
+concurrency:
+  group: security-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   cve:
     name: CVE scan (pip-audit)
