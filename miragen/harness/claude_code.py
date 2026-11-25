@@ -57,11 +57,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
 import shutil
 import sys
+import tempfile
 import time
 import uuid
 from collections import deque
@@ -119,6 +121,14 @@ STATE_FILE = "miragen-instances.json"
 WRAPPER_FILE = "miragen-claude"
 KEEP_ENV = "MIRAGEN_ENV_KEEP"
 MIRADESIGN_AGENT_ENV = "MIRADESIGN_AGENT"
+# An agent MiraRun runs authenticates to MiraDesign with an audience-bound
+# run token (`mirarun-run-token://miradesign`, at most 900 s), handed over in
+# the turn's `secret_env` under this name. The MiraDesign plugin's hooks and
+# its MCP headersHelper read it from the file MIRADESIGN_TOKEN_FILE names
+# (miradesign plugin 0.13.1), re-read on every call: written at turn start,
+# emptied at turn end, never in the child's environment itself.
+MIRADESIGN_RUN_TOKEN_VAR = "MIRADESIGN_TOKEN"
+MIRADESIGN_TOKEN_FILE_ENV = "MIRADESIGN_TOKEN_FILE"
 # spec.harness.subagent_model: pin → every subagent runs the session's model.
 SUBAGENT_MODEL_ENV = "CLAUDE_CODE_SUBAGENT_MODEL"
 # Without it an Agent call's own `model` still wins over the variable above
@@ -453,11 +463,49 @@ class ClaudeCodeHarness(MiraRunEnv):
         elif os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
             env["CLAUDE_CODE_OAUTH_TOKEN"] = os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
         env.update(self._mirarun_env(instance))
+        env[MIRADESIGN_TOKEN_FILE_ENV] = str(self._run_token_file(instance))
         keep = [k for k in ENV_ALLOWLIST if k in os.environ]
         keep += [*env, "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SDK_READS_SESSION_STATE", "PWD"]
         self._check_scrubbed(keep)
         env[KEEP_ENV] = " ".join(keep)
         return env
+
+    def _run_token_file(self, instance: str) -> Path:
+        """Where this instance's MiraDesign run token lives during a turn: one
+        0600 file per instance under a 0700 directory, named by a digest so no
+        instance name ever becomes a path."""
+        digest = hashlib.sha256(instance.encode()).hexdigest()[:32]
+        return self.settings.claude_home / "run-tokens" / f"{digest}.miradesign"
+
+    @contextlib.contextmanager
+    def _run_token(self, instance: str, secret_env: dict[str, str] | None):
+        """The turn's run token in its file for exactly the turn: a later turn
+        without one (or a crash mid-turn) never leaves a stale token behind
+        for the next process to send."""
+        self._put_run_token(instance, secret_env)
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                self._put_run_token(instance, None)
+
+    def _put_run_token(self, instance: str, secret_env: dict[str, str] | None) -> None:
+        """Write the turn's MiraDesign run token (or empty the file when the
+        turn carries none), atomically, 0600."""
+        path = self._run_token_file(instance)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.parent.chmod(0o700)
+        token = (secret_env or {}).get(MIRADESIGN_RUN_TOKEN_VAR, "")
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tok-")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(token)
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
 
     def _check_scrubbed(self, keep: list[str]) -> None:
         allowed = _GATEWAY_ALLOWED if self._gateway_mode() else frozenset()
@@ -795,7 +843,8 @@ class ClaudeCodeHarness(MiraRunEnv):
             async with agent.lock:
                 agent.last_used = time.monotonic()
                 with self.gateway.turn(instance, turn.run_id,
-                                       secret_env=turn.secret_env) as log:
+                                       secret_env=turn.secret_env) as log, \
+                        self._run_token(instance, turn.secret_env):
                     try:
                         async with asyncio.timeout(self.settings.turn_timeout_s):
                             await agent.client.query(self._compose(turn))
