@@ -890,3 +890,31 @@ async def test_the_engineer_posture_carries_refs_too(env):
     assert {k: child[k] for k in MIRARUN_ENV} == MIRARUN_ENV
     assert child["MIRADESIGN_AGENT"] == "lane-a-engineer-1"
     assert set(MIRARUN_ENV) <= set(child["MIRAGEN_ENV_KEEP"].split())
+
+
+async def test_the_miradesign_run_token_is_in_its_file_for_exactly_the_turn(env):
+    """An agent MiraRun runs gets its MiraDesign run token (at most 900 s) in
+    each turn's secret_env. The plugin reads it from MIRADESIGN_TOKEN_FILE on
+    every call, so the harness writes it there at turn start (0600, never in
+    the child's environment) and empties it at turn end."""
+    seen: list[tuple[str, int]] = []
+
+    def script(client, prompt):
+        path = Path(client.options.env["MIRADESIGN_TOKEN_FILE"])
+        seen.append((path.read_text(), path.stat().st_mode & 0o777))
+        yield from _echo(client, prompt)
+
+    env.script = script
+    h = env.harness(engineer_profile())
+    await h.run(turn("one", instance="lane-a-engineer-1",
+                     secret_env={"MIRADESIGN_TOKEN": "run-token-1"}))
+    await h.run(turn("two", instance="lane-a-engineer-1", run_id="r2",
+                     secret_env={"MIRADESIGN_TOKEN": "run-token-2"}))
+    await h.run(turn("three", instance="lane-a-engineer-1", run_id="r3"))
+    assert seen == [("run-token-1", 0o600), ("run-token-2", 0o600), ("", 0o600)]
+    client_env = FakeClient.instances[0].options.env
+    path = Path(client_env["MIRADESIGN_TOKEN_FILE"])
+    assert path.read_text() == ""
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+    assert "MIRADESIGN_TOKEN_FILE" in client_env["MIRAGEN_ENV_KEEP"].split()
+    assert not any("run-token" in v for v in client_env.values())
