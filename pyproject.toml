@@ -73,8 +73,9 @@ dev = [
     # leaves a real gap in the series.
     "pytest-cov>=5.0",
     # The bridge MCP's OAuth guard is exercised by tests/test_hosted_bridge.py;
-    # CI installs `.[dev]` only.
-    "origo>=0.3.0",
+    # CI installs `.[dev]` only. 0.5.2 is the first origo with the upstream
+    # IdentityProvider's scopes, recheck_on_refresh and token_key_files.
+    "origo>=0.5.2",
     # tests/test_observability.py sends a real event through the SDK; without
     # it there the leak test would have nothing to exercise.
     "sentry-sdk[fastapi]==2.66.1",
@@ -117,13 +118,14 @@ daemon = [
     "sqlalchemy>=2.0",
     # The bridge MCP mount's OAuth credential class (claude.ai custom
     # connectors); the same drop-in provider Loimi/miradeploy/mirarun use.
-    "origo>=0.3.0",
+    # >=0.5.2: upstream OIDC sign-in (MCP_IDP_*) with scopes and re-check.
+    "origo>=0.5.2",
 ]
 # The session plane alone (docs/external-sessions.md): a hosted or local
 # miragend that serves Claude Code/Codex sessions and the bridge MCP without
 # Docker. `daemon` is a superset.
 bridge = [
-    "origo>=0.3.0",
+    "origo>=0.5.2",
 ]
 # Optional error reporting for miragend and the memory worker
 # (miragen/observability.py). Inert without SENTRY_DSN. Pinned exactly: an SDK

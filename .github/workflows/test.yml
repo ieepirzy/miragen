@@ -12,6 +12,10 @@ concurrency:
   group: tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # origo 0.5.2 (commit of that version); see the Install step.
+  ORIGO_SOURCE: https://github.com/ieepirzy/origo/archive/4204ab2b422142bc1549ea92e70e06f9497965c0.tar.gz
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -29,6 +33,9 @@ jobs:
       - name: Install
         run: |
           pip install -e ./packages/grok-build-client
+          # origo >=0.5.2 is not on PyPI yet: satisfy the floor from the
+          # tagged source of that version. Drop once it is released.
+          pip install "$ORIGO_SOURCE"
           pip install -e ".[dev,claude-code]"
 
       # Coverage is measured on every leg so the command stays identical
@@ -95,7 +102,10 @@ jobs:
       # Both packages, installed so pyright resolves their imports. Without
       # the project's own dependencies the error count is dominated by
       # unresolved imports and is not comparable with a run that has them.
-      project-install: "-e ./packages/grok-build-client -e .[dev]"
+      # The origo archive satisfies the dev extra's origo>=0.5.2 floor until
+      # that version is on PyPI (same pin as ORIGO_SOURCE above; `with:`
+      # cannot read the workflow env). Drop it with ORIGO_SOURCE.
+      project-install: "-e ./packages/grok-build-client https://github.com/ieepirzy/origo/archive/4204ab2b422142bc1549ea92e70e06f9497965c0.tar.gz -e .[dev]"
       reports-artifact: test-reports-py312
       tests-python-version: "3.12"
       # Telemetry only for now: `miragen/` carries 6 ruff findings and the
