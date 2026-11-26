@@ -29,11 +29,6 @@ COPY . /build/
 ARG INSTALL_CLAUDE_CODE=1
 ARG CLAUDE_CODE_VERSION=2.1.280
 
-# origo >=0.5.2 (the daemon extra's floor) is not on PyPI yet: install that
-# version from its source archive first. Drop once it is released.
-ARG ORIGO_SOURCE=https://github.com/ieepirzy/origo/archive/4204ab2b422142bc1549ea92e70e06f9497965c0.tar.gz
-RUN pip install --no-cache-dir "$ORIGO_SOURCE"
-
 RUN pip install --no-cache-dir "/build[daemon,sentry]" \
     && apt-get update && apt-get install -y --no-install-recommends gosu curl ca-certificates \
     && if [ "$INSTALL_CLAUDE_CODE" = "1" ]; then \
