@@ -148,6 +148,8 @@ def create_app(
     `bridge_oauth` (optional, with `sessions`): origo settings for the
     bridge MCP mount — {"base_url", "client_id", "client_secret",
     "auto_approve", "redirect_uris", "storage_path"}; None = bearer only.
+    When set, /mcp takes origo tokens only and the daemon bearer stays the
+    credential of the REST routes (see _BridgeMcpGuard).
 
     `harness_setup` (optional): a HarnessSetupService — the daemon keeps
     Grok Build / Codex on this machine joined (miragen/daemon/harness_setup.py);
@@ -428,7 +430,7 @@ def create_app(
 
 
 # ---------------------------------------------------------------------------
-# Bridge MCP mount (/mcp): bearer OR origo OAuth
+# Bridge MCP mount (/mcp): origo OAuth when configured, else the bearer
 # ---------------------------------------------------------------------------
 
 BRIDGE_MCP_CAPABILITY = "bridge-mcp/v1"
@@ -436,12 +438,20 @@ BRIDGE_MCP_CAPABILITY = "bridge-mcp/v1"
 
 class _BridgeMcpGuard:
     """ASGI guard for the mounted FastMCP app. Route dependencies don't
-    reach a mounted sub-app, so the two credential classes are checked
-    here: the daemon bearer (automation, `claude mcp add --header`) and,
-    when configured, an origo access token (claude.ai custom connector).
-    An empty daemon token keeps the existing "network isolation" contract
-    — the mount is then open unless origo is configured, in which case
-    origo is the only gate."""
+    reach a mounted sub-app, so the credential is checked here.
+
+    - OAuth configured (`self.provider` set: MCP_BASE_URL with a client, or
+      MCP_IDP_*): /mcp accepts an origo access token and nothing else. The
+      daemon bearer is NOT an MCP credential then; it keeps opening the
+      session API (/sessions/v1/*) and the other REST routes, which check it
+      through their own dependency. A person reaches the tools by signing in.
+    - No OAuth configured (a local or bearer-only daemon): unchanged. The
+      daemon bearer opens /mcp, and an empty daemon token keeps the
+      "network isolation" contract (the mount is open).
+
+    Keyed on "any OAuth configured" rather than on MCP_IDP_* alone: once a
+    sign-in exists, a shared static secret on the MCP would be a second,
+    weaker way past it."""
 
     def __init__(self, token: str) -> None:
         self.token = token
@@ -449,17 +459,17 @@ class _BridgeMcpGuard:
         self.inner = _bridge_not_ready
 
     def _authorized(self, auth_header: bytes) -> bool:
-        if self.token and hmac.compare_digest(auth_header, f"Bearer {self.token}".encode()):
-            return True
         if self.provider is not None:
             value = auth_header.decode("latin-1", "replace")
             scheme, _, token = value.partition(" ")
-            if scheme.lower() == "bearer" and token and self.provider.verify_token(
-                token, resource=self.provider.resource_identifier
-            ) is not None:
-                return True
-            return False
-        return not self.token  # unguarded daemon, no origo: network isolation
+            return bool(
+                scheme.lower() == "bearer" and token and self.provider.verify_token(
+                    token, resource=self.provider.resource_identifier
+                ) is not None
+            )
+        if not self.token:
+            return True  # unguarded daemon, no OAuth: network isolation
+        return hmac.compare_digest(auth_header, f"Bearer {self.token}".encode())
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":

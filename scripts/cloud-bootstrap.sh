@@ -6,7 +6,8 @@
 #
 # What it does, idempotently, for the invoking user's ~/.claude:
 #   1. registers the `miragen` plugin marketplace and installs the
-#      `miragen-memory` plugin (hooks + MCP + skill) — WITHOUT the token
+#      `miragen-memory` plugin (hooks + skill; the tools come from the
+#      bridge's connector, signed in as the person) — WITHOUT the token
 #      option: the hooks read MIRAGEND_TOKEN from the environment, so no
 #      secret ever sits on a command line or in settings;
 #   2. writes Claude Code `type: http` hooks into ~/.claude/settings.json as

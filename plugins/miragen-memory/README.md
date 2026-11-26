@@ -13,12 +13,16 @@ What you get, automatically, per session:
 | tool failures, turn ends, subagents | captured as operational trail |
 | compaction, session end | a session episode written to memory AND filed as a `session_episode` artifact under the session's run; the run closed at end |
 
-Plus the `miragen-bridge` MCP server: `memory_recall / memory_read /
-memory_remember / memory_correct / memory_checkpoint` and `store_put_artifact /
-store_search / store_get_artifact / store_lineage / store_open_run /
-store_close_run / store_run_tree / store_list_namespaces`, and
-`bridge_status / bridge_sessions`. The skill `memory-bridge` tells the model
-when to use them.
+The tools — `memory_recall / memory_read / memory_remember / memory_correct /
+memory_checkpoint`, `store_put_artifact / store_search / store_get_artifact /
+store_lineage / store_open_run / store_close_run / store_run_tree /
+store_list_namespaces` and `bridge_status / bridge_sessions` — are the
+daemon's MCP server at `<daemon>/mcp`. In Claude Code the plugin does **not**
+configure it (since 0.4.0): add the daemon as a connector and sign in as
+yourself (OAuth). A daemon with sign-in configured accepts only signed-in
+tokens on `/mcp`; the bearer token below opens the hooks' endpoints only.
+Under Codex and Grok Build the plugin's stdio proxy serves the tools (see
+below). The skill `memory-bridge` tells the model when to use them.
 
 **Agent memory, not organizational memory.** The bridge is the agents'
 memory: working state, recall, episodes and each session's own work trail.
@@ -36,7 +40,8 @@ session's own work, so there is no `store_supersede_artifact` here.
 ```
 
 You are asked for two options: the daemon URL and its bearer token
-(`MIRAGEND_TOKEN`; stored in the credential store, not in settings.json).
+(`MIRAGEND_TOKEN`, used by the hooks; stored in the credential store, not in
+settings.json).
 The hooks read them as `CLAUDE_PLUGIN_OPTION_DAEMON_URL` /
 `CLAUDE_PLUGIN_OPTION_TOKEN`, falling back to `MIRAGEND_URL` / `MIRAGEND_TOKEN`
 in the environment — which is how a cloud environment supplies them when
@@ -93,6 +98,11 @@ marketplace add ieepirzy/miragen && codex plugin add miragen-memory@miragen`;
 its `.codex-plugin/plugin.json` declares an empty hooks file (the daemon's
 native hooks are the Codex path) and the proxy.
 
+The proxy sends the daemon bearer, so its tools work against a daemon
+without sign-in (a local or bearer-only `miragend`). A daemon with OAuth
+configured refuses the bearer on `/mcp`; the hooks keep working there, the
+proxy's tools do not.
+
 Grok **discards** SessionStart/UserPromptSubmit hook output. The start block
 and prompt recall are queued (0600, under `~/.local/state/miragen-hook/`) and
 handed to the model with the **first tool result** that follows, exactly
@@ -137,8 +147,8 @@ CLAUDE="$(command -v claude || echo /opt/node22/bin/claude)"
   --config daemon_url=https://memory.muutto365.fi || true
 ```
 
-The plugin's bundled MCP server then has no bearer in cloud sessions and shows
-as failed; enable the bridge as a claude.ai connector on the session for tools.
+For the tools, enable the bridge as a connector on the session; the plugin
+brings the hooks only.
 Repository HTTP hooks (below) work without any plugin.
 
 Alternative without any plugin: `miragen-hook install claude-code --http

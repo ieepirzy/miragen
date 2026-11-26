@@ -540,13 +540,94 @@ class TestBridgeMcp:
             assert meta.json()["authorization_endpoint"] == "https://memory.example/authorize"
             resource = client.get("/.well-known/oauth-protected-resource")
             assert resource.status_code == 200
-            # The daemon bearer still works alongside OAuth.
-            ok = client.post("/mcp", headers={"Authorization": "Bearer secret",
-                                              "Accept": "application/json, text/event-stream"},
+            accept = {"Accept": "application/json, text/event-stream"}
+            ping = {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}}
+            # With OAuth configured the daemon bearer is not an MCP credential:
+            # refused, with the challenge that sends a client to sign in.
+            refused = client.post("/mcp", headers={**accept, "Authorization": "Bearer secret"}, json=ping)
+            assert refused.status_code == 401
+            assert "resource_metadata=" in refused.headers["www-authenticate"]
+            assert client.post("/mcp/", headers={**accept, "Authorization": "Bearer secret"},
+                               json=ping).status_code == 401
+            # An origo access token from the sign-in flow is what opens /mcp.
+            token = _origo_access_token(client)
+            ok = client.post("/mcp", headers={**accept, "Authorization": f"Bearer {token}"}, json=ping)
+            assert ok.status_code == 200
+            # ...and it opens nothing else: the session API keeps the bearer.
+            assert client.get("/sessions/v1/stats",
+                              headers={"Authorization": f"Bearer {token}"}).status_code == 401
+            assert client.get("/sessions/v1/stats", headers={"Authorization": "Bearer secret"}).status_code == 200
+
+    def test_mount_guard_idp_refuses_the_bearer(self, tmp_path, monkeypatch):
+        """Upstream sign-in configured (MCP_IDP_*, as a hosted bridge runs):
+        /mcp refuses the daemon bearer; the session API still takes it."""
+        from miragen.daemon.api import bridge_oauth_from_env
+
+        secret = tmp_path / "idp-secret"
+        secret.write_text("upstream-secret\n")
+        oauth = bridge_oauth_from_env(tmp_path, {
+            "MCP_BASE_URL": "https://memory.example",
+            "MCP_IDP_ISSUER": "https://id.example/realms/staff",
+            "MCP_IDP_CLIENT_ID": "bridge",
+            "MCP_IDP_CLIENT_SECRET_FILE": str(secret),
+            "MCP_IDP_ALLOWED_GROUPS": "engineers",
+            "MCP_CIMD_ALLOWED_CLIENTS": "https://claude.ai/oauth/mcp-oauth-client-metadata",
+        })
+        assert oauth is not None and oauth["idp"] is not None
+        h = Harness(tmp_path)
+        app = create_app(None, token="secret", sessions=h.plane, bridge_oauth=oauth)
+        accept = {"Accept": "application/json, text/event-stream"}
+        ping = {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}}
+        with TestClient(app) as client:
+            refused = client.post("/mcp", headers={**accept, "Authorization": "Bearer secret"}, json=ping)
+            assert refused.status_code == 401
+            assert "resource_metadata=" in refused.headers["www-authenticate"]
+            assert client.get("/sessions/v1/stats", headers={"Authorization": "Bearer secret"}).status_code == 200
+            assert client.get("/sessions/v1/stats").status_code == 401
+            # Positive control in the same app: a token the provider vouches
+            # for is let through, so the 401 above is the bearer's, not a
+            # mount that refuses everything.
+            [guard] = [r.app for r in app.routes if getattr(r, "path", None) == "/mcp"]
+            monkeypatch.setattr(guard.provider, "verify_token",
+                                lambda token, resource=None: {"sub": "p"} if token == "signed-in" else None)
+            assert client.post("/mcp", headers={**accept, "Authorization": "Bearer signed-in"},
+                               json=ping).status_code == 200
+            assert client.post("/mcp", headers={**accept, "Authorization": "Bearer secret"},
+                               json=ping).status_code == 401
+
+    def test_mount_guard_without_token_or_oauth_stays_open(self, tmp_path):
+        """A local daemon with neither a token nor OAuth: network isolation,
+        exactly as before."""
+        h = Harness(tmp_path)
+        app = create_app(None, token="", sessions=h.plane)
+        with TestClient(app) as client:
+            ok = client.post("/mcp", headers={"Accept": "application/json, text/event-stream"},
                              json={"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}})
             assert ok.status_code == 200
-            # Health and the session routes are untouched by origo.
-            assert client.get("/sessions/v1/stats", headers={"Authorization": "Bearer secret"}).status_code == 200
+
+
+def _origo_access_token(client) -> str:
+    """The static client's authorization-code flow (auto-approve, PKCE S256)
+    against the app's own origo routes; returns the access token."""
+    import base64
+    import hashlib
+    from urllib.parse import parse_qs, urlsplit
+
+    verifier = "v" * 64
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    redirect = "https://claude.ai/api/mcp/auth_callback"
+    resp = client.get("/authorize", params={
+        "response_type": "code", "client_id": "claude", "redirect_uri": redirect,
+        "code_challenge": challenge, "code_challenge_method": "S256", "state": "st",
+        "resource": "https://memory.example/mcp"}, follow_redirects=False)
+    assert resp.status_code in (302, 303), resp.text
+    code = parse_qs(urlsplit(resp.headers["location"]).query)["code"][0]
+    tok = client.post("/token", data={
+        "grant_type": "authorization_code", "code": code, "redirect_uri": redirect,
+        "client_id": "claude", "client_secret": "s3", "code_verifier": verifier,
+        "resource": "https://memory.example/mcp"})
+    assert tok.status_code == 200, tok.text
+    return tok.json()["access_token"]
 
 
 # ── review findings (PR #97) ─────────────────────────────────────────────────

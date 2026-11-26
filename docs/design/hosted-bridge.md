@@ -97,12 +97,16 @@ The `store_*` subset is for filing the session's own work trail. The bridge is
 agent memory. Operating organizational knowledge (recording and superseding
 decisions and other org artifacts) belongs to Loimi core's own MCP server, so
 the bridge deliberately has no `store_supersede_artifact`.
-Two credential classes open it: the daemon bearer (automation, the plugin's
-`.mcp.json`, `claude mcp add --header`) and an origo OAuth token
-(claude.ai custom connector; `MCP_BASE_URL` / `MCP_CLIENT_ID` /
-`MCP_CLIENT_SECRET`, pre-registered private client, `MCP_AUTO_APPROVE`;
-optionally people sign in at an upstream OIDC provider via `MCP_IDP_*`,
-with `MCP_CIMD_ALLOWED_CLIENTS` for URL-identified connector clients).
+What opens it depends on whether OAuth is configured
+(`MCP_BASE_URL` / `MCP_CLIENT_ID` / `MCP_CLIENT_SECRET`, pre-registered
+private client, `MCP_AUTO_APPROVE`; optionally people sign in at an upstream
+OIDC provider via `MCP_IDP_*`, with `MCP_CIMD_ALLOWED_CLIENTS` for
+URL-identified connector clients). With OAuth configured, only an origo
+access token opens `/mcp`: a person signs in, and the daemon bearer is
+refused there (it keeps opening `/sessions/v1/*` and the other REST routes,
+which is what the hooks use). Without any OAuth (a local or bearer-only
+daemon), the daemon bearer opens `/mcp` as before, and an empty daemon token
+leaves it open (network isolation).
 The guide advertises the tools (`tools_available`) exactly when the mount is
 enabled. `memory_recall` is the explicit lexical search the guide promises
 ("an absent packet does not mean the store is empty").
@@ -110,9 +114,10 @@ enabled. `memory_recall` is the explicit lexical search the guide promises
 **Distribution as a plugin.** `plugins/miragen-memory` carries the hooks
 (shell form, `PYTHONPATH="${CLAUDE_PLUGIN_ROOT}" python3 -m miragen_hook
 claude-code`), the vendored adapter (`tests/test_plugin_bundle.py` pins it
-identical to `miragen_hook/`), the `miragen-bridge` MCP server config with
-`${user_config.*}` substitution, and the `memory-bridge` skill (§18.8's
-detailed guidance). Options arrive at hooks as `CLAUDE_PLUGIN_OPTION_*`,
+identical to `miragen_hook/`) and the `memory-bridge` skill (§18.8's
+detailed guidance). Since plugin 0.4.0 it configures no MCP server for
+Claude Code: the tools come from the daemon as a connector the person signs
+in to, so no static token is ever an MCP credential. Options arrive at hooks as `CLAUDE_PLUGIN_OPTION_*`,
 with `MIRAGEND_URL` / `MIRAGEND_TOKEN` as the environment fallback — the
 form a cloud environment uses. The marketplace is the repository itself
 (`.claude-plugin/marketplace.json`). Plugins declared in a repository's

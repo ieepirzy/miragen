@@ -25,7 +25,12 @@ intentionally have no supersede tool. If you're asked to correct organizational
 knowledge and only have this bridge, say it needs the Loimi connector. Never
 work around it with a fresh `store_put_artifact`.
 
-## Memory tools (MCP server `miragen-bridge`)
+## Memory tools
+
+In Claude Code these come from the memory bridge's **connector**, signed in as
+you (the plugin itself only runs the hooks). Under Codex and Grok Build they
+come from the plugin's `miragen-bridge` server. If none of them is available,
+say so rather than guessing what memory holds.
 
 Everything is scoped by the daemon from the `project` you name — the repository
 remote (`github.com/org/repo`), its name, or your session key

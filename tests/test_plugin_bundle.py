@@ -63,9 +63,11 @@ def test_manifests_and_mcp_config():
     assert manifest["name"] == "miragen-memory"
     assert manifest["userConfig"]["token"]["sensitive"] is True
     assert set(manifest["userConfig"]) == {"daemon_url", "token"}
-    mcp = json.loads((PLUGIN / ".mcp.json").read_text())["miragen-bridge"]
-    assert mcp == {"type": "http", "url": "${user_config.daemon_url}/mcp",
-                   "headers": {"Authorization": "Bearer ${user_config.token}"}}
+    # No MCP server of its own: the bearer is not an MCP credential on a
+    # daemon with sign-in, and Claude Code reaches the tools through the
+    # bridge's connector, signed in as the person. The plugin is hooks only.
+    assert not (PLUGIN / ".mcp.json").exists()
+    assert "mcpServers" not in manifest
     marketplace = json.loads((ROOT / ".claude-plugin" / "marketplace.json").read_text())
     assert marketplace["name"] == "miragen"
     [entry] = marketplace["plugins"]
