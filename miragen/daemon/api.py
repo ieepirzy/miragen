@@ -1143,6 +1143,10 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
             bridge_oauth_from_env(sessions.state_dir)
             if sessions is not None and sessions.config.mcp.enabled else None
         ),
+        bridge_run_tokens=(
+            bridge_run_tokens_from_env()
+            if sessions is not None and sessions.config.mcp.enabled else None
+        ),
         harness_setup=harness_setup,
     )
 
