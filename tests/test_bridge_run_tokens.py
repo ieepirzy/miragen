@@ -288,3 +288,20 @@ def test_run_tokens_off_by_default(tmp_path):
     with TestClient(app) as client:
         assert client.get("/health").json()["sessions"]["mcp"]["run_tokens"] is False
         assert client.post("/mcp", headers=_bearer(_token()), json=PING).status_code == 401
+
+
+def test_every_daemon_start_path_reads_the_bridge_settings():
+    """main() builds the app in two places (session plane alone, and with
+    the lifecycle plane). Both must read MCP_RUN_TOKEN_* as they read the
+    OAuth settings, or one kind of daemon silently ignores them."""
+    import ast
+    import inspect
+
+    from miragen.daemon import api
+
+    tree = ast.parse(inspect.getsource(api.main).lstrip())
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and getattr(n.func, "id", None) == "create_app"]
+    assert len(calls) == 2
+    for call in calls:
+        assert {"bridge_oauth", "bridge_run_tokens"} <= {k.arg for k in call.keywords}
