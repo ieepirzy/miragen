@@ -1,7 +1,7 @@
 {
   "name": "miragen-memory",
-  "version": "0.3.4",
-  "description": "Join this Claude Code session to the miragen memory bridge: context injected at start, prompts/outcomes captured, episodes filed as Loimi artifacts, memory_* and store_* tools via MCP.",
+  "version": "0.4.0",
+  "description": "Join this Claude Code session to the miragen memory bridge: context injected at start, prompts/outcomes captured, episodes filed as Loimi artifacts. Hooks only; the memory_* and store_* tools come from the bridge's connector, signed in as you.",
   "author": {
     "name": "ieepirzy",
     "url": "https://github.com/ieepirzy"
@@ -27,7 +27,7 @@
     "token": {
       "type": "string",
       "title": "Bridge bearer token",
-      "description": "MIRAGEND_TOKEN of that daemon, sent as Authorization: Bearer on hooks and MCP calls. Leave empty where a prompt is impossible (cloud environments): the hooks then read MIRAGEND_TOKEN from the session environment.",
+      "description": "MIRAGEND_TOKEN of that daemon, sent as Authorization: Bearer by the hooks. Leave empty where a prompt is impossible (cloud environments): the hooks then read MIRAGEND_TOKEN from the session environment.",
       "sensitive": true,
       "required": false
     }

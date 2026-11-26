@@ -45,8 +45,13 @@ It adds three things to the local picture above:
 - **The Loimi artifact store.** Each session gets a run; compaction and
   session-end episodes are filed as `session_episode` artifacts under it;
   the run closes at session end. The injected header carries `store_run=…`.
-- **The bridge MCP (`/mcp`).** `memory_*` and `store_*` tools for the model,
-  guarded by the daemon bearer and, optionally, origo OAuth for claude.ai.
+- **The bridge MCP (`/mcp`).** `memory_*` and `store_*` tools for the model.
+  With origo OAuth configured (`MCP_BASE_URL` + a client, optionally
+  `MCP_IDP_*`), `/mcp` accepts only an origo access token: people sign in,
+  and the daemon bearer is refused there while it keeps opening the session
+  API (`/sessions/v1/*`) and the other REST routes. Without any OAuth
+  configured (a local, bearer-only daemon) the daemon bearer opens `/mcp`
+  as it always did.
 
 ### Deploy the daemon
 
@@ -56,7 +61,7 @@ Docker socket. Environment:
 | Variable | Meaning |
 |---|---|
 | `MIRAGEND_SESSIONS_CONFIG` | path to `sessions.yaml` (see `scripts/miragend-local/sessions.example.yaml`) |
-| `MIRAGEND_TOKEN` (`_FILE`) | the bridge bearer every client sends |
+| `MIRAGEND_TOKEN` (`_FILE`) | the bridge bearer the hooks and REST clients send; on `/mcp` only when no OAuth is configured |
 | `MIRAGEND_HOST` / `MIRAGEND_PORT` / `MIRAGEND_STATE_DIR` | bind + state (a volume: sessions, journal, the minted principal token, OAuth state) |
 | `LOIMI_MEMORY_URL` | Loimi base URL (`http://loimi:8400` on the shared network) |
 | `LOIMI_OPERATOR_TOKEN` (`_FILE`) | Loimi's store bearer: provisions the principal and scopes, and is the artifact store credential unless `LOIMI_STORE_TOKEN` is set |
@@ -79,9 +84,9 @@ Docker socket. Environment:
 /plugin install miragen-memory@miragen
 ```
 
-Enter the daemon URL and the bearer when asked. Hooks and the
-`miragen-bridge` MCP server are configured by the plugin; nothing is
-installed on the machine (the adapter is stdlib Python 3). For cloud
+Enter the daemon URL and the bearer when asked. The plugin configures the
+hooks only; for the `memory_*` / `store_*` tools add the daemon as a
+connector and sign in (below). Nothing is installed on the machine (the adapter is stdlib Python 3). For cloud
 sessions, enable the plugin for your claude.ai account or declare it in the
 repository's `.claude/settings.json` (`extraKnownMarketplaces` +
 `enabledPlugins`), allow the daemon's host in the environment's network
@@ -273,9 +278,11 @@ the daemon's server winning).
 
 ### Join from claude.ai / any MCP client
 
-Custom connector URL `https://<daemon>/mcp` (OAuth, the pre-registered
-client). From a terminal: `claude mcp add --transport http miragen-bridge
-https://<daemon>/mcp --header "Authorization: Bearer <token>"`.
+Custom connector URL `https://<daemon>/mcp` (OAuth: the pre-registered
+client, or a Client ID Metadata Document client with `MCP_IDP_*`). From a
+terminal: `claude mcp add --transport http miragen-bridge https://<daemon>/mcp`
+and sign in when asked. A `--header "Authorization: Bearer <token>"` works
+only on a daemon without OAuth configured.
 
 ## Enable it on the development machine (local daemon)
 
