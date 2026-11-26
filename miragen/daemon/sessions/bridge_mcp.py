@@ -11,10 +11,12 @@ daemon resolves those into scopes and runs exactly as it does for hook
 events — a tool argument can name a project, never a scope, a principal
 or a credential.
 
-Two credential classes open the mount (api.py): the daemon bearer
-(automation, `claude mcp add --header`) and an origo OAuth token
-(claude.ai custom connector). Results are JSON strings; a write counts
-only when its status says accepted/captured.
+Credentials that open the mount (api.py): the daemon bearer (automation,
+`claude mcp add --header`; not once OAuth is configured), an origo OAuth
+token (claude.ai custom connector), and, when configured, an agent run's
+run token (run_tokens.py). Every caller acts through the daemon's one
+memory principal. Results are JSON strings; a write counts only when its
+status says accepted/captured.
 """
 
 from __future__ import annotations
@@ -112,10 +114,21 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
 
     # ── orientation ──────────────────────────────────────────────────────────
 
+    def _caller(ctx: Context | None) -> dict | None:
+        """The run-token caller the mount guard verified, if any."""
+        try:
+            request = ctx.request_context.request if ctx is not None else None
+        except (AttributeError, LookupError, ValueError):
+            return None
+        state = getattr(request, "scope", {}).get("state") if request is not None else None
+        caller = state.get("bridge_caller") if isinstance(state, dict) else None
+        return dict(caller) if isinstance(caller, dict) else None
+
     @mcp.tool()
-    async def bridge_status() -> str:
+    async def bridge_status(ctx: Context | None = None) -> str:
         """What this bridge is connected to: principal, Loimi/store health,
-        known projects and how to name one in the other tools."""
+        known projects and how to name one in the other tools; for an agent
+        run, also who the run token says the caller is."""
         plane = get_plane()
         described = plane.describe()
         projects = sorted({
@@ -125,6 +138,7 @@ def build_bridge_mcp(get_plane: Callable[[], Any]) -> FastMCP:
             "principal": described["principal"], "loimi": described["loimi"],
             "store": described["store"], "known_projects": projects,
             "default_project": plane.config.mcp.default_project,
+            "caller": _caller(ctx),
             "naming": "project = remote URL ('github.com/org/repo'), slug, repository name, "
                       "or a session key ('claude-code:<session_id>')",
         })
