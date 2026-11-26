@@ -122,9 +122,40 @@ def test_idp_defaults(idp_env):
     assert idp["token_key_files"] == []
 
 
-def test_secret_value_in_env_is_never_read(idp_env):
+def test_secret_value_and_file_together_refuse(idp_env):
     env = {**idp_env, "MCP_IDP_CLIENT_SECRET": "from-env"}
-    assert bridge_idp_from_env(env)["client_secret"] == "upstream-secret"
+    with pytest.raises(BridgeOAuthConfigError, match="both set"):
+        bridge_idp_from_env(env)
+
+
+def test_secret_resolved_by_the_startup_loader(tmp_path, idp_env):
+    """Regression: miragend's startup loader turns MCP_IDP_CLIENT_SECRET_FILE
+    into MCP_IDP_CLIENT_SECRET and deletes the _FILE variable; the bridge
+    must still start with that secret."""
+    from miragen.file_secrets import load_file_secrets
+
+    env = dict(idp_env)
+    load_file_secrets(env)
+    assert "MCP_IDP_CLIENT_SECRET_FILE" not in env
+    assert env["MCP_IDP_CLIENT_SECRET"] == "upstream-secret"
+    oauth = bridge_oauth_from_env(tmp_path, env)
+    assert oauth["idp"]["client_secret"] == "upstream-secret"
+
+
+def test_secret_value_alone_counts_as_idp_config(tmp_path):
+    # Any one MCP_IDP_* (the resolved secret included) turns validation on.
+    with pytest.raises(BridgeOAuthConfigError, match="MCP_IDP_ISSUER"):
+        bridge_oauth_from_env(tmp_path, {**STATIC, "MCP_IDP_CLIENT_SECRET": "s"})
+
+
+def test_empty_resolved_secret_refuses(tmp_path, idp_env, secret_file):
+    from miragen.file_secrets import load_file_secrets
+
+    secret_file.write_text("\n")
+    env = dict(idp_env)
+    load_file_secrets(env)
+    with pytest.raises(BridgeOAuthConfigError, match="MCP_IDP_CLIENT_SECRET"):
+        bridge_oauth_from_env(tmp_path, env)
 
 
 def test_idp_kwargs_cimd_only(tmp_path, idp_env):

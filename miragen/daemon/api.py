@@ -554,6 +554,7 @@ class BridgeOAuthConfigError(RuntimeError):
 BRIDGE_IDP_ENV = (
     "MCP_IDP_ISSUER",
     "MCP_IDP_CLIENT_ID",
+    "MCP_IDP_CLIENT_SECRET",
     "MCP_IDP_CLIENT_SECRET_FILE",
     "MCP_IDP_ALLOWED_GROUPS",
     "MCP_IDP_GROUPS_CLAIM",
@@ -602,17 +603,27 @@ def bridge_idp_from_env(env: Mapping[str, str]) -> dict | None:
     client_id = _env_str(env, "MCP_IDP_CLIENT_ID")
     if not client_id:
         raise BridgeOAuthConfigError("MCP_IDP_* needs MCP_IDP_CLIENT_ID")
+    # miragend resolves every FOO_FILE into FOO at startup
+    # (miragen.file_secrets.load_file_secrets) and drops FOO_FILE, so the
+    # secret normally arrives here as MCP_IDP_CLIENT_SECRET. A still-present
+    # MCP_IDP_CLIENT_SECRET_FILE (no loader ran) is read here instead.
+    client_secret = _env_str(env, "MCP_IDP_CLIENT_SECRET")
     secret_file = _env_str(env, "MCP_IDP_CLIENT_SECRET_FILE")
-    if not secret_file:
+    if client_secret and secret_file:
         raise BridgeOAuthConfigError(
-            "MCP_IDP_* needs MCP_IDP_CLIENT_SECRET_FILE (a path, never the value)")
-    try:
-        client_secret = Path(secret_file).read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        raise BridgeOAuthConfigError(
-            f"MCP_IDP_CLIENT_SECRET_FILE {secret_file!r} is unreadable: {exc.strerror}") from None
+            "MCP_IDP_CLIENT_SECRET and MCP_IDP_CLIENT_SECRET_FILE are both set; set one")
     if not client_secret:
-        raise BridgeOAuthConfigError(f"MCP_IDP_CLIENT_SECRET_FILE {secret_file!r} is empty")
+        if not secret_file:
+            raise BridgeOAuthConfigError(
+                "MCP_IDP_* needs MCP_IDP_CLIENT_SECRET_FILE (a mounted secret file, resolved "
+                "into MCP_IDP_CLIENT_SECRET at startup) or MCP_IDP_CLIENT_SECRET")
+        try:
+            client_secret = Path(secret_file).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise BridgeOAuthConfigError(
+                f"MCP_IDP_CLIENT_SECRET_FILE {secret_file!r} is unreadable: {exc.strerror}") from None
+        if not client_secret:
+            raise BridgeOAuthConfigError(f"MCP_IDP_CLIENT_SECRET_FILE {secret_file!r} is empty")
     allowed_groups = _env_csv(env, "MCP_IDP_ALLOWED_GROUPS")
     if not allowed_groups:
         # Written out, never defaulted: without a gate every account the
