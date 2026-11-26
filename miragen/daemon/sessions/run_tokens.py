@@ -123,7 +123,7 @@ class _Jwks:
                 keys[str(entry["kid"])] = jwt.PyJWK(entry, algorithm="ES256").key
             return keys
         except Exception as error:  # noqa: BLE001 - a failed fetch keeps the last good set
-            logger.warning("run-token JWKS fetch failed (%s)", type(error).__name__)
+            logger.warning("signing key set fetch failed (%s)", type(error).__name__)
             return None
 
     def key(self, kid: str) -> Any | None:
