@@ -515,10 +515,12 @@ def mount_bridge_mcp(app: FastAPI, sessions: SessionPlane, *, token: str, oauth:
         for key, value in vars(oauth_app.state)["_state"].items():
             setattr(app.state, key, value)
         logger.info(
-            "bridge MCP: origo OAuth enabled (static client %r, upstream sign-in %s, CIMD clients %d)",
+            "bridge MCP: origo OAuth enabled (static client %r, upstream sign-in %s, "
+            "CIMD clients %d, managed sign-in %s)",
             oauth.get("client_id"),
             "on" if oauth.get("idp") else "off",
             len(oauth.get("cimd_allowed_clients") or ()),
+            "on" if oauth.get("managed_sign_in") else "off",
         )
 
     @app.middleware("http")
@@ -662,6 +664,31 @@ def bridge_idp_from_env(env: Mapping[str, str]) -> dict | None:
     }
 
 
+def bridge_managed_sign_in_from_env(env: Mapping[str, str]) -> dict | None:
+    """MCP_MANAGED_SIGNIN_*: managed sign-in for a connector platform's
+    organization members (ID-JAG assertions at /token as the jwt-bearer
+    grant), with no browser sign-in. The platform signs a short-lived
+    assertion naming the member's email; origo issues a token for the one
+    enabled upstream user with that verified email, through the same group
+    gate as an interactive sign-in. None when MCP_MANAGED_SIGNIN_ISSUER is
+    unset; the other two without it refuse to start."""
+    issuer = _env_str(env, "MCP_MANAGED_SIGNIN_ISSUER")
+    tenant = _env_str(env, "MCP_MANAGED_SIGNIN_TENANT")
+    directory_url = _env_str(env, "MCP_MANAGED_SIGNIN_DIRECTORY_URL")
+    if not issuer:
+        if tenant or directory_url:
+            raise BridgeOAuthConfigError(
+                "MCP_MANAGED_SIGNIN_TENANT/_DIRECTORY_URL are set without "
+                "MCP_MANAGED_SIGNIN_ISSUER")
+        return None
+    if not _https_url(issuer):
+        raise BridgeOAuthConfigError("MCP_MANAGED_SIGNIN_ISSUER must be an https URL")
+    # The directory URL's own rules (https, or http to an in-cluster service
+    # name; scheme, host and port only) are origo's, enforced when the
+    # provider is built at startup.
+    return {"issuer": issuer, "tenant": tenant or None, "directory_url": directory_url or None}
+
+
 def bridge_oauth_from_env(state_dir: Path, env: Mapping[str, str] | None = None) -> dict | None:
     """The bridge's OAuth settings, or None for bearer only.
 
@@ -686,6 +713,11 @@ def bridge_oauth_from_env(state_dir: Path, env: Mapping[str, str] | None = None)
         raise BridgeOAuthConfigError(
             "MCP_CIMD_ALLOWED_CLIENTS without MCP_IDP_*: every account on the listed platform "
             "could get a token; set the identity provider too")
+    managed = bridge_managed_sign_in_from_env(env)
+    if managed is not None and (idp is None or not cimd):
+        raise BridgeOAuthConfigError(
+            "MCP_MANAGED_SIGNIN_ISSUER needs MCP_IDP_* (the person is looked up there) and "
+            "MCP_CIMD_ALLOWED_CLIENTS (only those clients may present an assertion)")
     static = bool(client_id and client_secret)
     if idp is None:
         if not (base_url and static):
@@ -717,6 +749,7 @@ def bridge_oauth_from_env(state_dir: Path, env: Mapping[str, str] | None = None)
         "storage_path": str(state_dir / "oauth-state.sqlite"),
         "idp": idp,
         "cimd_allowed_clients": cimd,
+        "managed_sign_in": managed,
     }
 
 
@@ -747,10 +780,12 @@ def bridge_oauth_provider_kwargs(oauth: dict) -> dict:
         # people sign in upstream.
         "allow_unauthenticated_consent": True,
         # Explicitly off rather than left to origo's defaults: without
-        # MCP_IDP_* nothing may enable registration, CIMD or upstream sign-in.
+        # MCP_IDP_* nothing may enable registration, CIMD, upstream or
+        # managed sign-in.
         "public_registration": False,
         "cimd_allowed_clients": None,
         "identity_provider": None,
+        "managed_sign_in": None,
     }
     if client_id:
         kwargs["clients"] = {client_id: oauth["client_secret"]}
@@ -759,7 +794,7 @@ def bridge_oauth_provider_kwargs(oauth: dict) -> dict:
     if not idp:
         return kwargs
 
-    from origo import IdentityProvider
+    from origo import IdentityProvider, ManagedSignIn
 
     kwargs["allow_unauthenticated_consent"] = False
     idp_kwargs: dict = {
@@ -783,6 +818,14 @@ def bridge_oauth_provider_kwargs(oauth: dict) -> dict:
         # allowlist set it accepts just those URLs and turns /register off.
         kwargs["public_registration"] = True
         kwargs["cimd_allowed_clients"] = cimd
+    managed = oauth.get("managed_sign_in")
+    if managed:
+        # group_paths stays False (short names), so MCP_IDP_ALLOWED_GROUPS
+        # means the same on both sign-in paths. directory_url None lets
+        # origo fall back to its own env var, else the issuer's host.
+        kwargs["managed_sign_in"] = ManagedSignIn(
+            issuer=managed["issuer"], tenant=managed.get("tenant"),
+            directory_url=managed.get("directory_url"))
     return kwargs
 
 

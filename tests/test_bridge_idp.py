@@ -80,6 +80,7 @@ def test_static_client_kwargs_are_the_previous_flow(tmp_path):
     assert kwargs["identity_provider"] is None
     assert kwargs["public_registration"] is False
     assert kwargs["cimd_allowed_clients"] is None
+    assert kwargs["managed_sign_in"] is None
 
 
 def test_static_client_provider_builds(tmp_path):
@@ -269,3 +270,91 @@ def test_empty_secret_file_refuses(tmp_path, idp_env, secret_file):
 def test_cimd_without_idp_refuses(tmp_path):
     with pytest.raises(BridgeOAuthConfigError, match="without MCP_IDP_"):
         bridge_oauth_from_env(tmp_path, {**STATIC, "MCP_CIMD_ALLOWED_CLIENTS": CIMD})
+
+
+# ── managed sign-in (MCP_MANAGED_SIGNIN_*) ───────────────────────────────────
+
+ASSERTION_ISSUER = "https://issuer.example/issuers/iss_123"
+
+
+def test_managed_unset_is_none(tmp_path, idp_env):
+    oauth = bridge_oauth_from_env(tmp_path, idp_env)
+    assert oauth["managed_sign_in"] is None
+    assert bridge_oauth_provider_kwargs(oauth)["managed_sign_in"] is None
+
+
+def test_managed_env_parsed(idp_env):
+    from miragen.daemon.api import bridge_managed_sign_in_from_env
+
+    assert bridge_managed_sign_in_from_env({"MCP_MANAGED_SIGNIN_ISSUER": ASSERTION_ISSUER}) == {
+        "issuer": ASSERTION_ISSUER, "tenant": None, "directory_url": None}
+    assert bridge_managed_sign_in_from_env({
+        "MCP_MANAGED_SIGNIN_ISSUER": ASSERTION_ISSUER, "MCP_MANAGED_SIGNIN_TENANT": " t-1 ",
+        "MCP_MANAGED_SIGNIN_DIRECTORY_URL": "http://idp.idp.svc.cluster.local:8080",
+    }) == {"issuer": ASSERTION_ISSUER, "tenant": "t-1",
+           "directory_url": "http://idp.idp.svc.cluster.local:8080"}
+
+
+def test_managed_reaches_oauth_provider(tmp_path, idp_env, monkeypatch):
+    from origo import ManagedSignIn, OAuthProvider
+
+    monkeypatch.delenv("ORIGO_MANAGED_SIGNIN_DIRECTORY_URL", raising=False)
+    monkeypatch.delenv("ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_ID", raising=False)
+    monkeypatch.delenv("ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_SECRET_FILE", raising=False)
+    env = {**idp_env, "MCP_MANAGED_SIGNIN_ISSUER": ASSERTION_ISSUER,
+           "MCP_MANAGED_SIGNIN_TENANT": "t-1",
+           "MCP_MANAGED_SIGNIN_DIRECTORY_URL": "http://idp.idp.svc.cluster.local:8080"}
+    kwargs = bridge_oauth_provider_kwargs(bridge_oauth_from_env(tmp_path, env))
+    managed = kwargs["managed_sign_in"]
+    assert isinstance(managed, ManagedSignIn)
+    assert managed.issuer == ASSERTION_ISSUER
+    assert managed.tenant == "t-1"
+    assert managed.directory_url == "http://idp.idp.svc.cluster.local:8080"
+    assert managed.group_paths is False
+    provider = OAuthProvider(**kwargs)
+    assert provider.managed_sign_in is managed
+
+
+def test_managed_arguments(tmp_path, idp_env, monkeypatch):
+    import origo
+
+    seen = {}
+
+    class Recorder:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+    monkeypatch.setattr(origo, "ManagedSignIn", Recorder)
+    env = {**idp_env, "MCP_MANAGED_SIGNIN_ISSUER": ASSERTION_ISSUER}
+    bridge_oauth_provider_kwargs(bridge_oauth_from_env(tmp_path, env))
+    assert seen == {"issuer": ASSERTION_ISSUER, "tenant": None, "directory_url": None}
+
+
+@pytest.mark.parametrize("mutate, message", [
+    (lambda e: {**e, "MCP_MANAGED_SIGNIN_ISSUER": "http://issuer.example/x"}, "https URL"),
+    (lambda e: {**e, "MCP_MANAGED_SIGNIN_ISSUER": "issuer.example"}, "https URL"),
+    (lambda e: {**_drop(e, "MCP_MANAGED_SIGNIN_ISSUER"), "MCP_MANAGED_SIGNIN_TENANT": "t-1"},
+     "without MCP_MANAGED_SIGNIN_ISSUER"),
+    (lambda e: {**_drop(e, "MCP_MANAGED_SIGNIN_ISSUER"),
+                "MCP_MANAGED_SIGNIN_DIRECTORY_URL": "https://idp.example"},
+     "without MCP_MANAGED_SIGNIN_ISSUER"),
+    (lambda e: {**_drop(e, "MCP_CIMD_ALLOWED_CLIENTS"), **STATIC}, "MCP_CIMD_ALLOWED_CLIENTS"),
+])
+def test_half_configured_managed_refuses(tmp_path, idp_env, mutate, message):
+    env = {**idp_env, "MCP_MANAGED_SIGNIN_ISSUER": ASSERTION_ISSUER}
+    with pytest.raises(BridgeOAuthConfigError, match=message):
+        bridge_oauth_from_env(tmp_path, mutate(env))
+
+
+def test_managed_without_idp_refuses(tmp_path):
+    with pytest.raises(BridgeOAuthConfigError, match="needs MCP_IDP_"):
+        bridge_oauth_from_env(tmp_path, {**STATIC, "MCP_MANAGED_SIGNIN_ISSUER": ASSERTION_ISSUER})
+
+
+def test_managed_bad_directory_url_refuses_at_startup(tmp_path, idp_env):
+    # origo's own rule: plain http only to an in-cluster service name.
+    env = {**idp_env, "MCP_MANAGED_SIGNIN_ISSUER": ASSERTION_ISSUER,
+           "MCP_MANAGED_SIGNIN_DIRECTORY_URL": "http://idp.example:8080"}
+    oauth = bridge_oauth_from_env(tmp_path, env)
+    with pytest.raises(ValueError):
+        bridge_oauth_provider_kwargs(oauth)
