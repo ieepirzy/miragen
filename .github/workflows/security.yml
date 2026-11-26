@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+    # labeled: the `run-dast` label runs the DAST job on a pull request.
+    types: [opened, synchronize, reopened, labeled]
   schedule:
     - cron: "0 6 * * 1"  # weekly Monday scan
 
@@ -43,6 +45,134 @@ jobs:
       - uses: actions/checkout@v4
       - name: Scan
         run: semgrep scan --config auto --error miragen/
+
+  # Bandit beside Semgrep (Loimi decision 1a469678, Ilari 2026-11-26).
+  # Report-only for the first week: SECURITY_ENFORCE "true" (on or after
+  # 2026-12-03) makes HIGH findings fail the job. Medium and higher
+  # severity, medium and higher confidence, as the booking backend's job.
+  bandit:
+    name: SAST (Bandit)
+    runs-on: ubuntu-latest
+    env:
+      SECURITY_ENFORCE: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Bandit
+        run: |
+          pip install 'bandit[toml]==1.9.4'
+          bandit -r miragen miragen_hook -ll -ii -q -f json -o bandit.json || true
+      - name: Summarise findings
+        run: >-
+          python scripts/ci/security_summary.py
+          --title "SAST: Bandit" --bandit bandit.json
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: bandit.json
+          if-no-files-found: ignore
+
+  # DAST: an OWASP ZAP API scan of miragend, built from this commit.
+  # Unauthenticated on purpose: MIRAGEND_TOKEN is one full-control token, and
+  # ZAP's OpenAPI import sends a request to every operation, POSTs included,
+  # so an authenticated scan would start real agent containers. Without the
+  # token every guarded route must answer 401, so this checks the auth
+  # boundary, headers and error leakage, and changes nothing. An
+  # authenticated scan needs a read-only token first (follow-up).
+  # Passive only (-S), as the booking backend's ZAP gate. Main pushes, the
+  # weekly schedule and on request; not every PR (~10 minutes).
+  dast:
+    name: DAST (ZAP API scan, unauthenticated)
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-dast')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SECURITY_ENFORCE: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build miragend
+        run: >-
+          docker build --file Dockerfile.miragend
+          --build-arg INSTALL_CLAUDE_CODE=0
+          --tag miragend:dast .
+
+      # The daemon needs a Docker client at start (image-contract checks).
+      # The token is random and never given to the scanner.
+      - name: Start miragend
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/workspace" "$RUNNER_TEMP/zap"
+          chmod 0777 "$RUNNER_TEMP/zap"
+          docker run --detach --name miragend-dast \
+            --publish 127.0.0.1:8000:8000 \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            --volume "$RUNNER_TEMP/workspace:$RUNNER_TEMP/workspace" \
+            --env MIRAGEND_HOST=0.0.0.0 --env MIRAGEND_PORT=8000 \
+            --env MIRAGEN_WORKSPACE="$RUNNER_TEMP/workspace" \
+            --env MIRAGEND_TOKEN="$(openssl rand -hex 32)" \
+            miragend:dast
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8000/health >/dev/null; then
+              break
+            fi
+            if [ "$attempt" = 30 ]; then
+              docker logs miragend-dast
+              exit 1
+            fi
+            sleep 2
+          done
+          curl --fail --silent --show-error http://127.0.0.1:8000/openapi.json -o "$RUNNER_TEMP/zap/openapi.json"
+          python -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["paths"]), "paths in the OpenAPI document")' "$RUNNER_TEMP/zap/openapi.json"
+
+      # Exit 0/1/2 are scan outcomes; 3 and up mean the scan itself failed.
+      - name: ZAP API scan
+        run: |
+          # The step shell runs with -e; ZAP's warn/fail exits must not end it.
+          set +e
+          docker run --rm --network host \
+            -v "$RUNNER_TEMP/zap:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af \
+            zap-api-scan.py \
+              -t http://127.0.0.1:8000/openapi.json -f openapi \
+              -S -I -T 15 \
+              -J zap-report.json -r zap-report.html
+          status=$?
+          echo "ZAP exit status: $status"
+          if [ "$status" -ge 3 ]; then
+            echo "::error::the ZAP scan did not complete (exit $status)"
+            exit 1
+          fi
+
+      - name: Summarise findings
+        if: always()
+        run: >-
+          python3 scripts/ci/security_summary.py
+          --title "DAST: ZAP API scan of miragend (unauthenticated, passive)"
+          --zap "$RUNNER_TEMP/zap/zap-report.json"
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-reports
+          path: |
+            ${{ runner.temp }}/zap/zap-report.json
+            ${{ runner.temp }}/zap/zap-report.html
+            ${{ runner.temp }}/zap/openapi.json
+          if-no-files-found: ignore
+
+      - name: miragend logs on failure
+        if: failure()
+        run: docker logs miragend-dast
+
+      - name: Stop miragend
+        if: always()
+        run: docker rm --force miragend-dast || true
 
   gitleaks:
     name: Secret scan (Gitleaks)
