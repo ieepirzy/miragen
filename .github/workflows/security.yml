@@ -49,7 +49,7 @@ jobs:
   # Bandit beside Semgrep (Loimi decision 1a469678, Ilari 2026-11-26).
   # Report-only for the first week: SECURITY_ENFORCE "true" (on or after
   # 2026-12-03) makes HIGH findings fail the job. Medium and higher
-  # severity, medium and higher confidence, as movingfirm-backend's job.
+  # severity, medium and higher confidence, as the booking backend's job.
   bandit:
     name: SAST (Bandit)
     runs-on: ubuntu-latest
@@ -83,7 +83,7 @@ jobs:
   # token every guarded route must answer 401, so this checks the auth
   # boundary, headers and error leakage, and changes nothing. An
   # authenticated scan needs a read-only token first (follow-up).
-  # Passive only (-S), as movingfirm-backend's ZAP gate. Main pushes, the
+  # Passive only (-S), as the booking backend's ZAP gate. Main pushes, the
   # weekly schedule and on request; not every PR (~10 minutes).
   dast:
     name: DAST (ZAP API scan, unauthenticated)
