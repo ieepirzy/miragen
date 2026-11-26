@@ -57,6 +57,10 @@ dependencies = [
     # silently pick an incompatible mcp and break at import time instead of
     # at install time.
     "mcp<2",
+    # The bridge MCP's run-token verifier (miragen/daemon/sessions/run_tokens.py,
+    # ES256). mcp already requires the same; declared because it is imported
+    # directly.
+    "pyjwt[crypto]>=2.10.1",
     # OTLP span export (miragen/telemetry.py). Same floor as mira-sdk's
     # telemetry module — the two must speak the same wire format and
     # attribute vocabulary (mira.* resource attributes, OTLP/HTTP).

@@ -138,6 +138,7 @@ def create_app(
     contract_transport=None,
     sessions: SessionPlane | None = None,
     bridge_oauth: dict | None = None,
+    bridge_run_tokens=None,
     harness_setup=None,
 ) -> FastAPI:
     """`core` is the Docker-bound lifecycle plane; `sessions` the external
@@ -150,6 +151,9 @@ def create_app(
     "auto_approve", "redirect_uris", "storage_path"}; None = bearer only.
     When set, /mcp takes origo tokens only and the daemon bearer stays the
     credential of the REST routes (see _BridgeMcpGuard).
+
+    `bridge_run_tokens` (optional, with `sessions`): a RunTokenSettings
+    (bridge_run_tokens_from_env) — /mcp also takes agents' run tokens.
 
     `harness_setup` (optional): a HarnessSetupService — the daemon keeps
     Grok Build / Codex on this machine joined (miragen/daemon/harness_setup.py);
@@ -216,6 +220,7 @@ def create_app(
         if sessions is not None:
             body["sessions"] = sessions.describe()
             body["sessions"]["mcp"]["oauth"] = bridge_oauth is not None
+            body["sessions"]["mcp"]["run_tokens"] = bridge_run_tokens is not None
         if harness_setup is not None:
             body["harness_setup"] = harness_setup.describe()
         return body
@@ -234,7 +239,8 @@ def create_app(
         app.router.on_shutdown.append(sessions.stop)
 
         if sessions.config.mcp.enabled:
-            mount_bridge_mcp(app, sessions, token=token, oauth=bridge_oauth)
+            mount_bridge_mcp(app, sessions, token=token, oauth=bridge_oauth,
+                             run_tokens=bridge_run_tokens)
 
     if core is None:
         return app
@@ -451,12 +457,33 @@ class _BridgeMcpGuard:
 
     Keyed on "any OAuth configured" rather than on MCP_IDP_* alone: once a
     sign-in exists, a shared static secret on the MCP would be a second,
-    weaker way past it."""
+    weaker way past it.
+
+    Run tokens (`self.run_tokens` set: MCP_RUN_TOKEN_*) are one more
+    credential for /mcp alone, in either mode: a short-lived ES256 JWT a
+    control plane minted for an agent run (miragen.daemon.sessions.run_tokens).
+    They change nothing above: the daemon bearer is still refused on /mcp once
+    OAuth is configured, and a run token never opens the session API. The
+    verified caller is put on the request scope (`state["bridge_caller"]`)
+    for bridge_status and audit."""
 
     def __init__(self, token: str) -> None:
         self.token = token
         self.provider = None
+        self.run_tokens = None
         self.inner = _bridge_not_ready
+
+    async def _run_caller(self, auth_header: bytes):
+        """The run token's caller, or None. The JWKS fetch may block, so the
+        check runs in a worker thread; only JWT-shaped bearers get there."""
+        if self.run_tokens is None:
+            return None
+        scheme, _, token = auth_header.decode("latin-1", "replace").partition(" ")
+        if scheme.lower() != "bearer" or not self.run_tokens.looks_like_jwt(token):
+            return None
+        import anyio.to_thread
+
+        return await anyio.to_thread.run_sync(self.run_tokens.caller, token)
 
     def _authorized(self, auth_header: bytes) -> bool:
         if self.provider is not None:
@@ -478,7 +505,13 @@ class _BridgeMcpGuard:
                 if raw_name == b"authorization":
                     supplied = raw_value
                     break
-            if not self._authorized(supplied):
+            authorized = self._authorized(supplied)
+            if not authorized:
+                caller = await self._run_caller(supplied)
+                if caller is not None:
+                    authorized = True
+                    scope.setdefault("state", {})["bridge_caller"] = caller.describe()
+            if not authorized:
                 headers = [(b"content-type", b"application/json")]
                 if self.provider is not None:
                     # RFC 9728 challenge: an OAuth-capable client discovers
@@ -502,7 +535,10 @@ async def _bridge_not_ready(scope, receive, send):
                     "body": b'{"detail": "bridge MCP not started", "code": "unavailable"}'})
 
 
-def mount_bridge_mcp(app: FastAPI, sessions: SessionPlane, *, token: str, oauth: dict | None) -> None:
+def mount_bridge_mcp(
+    app: FastAPI, sessions: SessionPlane, *, token: str, oauth: dict | None,
+    run_tokens=None,
+) -> None:
     from contextlib import AsyncExitStack
 
     from miragen.daemon.sessions.bridge_mcp import build_bridge_mcp
@@ -510,6 +546,19 @@ def mount_bridge_mcp(app: FastAPI, sessions: SessionPlane, *, token: str, oauth:
     guard = _BridgeMcpGuard(token)
     mcp = build_bridge_mcp(lambda: sessions)
     app.state.bridge_mcp = mcp
+
+    if run_tokens is not None:
+        from miragen.daemon.sessions.run_tokens import RunTokenSettings, RunTokenVerifier
+
+        guard.run_tokens = (
+            RunTokenVerifier(run_tokens) if isinstance(run_tokens, RunTokenSettings) else run_tokens
+        )
+        settings = guard.run_tokens.settings
+        logger.info(
+            "bridge MCP: run tokens accepted on /mcp (issuer %r, audience %r, tenant %r, "
+            "%d agent principal(s))",
+            settings.issuer, settings.audience, settings.tenant, len(settings.agents),
+        )
 
     if oauth is not None:
         from origo import OAuthProvider
@@ -697,6 +746,69 @@ def bridge_managed_sign_in_from_env(env: Mapping[str, str]) -> dict | None:
     # name; scheme, host and port only) are origo's, enforced when the
     # provider is built at startup.
     return {"issuer": issuer, "tenant": tenant or None, "directory_url": directory_url or None}
+
+
+BRIDGE_RUN_TOKEN_ENV = (
+    "MCP_RUN_TOKEN_JWKS_URL",
+    "MCP_RUN_TOKEN_JWKS_ALLOW_HTTP",
+    "MCP_RUN_TOKEN_ISSUER",
+    "MCP_RUN_TOKEN_AUDIENCE",
+    "MCP_RUN_TOKEN_TENANT",
+    "MCP_RUN_TOKEN_AGENTS",
+)
+
+
+def bridge_run_tokens_from_env(env: Mapping[str, str] | None = None):
+    """MCP_RUN_TOKEN_*: /mcp also accepts agents' run tokens (see
+    miragen.daemon.sessions.run_tokens). None when none of them is set; any
+    one set makes every required one required, or startup is refused.
+
+    - MCP_RUN_TOKEN_JWKS_URL: the issuer's public JWKS, https (plain http only
+      with MCP_RUN_TOKEN_JWKS_ALLOW_HTTP=true, e.g. an in-cluster service).
+    - MCP_RUN_TOKEN_ISSUER / _AUDIENCE: the exact `iss` / `aud`.
+    - MCP_RUN_TOKEN_TENANT: the exact `tenant` claim.
+    - MCP_RUN_TOKEN_AGENTS: comma-separated agent principals of that tenant
+      (`agent.<tenant>.<class>.<name>[.<slot>]`) admitted; written out, never
+      defaulted, so turning run tokens on names exactly who gets in.
+
+    No name ends in _FILE: none of these is a secret, and the startup loader
+    would read such a variable as a file path."""
+    from miragen.daemon.sessions.run_tokens import TENANT_RE, RunTokenSettings, principal_re
+
+    env = os.environ if env is None else env
+    if not any(_env_str(env, name) for name in BRIDGE_RUN_TOKEN_ENV):
+        return None
+    url = _env_str(env, "MCP_RUN_TOKEN_JWKS_URL")
+    allow_http = _env_flag(env, "MCP_RUN_TOKEN_JWKS_ALLOW_HTTP")
+    parts = urlsplit(url)
+    if not (parts.scheme == "https" or (allow_http and parts.scheme == "http")) \
+            or not parts.hostname or parts.username or parts.password:
+        raise BridgeOAuthConfigError(
+            "MCP_RUN_TOKEN_JWKS_URL must be an https URL (plain http only with "
+            "MCP_RUN_TOKEN_JWKS_ALLOW_HTTP=true)")
+    issuer = _env_str(env, "MCP_RUN_TOKEN_ISSUER")
+    audience = _env_str(env, "MCP_RUN_TOKEN_AUDIENCE")
+    tenant = _env_str(env, "MCP_RUN_TOKEN_TENANT")
+    missing = [name for name, value in (("MCP_RUN_TOKEN_ISSUER", issuer),
+                                        ("MCP_RUN_TOKEN_AUDIENCE", audience),
+                                        ("MCP_RUN_TOKEN_TENANT", tenant)) if not value]
+    if missing:
+        raise BridgeOAuthConfigError(f"MCP_RUN_TOKEN_* needs {', '.join(missing)}")
+    if not TENANT_RE.fullmatch(tenant):
+        raise BridgeOAuthConfigError(f"MCP_RUN_TOKEN_TENANT {tenant!r} is not a tenant id")
+    agents = _env_csv(env, "MCP_RUN_TOKEN_AGENTS")
+    if not agents:
+        raise BridgeOAuthConfigError(
+            "MCP_RUN_TOKEN_* needs MCP_RUN_TOKEN_AGENTS: the agent principals admitted, "
+            f"comma-separated (agent.{tenant}.<class>.<name>)")
+    pattern = principal_re(tenant)
+    for agent in agents:
+        if not pattern.fullmatch(agent):
+            raise BridgeOAuthConfigError(
+                f"MCP_RUN_TOKEN_AGENTS: {agent!r} is not an agent principal of {tenant!r} "
+                f"(agent.{tenant}.<class>.<name>)")
+    return RunTokenSettings(jwks_url=url, issuer=issuer, audience=audience, tenant=tenant,
+                            agents=frozenset(agents))
 
 
 def bridge_oauth_from_env(state_dir: Path, env: Mapping[str, str] | None = None) -> dict | None:
@@ -954,6 +1066,7 @@ def main() -> None:  # pragma: no cover - exercised only in a real deployment
         app = create_app(
             None, token=token, sessions=sessions,
             bridge_oauth=bridge_oauth_from_env(sessions.state_dir) if sessions.config.mcp.enabled else None,
+            bridge_run_tokens=bridge_run_tokens_from_env() if sessions.config.mcp.enabled else None,
             harness_setup=harness_setup,
         )
         uvicorn.run(

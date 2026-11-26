@@ -631,7 +631,7 @@ class TestHttp:
         assert body["capabilities"] == ["sessions/v1", "bridge-mcp/v1"]
         assert not set(DAEMON_CAPABILITIES) & set(body["capabilities"])
         assert body["sessions"]["mcp"] == {"enabled": True, "default_project": "mcp:default",
-                                           "oauth": False}
+                                           "oauth": False, "run_tokens": False}
         assert body["sessions"]["store"]["configured"] is True
         assert body["sessions"]["principal"] == PRINCIPAL
         assert body["sessions"]["loimi"]["credential_configured"] is True

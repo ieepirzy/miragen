@@ -51,7 +51,10 @@ It adds three things to the local picture above:
   and the daemon bearer is refused there while it keeps opening the session
   API (`/sessions/v1/*`) and the other REST routes. Without any OAuth
   configured (a local, bearer-only daemon) the daemon bearer opens `/mcp`
-  as it always did.
+  as it always did. Agents launched with no person behind them can open
+  `/mcp` with a **run token** (`MCP_RUN_TOKEN_*`, below), in either mode:
+  a short-lived ES256 JWT their control plane minted for this bridge's
+  audience. It never opens the session API.
 
 ### Deploy the daemon
 
@@ -72,6 +75,7 @@ Docker socket. Environment:
 | `MCP_IDP_RECHECK_ON_REFRESH`, `MCP_IDP_TOKEN_KEY_FILES` | re-check the person at the provider on every refresh; needs comma-separated paths to 32-byte keys that seal the kept upstream refresh tokens |
 | `MCP_CIMD_ALLOWED_CLIENTS` | with `MCP_IDP_*` only: comma-separated exact https client_id URLs (e.g. `https://claude.ai/oauth/mcp-oauth-client-metadata`) that may connect by Client ID Metadata Document; dynamic registration stays off |
 | `MCP_MANAGED_SIGNIN_ISSUER`, `MCP_MANAGED_SIGNIN_TENANT`, `MCP_MANAGED_SIGNIN_DIRECTORY_URL` | optional managed sign-in: a connector platform's organization members connect without a browser sign-in (ID-JAG assertion at `/token`, jwt-bearer grant), looked up at the upstream provider by verified email and gated by `MCP_IDP_ALLOWED_GROUPS`. The issuer is https, exactly the assertion's `iss`; the tenant, if set, must match its `aud_tenant`; the directory URL is the provider's admin API base for the lookup (https, or http to an in-cluster service name; default: the issuer's host). Needs `MCP_IDP_*` and `MCP_CIMD_ALLOWED_CLIENTS`; tenant or directory URL without the issuer refuses to start |
+| `MCP_RUN_TOKEN_JWKS_URL`, `MCP_RUN_TOKEN_ISSUER`, `MCP_RUN_TOKEN_AUDIENCE`, `MCP_RUN_TOKEN_TENANT`, `MCP_RUN_TOKEN_AGENTS` | optional: `/mcp` also accepts agent run tokens. ES256 only, key by `kid` from the JWKS (https; plain http only with `MCP_RUN_TOKEN_JWKS_ALLOW_HTTP=true`, e.g. an in-cluster service); `iss`, `aud` and `tenant` exact; `exp`/`iat` present, at most 900 s apart, 30 s leeway; `sub` equals `act.sub`, an agent principal `agent.<tenant>.<class>.<name>[.<slot>]` listed in the comma-separated `MCP_RUN_TOKEN_AGENTS`. The caller acts through the daemon's memory principal like a signed-in person; `bridge_status` shows the token's principal and run. Any of them set makes all five required; a half-set configuration refuses to start |
 
 `GET /health` → `sessions.principal_source` (`environment` / `state_dir` /
 `created` / `minted` / `missing`), `sessions.loimi.shared_scopes`,
