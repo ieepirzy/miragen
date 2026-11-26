@@ -100,7 +100,9 @@ the bridge deliberately has no `store_supersede_artifact`.
 Two credential classes open it: the daemon bearer (automation, the plugin's
 `.mcp.json`, `claude mcp add --header`) and an origo OAuth token
 (claude.ai custom connector; `MCP_BASE_URL` / `MCP_CLIENT_ID` /
-`MCP_CLIENT_SECRET`, pre-registered private client, `MCP_AUTO_APPROVE`).
+`MCP_CLIENT_SECRET`, pre-registered private client, `MCP_AUTO_APPROVE`;
+optionally people sign in at an upstream OIDC provider via `MCP_IDP_*`,
+with `MCP_CIMD_ALLOWED_CLIENTS` for URL-identified connector clients).
 The guide advertises the tools (`tools_available`) exactly when the mount is
 enabled. `memory_recall` is the explicit lexical search the guide promises
 ("an absent packet does not mean the store is empty").

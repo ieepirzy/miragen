@@ -17,8 +17,10 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+from collections.abc import Mapping
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
@@ -502,14 +504,7 @@ def mount_bridge_mcp(app: FastAPI, sessions: SessionPlane, *, token: str, oauth:
     if oauth is not None:
         from origo import OAuthProvider
 
-        provider = OAuthProvider(
-            base_url=oauth["base_url"],
-            clients={oauth["client_id"]: oauth["client_secret"]},
-            client_redirect_uris={oauth["client_id"]: list(oauth["redirect_uris"])},
-            auto_approve=bool(oauth.get("auto_approve", False)),
-            mcp_path="/mcp",
-            storage_path=oauth.get("storage_path"),
-        )
+        provider = OAuthProvider(**bridge_oauth_provider_kwargs(oauth))
         guard.provider = provider
         # Adopt origo's flow routes AND its state (its endpoints read
         # request.app.state; the set grows between releases — README:
@@ -519,7 +514,12 @@ def mount_bridge_mcp(app: FastAPI, sessions: SessionPlane, *, token: str, oauth:
             app.router.routes.insert(0, route)
         for key, value in vars(oauth_app.state)["_state"].items():
             setattr(app.state, key, value)
-        logger.info(f"bridge MCP: origo OAuth enabled for client {oauth['client_id']!r}")
+        logger.info(
+            "bridge MCP: origo OAuth enabled (static client %r, upstream sign-in %s, CIMD clients %d)",
+            oauth.get("client_id"),
+            "on" if oauth.get("idp") else "off",
+            len(oauth.get("cimd_allowed_clients") or ()),
+        )
 
     @app.middleware("http")
     async def _mcp_mount_slash(request: Request, call_next):
@@ -545,28 +545,234 @@ def mount_bridge_mcp(app: FastAPI, sessions: SessionPlane, *, token: str, oauth:
     app.router.on_shutdown.append(_stop)
 
 
-def bridge_oauth_from_env(state_dir: Path) -> dict | None:  # pragma: no cover - deployment wiring
-    """MCP_BASE_URL + MCP_CLIENT_ID + MCP_CLIENT_SECRET, all three or none
-    (the miradeploy/mirarun/Loimi convention). Token storage persists in
-    the state dir so a restart does not log every connector out."""
-    base_url = os.getenv("MCP_BASE_URL")
-    client_id = os.getenv("MCP_CLIENT_ID")
-    client_secret = os.getenv("MCP_CLIENT_SECRET")
-    if not (base_url and client_id and client_secret):
-        if any((base_url, client_id, client_secret)):
-            logger.warning("bridge MCP: MCP_BASE_URL/MCP_CLIENT_ID/MCP_CLIENT_SECRET are all "
-                           "required together; OAuth disabled, bearer only")
+class BridgeOAuthConfigError(RuntimeError):
+    """A half-configured bridge sign-in: refuse to start rather than run open."""
+
+
+BRIDGE_IDP_ENV = (
+    "MCP_IDP_ISSUER",
+    "MCP_IDP_CLIENT_ID",
+    "MCP_IDP_CLIENT_SECRET_FILE",
+    "MCP_IDP_ALLOWED_GROUPS",
+    "MCP_IDP_GROUPS_CLAIM",
+    "MCP_IDP_SCOPES",
+    "MCP_IDP_RECHECK_ON_REFRESH",
+    "MCP_IDP_TOKEN_KEY_FILES",
+    "MCP_IDP_MAX_GRANT_AGE",
+)
+
+
+def _env_str(env: Mapping[str, str], name: str) -> str:
+    # `or ""`: Compose interpolates a declared-but-unset variable to "".
+    return (env.get(name) or "").strip()
+
+
+def _env_csv(env: Mapping[str, str], name: str) -> list[str]:
+    return [part.strip() for part in _env_str(env, name).split(",") if part.strip()]
+
+
+def _env_flag(env: Mapping[str, str], name: str) -> bool:
+    text = _env_str(env, name).lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off", ""):
+        return False
+    raise BridgeOAuthConfigError(f"{name} must be true or false, not {text!r}")
+
+
+def _https_url(url: str, *, need_path: bool = False) -> bool:
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
+        return False
+    return bool(parts.path.strip("/")) or not need_path
+
+
+def bridge_idp_from_env(env: Mapping[str, str]) -> dict | None:
+    """MCP_IDP_*: people sign in to the bridge's OAuth flow at an upstream
+    OIDC provider (such as Keycloak) behind a group gate. None when none of
+    them is set (the pre-existing behaviour); any one set means every
+    required one must be, or startup is refused."""
+    if not any(_env_str(env, name) for name in BRIDGE_IDP_ENV):
         return None
-    extras = [u.strip() for u in os.getenv("MCP_CLIENT_REDIRECT_URIS", "").split(",") if u.strip()]
+    issuer = _env_str(env, "MCP_IDP_ISSUER")
+    if not _https_url(issuer):
+        raise BridgeOAuthConfigError("MCP_IDP_ISSUER must be an https URL")
+    client_id = _env_str(env, "MCP_IDP_CLIENT_ID")
+    if not client_id:
+        raise BridgeOAuthConfigError("MCP_IDP_* needs MCP_IDP_CLIENT_ID")
+    secret_file = _env_str(env, "MCP_IDP_CLIENT_SECRET_FILE")
+    if not secret_file:
+        raise BridgeOAuthConfigError(
+            "MCP_IDP_* needs MCP_IDP_CLIENT_SECRET_FILE (a path, never the value)")
+    try:
+        client_secret = Path(secret_file).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise BridgeOAuthConfigError(
+            f"MCP_IDP_CLIENT_SECRET_FILE {secret_file!r} is unreadable: {exc.strerror}") from None
+    if not client_secret:
+        raise BridgeOAuthConfigError(f"MCP_IDP_CLIENT_SECRET_FILE {secret_file!r} is empty")
+    allowed_groups = _env_csv(env, "MCP_IDP_ALLOWED_GROUPS")
+    if not allowed_groups:
+        # Written out, never defaulted: without a gate every account the
+        # provider knows could sign in.
+        raise BridgeOAuthConfigError(
+            "MCP_IDP_* needs MCP_IDP_ALLOWED_GROUPS: the group names exactly as the provider "
+            "emits them (without a gate every account could sign in)")
+    scopes_text = _env_str(env, "MCP_IDP_SCOPES")
+    scopes = scopes_text.split() if scopes_text else None
+    if scopes is not None and "openid" not in scopes:
+        raise BridgeOAuthConfigError("MCP_IDP_SCOPES must include openid")
+    max_age_text = _env_str(env, "MCP_IDP_MAX_GRANT_AGE")
+    max_grant_age = None
+    if max_age_text:
+        try:
+            max_grant_age = int(max_age_text)
+        except ValueError:
+            raise BridgeOAuthConfigError(
+                f"MCP_IDP_MAX_GRANT_AGE must be whole seconds, not {max_age_text!r}") from None
+        if max_grant_age <= 0:
+            raise BridgeOAuthConfigError("MCP_IDP_MAX_GRANT_AGE must be a positive number of seconds")
+    recheck = _env_flag(env, "MCP_IDP_RECHECK_ON_REFRESH")
+    token_key_files = _env_csv(env, "MCP_IDP_TOKEN_KEY_FILES")
+    if recheck and not token_key_files:
+        raise BridgeOAuthConfigError(
+            "MCP_IDP_RECHECK_ON_REFRESH needs MCP_IDP_TOKEN_KEY_FILES (keys sealing the kept "
+            "upstream refresh tokens)")
+    return {
+        "issuer": issuer,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "allowed_groups": allowed_groups,
+        "groups_claim": _env_str(env, "MCP_IDP_GROUPS_CLAIM") or "groups",
+        "scopes": scopes,
+        "max_grant_age": max_grant_age,
+        "recheck_on_refresh": recheck,
+        "token_key_files": token_key_files,
+    }
+
+
+def bridge_oauth_from_env(state_dir: Path, env: Mapping[str, str] | None = None) -> dict | None:
+    """The bridge's OAuth settings, or None for bearer only.
+
+    The static client: MCP_BASE_URL + MCP_CLIENT_ID + MCP_CLIENT_SECRET, all
+    three or none. Optional upstream sign-in: MCP_IDP_* (see
+    bridge_idp_from_env) and MCP_CIMD_ALLOWED_CLIENTS (exact https client_id
+    URLs). Without any MCP_IDP_* / MCP_CIMD_* set this is exactly the
+    static-client behaviour it always was. With them, anything half-set
+    raises BridgeOAuthConfigError: fail closed, never run open. Token storage
+    persists in the state dir so a restart does not log every connector out."""
+    env = os.environ if env is None else env
+    base_url = _env_str(env, "MCP_BASE_URL")
+    client_id = _env_str(env, "MCP_CLIENT_ID")
+    client_secret = _env_str(env, "MCP_CLIENT_SECRET")
+    idp = bridge_idp_from_env(env)
+    cimd = _env_csv(env, "MCP_CIMD_ALLOWED_CLIENTS")
+    for url in cimd:
+        if not _https_url(url, need_path=True):
+            raise BridgeOAuthConfigError(
+                f"MCP_CIMD_ALLOWED_CLIENTS: {url!r} is not an exact https client_id URL")
+    if cimd and idp is None:
+        raise BridgeOAuthConfigError(
+            "MCP_CIMD_ALLOWED_CLIENTS without MCP_IDP_*: every account on the listed platform "
+            "could get a token; set the identity provider too")
+    static = bool(client_id and client_secret)
+    if idp is None:
+        if not (base_url and static):
+            if any((base_url, client_id, client_secret)):
+                logger.warning("bridge MCP: MCP_BASE_URL/MCP_CLIENT_ID/MCP_CLIENT_SECRET are all "
+                               "required together; OAuth disabled, bearer only")
+            return None
+    else:
+        if not base_url:
+            raise BridgeOAuthConfigError(
+                "MCP_IDP_* needs MCP_BASE_URL: people sign in through /mcp's OAuth flow")
+        if (client_id or client_secret) and not static:
+            raise BridgeOAuthConfigError(
+                "MCP_CLIENT_ID and MCP_CLIENT_SECRET are required together")
+        if not (static or cimd):
+            raise BridgeOAuthConfigError(
+                "MCP_IDP_* needs a client to sign in with: MCP_CIMD_ALLOWED_CLIENTS or the "
+                "MCP_CLIENT_ID/MCP_CLIENT_SECRET pair")
+    extras = _env_csv(env, "MCP_CLIENT_REDIRECT_URIS")
     redirect_uris = list(BRIDGE_DEFAULT_REDIRECT_URIS) + [
         u for u in extras if u not in BRIDGE_DEFAULT_REDIRECT_URIS
     ]
     return {
-        "base_url": base_url, "client_id": client_id, "client_secret": client_secret,
-        "auto_approve": os.getenv("MCP_AUTO_APPROVE", "false").lower() == "true",
+        "base_url": base_url,
+        "client_id": client_id if static else None,
+        "client_secret": client_secret if static else None,
+        "auto_approve": _env_str(env, "MCP_AUTO_APPROVE").lower() == "true",
         "redirect_uris": redirect_uris,
         "storage_path": str(state_dir / "oauth-state.sqlite"),
+        "idp": idp,
+        "cimd_allowed_clients": cimd,
     }
+
+
+def bridge_oauth_provider_kwargs(oauth: dict) -> dict:
+    """origo's OAuthProvider arguments for the bridge settings `oauth`.
+
+    Without an identity provider this is the static-client flow as before:
+    the predefined confidential client, approve page (or auto_approve), and
+    every newer origo option passed explicitly off.
+
+    With one, people sign in at the upstream provider behind its group gate
+    (origo then never shows the approve page); the static client keeps
+    working alongside, and listed CIMD clients may come in by their URL."""
+    client_id = oauth.get("client_id")
+    kwargs: dict = {
+        "base_url": oauth["base_url"],
+        "clients": {},
+        "client_redirect_uris": {},
+        "auto_approve": bool(oauth.get("auto_approve", False)),
+        "mcp_path": "/mcp",
+        "storage_path": oauth.get("storage_path"),
+        # origo >=0.4 refuses /authorize without an identity provider unless
+        # this is on; the origo this ran on before (0.3) had no such gate and
+        # behaved as if it were. On for the static-client path so an unset
+        # MCP_IDP_* changes nothing: that client is confidential, so a code
+        # from the approve page is useless without its secret at /token.
+        # Passed explicitly (never left to origo's env var); False below once
+        # people sign in upstream.
+        "allow_unauthenticated_consent": True,
+        # Explicitly off rather than left to origo's defaults: without
+        # MCP_IDP_* nothing may enable registration, CIMD or upstream sign-in.
+        "public_registration": False,
+        "cimd_allowed_clients": None,
+        "identity_provider": None,
+    }
+    if client_id:
+        kwargs["clients"] = {client_id: oauth["client_secret"]}
+        kwargs["client_redirect_uris"] = {client_id: list(oauth["redirect_uris"])}
+    idp = oauth.get("idp")
+    if not idp:
+        return kwargs
+
+    from origo import IdentityProvider
+
+    kwargs["allow_unauthenticated_consent"] = False
+    idp_kwargs: dict = {
+        "issuer": idp["issuer"],
+        "client_id": idp["client_id"],
+        "client_secret": idp["client_secret"],
+        "allowed_groups": list(idp["allowed_groups"]),
+        "groups_claim": idp.get("groups_claim") or "groups",
+        "recheck_on_refresh": bool(idp.get("recheck_on_refresh", False)),
+        "token_key_files": list(idp.get("token_key_files") or ()) or None,
+    }
+    # Left out when unset so origo's own defaults apply.
+    if idp.get("scopes"):
+        idp_kwargs["scopes"] = list(idp["scopes"])
+    if idp.get("max_grant_age"):
+        idp_kwargs["max_grant_age"] = int(idp["max_grant_age"])
+    kwargs["identity_provider"] = IdentityProvider(**idp_kwargs)
+    cimd = list(oauth.get("cimd_allowed_clients") or ())
+    if cimd:
+        # origo resolves a CIMD client_id only in its public mode; with the
+        # allowlist set it accepts just those URLs and turns /register off.
+        kwargs["public_registration"] = True
+        kwargs["cimd_allowed_clients"] = cimd
+    return kwargs
 
 
 BRIDGE_DEFAULT_REDIRECT_URIS = (
